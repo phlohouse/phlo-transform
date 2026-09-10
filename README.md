@@ -182,6 +182,7 @@ runs a disposable container and is executed explicitly in CI.
 ## Documentation
 
 - [Full specification](SPEC.md)
+- [Blog series: what Phlo Transform is, from first principles](docs/blog/README.md)
 - [Implementation roadmap](docs/roadmap/README.md)
 - [Phase 0 compiler architecture](docs/architecture.md)
 - [Phase 1 engine architecture](docs/engine.md)

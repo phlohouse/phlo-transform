@@ -2236,6 +2236,7 @@ dependencies = [
  "clap",
  "duckdb",
  "insta",
+ "libc",
  "phlo-transform-core",
  "phlo-transform-daemon",
  "phlo-transform-dbt",

@@ -244,6 +244,12 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Rust ignores SIGPIPE by default, which turns `cmd | head` into a
+    // panic on println!. Restore the default so a closed pipe exits quietly.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     match run(&cli).await {
         Ok(code) => code,
