@@ -50,8 +50,16 @@ It is intentionally not a dbt compatibility project. The goal is a smaller, more
   cross-workflow dependency policy, and registered consumers in impact. See
   [`docs/workflow.md`](docs/workflow.md). Host-side tasks/`workflow.toml`
   remain with the wider Phlo host.
+- **Phase 8 — daemon and agent APIs: done (local service).** A versioned
+  local HTTP/JSON semantic service with a coherent snapshot, file watcher and
+  reload. See [`docs/daemon.md`](docs/daemon.md). Targeted invalidation, LSP and
+  remote security are deferred.
 
-No daemon yet — Phase 8.
+All eight roadmap phases are implemented.
+
+All eight roadmap phases are implemented. Later opportunities (targeted
+invalidation, LSP, remote service security, distribution statistics) are noted
+in the phase docs.
 
 ## Toolchain
 
@@ -113,3 +121,4 @@ runs a disposable container and is executed explicitly in CI.
 - [Phase 5 Nessie and WAP](docs/wap.md)
 - [Phase 6 native data diff](docs/diff.md)
 - [Phase 7 workflow integration](docs/workflow.md)
+- [Phase 8 daemon and agent APIs](docs/daemon.md)

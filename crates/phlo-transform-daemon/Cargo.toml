@@ -1,27 +1,23 @@
 [package]
-name = "phlo-transform-cli"
-description = "Command line interface for Phlo Transform."
+name = "phlo-transform-daemon"
+description = "Local semantic service for Phlo Transform."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "phlo-transform"
-path = "src/main.rs"
-
 [dependencies]
-clap = { workspace = true }
+axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+walkdir = { workspace = true }
 phlo-transform-core = { workspace = true }
-phlo-transform-daemon = { workspace = true }
 phlo-transform-engine = { workspace = true }
-phlo-transform-nessie = { workspace = true }
-phlo-transform-trino = { workspace = true }
 
 [dev-dependencies]
-assert_cmd = "2"
-insta = "1"
+axum = { workspace = true }
+reqwest = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }

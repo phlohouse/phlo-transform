@@ -6,6 +6,7 @@ members = [
     "crates/phlo-transform-engine",
     "crates/phlo-transform-nessie",
     "crates/phlo-transform-trino",
+    "crates/phlo-transform-daemon",
     "crates/phlo-transform-cli",
 ]
 
@@ -19,6 +20,7 @@ rust-version = "1.93"
 [workspace.dependencies]
 # Internal crates.
 phlo-transform-core = { path = "crates/phlo-transform-core", version = "0.0.0" }
+phlo-transform-daemon = { path = "crates/phlo-transform-daemon", version = "0.0.0" }
 phlo-transform-engine = { path = "crates/phlo-transform-engine", version = "0.0.0" }
 phlo-transform-nessie = { path = "crates/phlo-transform-nessie", version = "0.0.0" }
 phlo-transform-sql = { path = "crates/phlo-transform-sql", version = "0.0.0" }
@@ -26,6 +28,7 @@ phlo-transform-trino = { path = "crates/phlo-transform-trino", version = "0.0.0"
 
 # External crates.
 async-trait = "0.1"
+axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
 globset = "0.4"
 petgraph = "0.8"
@@ -37,7 +40,7 @@ sha2 = "0.10"
 sqlparser = { version = "0.62", features = ["visitor"] }
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "macros"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "1"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"

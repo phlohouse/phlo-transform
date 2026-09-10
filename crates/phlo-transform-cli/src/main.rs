@@ -4,9 +4,11 @@
 //! command supports `--json`; human and JSON output are derived from the same
 //! report structures.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use phlo_transform_core::{
@@ -15,6 +17,7 @@ use phlo_transform_core::{
     Nullability, Relation, RelationSchema, SchemaColumn, SelectionOptions, SourceId,
     StaticSchemaProvider,
 };
+use phlo_transform_daemon::{serve, spawn_watcher, WorkspaceService};
 use phlo_transform_engine::{
     diff, promote, Adapter, ArtifactWriter, CancelHandle, DiffPolicy, DiffRequest, DiffStrategy,
     ExecutionStatus, Plan, PlanAction, Planner, PromotionRequest, RunOptions, RunResult, Runner,
@@ -165,6 +168,15 @@ enum Command {
         #[arg(long)]
         sample: Option<f64>,
     },
+    /// Run the local semantic service.
+    Daemon {
+        /// Local port to bind.
+        #[arg(long, default_value_t = 7070)]
+        port: u16,
+        /// File-watch polling interval in milliseconds.
+        #[arg(long, default_value_t = 500)]
+        watch_interval_ms: u64,
+    },
 }
 
 #[tokio::main]
@@ -188,6 +200,14 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: &Cli) -> Result<ExitCode, String> {
+    if let Command::Daemon {
+        port,
+        watch_interval_ms,
+    } = &cli.command
+    {
+        return run_daemon(cli, *port, *watch_interval_ms).await;
+    }
+
     let project = match load_project(&cli.root) {
         Ok(project) => project,
         Err(diagnostics) => {
@@ -242,6 +262,7 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
             )
             .await
         }
+        Command::Daemon { .. } => Ok(ExitCode::SUCCESS),
     }
 }
 
@@ -1191,4 +1212,23 @@ fn print_diff_human(report: &phlo_transform_engine::DiffReport) {
         );
     }
     println!();
+}
+
+async fn run_daemon(cli: &Cli, port: u16, watch_interval_ms: u64) -> Result<ExitCode, String> {
+    let service = WorkspaceService::load(&cli.root);
+    let _watcher = spawn_watcher(
+        service.clone(),
+        Duration::from_millis(watch_interval_ms.max(50)),
+    );
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    if !cli.json {
+        eprintln!(
+            "phlo-transform daemon listening on http://{address} (root {})",
+            cli.root.display()
+        );
+    }
+    serve(service, address)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(ExitCode::SUCCESS)
 }

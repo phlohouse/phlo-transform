@@ -433,3 +433,21 @@ Phase 8 is complete when:
 - richer agent tools for safe automated migration;
 - proactive PR impact summaries;
 - compiler-backed autocomplete.
+
+## Implementation notes
+
+Phase 8 is implemented as a local semantic HTTP/JSON service. See
+[`docs/daemon.md`](../daemon.md).
+
+- `phlo-transform-daemon`: `WorkspaceService` holding an immutable compiled
+  snapshot, versioned `/v1` routes for status/check/models/inspect/lineage/
+  impact/graph, and a polling file watcher that reloads on change.
+- CLI `daemon` command binds `127.0.0.1`.
+- API and CLI share the same report DTOs; errors carry stable codes.
+- Tests cover the HTTP surface, explicit reload and watcher-driven reload
+  without restart.
+
+Not implemented: dependency-aware targeted invalidation (reload is a coherent
+full recompile), push/subscription diagnostics, LSP bridge, remote security,
+and a tracked 1,000-model benchmark.
+
