@@ -273,3 +273,22 @@ pub struct ModelContract {
     pub enforced: bool,
     pub columns: Vec<ColumnContract>,
 }
+
+/// Numeric tolerance for a diffed column.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ColumnTolerance {
+    pub absolute: Option<f64>,
+    pub relative: Option<f64>,
+}
+
+/// Declarative data-diff policy and tolerances for a model.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DiffPolicySpec {
+    pub max_added_rows: Option<i64>,
+    pub max_removed_rows: Option<i64>,
+    pub max_modified_rows: Option<i64>,
+    pub max_changed_fraction: Option<f64>,
+    pub require_full_diff: bool,
+    pub require_keyed_diff: bool,
+    pub tolerances: std::collections::BTreeMap<String, ColumnTolerance>,
+}

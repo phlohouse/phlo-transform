@@ -9,7 +9,7 @@ use crate::identity::{ModelId, Namespace, SourceId};
 use crate::model::{ModelConfig, ModelOrigin, Relation, TestId, TransformRoot};
 
 /// A fully resolved model.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CompiledModel {
     pub id: ModelId,
     /// Physical namespace used for relative resolution.

@@ -179,6 +179,9 @@ enum Command {
         /// Force a full keyed comparison.
         #[arg(long)]
         full: bool,
+        /// Compare at partition granularity (comma-separated columns).
+        #[arg(long)]
+        partition: Option<String>,
         /// Deterministic sample fraction (0..1).
         #[arg(long)]
         sample: Option<f64>,
@@ -294,6 +297,7 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
             base,
             base_relation,
             full,
+            partition,
             sample,
         } => {
             run_diff(
@@ -303,6 +307,7 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
                 base,
                 base_relation,
                 *full,
+                partition.as_deref(),
                 *sample,
             )
             .await
@@ -492,10 +497,31 @@ fn read_environment(cli: &Cli) -> Option<EnvironmentSetup> {
     serde_json::from_value(value.get("environment")?.clone()).ok()
 }
 
-fn read_diff_passed(cli: &Cli) -> Option<bool> {
+fn read_diff(cli: &Cli) -> Option<serde_json::Value> {
     let text = std::fs::read_to_string(artifact_path(cli, "diff.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    value.get("diff")?.get("passed")?.as_bool()
+    serde_json::from_str(&text).ok()
+}
+
+/// A diff is stale once the candidate model version it recorded is no longer
+/// the candidate's materialised version.
+fn diff_is_stale(cli: &Cli, candidate: &str, diff: &serde_json::Value) -> Option<String> {
+    let state = open_state(cli)?;
+    let diff = diff.get("diff")?;
+    let model = diff.get("model")?.as_str()?;
+    let version = diff.get("candidate_version")?.as_str()?;
+    match state
+        .materialized_version(model, Some(candidate))
+        .ok()
+        .flatten()
+    {
+        Some(record) if record.version.hash == version => None,
+        Some(_) => Some(format!(
+            "diff artifact for `{model}` is stale: candidate data changed since the diff"
+        )),
+        None => Some(format!(
+            "diff artifact for `{model}` is stale: candidate is not materialised"
+        )),
+    }
 }
 
 fn build_nessie(cli: &Cli) -> Result<Arc<dyn NessieClient>, String> {
@@ -543,7 +569,32 @@ async fn run_promote(
     }
 
     let environment = read_environment(cli);
-    let diff_passed = read_diff_passed(cli);
+    let diff = read_diff(cli);
+    let diff_passed = diff
+        .as_ref()
+        .and_then(|value| value.get("diff")?.get("passed")?.as_bool());
+
+    if require_diff {
+        if diff_passed != Some(true) {
+            let message = "a passing data diff is required before promotion".to_string();
+            if cli.json {
+                print_json(&serde_json::json!({ "ok": false, "error": message }))?;
+            } else {
+                eprintln!("error: {message}");
+            }
+            return Ok(ExitCode::FAILURE);
+        }
+        if let Some(value) = &diff {
+            if let Some(reason) = diff_is_stale(cli, candidate, value) {
+                if cli.json {
+                    print_json(&serde_json::json!({ "ok": false, "error": reason }))?;
+                } else {
+                    eprintln!("error: {reason}");
+                }
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+    }
 
     let request = PromotionRequest {
         candidate_ref: candidate.to_string(),
@@ -1167,6 +1218,7 @@ fn print_section(title: &str, values: &[String]) {
     println!();
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_diff(
     cli: &Cli,
     compilation: &Compilation,
@@ -1174,6 +1226,7 @@ async fn run_diff(
     base: &Option<String>,
     base_relation: &Option<String>,
     full: bool,
+    partition: Option<&str>,
     sample: Option<f64>,
 ) -> Result<ExitCode, String> {
     let id = ModelId::parse(model).map_err(|error| format!("invalid model `{model}`: {error}"))?;
@@ -1200,7 +1253,21 @@ async fn run_diff(
         Some(spec) => parse_relation(spec),
         None => candidate_relation.clone(),
     };
-    let strategy = if full {
+    let partition_columns: Vec<String> = partition
+        .map(|columns| {
+            columns
+                .split(',')
+                .map(str::trim)
+                .filter(|column| !column.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let strategy = if !partition_columns.is_empty() {
+        DiffStrategy::Partition {
+            columns: partition_columns,
+        }
+    } else if full {
         DiffStrategy::Full
     } else if sample.is_some() {
         DiffStrategy::Sampled
@@ -1221,7 +1288,7 @@ async fn run_diff(
         key_columns,
         columns,
         strategy,
-        policy: DiffPolicy::default(),
+        policy: diff_policy(compiled.config.diff.as_ref()),
         sample_fraction: sample,
     };
 
@@ -1250,6 +1317,21 @@ async fn run_diff(
             }
             Ok(ExitCode::FAILURE)
         }
+    }
+}
+
+fn diff_policy(spec: Option<&phlo_transform_core::DiffPolicySpec>) -> DiffPolicy {
+    match spec {
+        Some(spec) => DiffPolicy {
+            max_added_rows: spec.max_added_rows,
+            max_removed_rows: spec.max_removed_rows,
+            max_modified_rows: spec.max_modified_rows,
+            max_changed_fraction: spec.max_changed_fraction,
+            require_full_diff: spec.require_full_diff,
+            require_keyed_diff: spec.require_keyed_diff,
+            tolerances: spec.tolerances.clone(),
+        },
+        None => DiffPolicy::default(),
     }
 }
 
@@ -1306,6 +1388,28 @@ fn print_diff_human(report: &phlo_transform_engine::DiffReport) {
         println!("Changed values");
         for (column, count) in &report.column_changes {
             println!("  {column:<20} {count}");
+        }
+    }
+    if !report.partitions_added.is_empty()
+        || !report.partitions_removed.is_empty()
+        || !report.partitions_changed.is_empty()
+    {
+        println!();
+        println!("Partitions");
+        println!("  added    {}", report.partitions_added.len());
+        println!("  removed  {}", report.partitions_removed.len());
+        println!("  changed  {}", report.partitions_changed.len());
+    }
+    if !report.schema_changes.is_empty() {
+        println!();
+        println!("Schema");
+        for change in &report.schema_changes {
+            let marker = match change.kind.as_str() {
+                "added" => "+",
+                "removed" => "-",
+                _ => "~",
+            };
+            println!("  {marker} {} ({})", change.column, change.detail);
         }
     }
     for result in &report.policy_results {

@@ -47,6 +47,30 @@ pub struct ModelContractConfig {
     pub columns: BTreeMap<String, ColumnContractConfig>,
     /// `[model.<name>.incremental]`.
     pub incremental: IncrementalModelConfig,
+    /// `[model.<name>.diff]`.
+    pub diff: DiffConfig,
+}
+
+/// The `[model.<name>.diff]` settings.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DiffConfig {
+    pub max_added_rows: Option<i64>,
+    pub max_removed_rows: Option<i64>,
+    pub max_modified_rows: Option<i64>,
+    pub max_changed_fraction: Option<f64>,
+    pub require_full_diff: bool,
+    pub require_keyed_diff: bool,
+    /// `[model.<name>.diff.columns.<column>]`.
+    pub columns: BTreeMap<String, ToleranceConfig>,
+}
+
+/// Per-column numeric tolerances for diffing.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ToleranceConfig {
+    pub absolute_tolerance: Option<f64>,
+    pub relative_tolerance: Option<f64>,
 }
 
 /// The `[model.<name>.incremental]` settings.

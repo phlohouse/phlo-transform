@@ -57,12 +57,12 @@ implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
   Missing: schema-policy/Iceberg-snapshot audit gates, candidate cleanup/rebase;
   Nessie Iceberg catalogs have no view support. Live Nessie + Iceberg E2E is in
   CI.
-- **Phase 6 — native data diff: partial/deviated.** Keyed diff with per-column
-  change counts, policies, `diff.json` and a Trino keyed-diff test. See
-  [`docs/diff.md`](docs/diff.md). Gaps: `sampled` is a label (no sampling), no
-  partition strategy, `full` equals keyed, schema changes are never populated,
-  config policies/tolerances are unparsed, and stale-diff invalidation is
-  missing.
+- **Phase 6 — native data diff: partial.** Keyed diff with per-column change
+  counts, config-driven policies and numeric tolerances, real sampling,
+  partition-aware summaries, populated schema diffs, `diff.json`, and
+  stale-aware promotion gating. See [`docs/diff.md`](docs/diff.md). Gaps:
+  partition strategy compares partition row counts (no metadata pruning); no
+  example-value redaction.
 - **Phase 7 — workflow integration: partial (transform-side).** Workflow
   ownership, a unified typed graph artifact (`model`/`source`/`quality_gate`),
   cross-workflow dependency policy, and registered consumers in impact. See

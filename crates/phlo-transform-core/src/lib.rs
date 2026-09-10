@@ -58,8 +58,8 @@ pub use schema::{
 };
 pub use select::{select_models, SelectionOptions};
 pub use semantic::{
-    Assertion, ColumnContract, ColumnRef, DataType, ModelContract, ModelSchema, Nullability,
-    OutputColumn, RelationRef,
+    Assertion, ColumnContract, ColumnRef, ColumnTolerance, DataType, DiffPolicySpec, ModelContract,
+    ModelSchema, Nullability, OutputColumn, RelationRef,
 };
 pub use version::{
     model_version, EmptySourceStateProvider, ModelVersion, SourceStateProvider,

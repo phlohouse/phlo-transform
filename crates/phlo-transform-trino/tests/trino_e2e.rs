@@ -12,8 +12,8 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 use phlo_transform_core::{
-    compile, select_models, Compilation, Materialization, ModelId, ModelOrigin, Relation,
-    SemanticModel, SemanticProject, SemanticTest, TestId, WorkspaceDefaults,
+    compile, select_models, ColumnTolerance, Compilation, Materialization, ModelId, ModelOrigin,
+    Relation, SemanticModel, SemanticProject, SemanticTest, TestId, WorkspaceDefaults,
 };
 use phlo_transform_engine::{
     diff, Adapter, DiffPolicy, DiffRequest, DiffStrategy, ExecutionStatus, Planner, RunOptions,
@@ -228,4 +228,100 @@ async fn computes_keyed_data_diff_against_trino() {
     assert_eq!(report.row_summary.modified, 1);
     assert_eq!(report.row_summary.unchanged, 1);
     assert_eq!(report.column_changes.get("value"), Some(&1));
+}
+
+#[tokio::test]
+#[ignore = "requires Docker; run with --ignored"]
+async fn diff_supports_partitions_tolerances_schema_and_sampling() {
+    let (_container, adapter) = start_trino().await;
+    let adapter = Arc::new(adapter);
+    adapter
+        .execute("CREATE SCHEMA IF NOT EXISTS memory.default")
+        .await
+        .expect("schema");
+
+    for (name, sql) in [
+        (
+            "diff_base",
+            "select 1 as id, 10.0 as value, DATE '2026-09-09' as d \
+             union all select 2, 20.0, DATE '2026-09-10'",
+        ),
+        (
+            "diff_candidate",
+            "select 1 as id, 10.0000001 as value, DATE '2026-09-09' as d \
+             union all select 3, 30.0, DATE '2026-09-11'",
+        ),
+    ] {
+        let _ = adapter
+            .execute(&format!("DROP TABLE IF EXISTS memory.default.{name}"))
+            .await;
+        adapter
+            .execute(&format!("CREATE TABLE memory.default.{name} AS {sql}"))
+            .await
+            .expect("create");
+    }
+
+    let relation = |table: &str| Relation {
+        catalog: Some("memory".to_string()),
+        schema: "default".to_string(),
+        table: table.to_string(),
+    };
+    let request = |strategy: DiffStrategy, policy: DiffPolicy| DiffRequest {
+        model: "assay.results".to_string(),
+        candidate_relation: relation("diff_candidate"),
+        base_relation: relation("diff_base"),
+        candidate_ref: None,
+        base_ref: None,
+        candidate_version: None,
+        base_version: None,
+        key_columns: vec!["id".to_string()],
+        columns: vec!["value".to_string()],
+        strategy,
+        policy,
+        sample_fraction: None,
+    };
+
+    // Tolerance: the tiny difference is within bounds.
+    let mut policy = DiffPolicy::default();
+    policy.tolerances.insert(
+        "value".to_string(),
+        ColumnTolerance {
+            absolute: Some(0.001),
+            relative: None,
+        },
+    );
+    let report = diff(adapter.clone(), &request(DiffStrategy::Keyed, policy))
+        .await
+        .expect("tolerance diff");
+    assert_eq!(report.row_summary.modified, 0);
+
+    // Without tolerance the same difference counts as modified.
+    let report = diff(
+        adapter.clone(),
+        &request(DiffStrategy::Keyed, DiffPolicy::default()),
+    )
+    .await
+    .expect("strict diff");
+    assert_eq!(report.row_summary.modified, 1);
+
+    // Partition-aware: one partition removed, one added.
+    let report = diff(
+        adapter.clone(),
+        &request(
+            DiffStrategy::Partition {
+                columns: vec!["d".to_string()],
+            },
+            DiffPolicy::default(),
+        ),
+    )
+    .await
+    .expect("partition diff");
+    assert_eq!(report.partitions_added.len(), 1);
+    assert_eq!(report.partitions_removed.len(), 1);
+
+    // Sampling at 100% still executes and reports counts.
+    let mut sampled = request(DiffStrategy::Sampled, DiffPolicy::default());
+    sampled.sample_fraction = Some(1.0);
+    let report = diff(adapter.clone(), &sampled).await.expect("sampled diff");
+    assert!(report.coverage.contains("sampled"));
 }

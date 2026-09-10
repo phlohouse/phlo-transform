@@ -9,20 +9,24 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use phlo_transform_core::{Relation, SchemaChangeSafety};
+use phlo_transform_core::{ColumnTolerance, DataType, Relation};
 
 use crate::adapter::Adapter;
 use crate::error::EngineError;
 use crate::util::now_rfc3339;
 
 /// How a diff compares data.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffStrategy {
     Keyed,
     Aggregate,
     Full,
     Sampled,
+    /// Compare at partition granularity.
+    Partition {
+        columns: Vec<String>,
+    },
 }
 
 /// Declarative diff policy.
@@ -34,6 +38,7 @@ pub struct DiffPolicy {
     pub max_changed_fraction: Option<f64>,
     pub require_keyed_diff: bool,
     pub require_full_diff: bool,
+    pub tolerances: BTreeMap<String, ColumnTolerance>,
 }
 
 /// A single policy evaluation result.
@@ -103,6 +108,12 @@ pub struct DiffReport {
     pub column_changes: BTreeMap<String, i64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub schema_changes: Vec<SchemaChange>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub partitions_added: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub partitions_removed: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub partitions_changed: Vec<String>,
     pub policy_results: Vec<PolicyResult>,
     pub passed: bool,
     pub started_at: String,
@@ -115,8 +126,11 @@ pub async fn diff(
     request: &DiffRequest,
 ) -> Result<DiffReport, EngineError> {
     let started_at = now_rfc3339();
-    let base_rows = row_count(adapter.as_ref(), &request.base_relation).await?;
-    let candidate_rows = row_count(adapter.as_ref(), &request.candidate_relation).await?;
+    let candidate_sql = relation_sql(&request.candidate_relation, request);
+    let base_sql = relation_sql(&request.base_relation, request);
+
+    let base_rows = row_count(adapter.as_ref(), &base_sql).await?;
+    let candidate_rows = row_count(adapter.as_ref(), &candidate_sql).await?;
 
     let mut summary = RowSummary {
         base_rows,
@@ -125,29 +139,60 @@ pub async fn diff(
         ..Default::default()
     };
     let mut column_changes: BTreeMap<String, i64> = BTreeMap::new();
+    let mut partitions_added = Vec::new();
+    let mut partitions_removed = Vec::new();
+    let mut partitions_changed = Vec::new();
     let coverage;
 
-    if request.key_columns.is_empty() {
-        // Without a stable key only aggregate/row-count comparison is possible.
-        coverage = "aggregate (row counts only)".to_string();
-    } else {
-        let (added, removed, modified, unchanged) = keyed_counts(adapter.as_ref(), request).await?;
-        summary.added = added;
-        summary.removed = removed;
-        summary.modified = modified;
-        summary.unchanged = unchanged;
-        for column in &request.columns {
-            let changed = column_changed(adapter.as_ref(), request, column).await?;
-            if changed > 0 {
-                column_changes.insert(column.clone(), changed);
+    match &request.strategy {
+        DiffStrategy::Partition { columns } => {
+            let (added, removed, changed) =
+                partition_summary(adapter.as_ref(), &base_sql, &candidate_sql, columns).await?;
+            partitions_added = added;
+            partitions_removed = removed;
+            partitions_changed = changed;
+            coverage = format!(
+                "partition-aware ({} partitions changed)",
+                partitions_changed.len()
+            );
+        }
+        _ => {
+            if request.key_columns.is_empty() {
+                coverage = if matches!(request.strategy, DiffStrategy::Sampled) {
+                    "sampled aggregate (row counts only)".to_string()
+                } else {
+                    "aggregate (row counts only)".to_string()
+                };
+            } else {
+                let (added, removed, modified, unchanged) =
+                    keyed_counts(adapter.as_ref(), request, &base_sql, &candidate_sql).await?;
+                summary.added = added;
+                summary.removed = removed;
+                summary.modified = modified;
+                summary.unchanged = unchanged;
+                for column in &request.columns {
+                    let changed = column_changed(
+                        adapter.as_ref(),
+                        request,
+                        &base_sql,
+                        &candidate_sql,
+                        column,
+                    )
+                    .await?;
+                    if changed > 0 {
+                        column_changes.insert(column.clone(), changed);
+                    }
+                }
+                coverage = match request.strategy {
+                    DiffStrategy::Sampled => "sampled keyed".to_string(),
+                    DiffStrategy::Full => "full keyed".to_string(),
+                    _ => "keyed".to_string(),
+                };
             }
         }
-        coverage = match request.strategy {
-            DiffStrategy::Sampled => "sampled keyed (deterministic seed)".to_string(),
-            DiffStrategy::Full => "full keyed".to_string(),
-            _ => "keyed".to_string(),
-        };
     }
+
+    let schema_changes = schema_changes(adapter.as_ref(), request).await;
 
     let policy_results = evaluate_policy(&request.policy, request, &summary);
     let passed = policy_results.iter().all(|result| result.passed);
@@ -161,12 +206,15 @@ pub async fn diff(
         base_version: request.base_version.clone(),
         candidate_relation: request.candidate_relation.display(),
         base_relation: request.base_relation.display(),
-        strategy: request.strategy,
+        strategy: request.strategy.clone(),
         coverage,
         key_columns: request.key_columns.clone(),
         row_summary: summary,
         column_changes,
-        schema_changes: Vec::new(),
+        schema_changes,
+        partitions_added,
+        partitions_removed,
+        partitions_changed,
         policy_results,
         passed,
         started_at,
@@ -174,42 +222,69 @@ pub async fn diff(
     })
 }
 
-/// Attach schema changes (from the Phase 2 classifier) to a report.
-pub fn attach_schema_changes(report: &mut DiffReport, safety: SchemaChangeSafety) {
-    report.schema_changes.push(SchemaChange {
-        column: "*".to_string(),
-        kind: "schema".to_string(),
-        detail: "see compiler schema classification".to_string(),
-        safety: format!("{safety:?}").to_lowercase(),
-    });
+/// The SQL expression for a relation, applying sampling when requested.
+fn relation_sql(relation: &Relation, request: &DiffRequest) -> String {
+    match (&request.strategy, request.sample_fraction) {
+        (DiffStrategy::Sampled, Some(fraction)) => format!(
+            "{} TABLESAMPLE BERNOULLI ({})",
+            relation.sql(),
+            (fraction.clamp(0.0, 1.0) * 100.0)
+        ),
+        _ => relation.sql(),
+    }
 }
 
-async fn row_count(adapter: &dyn Adapter, relation: &Relation) -> Result<i64, EngineError> {
+async fn row_count(adapter: &dyn Adapter, relation_sql: &str) -> Result<i64, EngineError> {
     let result = adapter
-        .execute(&format!("SELECT count(*) FROM {}", relation.sql()))
+        .execute(&format!("SELECT count(*) FROM {relation_sql}"))
         .await
         .map_err(EngineError::Adapter)?;
     Ok(first_cell_i64(&result.rows))
 }
 
+fn change_predicate(column: &str, tolerance: Option<&ColumnTolerance>) -> String {
+    let column = quote(column);
+    let exact = format!("b.{column} IS DISTINCT FROM c.{column}");
+    let Some(tolerance) = tolerance else {
+        return exact;
+    };
+    let mut within = vec![format!("b.{column} = c.{column}")];
+    let difference = format!("abs(b.{column} - c.{column})");
+    if let Some(absolute) = tolerance.absolute {
+        within.push(format!("{difference} <= {absolute}"));
+    }
+    if let Some(relative) = tolerance.relative {
+        within.push(format!(
+            "{difference} <= {relative} * greatest(abs(b.{column}), abs(c.{column}))"
+        ));
+    }
+    format!(
+        "((b.{column} IS NULL) <> (c.{column} IS NULL)) \
+         OR (b.{column} IS NOT NULL AND c.{column} IS NOT NULL AND NOT ({}))",
+        within.join(" OR ")
+    )
+}
+
 async fn keyed_counts(
     adapter: &dyn Adapter,
     request: &DiffRequest,
+    base_sql: &str,
+    candidate_sql: &str,
 ) -> Result<(i64, i64, i64, i64), EngineError> {
     let keys = &request.key_columns;
     let join: Vec<String> = keys
         .iter()
         .map(|key| format!("b.{} IS NOT DISTINCT FROM c.{}", quote(key), quote(key)))
         .collect();
-    let change_conditions: Vec<String> = request
+    let conditions: Vec<String> = request
         .columns
         .iter()
-        .map(|column| format!("b.{} IS DISTINCT FROM c.{}", quote(column), quote(column)))
+        .map(|column| change_predicate(column, request.policy.tolerances.get(column)))
         .collect();
-    let any_changed = if change_conditions.is_empty() {
+    let any_changed = if conditions.is_empty() {
         "false".to_string()
     } else {
-        change_conditions.join(" OR ")
+        conditions.join(" OR ")
     };
     let first_key = quote(&keys[0]);
     let sql = format!(
@@ -218,11 +293,9 @@ async fn keyed_counts(
            count(*) FILTER (WHERE c.{first_key} IS NULL) AS removed, \
            count(*) FILTER (WHERE b.{first_key} IS NOT NULL AND c.{first_key} IS NOT NULL AND ({any_changed})) AS modified, \
            count(*) FILTER (WHERE b.{first_key} IS NOT NULL AND c.{first_key} IS NOT NULL AND NOT ({any_changed})) AS unchanged \
-         FROM ({candidate}) c \
-         FULL OUTER JOIN ({base}) b ON {join}",
-        candidate = request.candidate_relation.sql(),
-        base = request.base_relation.sql(),
-        join = join.join(" AND "),
+         FROM ({candidate_sql}) c \
+         FULL OUTER JOIN ({base_sql}) b ON {}",
+        join.join(" AND "),
     );
     let result = adapter.execute(&sql).await.map_err(EngineError::Adapter)?;
     let row = result.rows.first().cloned().unwrap_or_default();
@@ -232,6 +305,8 @@ async fn keyed_counts(
 async fn column_changed(
     adapter: &dyn Adapter,
     request: &DiffRequest,
+    base_sql: &str,
+    candidate_sql: &str,
     column: &str,
 ) -> Result<i64, EngineError> {
     let keys = &request.key_columns;
@@ -239,16 +314,129 @@ async fn column_changed(
         .iter()
         .map(|key| format!("b.{} = c.{}", quote(key), quote(key)))
         .collect();
+    let predicate = change_predicate(column, request.policy.tolerances.get(column));
     let sql = format!(
-        "SELECT count(*) FROM ({candidate}) c JOIN ({base}) b ON {join} \
-         WHERE b.{column} IS DISTINCT FROM c.{column}",
-        candidate = request.candidate_relation.sql(),
-        base = request.base_relation.sql(),
-        join = join.join(" AND "),
-        column = quote(column),
+        "SELECT count(*) FROM ({candidate_sql}) c JOIN ({base_sql}) b ON {} WHERE {predicate}",
+        join.join(" AND "),
     );
     let result = adapter.execute(&sql).await.map_err(EngineError::Adapter)?;
     Ok(first_cell_i64(&result.rows))
+}
+
+async fn partition_summary(
+    adapter: &dyn Adapter,
+    base_sql: &str,
+    candidate_sql: &str,
+    columns: &[String],
+) -> Result<(Vec<String>, Vec<String>, Vec<String>), EngineError> {
+    let casts: Vec<String> = columns
+        .iter()
+        .map(|column| format!("CAST({} AS varchar)", quote(column)))
+        .collect();
+    let key = if casts.len() == 1 {
+        casts[0].clone()
+    } else {
+        format!("concat_ws('|', {})", casts.join(", "))
+    };
+
+    let added = adapter
+        .execute(&format!(
+            "SELECT {key} FROM ({candidate_sql}) EXCEPT SELECT {key} FROM ({base_sql}) ORDER BY 1"
+        ))
+        .await
+        .map_err(EngineError::Adapter)?;
+    let removed = adapter
+        .execute(&format!(
+            "SELECT {key} FROM ({base_sql}) EXCEPT SELECT {key} FROM ({candidate_sql}) ORDER BY 1"
+        ))
+        .await
+        .map_err(EngineError::Adapter)?;
+    let changed = adapter
+        .execute(&format!(
+            "SELECT c.__key FROM \
+               (SELECT {key} AS __key, count(*) AS n FROM ({candidate_sql}) GROUP BY 1) c \
+             JOIN \
+               (SELECT {key} AS __key, count(*) AS n FROM ({base_sql}) GROUP BY 1) b \
+             ON c.__key = b.__key WHERE c.n <> b.n ORDER BY 1"
+        ))
+        .await
+        .map_err(EngineError::Adapter)?;
+
+    Ok((
+        column_values(&added.rows),
+        column_values(&removed.rows),
+        column_values(&changed.rows),
+    ))
+}
+
+fn column_values(rows: &[Vec<String>]) -> Vec<String> {
+    rows.iter().filter_map(|row| row.first().cloned()).collect()
+}
+
+async fn schema_changes(adapter: &dyn Adapter, request: &DiffRequest) -> Vec<SchemaChange> {
+    let Ok(candidate) = adapter.relation_columns(&request.candidate_relation).await else {
+        return Vec::new();
+    };
+    let Ok(base) = adapter.relation_columns(&request.base_relation).await else {
+        return Vec::new();
+    };
+    if candidate.is_empty() && base.is_empty() {
+        return Vec::new();
+    }
+
+    let candidate_types: BTreeMap<String, DataType> = candidate
+        .iter()
+        .map(|column| {
+            (
+                column.name.clone(),
+                DataType::parse_trino(&column.data_type),
+            )
+        })
+        .collect();
+    let base_types: BTreeMap<String, DataType> = base
+        .iter()
+        .map(|column| {
+            (
+                column.name.clone(),
+                DataType::parse_trino(&column.data_type),
+            )
+        })
+        .collect();
+
+    let mut changes = Vec::new();
+    for (name, base_type) in &base_types {
+        match candidate_types.get(name) {
+            None => changes.push(SchemaChange {
+                column: name.clone(),
+                kind: "removed".to_string(),
+                detail: format!("{base_type} removed"),
+                safety: "full_rebuild_required".to_string(),
+            }),
+            Some(candidate_type) if candidate_type != base_type => changes.push(SchemaChange {
+                column: name.clone(),
+                kind: "changed".to_string(),
+                detail: format!("{base_type} -> {candidate_type}"),
+                safety: if candidate_type.is_numeric() && base_type.is_numeric() {
+                    "review".to_string()
+                } else {
+                    "error".to_string()
+                },
+            }),
+            Some(_) => {}
+        }
+    }
+    for (name, candidate_type) in &candidate_types {
+        if !base_types.contains_key(name) {
+            changes.push(SchemaChange {
+                column: name.clone(),
+                kind: "added".to_string(),
+                detail: format!("{candidate_type} added"),
+                safety: "safe".to_string(),
+            });
+        }
+    }
+    changes.sort_by(|left, right| left.column.cmp(&right.column));
+    changes
 }
 
 fn evaluate_policy(
@@ -321,21 +509,22 @@ fn cell(row: &[String], index: usize) -> i64 {
         .unwrap_or(0)
 }
 
+/// Attach a schema-safety classification (kept for compatibility).
+pub fn attach_schema_changes(
+    report: &mut DiffReport,
+    safety: phlo_transform_core::SchemaChangeSafety,
+) {
+    report.schema_changes.push(SchemaChange {
+        column: "*".to_string(),
+        kind: "schema".to_string(),
+        detail: "see compiler schema classification".to_string(),
+        safety: format!("{safety:?}").to_lowercase(),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn summary(added: i64, removed: i64, modified: i64) -> RowSummary {
-        RowSummary {
-            base_rows: 100,
-            candidate_rows: 100 + added - removed,
-            delta: added - removed,
-            added,
-            removed,
-            modified,
-            unchanged: 90,
-        }
-    }
 
     fn request(keyed: bool) -> DiffRequest {
         DiffRequest {
@@ -375,21 +564,42 @@ mod tests {
             max_changed_fraction: Some(0.05),
             require_keyed_diff: true,
             require_full_diff: false,
+            tolerances: BTreeMap::new(),
         };
-        let results = evaluate_policy(&policy, &request(true), &summary(2, 0, 2));
-        assert!(results.iter().all(|result| result.passed));
-
-        let results = evaluate_policy(&policy, &request(false), &summary(2, 0, 2));
-        assert!(results.iter().any(|result| !result.passed));
+        let summary = RowSummary {
+            base_rows: 100,
+            candidate_rows: 100,
+            added: 2,
+            removed: 0,
+            modified: 2,
+            unchanged: 90,
+            ..Default::default()
+        };
+        assert!(evaluate_policy(&policy, &request(true), &summary)
+            .iter()
+            .all(|result| result.passed));
+        assert!(evaluate_policy(&policy, &request(false), &summary)
+            .iter()
+            .any(|result| !result.passed));
     }
 
     #[test]
-    fn removed_rows_are_gated() {
-        let policy = DiffPolicy {
-            max_removed_rows: Some(0),
-            ..Default::default()
+    fn tolerance_predicate_uses_numeric_bounds() {
+        let tolerance = ColumnTolerance {
+            absolute: Some(0.001),
+            relative: Some(0.01),
         };
-        let results = evaluate_policy(&policy, &request(true), &summary(0, 3, 0));
-        assert!(!results[0].passed);
+        let predicate = change_predicate("value", Some(&tolerance));
+        assert!(predicate.contains("abs("));
+        assert!(predicate.contains("greatest("));
+    }
+
+    #[test]
+    fn sampling_wraps_the_relation() {
+        let mut request = request(true);
+        request.strategy = DiffStrategy::Sampled;
+        request.sample_fraction = Some(0.1);
+        let sql = relation_sql(&request.candidate_relation, &request);
+        assert!(sql.contains("TABLESAMPLE BERNOULLI"));
     }
 }

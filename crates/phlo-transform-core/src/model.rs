@@ -115,7 +115,7 @@ pub struct RootRef {
 /// The frontend computes this by applying the documented precedence
 /// (workspace → transform root → folder → model directive). The compiler only
 /// consumes the result.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ModelConfig {
     pub materialization: Materialization,
     pub tags: Vec<String>,
@@ -124,6 +124,8 @@ pub struct ModelConfig {
     pub schema: Option<String>,
     /// Incremental intent, when configured.
     pub incremental: Option<IncrementalStrategy>,
+    /// Data-diff policy, when configured.
+    pub diff: Option<crate::semantic::DiffPolicySpec>,
 }
 
 impl Default for ModelConfig {
@@ -134,6 +136,7 @@ impl Default for ModelConfig {
             owner: None,
             schema: None,
             incremental: None,
+            diff: None,
         }
     }
 }
@@ -196,7 +199,7 @@ fn quote_identifier(value: &str) -> String {
 }
 
 /// A single semantic model, prior to dependency resolution.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SemanticModel {
     /// Logical identity (derived or pinned).
     pub id: ModelId,
@@ -275,7 +278,7 @@ pub struct SemanticTest {
 }
 
 /// The complete semantic input to the compiler.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SemanticProject {
     /// Workspace root as provided by the caller, when file-backed.
     pub workspace_root: Option<PathBuf>,

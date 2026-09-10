@@ -402,32 +402,23 @@ Phase 6 is complete when:
 
 ## Implementation notes
 
-Phase 6 is **partially implemented and partly deviated** (audited against code
-and tests). See [`docs/diff.md`](../diff.md).
+Phase 6 is **partially implemented** (audited against code and tests). See
+[`docs/diff.md`](../diff.md).
 
 Implemented:
 
 - keyed diff via warehouse-side `FULL OUTER JOIN` + `IS DISTINCT FROM`,
   reporting added/removed/modified/unchanged and per-column change counts;
-- aggregate fallback without a key, plus explicit `full` and `sampled` labels;
+- aggregate fallback, explicit `full`, real `TABLESAMPLE` `sampled`, and a
+  partition strategy reporting added/removed/changed partitions;
 - keys reused from `@incremental key=`/`@key`;
-- policy evaluation (`max_*`, `require_keyed_diff`, `require_full_diff`) and a
-  `diff.json` artifact;
-- promotion request flags (`diff_passed`/`require_diff`);
-- keyed diff correctness validated against live Trino (memory connector).
+- config-driven policies and per-column numeric tolerances;
+- populated `schema_changes` (added/removed/changed with safety);
+- promotion reads `diff.json`, enforces `--require-diff`, and rejects a stale
+  diff whose candidate version no longer matches;
+- live Trino coverage for keyed, tolerance, partition-aware and sampled diffs.
 
-Audited gaps and deviations:
-
-- **`sampled` is a label only**: `sample_fraction` is recorded but never applied
-  to the SQL, and no `TABLESAMPLE`/seed is used. `full` is identical to keyed.
-- **No partition strategy** exists (`DiffStrategy` has keyed/aggregate/full/
-  sampled only).
-- `schema_changes` is never populated — `attach_schema_changes` is defined but
-  unused, and `classify_schema_change` is not invoked.
-- Diff policies are not parsed from `phlo.toml` and (with `--base-relation`
-  absent) the CLI compares the model target against itself.
-- Promotion does not read a diff artifact; the diff gate flags are never set by
-  the CLI, and a changed candidate does not invalidate an earlier diff.
-- No example values and therefore no redaction (trivially safe, but the
-  bounded/redacted output requirement is unmet).
+Remaining gaps: the partition strategy compares partition row counts rather
+than pruning by partition metadata; no example values are emitted, so there is
+no redaction policy to exercise.
 

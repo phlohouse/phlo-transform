@@ -28,21 +28,45 @@ relations, the strategy, cover/part columns and coverage.
   `IS DISTINCT FROM` (null-safe).
 - **aggregate** — row-count comparison when no key is known; coverage is
   marked as aggregate only.
-- **full** — currently identical to keyed (no distinct full-scan strategy).
-- **sampled** — currently a **label only**: the requested `--sample` fraction
-  is recorded in the report but not applied to the generated SQL. There is no
-  `TABLESAMPLE` or recorded sampling seed yet.
+- **full** — full keyed comparison.
+- **sampled** — compares `TABLESAMPLE BERNOULLI (<fraction*100>)`; the
+  fraction is recorded in the report for reproducibility.
+- **partition** — compares partitions by `(partition columns)`:
+  `partitions_added`, `partitions_removed` and `partitions_changed` (partitions
+  present on both sides with different row counts).
 
-There is no partition-based strategy. Keys are never configured twice: the
-same declaration drives incremental merge, assertions and diffing.
+Keys are never configured twice: the same declaration drives incremental merge,
+assertions and diffing.
+
+## Numeric tolerances
+
+Per-column tolerances are configured under the model diff policy and applied in
+the warehouse comparison (rows within `absolute` or `relative` tolerance are
+unchanged):
+
+```toml
+[model."assay.results".diff.columns.concentration]
+absolute_tolerance = 1e-9
+relative_tolerance = 1e-6
+```
+
+## Schema diff
+
+`schema_changes` is populated from the candidate and base relation schemas:
+added, removed (`full_rebuild_required`) and changed (`review` for numeric
+widening, `error` otherwise) columns appear alongside the row-level result.
 
 ## Policies
 
+Policies are read from `phlo.toml` when diffing a model:
+
 ```toml
-[model.assay_results.diff]
+[model."assay.results".diff]
 max_removed_rows = 0
 max_changed_fraction = 0.05
 max_added_rows = 10000
+require_keyed_diff = false
+require_full_diff = false
 ```
 
 Supported gates: `max_added_rows`, `max_removed_rows`, `max_modified_rows`,
@@ -51,10 +75,10 @@ policy fails the command and blocks promotion.
 
 ## WAP integration
 
-`PromotionRequest` accepts `diff_passed` and `require_diff`; when a diff gate
-is required and no passing diff exists, promotion is refused. Promotion
-artifacts record the promotion; wiring the exact diff id into the promotion
-record is a follow-up.
+`PromotionRequest` accepts `diff_passed` and `require_diff`. `phlo-transform
+promote --require-diff` reads `diff.json`, requires a passing diff, and rejects
+a diff whose recorded candidate model version no longer matches the candidate's
+materialised version (stale-diff invalidation).
 
 ## Execution and coverage
 
@@ -65,10 +89,12 @@ coverage, promotion blocks.
 ## Tests
 
 - policy threshold pass/fail and removed-row gating (unit);
-- keyed diff correctness against live Trino (added/removed/modified/unchanged
-  and per-column counts) in the ignored integration suite.
+- tolerance predicate and sampling unit tests;
+- live Trino keyed, tolerance, partition-aware and sampled diff;
+- WAP E2E covers keyed diff before promotion.
 
 ## Deferred
 
-Partition-metadata pruning, statistical distribution summaries, example-value
-redaction policy, and stale-diff invalidation beyond the promotion gate flag.
+Partition-metadata pruning (the current partition strategy compares partition
+row counts), statistical distribution summaries, and example-value redaction
+(no example values are emitted).

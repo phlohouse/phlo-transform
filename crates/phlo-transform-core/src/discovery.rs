@@ -23,7 +23,7 @@ use crate::model::{
     SemanticModel, SemanticProject, SemanticTest, TestId, TransformRoot, TransformRootId,
     WorkspaceDefaults,
 };
-use crate::semantic::{ColumnContract, DataType, ModelContract};
+use crate::semantic::{ColumnContract, ColumnTolerance, DataType, DiffPolicySpec, ModelContract};
 
 const DEFAULT_INCLUDES: &[&str] = &["transforms/**", "workflows/*/transforms/**"];
 const DEFAULT_EXCLUDES: &[&str] = &[
@@ -126,6 +126,7 @@ pub fn load_project(workspace_root: &Path) -> Result<SemanticProject, Vec<Diagno
         if let Some(section) = contracts.get(&model.id.logical_name()) {
             model.contract = contract_from_section(section);
             apply_incremental_config(&mut model.config, section);
+            apply_diff_config(&mut model.config, section);
         }
     }
 
@@ -222,6 +223,43 @@ fn apply_incremental_config(config: &mut ModelConfig, section: &ModelContractCon
                 .and_then(parse_overlap_seconds);
         }
     }
+}
+
+/// Apply `[model.<name>.diff]` to a model's effective config.
+fn apply_diff_config(config: &mut ModelConfig, section: &ModelContractConfig) {
+    let diff = &section.diff;
+    let has_policy = diff.max_added_rows.is_some()
+        || diff.max_removed_rows.is_some()
+        || diff.max_modified_rows.is_some()
+        || diff.max_changed_fraction.is_some()
+        || diff.require_full_diff
+        || diff.require_keyed_diff
+        || !diff.columns.is_empty();
+    if !has_policy {
+        return;
+    }
+    let tolerances = diff
+        .columns
+        .iter()
+        .map(|(name, tolerance)| {
+            (
+                name.clone(),
+                ColumnTolerance {
+                    absolute: tolerance.absolute_tolerance,
+                    relative: tolerance.relative_tolerance,
+                },
+            )
+        })
+        .collect();
+    config.diff = Some(DiffPolicySpec {
+        max_added_rows: diff.max_added_rows,
+        max_removed_rows: diff.max_removed_rows,
+        max_modified_rows: diff.max_modified_rows,
+        max_changed_fraction: diff.max_changed_fraction,
+        require_full_diff: diff.require_full_diff,
+        require_keyed_diff: diff.require_keyed_diff,
+        tolerances,
+    });
 }
 
 fn build_incremental(
@@ -791,6 +829,7 @@ fn effective_config(
         owner,
         schema,
         incremental: directives.incremental.clone(),
+        diff: None,
     }
 }
 
