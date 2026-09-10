@@ -1,0 +1,91 @@
+# Phlo Transform implementation roadmap
+
+This folder breaks [`SPEC.md`](../../SPEC.md) into implementation phases.
+
+The roadmap is ordered by architectural dependency rather than by marketing release. Each phase should leave the repository in a usable and testable state and should not introduce abstractions that are only needed by later phases.
+
+## Delivery order
+
+| Phase | Outcome | Depends on |
+|---|---|---|
+| [0 — Compiler spike](00-compiler-spike.md) | Prove workspace discovery, SQL parsing, relation resolution and DAG construction | — |
+| [1 — MVP build engine](01-mvp-build-engine.md) | Execute table/view DAGs through Trino with plans, tests and persisted run state | 0 |
+| [2 — Typed compiler and lineage](02-typed-compiler-lineage.md) | Resolve columns/types and derive column lineage, contracts and impact | 1 |
+| [3 — State-aware execution](03-state-aware-execution.md) | Content-address model versions and rebuild only what is required | 2 |
+| [4 — Incremental models](04-incremental-models.md) | Add declarative append/key/partition/window incremental strategies | 3 |
+| [5 — Nessie and WAP](05-nessie-wap.md) | Branch-native environments, Write-Audit-Publish, promotion and rollback | 4 |
+| [6 — Data diff](06-data-diff.md) | Compare candidate and published data and use diffs as gates | 5 |
+| [7 — Workflow integration](07-workflow-integration.md) | Merge transform DAGs into wider Phlo workflow/data lineage | 2, 5 |
+| [8 — Daemon and agent APIs](08-daemon-agent-apis.md) | Incremental compiler service, editor/UI integration and agent-native queries | 2, 3 |
+
+## Milestones
+
+### M0 — Architecture proven
+
+Phases 0 complete.
+
+We can discover a multi-root workspace and derive a valid graph from ordinary SQL relations without `ref()`.
+
+### M1 — Useful transform runner
+
+Phases 0–1 complete.
+
+A developer can run `check`, `plan`, `apply`, `run`, `test`, `inspect` and `list` against Trino using table/view models.
+
+### M2 — Compiler differentiator
+
+Phases 2–3 complete.
+
+The engine understands columns and types, can explain lineage and impact, and uses content-addressed state to avoid unnecessary work.
+
+### M3 — Production-capable lakehouse engine
+
+Phases 4–6 complete.
+
+Incremental models, Nessie branches, WAP, promotion, rollback and data diffs are available.
+
+### M4 — Phlo-native platform component
+
+Phases 7–8 complete.
+
+Transforms participate in the wider Phlo workflow graph and the compiler becomes a reusable service for UI, CI, editors and agents.
+
+## Cross-cutting rules
+
+These rules apply to every phase:
+
+1. **Do not add configuration if the compiler can infer the same information safely.**
+2. **Do not make `ref()` the dependency primitive.** Ordinary SQL relation names remain the native path.
+3. **Do not introduce arbitrary runtime macros or Python execution.**
+4. **Every human-facing semantic result must have a structured representation.**
+5. **Compilation must remain side-effect free.** Warehouse mutation only occurs in execution/apply paths.
+6. **Ambiguity is an error.** Never silently pick a model/source candidate.
+7. **Preserve stable logical model identity independently of physical paths.**
+8. **Prefer semantic/AST hashes to raw text hashes.** Formatting-only changes should not rebuild data once canonicalisation exists.
+9. **Keep Trino first.** Add adapters only after the adapter contract is proven by a real second implementation.
+10. **Keep crates coarse until boundaries are demonstrated by implementation.**
+
+## Suggested repository shape during early development
+
+Avoid creating every crate listed in the long-term spec immediately. Start with something closer to:
+
+```text
+crates/
+├── phlo-transform-core/
+├── phlo-transform-sql/
+├── phlo-transform-trino/
+└── phlo-transform-cli/
+```
+
+Split additional crates only when ownership and dependency direction are clear.
+
+## Definition of done for a phase
+
+A roadmap phase is complete only when:
+
+- its acceptance criteria pass in CI;
+- public behaviour is covered by integration tests;
+- relevant CLI commands support JSON output;
+- errors have stable typed categories/codes where appropriate;
+- documentation/examples match actual behaviour;
+- no later-phase placeholder architecture is required for the completed feature to work.
