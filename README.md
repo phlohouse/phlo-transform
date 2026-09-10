@@ -33,9 +33,13 @@ It is intentionally not a dbt compatibility project. The goal is a smaller, more
   `SourceStateProvider`, materialised-version state, state-aware plan
   (`build`/`skip`/`cached` with reasons) and stale-plan rejection. See
   [`docs/state.md`](docs/state.md).
+- **Phase 4 — incremental models: done.** `@incremental`
+  append/key/partition/time-window intent, version hashing, full-rebuild
+  detection, adapter `append`/`merge`, bootstrap and schema-change
+  classification. See [`docs/incremental.md`](docs/incremental.md).
 
-No incremental models, Nessie, WAP, data diff, workflow integration or daemon
-yet — those are later phases.
+No Nessie, WAP, data diff, workflow integration or daemon yet — those are
+later phases.
 
 ## Toolchain
 
@@ -93,3 +97,4 @@ runs a disposable container and is executed explicitly in CI.
 - [Phase 1 engine architecture](docs/engine.md)
 - [Phase 2 semantic compiler](docs/semantic.md)
 - [Phase 3 state-aware execution](docs/state.md)
+- [Phase 4 incremental models](docs/incremental.md)

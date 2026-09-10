@@ -9,11 +9,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use phlo_transform_sql::{parse_directives, Materialization};
+use phlo_transform_sql::{parse_directives, IncrementalStrategy, Materialization};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::config::{
-    read_phlo_config, read_root_config, FolderConfig, PhloConfig, TransformRootConfig,
+    read_phlo_config, read_root_config, FolderConfig, ModelContractConfig, PhloConfig,
+    TransformRootConfig,
 };
 use crate::diagnostics::{codes, Diagnostic};
 use crate::identity::{IdentityError, ModelId, Namespace};
@@ -120,10 +121,11 @@ pub fn load_project(workspace_root: &Path) -> Result<SemanticProject, Vec<Diagno
 
     models.sort_by(|left, right| left.id.cmp(&right.id));
 
-    let contracts = model_contracts(&config);
+    let contracts = normalized_sections(&config);
     for model in &mut models {
-        if let Some(contract) = contracts.get(&model.id.logical_name()) {
-            model.contract = Some(contract.clone());
+        if let Some(section) = contracts.get(&model.id.logical_name()) {
+            model.contract = contract_from_section(section);
+            apply_incremental_config(&mut model.config, section);
         }
     }
 
@@ -162,33 +164,117 @@ fn workspace_defaults(config: &PhloConfig, diagnostics: &mut Vec<Diagnostic>) ->
     }
 }
 
-/// Normalise `[model.<name>...]` sections into contracts keyed by logical name.
-///
-/// Both `assay_results` and `assay.results` keys are accepted.
-fn model_contracts(config: &PhloConfig) -> BTreeMap<String, ModelContract> {
-    let mut contracts = BTreeMap::new();
+/// Normalise `[model.<name>...]` sections, accepting dotted or underscored keys.
+fn normalized_sections(config: &PhloConfig) -> BTreeMap<String, ModelContractConfig> {
+    let mut sections = BTreeMap::new();
     for (key, section) in &config.model {
-        let contract = ModelContract {
-            enforced: section.contract.enforced,
-            columns: section
-                .columns
-                .iter()
-                .map(|(name, column)| ColumnContract {
-                    name: name.clone(),
-                    data_type: column.data_type.as_deref().and_then(|text| {
-                        let data_type = DataType::parse_trino(text);
-                        data_type.is_known().then_some(data_type)
-                    }),
-                    nullable: column.nullable,
-                })
-                .collect(),
-        };
-        contracts.insert(key.clone(), contract.clone());
+        sections.insert(key.clone(), section.clone());
         if key.contains('_') {
-            contracts.insert(key.replace('_', "."), contract);
+            sections.insert(key.replace('_', "."), section.clone());
         }
     }
-    contracts
+    sections
+}
+
+fn contract_from_section(section: &ModelContractConfig) -> Option<ModelContract> {
+    if !section.contract.enforced && section.columns.is_empty() {
+        return None;
+    }
+    Some(ModelContract {
+        enforced: section.contract.enforced,
+        columns: section
+            .columns
+            .iter()
+            .map(|(name, column)| ColumnContract {
+                name: name.clone(),
+                data_type: column.data_type.as_deref().and_then(|text| {
+                    let data_type = DataType::parse_trino(text);
+                    data_type.is_known().then_some(data_type)
+                }),
+                nullable: column.nullable,
+            })
+            .collect(),
+    })
+}
+
+/// Apply `[model.<name>.incremental]` to a model's effective config.
+fn apply_incremental_config(config: &mut ModelConfig, section: &ModelContractConfig) {
+    let incremental = &section.incremental;
+    if config.incremental.is_none() {
+        if let Some(strategy) = incremental
+            .strategy
+            .as_deref()
+            .and_then(|strategy| build_incremental(strategy, incremental))
+        {
+            config.materialization = Materialization::Incremental;
+            config.incremental = Some(strategy);
+        }
+    }
+    if let Some(IncrementalStrategy::TimeWindow {
+        overlap_seconds, ..
+    }) = &mut config.incremental
+    {
+        if overlap_seconds.is_none() {
+            *overlap_seconds = incremental
+                .overlap
+                .as_deref()
+                .and_then(parse_overlap_seconds);
+        }
+    }
+}
+
+fn build_incremental(
+    strategy: &str,
+    config: &crate::config::IncrementalModelConfig,
+) -> Option<IncrementalStrategy> {
+    let columns = |value: &Option<String>| -> Vec<String> {
+        value
+            .as_deref()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    match strategy.trim().to_ascii_lowercase().as_str() {
+        "append" => Some(IncrementalStrategy::Append),
+        "key" => {
+            let columns = columns(&config.key);
+            (!columns.is_empty()).then_some(IncrementalStrategy::Key { columns })
+        }
+        "partition" => {
+            let columns = columns(&config.partition);
+            (!columns.is_empty()).then_some(IncrementalStrategy::Partition { columns })
+        }
+        "time-window" | "window" => {
+            config
+                .column
+                .as_ref()
+                .map(|column| IncrementalStrategy::TimeWindow {
+                    column: column.clone(),
+                    overlap_seconds: None,
+                })
+        }
+        _ => None,
+    }
+}
+
+/// Parse a simple duration such as `30m`, `2h` or `1d` into seconds.
+fn parse_overlap_seconds(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let (number, unit) = value.split_at(value.find(|c: char| !c.is_ascii_digit())?);
+    let number: u64 = number.parse().ok()?;
+    match unit.trim() {
+        "s" | "sec" | "secs" => Some(number),
+        "m" | "min" | "mins" => Some(number * 60),
+        "h" | "hr" | "hrs" => Some(number * 3600),
+        "d" | "day" | "days" => Some(number * 86_400),
+        _ => None,
+    }
 }
 
 fn combined_includes(config: &PhloConfig) -> Vec<String> {
@@ -701,6 +787,7 @@ fn effective_config(
         tags,
         owner,
         schema,
+        incremental: directives.incremental.clone(),
     }
 }
 

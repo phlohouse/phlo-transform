@@ -18,11 +18,11 @@ expression: stdout(&output)
     "target": "reporting.monthly",
     "tests": [],
     "used_by": [],
-    "version": "cd67970"
+    "version": "4e889bb"
   },
   "state": {
     "current": null,
-    "desired": "cd67970",
+    "desired": "4e889bb",
     "status": "new"
   }
 }

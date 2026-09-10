@@ -28,6 +28,20 @@ pub struct ModelContractConfig {
     pub contract: ContractSettings,
     /// `[model.<name>.columns.<column>]`.
     pub columns: BTreeMap<String, ColumnContractConfig>,
+    /// `[model.<name>.incremental]`.
+    pub incremental: IncrementalModelConfig,
+}
+
+/// The `[model.<name>.incremental]` settings.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct IncrementalModelConfig {
+    pub strategy: Option<String>,
+    pub key: Option<String>,
+    pub partition: Option<String>,
+    pub column: Option<String>,
+    /// Overlap for `time-window`, e.g. `2h`.
+    pub overlap: Option<String>,
 }
 
 /// The `[model.<name>.contract]` settings.

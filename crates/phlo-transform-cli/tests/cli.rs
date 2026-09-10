@@ -13,6 +13,12 @@ fn workspace_root() -> PathBuf {
 }
 
 fn run(args: &[&str]) -> Output {
+    // Keep tests isolated from any local `.phlo` state left by manual runs.
+    if let Some(position) = args.iter().position(|arg| *arg == "--root") {
+        if let Some(root) = args.get(position + 1) {
+            let _ = std::fs::remove_dir_all(PathBuf::from(root).join(".phlo"));
+        }
+    }
     Command::cargo_bin("phlo-transform")
         .expect("binary builds")
         .current_dir(workspace_root())

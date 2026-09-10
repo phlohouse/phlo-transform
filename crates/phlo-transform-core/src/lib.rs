@@ -43,14 +43,15 @@ pub use model::{
     SemanticModel, SemanticProject, SemanticTest, TestId, TransformRoot, TransformRootId,
     WorkspaceDefaults,
 };
-pub use phlo_transform_sql::Materialization;
+pub use phlo_transform_sql::{IncrementalStrategy, Materialization};
 pub use report::{
     CheckReport, ColumnLineageReport, ColumnReport, GraphArtifact, GraphEdgeArtifact,
     GraphNodeArtifact, ImpactReport, InspectReport, ListReport, ModelDetail, ModelLineageReport,
     ModelSummary, RootReport, SourceSummary, TestSummary,
 };
 pub use schema::{
-    EmptySchemaProvider, RelationSchema, SchemaColumn, SchemaProvider, StaticSchemaProvider,
+    classify_schema_change, EmptySchemaProvider, RelationSchema, SchemaChangeSafety, SchemaColumn,
+    SchemaProvider, StaticSchemaProvider,
 };
 pub use select::{select_models, SelectionOptions};
 pub use semantic::{

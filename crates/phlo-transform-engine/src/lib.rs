@@ -24,7 +24,9 @@ pub use artifacts::{
 pub use cancel::CancelHandle;
 pub use error::{AdapterError, EngineError};
 pub use events::{EngineEvent, ExecutionStatus};
-pub use plan::{dependency_closure, Plan, PlanAction, PlannedModel, PlannedTest, Planner};
+pub use plan::{
+    dependency_closure, ChangeReason, Plan, PlanAction, PlannedModel, PlannedTest, Planner,
+};
 pub use run::{ModelResult, RunOptions, RunResult, Runner, TestResult};
 pub use state::{
     MaterializedRecord, ModelRunRecord, RunRecord, RunSummary, SqliteStateStore, StateStore,

@@ -275,3 +275,21 @@ Phase 4 is complete when:
 - Nessie/WAP promotion;
 - data diffs as policy gates;
 - streaming execution.
+
+## Implementation notes
+
+Phase 4 is implemented at the representation/planning/execution level. See
+[`docs/incremental.md`](../incremental.md).
+
+- `@incremental` directives and `[model.<name>.incremental]` config parse into
+  `IncrementalStrategy` (`append`/`key`/`partition`/`time-window`); key
+  declarations imply identity.
+- Strategy participates in the model-version `config_hash`; key/strategy
+  changes produce an `incremental_change` reason and a full rebuild.
+- Adapter gains `append` and `merge`; the engine chooses bootstrap CTAS,
+  append, merge, or a safe full rebuild.
+- `classify_schema_change` classifies evolving schemas.
+
+Not yet implemented: precise partition/time-window execution and watermarks;
+dedicated watermark state.
+

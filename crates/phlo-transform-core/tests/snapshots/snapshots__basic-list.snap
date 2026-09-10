@@ -10,7 +10,7 @@ expression: "compiled(\"basic-multi-root\").list_report()"
       "namespace": "assay",
       "materialization": "view",
       "target": "assay.raw",
-      "version": "5cdedad",
+      "version": "bd1f2c4",
       "path": "workflows/assay/transforms/raw.sql",
       "depends_on": [],
       "sources": [
@@ -23,7 +23,7 @@ expression: "compiled(\"basic-multi-root\").list_report()"
       "namespace": "assay",
       "materialization": "view",
       "target": "assay.results",
-      "version": "a7057b0",
+      "version": "ea19693",
       "path": "workflows/assay/transforms/results.sql",
       "depends_on": [
         "assay.raw"
@@ -36,7 +36,7 @@ expression: "compiled(\"basic-multi-root\").list_report()"
       "namespace": "reporting",
       "materialization": "view",
       "target": "reporting.monthly",
-      "version": "cd67970",
+      "version": "4e889bb",
       "path": "workflows/reporting/transforms/monthly.sql",
       "depends_on": [
         "assay.results"

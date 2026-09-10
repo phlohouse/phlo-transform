@@ -75,6 +75,10 @@ pub struct MaterializedRecord {
     pub environment: Option<String>,
     pub version: ModelVersion,
     pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incremental_strategy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incremental_key: Option<String>,
     pub run_id: String,
     pub materialized_at: String,
 }
@@ -183,11 +187,22 @@ impl SqliteStateStore {
                     target TEXT NOT NULL,
                     run_id TEXT NOT NULL,
                     materialized_at TEXT NOT NULL,
+                    incremental_strategy TEXT,
+                    incremental_key TEXT,
                     PRIMARY KEY (model_id, environment)
                 );
                 ",
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
+        // Best-effort migration for databases created before these columns.
+        let _ = connection.execute(
+            "ALTER TABLE model_versions ADD COLUMN incremental_strategy TEXT",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE model_versions ADD COLUMN incremental_key TEXT",
+            [],
+        );
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -334,8 +349,8 @@ impl StateStore for SqliteStateStore {
                 "INSERT OR REPLACE INTO model_versions
                  (model_id, environment, version_hash, sql_hash, config_hash, contract_hash,
                   dependency_hash, source_state_hash, compiler_version, target_hash, target,
-                  run_id, materialized_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  run_id, materialized_at, incremental_strategy, incremental_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 rusqlite::params![
                     record.model_id,
                     record.environment.clone().unwrap_or_default(),
@@ -350,6 +365,8 @@ impl StateStore for SqliteStateStore {
                     record.target,
                     record.run_id,
                     record.materialized_at,
+                    record.incremental_strategy,
+                    record.incremental_key,
                 ],
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
@@ -402,7 +419,7 @@ impl StateStore for SqliteStateStore {
 
 const MATERIALIZED_COLUMNS: &str = "model_id, environment, version_hash, sql_hash, config_hash, \
      contract_hash, dependency_hash, source_state_hash, compiler_version, target_hash, target, \
-     run_id, materialized_at";
+     run_id, materialized_at, incremental_strategy, incremental_key";
 
 fn materialized_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MaterializedRecord> {
     let environment: String = row.get(1)?;
@@ -424,6 +441,8 @@ fn materialized_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Materializ
             target_hash: row.get(9)?,
         },
         target: row.get(10)?,
+        incremental_strategy: row.get(13)?,
+        incremental_key: row.get(14)?,
         run_id: row.get(11)?,
         materialized_at: row.get(12)?,
     })

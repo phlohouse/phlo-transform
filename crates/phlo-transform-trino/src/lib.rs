@@ -205,6 +205,67 @@ impl Adapter for TrinoAdapter {
             .await
     }
 
+    async fn append(&self, relation: &Relation, sql: &str) -> Result<QueryResult, AdapterError> {
+        self.run(&format!("INSERT INTO {} {}", relation.sql(), sql))
+            .await
+    }
+
+    async fn merge(
+        &self,
+        relation: &Relation,
+        key_columns: &[String],
+        sql: &str,
+    ) -> Result<QueryResult, AdapterError> {
+        let columns = self.relation_columns(relation).await?;
+        if columns.is_empty() {
+            return Err(AdapterError::new(
+                "TRINO_MERGE",
+                format!(
+                    "cannot merge into {}: relation columns are unknown",
+                    relation.sql()
+                ),
+            ));
+        }
+        let update: Vec<String> = columns
+            .iter()
+            .filter(|column| {
+                !key_columns
+                    .iter()
+                    .any(|key| key.eq_ignore_ascii_case(&column.name))
+            })
+            .map(|column| format!("{} = s.{}", quote(&column.name), quote(&column.name)))
+            .collect();
+        let insert_columns: Vec<String> =
+            columns.iter().map(|column| quote(&column.name)).collect();
+        let insert_values: Vec<String> = columns
+            .iter()
+            .map(|column| format!("s.{}", quote(&column.name)))
+            .collect();
+        let on: Vec<String> = key_columns
+            .iter()
+            .map(|key| format!("t.{} = s.{}", quote(key), quote(key)))
+            .collect();
+
+        let mut merge = format!(
+            "MERGE INTO {} t USING ({}) s ON ({})",
+            relation.sql(),
+            sql,
+            on.join(" AND ")
+        );
+        if !update.is_empty() {
+            merge.push_str(&format!(
+                " WHEN MATCHED THEN UPDATE SET {}",
+                update.join(", ")
+            ));
+        }
+        merge.push_str(&format!(
+            " WHEN NOT MATCHED THEN INSERT ({}) VALUES ({})",
+            insert_columns.join(", "),
+            insert_values.join(", ")
+        ));
+        self.run(&merge).await
+    }
+
     async fn cancel(&self, query_id: &str) -> Result<(), AdapterError> {
         let url = format!("{}/v1/query/{}", self.config.endpoint, query_id);
         let response = self
@@ -238,6 +299,10 @@ impl Adapter for TrinoAdapter {
             })
             .collect())
     }
+}
+
+fn quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn is_missing_relation(error: &AdapterError) -> bool {

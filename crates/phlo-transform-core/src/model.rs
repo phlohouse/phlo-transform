@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use phlo_transform_sql::{Directives, Materialization};
+use phlo_transform_sql::{Directives, IncrementalStrategy, Materialization};
 
 use crate::diagnostics::Diagnostic;
 use crate::identity::{ModelId, Namespace};
@@ -122,6 +122,8 @@ pub struct ModelConfig {
     pub owner: Option<String>,
     /// Per-model target schema override, when configured.
     pub schema: Option<String>,
+    /// Incremental intent, when configured.
+    pub incremental: Option<IncrementalStrategy>,
 }
 
 impl Default for ModelConfig {
@@ -131,6 +133,7 @@ impl Default for ModelConfig {
             tags: Vec::new(),
             owner: None,
             schema: None,
+            incremental: None,
         }
     }
 }

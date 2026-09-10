@@ -269,9 +269,10 @@ fn version_inputs(
     // Only semantics-affecting configuration participates; tags and owner do
     // not change the physical output.
     let config = format!(
-        "materialization={};schema={}",
+        "materialization={};schema={};incremental={:?}",
         model.config.materialization,
-        model.config.schema.clone().unwrap_or_default()
+        model.config.schema.clone().unwrap_or_default(),
+        model.config.incremental
     );
 
     let contract = model

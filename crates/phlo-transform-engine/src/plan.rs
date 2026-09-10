@@ -11,7 +11,7 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use phlo_transform_core::graph::Dependency;
-use phlo_transform_core::{Compilation, Diagnostic, ModelId, ModelVersion};
+use phlo_transform_core::{Compilation, Diagnostic, Materialization, ModelId, ModelVersion};
 
 use crate::adapter::Adapter;
 use crate::error::EngineError;
@@ -43,6 +43,7 @@ pub enum ChangeReason {
     SourceChange,
     TargetChange,
     CompilerSemanticsChange,
+    IncrementalChange,
     MissingRelation,
     UnknownState,
 }
@@ -57,6 +58,7 @@ impl ChangeReason {
             ChangeReason::SourceChange => "a source state changed",
             ChangeReason::TargetChange => "physical target changed",
             ChangeReason::CompilerSemanticsChange => "compiler semantics changed",
+            ChangeReason::IncrementalChange => "incremental strategy or key changed",
             ChangeReason::MissingRelation => "target relation does not exist",
             ChangeReason::UnknownState => "no recorded materialised version",
         }
@@ -72,6 +74,10 @@ pub struct PlannedModel {
     pub action: PlanAction,
     pub reasons: Vec<ChangeReason>,
     pub exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incremental: Option<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub full_rebuild: bool,
     pub desired_version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_version: Option<String>,
@@ -180,7 +186,7 @@ impl Planner {
             };
             let desired = model.version.clone();
 
-            let (action, reasons, current_version, exists) = if blocked {
+            let (action, mut reasons, current_record, exists) = if blocked {
                 (PlanAction::Unknown, Vec::new(), None, false)
             } else {
                 let exists = self.adapter.relation_exists(&model.target).await?;
@@ -192,13 +198,42 @@ impl Planner {
                 };
                 let (action, reasons) =
                     self.decide(&desired, current.as_ref(), exists, environment.as_deref())?;
-                (
-                    action,
-                    reasons,
-                    current.as_ref().map(|record| record.version.hash.clone()),
-                    exists,
-                )
+                (action, reasons, current, exists)
             };
+
+            // A changed incremental strategy or key needs a full rebuild.
+            let mut full_rebuild = false;
+            if action == PlanAction::Build
+                && model.config.materialization == Materialization::Incremental
+            {
+                match &current_record {
+                    Some(record) => {
+                        let desired_strategy = model
+                            .config
+                            .incremental
+                            .as_ref()
+                            .map(|strategy| strategy.as_str().to_string());
+                        let desired_key = model
+                            .config
+                            .incremental
+                            .as_ref()
+                            .map(|strategy| strategy.columns().join(","))
+                            .filter(|key| !key.is_empty());
+                        if record.incremental_strategy != desired_strategy
+                            || record.incremental_key != desired_key
+                        {
+                            full_rebuild = true;
+                            if !reasons.contains(&ChangeReason::IncrementalChange) {
+                                reasons.push(ChangeReason::IncrementalChange);
+                            }
+                        }
+                    }
+                    None => full_rebuild = true,
+                }
+            }
+            let current_version = current_record
+                .as_ref()
+                .map(|record| record.version.hash.clone());
 
             models.push(PlannedModel {
                 id: model.id.logical_name(),
@@ -207,6 +242,12 @@ impl Planner {
                 action,
                 reasons,
                 exists,
+                incremental: model
+                    .config
+                    .incremental
+                    .as_ref()
+                    .map(|strategy| strategy.as_str().to_string()),
+                full_rebuild,
                 desired_version: desired.hash.clone(),
                 current_version,
                 dependencies: model

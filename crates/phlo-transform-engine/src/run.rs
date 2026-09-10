@@ -8,7 +8,7 @@ use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use phlo_transform_core::{Compilation, Materialization, ModelId};
+use phlo_transform_core::{Compilation, IncrementalStrategy, Materialization, ModelId};
 
 use crate::adapter::Adapter;
 use crate::cancel::CancelHandle;
@@ -85,6 +85,37 @@ struct Completion {
     id: ModelId,
     result: Result<crate::adapter::QueryResult, AdapterError>,
     duration_ms: u64,
+}
+
+/// The physical operation chosen for a model.
+#[derive(Clone)]
+enum ExecOp {
+    View,
+    Table,
+    Append,
+    Merge(Vec<String>),
+}
+
+fn exec_op(model: &phlo_transform_core::CompiledModel, info: Option<&PlannedModel>) -> ExecOp {
+    match model.config.materialization {
+        Materialization::View => ExecOp::View,
+        Materialization::Table => ExecOp::Table,
+        Materialization::Incremental => {
+            let needs_bootstrap = info
+                .map(|model| model.full_rebuild || !model.exists)
+                .unwrap_or(true);
+            if needs_bootstrap {
+                return ExecOp::Table;
+            }
+            match model.config.incremental.as_ref() {
+                Some(IncrementalStrategy::Append) => ExecOp::Append,
+                Some(IncrementalStrategy::Key { columns }) => ExecOp::Merge(columns.clone()),
+                // Partition and time-window currently fall back to a safe
+                // full rebuild; the intent is still recorded and planned.
+                _ => ExecOp::Table,
+            }
+        }
+    }
 }
 
 /// Executes plans against an adapter.
@@ -226,21 +257,23 @@ impl Runner {
                 let adapter = self.adapter.clone();
                 let target = model.target.clone();
                 let compiled_sql = model.compiled_sql.clone();
-                let materialization = model.config.materialization;
+                let op = exec_op(model, plan_info.get(&id));
                 let permit = semaphore.clone();
                 let task_id = id.clone();
                 join_set.spawn(async move {
                     let _permit = permit.acquire_owned().await;
                     let started = Instant::now();
-                    let result = match materialization {
-                        Materialization::View => {
+                    let result = match op {
+                        ExecOp::View => {
                             adapter.create_or_replace_view(&target, &compiled_sql).await
                         }
-                        Materialization::Table => {
+                        ExecOp::Table => {
                             adapter
                                 .create_or_replace_table(&target, &compiled_sql)
                                 .await
                         }
+                        ExecOp::Append => adapter.append(&target, &compiled_sql).await,
+                        ExecOp::Merge(keys) => adapter.merge(&target, &keys, &compiled_sql).await,
                     };
                     Completion {
                         id: task_id,
@@ -442,6 +475,17 @@ impl Runner {
                                 environment: options.environment.clone(),
                                 version: model.version.clone(),
                                 target: result.target.clone(),
+                                incremental_strategy: model
+                                    .config
+                                    .incremental
+                                    .as_ref()
+                                    .map(|strategy| strategy.as_str().to_string()),
+                                incremental_key: model
+                                    .config
+                                    .incremental
+                                    .as_ref()
+                                    .map(|strategy| strategy.columns().join(","))
+                                    .filter(|key| !key.is_empty()),
                                 run_id: run_id.clone(),
                                 materialized_at: finished_at.clone(),
                             })?;

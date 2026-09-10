@@ -11,12 +11,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use phlo_transform_core::{
-    compile, select_models, Compilation, ModelId, ModelOrigin, Relation, SelectionOptions,
-    SemanticModel, SemanticProject, SemanticTest, TestId,
+    compile, select_models, Compilation, IncrementalStrategy, Materialization, ModelId,
+    ModelOrigin, Relation, SelectionOptions, SemanticModel, SemanticProject, SemanticTest, TestId,
 };
 use phlo_transform_engine::{
-    Adapter, AdapterError, ArtifactWriter, CancelHandle, ColumnInfo, ExecutionStatus, Plan,
-    PlanAction, Planner, QueryResult, RunOptions, Runner, SqliteStateStore, StateStore,
+    Adapter, AdapterError, ArtifactWriter, CancelHandle, ChangeReason, ColumnInfo, ExecutionStatus,
+    Plan, PlanAction, Planner, QueryResult, RunOptions, Runner, SqliteStateStore, StateStore,
 };
 
 #[derive(Default)]
@@ -24,6 +24,8 @@ struct FakeAdapter {
     existing: Mutex<BTreeSet<String>>,
     fail_targets: Mutex<BTreeSet<String>>,
     created: Mutex<Vec<String>>,
+    appends: Mutex<Vec<String>>,
+    merges: Mutex<Vec<String>>,
     test_rows: Mutex<u64>,
     delay_ms: u64,
     current: AtomicUsize,
@@ -113,6 +115,31 @@ impl Adapter for FakeAdapter {
         _sql: &str,
     ) -> Result<QueryResult, AdapterError> {
         self.create(relation, "table-query").await
+    }
+
+    async fn append(&self, relation: &Relation, _sql: &str) -> Result<QueryResult, AdapterError> {
+        let display = relation.display();
+        self.appends.lock().unwrap().push(display.clone());
+        self.existing.lock().unwrap().insert(display);
+        Ok(QueryResult {
+            query_id: Some("append-query".to_string()),
+            ..Default::default()
+        })
+    }
+
+    async fn merge(
+        &self,
+        relation: &Relation,
+        _key_columns: &[String],
+        _sql: &str,
+    ) -> Result<QueryResult, AdapterError> {
+        let display = relation.display();
+        self.merges.lock().unwrap().push(display.clone());
+        self.existing.lock().unwrap().insert(display);
+        Ok(QueryResult {
+            query_id: Some("merge-query".to_string()),
+            ..Default::default()
+        })
     }
 
     async fn cancel(&self, _query_id: &str) -> Result<(), AdapterError> {
@@ -442,4 +469,110 @@ async fn stale_plan_is_rejected() {
         error,
         phlo_transform_engine::EngineError::StalePlan(_)
     ));
+}
+
+fn incremental_model(sql: &str, key: &str) -> SemanticModel {
+    let mut model = model("assay.events", sql);
+    model.config.materialization = Materialization::Incremental;
+    model.config.incremental = Some(IncrementalStrategy::Key {
+        columns: vec![key.to_string()],
+    });
+    model
+}
+
+fn compile_models(models: Vec<SemanticModel>) -> Compilation {
+    let compilation = compile(&SemanticProject::in_memory(models));
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+    compilation
+}
+
+#[tokio::test]
+async fn incremental_key_bootstraps_then_merges() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let environment = Some("dev".to_string());
+
+    let first = compile_models(vec![incremental_model("select 1 as id, 10 as value", "id")]);
+    let selected = select_models(&first, &SelectionOptions::default());
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&first, &selected, environment.clone())
+        .await
+        .unwrap();
+    assert!(plan.models[0].full_rebuild, "{:?}", plan.models[0]);
+    Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &first,
+            &plan,
+            &RunOptions {
+                environment: environment.clone(),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    // Bootstrap is a full create.
+    assert_eq!(adapter.created.lock().unwrap().len(), 1);
+    assert!(adapter.merges.lock().unwrap().is_empty());
+
+    // Changed SQL, same key: merge instead of full rebuild.
+    let second = compile_models(vec![incremental_model("select 2 as id, 20 as value", "id")]);
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&second, &selected, environment.clone())
+        .await
+        .unwrap();
+    assert_eq!(plan.models[0].action, PlanAction::Build);
+    assert!(!plan.models[0].full_rebuild, "{:?}", plan.models[0]);
+    Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &second,
+            &plan,
+            &RunOptions {
+                environment,
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(adapter.merges.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn changing_incremental_key_requires_full_rebuild() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let environment = Some("dev".to_string());
+
+    let first = compile_models(vec![incremental_model("select 1 as id, 10 as value", "id")]);
+    let selected = select_models(&first, &SelectionOptions::default());
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&first, &selected, environment.clone())
+        .await
+        .unwrap();
+    Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &first,
+            &plan,
+            &RunOptions {
+                environment: environment.clone(),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let second = compile_models(vec![incremental_model(
+        "select 1 as id, 10 as value",
+        "value",
+    )]);
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&second, &selected, environment)
+        .await
+        .unwrap();
+    assert!(plan.models[0].full_rebuild, "{:?}", plan.models[0]);
+    assert!(plan.models[0]
+        .reasons
+        .contains(&ChangeReason::IncrementalChange));
 }

@@ -775,6 +775,12 @@ fn print_plan_human(plan: &Plan) {
         for reason in &model.reasons {
             println!("           reason: {}", reason.label());
         }
+        if let Some(incremental) = &model.incremental {
+            println!("           strategy: {incremental}");
+        }
+        if model.full_rebuild {
+            println!("           full rebuild required");
+        }
     }
 
     println!();

@@ -50,6 +50,17 @@ pub trait Adapter: Send + Sync {
         sql: &str,
     ) -> Result<QueryResult, AdapterError>;
 
+    /// Append rows from `sql` into an existing relation.
+    async fn append(&self, relation: &Relation, sql: &str) -> Result<QueryResult, AdapterError>;
+
+    /// Merge rows from `sql` into an existing relation on the key columns.
+    async fn merge(
+        &self,
+        relation: &Relation,
+        key_columns: &[String],
+        sql: &str,
+    ) -> Result<QueryResult, AdapterError>;
+
     async fn cancel(&self, query_id: &str) -> Result<(), AdapterError>;
 
     /// Read column metadata for an existing relation.

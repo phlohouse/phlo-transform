@@ -18,6 +18,7 @@ use serde::Serialize;
 pub enum Materialization {
     View,
     Table,
+    Incremental,
 }
 
 impl Materialization {
@@ -25,6 +26,7 @@ impl Materialization {
         match value.trim().to_ascii_lowercase().as_str() {
             "view" => Some(Materialization::View),
             "table" => Some(Materialization::Table),
+            "incremental" => Some(Materialization::Incremental),
             _ => None,
         }
     }
@@ -33,6 +35,46 @@ impl Materialization {
         match self {
             Materialization::View => "view",
             Materialization::Table => "table",
+            Materialization::Incremental => "incremental",
+        }
+    }
+}
+
+/// Declarative incremental intent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "strategy", rename_all = "snake_case")]
+pub enum IncrementalStrategy {
+    Append,
+    Key {
+        columns: Vec<String>,
+    },
+    Partition {
+        columns: Vec<String>,
+    },
+    TimeWindow {
+        column: String,
+        overlap_seconds: Option<u64>,
+    },
+}
+
+impl IncrementalStrategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IncrementalStrategy::Append => "append",
+            IncrementalStrategy::Key { .. } => "key",
+            IncrementalStrategy::Partition { .. } => "partition",
+            IncrementalStrategy::TimeWindow { .. } => "time-window",
+        }
+    }
+
+    /// The identity/partition columns this strategy uses.
+    pub fn columns(&self) -> Vec<String> {
+        match self {
+            IncrementalStrategy::Append => Vec::new(),
+            IncrementalStrategy::Key { columns } | IncrementalStrategy::Partition { columns } => {
+                columns.clone()
+            }
+            IncrementalStrategy::TimeWindow { column, .. } => vec![column.clone()],
         }
     }
 }
@@ -64,6 +106,9 @@ pub struct Directives {
     /// `-- @not-null a,b` columns asserted non-null.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub not_null: Vec<String>,
+    /// `-- @incremental ...` intent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incremental: Option<IncrementalStrategy>,
     /// Non-fatal or fatal problems encountered while parsing directives.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<DirectiveIssue>,
@@ -163,6 +208,9 @@ pub fn parse_directives(sql: &str) -> Directives {
                     directives.not_null.extend(columns);
                 }
             }
+            "@incremental" => {
+                parse_incremental(&mut directives, name, value, line_number);
+            }
             _ => directives.issues.push(DirectiveIssue {
                 kind: DirectiveIssueKind::UnknownDirective,
                 name,
@@ -189,6 +237,50 @@ fn split_columns(value: &str) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn parse_incremental(directives: &mut Directives, name: String, value: String, line: usize) {
+    let value = value.trim();
+    if value.is_empty() {
+        missing_value(directives, name, line);
+        return;
+    }
+
+    let strategy = if let Some((key, columns)) = value.split_once('=') {
+        let columns = split_columns(columns);
+        match key.trim().to_ascii_lowercase().as_str() {
+            "key" if !columns.is_empty() => Some(IncrementalStrategy::Key { columns }),
+            "partition" if !columns.is_empty() => Some(IncrementalStrategy::Partition { columns }),
+            "window" if !columns.is_empty() => Some(IncrementalStrategy::TimeWindow {
+                column: columns[0].clone(),
+                overlap_seconds: None,
+            }),
+            _ => None,
+        }
+    } else {
+        match value.split_whitespace().next().map(str::to_ascii_lowercase) {
+            Some(word) if word == "append" => Some(IncrementalStrategy::Append),
+            _ => None,
+        }
+    };
+
+    match strategy {
+        Some(strategy) => {
+            if let IncrementalStrategy::Key { columns } = &strategy {
+                // A key declaration also implies identity semantics.
+                directives.keys.extend(columns.iter().cloned());
+                directives.keys.sort();
+                directives.keys.dedup();
+            }
+            directives.incremental = Some(strategy);
+            set_materialization(directives, Materialization::Incremental, name, line);
+        }
+        None => directives.issues.push(DirectiveIssue {
+            kind: DirectiveIssueKind::InvalidValue,
+            name,
+            line,
+        }),
+    }
 }
 
 fn parse_id(directives: &mut Directives, name: String, value: String, line: usize) {
@@ -358,5 +450,48 @@ mod tests {
     fn reports_key_without_value() {
         let directives = parse_directives("-- @key\nselect 1");
         assert_eq!(directives.issues[0].kind, DirectiveIssueKind::MissingValue);
+    }
+
+    #[test]
+    fn parses_incremental_strategies() {
+        assert_eq!(
+            parse_directives("-- @incremental append\nselect 1").incremental,
+            Some(IncrementalStrategy::Append)
+        );
+        assert_eq!(
+            parse_directives("-- @incremental key=a,b\nselect 1").incremental,
+            Some(IncrementalStrategy::Key {
+                columns: vec!["a".to_string(), "b".to_string()]
+            })
+        );
+        assert_eq!(
+            parse_directives("-- @incremental partition=run_date\nselect 1").incremental,
+            Some(IncrementalStrategy::Partition {
+                columns: vec!["run_date".to_string()]
+            })
+        );
+        assert_eq!(
+            parse_directives("-- @incremental window=updated_at\nselect 1").incremental,
+            Some(IncrementalStrategy::TimeWindow {
+                column: "updated_at".to_string(),
+                overlap_seconds: None
+            })
+        );
+    }
+
+    #[test]
+    fn incremental_key_implies_identity() {
+        let directives = parse_directives("-- @incremental key=experiment_id\nselect 1");
+        assert_eq!(
+            directives.materialization,
+            Some(Materialization::Incremental)
+        );
+        assert_eq!(directives.keys, vec!["experiment_id"]);
+    }
+
+    #[test]
+    fn invalid_incremental_is_reported() {
+        let directives = parse_directives("-- @incremental nonsense\nselect 1");
+        assert_eq!(directives.issues[0].kind, DirectiveIssueKind::InvalidValue);
     }
 }
