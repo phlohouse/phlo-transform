@@ -337,3 +337,121 @@ fn identity_helpers_reject_malformed_ids() {
         Err(IdentityError::MissingPath("assay".to_string()))
     );
 }
+
+#[test]
+fn materialization_and_metadata_follow_configured_precedence() {
+    use phlo_transform_core::Materialization;
+
+    let compilation = compile_fixture("materialization");
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let config = |name: &str| {
+        compilation
+            .model(&ModelId::parse(name).unwrap())
+            .unwrap()
+            .config
+            .clone()
+    };
+
+    // Root default (table) with root owner and tags.
+    let staging = config("assay.staging.raw");
+    assert_eq!(staging.materialization, Materialization::Table);
+    assert_eq!(staging.tags, vec!["assay"]);
+    assert_eq!(staging.owner.as_deref(), Some("assay-team"));
+    assert_eq!(staging.schema, None);
+
+    // Folder override: view, extra tag, folder schema.
+    let results = config("assay.marts.results");
+    assert_eq!(results.materialization, Materialization::View);
+    assert_eq!(results.tags, vec!["assay", "gold"]);
+    assert_eq!(results.schema.as_deref(), Some("marts"));
+
+    // Model directive beats the folder default.
+    let direct = config("assay.marts.direct");
+    assert_eq!(direct.materialization, Materialization::Table);
+}
+
+#[test]
+fn physical_targets_reflect_workspace_defaults() {
+    let compilation = compile_fixture("materialization");
+    let staging = compilation
+        .model(&ModelId::parse("assay.staging.raw").unwrap())
+        .unwrap();
+    assert_eq!(staging.target.catalog.as_deref(), Some("memory"));
+    assert_eq!(staging.target.schema, "analytics");
+    assert_eq!(staging.target.table, "assay__staging__raw");
+
+    // A folder schema override changes the target schema.
+    let results = compilation
+        .model(&ModelId::parse("assay.marts.results").unwrap())
+        .unwrap();
+    assert_eq!(results.target.schema, "marts");
+}
+
+#[test]
+fn compiled_sql_rewrites_models_and_preserves_sources() {
+    let compilation = compile_fixture("compiled-sql");
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let results = compilation
+        .model(&ModelId::parse("assay.results").unwrap())
+        .unwrap();
+    // External sources are left alone.
+    assert!(results.compiled_sql.contains("external.local_raw"));
+    // Workspace relations become physical targets.
+    assert!(
+        results.compiled_sql.contains("memory.analytics.assay__raw"),
+        "{}",
+        results.compiled_sql
+    );
+    assert_eq!(
+        results.compiled_sql.matches("assay__raw").count(),
+        1,
+        "{}",
+        results.compiled_sql
+    );
+    // The CTE named `raw` is not rewritten.
+    assert!(
+        results.compiled_sql.contains("FROM raw"),
+        "{}",
+        results.compiled_sql
+    );
+}
+
+#[test]
+fn discovers_and_compiles_custom_tests() {
+    let compilation = compile_fixture("tests-suite");
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let names: Vec<String> = compilation
+        .tests
+        .iter()
+        .map(|test| test.id.to_string())
+        .collect();
+    assert_eq!(names, vec!["raw_not_null", "results_positive"]);
+
+    let test = compilation
+        .tests
+        .iter()
+        .find(|test| test.id.to_string() == "results_positive")
+        .unwrap();
+    assert_eq!(test.targets, vec![ModelId::parse("assay.results").unwrap()]);
+    assert!(
+        test.compiled_sql.contains("assay.results"),
+        "{}",
+        test.compiled_sql
+    );
+    assert_eq!(
+        compilation
+            .tests_for(&ModelId::parse("assay.results").unwrap())
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn colliding_physical_targets_are_reported() {
+    let compilation = compile_fixture("target-collision");
+    assert!(!compilation.is_ok());
+    assert!(codes(&compilation).contains(&"PROJECT007".to_string()));
+}

@@ -14,6 +14,8 @@ pub mod directives;
 pub mod parse;
 pub mod relations;
 
-pub use directives::{parse_directives, DirectiveIssue, DirectiveIssueKind, Directives};
+pub use directives::{
+    parse_directives, DirectiveIssue, DirectiveIssueKind, Directives, Materialization,
+};
 pub use parse::{parse_statements, Dialect, SqlParseError};
 pub use relations::{extract_relations, ExtractedRelation, RelationName};

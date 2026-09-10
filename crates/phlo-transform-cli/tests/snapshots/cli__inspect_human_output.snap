@@ -2,10 +2,12 @@
 source: crates/phlo-transform-cli/tests/cli.rs
 expression: stdout(&output)
 ---
-Model:  assay.results
-ID:     model://assay/results
-Path:   workflows/assay/transforms/results.sql
-Pinned: (none)
+Model:         assay.results
+ID:            model://assay/results
+Path:          workflows/assay/transforms/results.sql
+Materialized:  view
+Target:        assay.results
+Pinned:        (none)
 
 Depends on:
   assay.raw
@@ -15,3 +17,6 @@ Sources:
 
 Used by:
   reporting.monthly
+
+Tests:
+  (none)

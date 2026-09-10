@@ -1,0 +1,4 @@
+[transform]
+default_materialization = "view"
+default_catalog = "memory"
+default_schema = "analytics"

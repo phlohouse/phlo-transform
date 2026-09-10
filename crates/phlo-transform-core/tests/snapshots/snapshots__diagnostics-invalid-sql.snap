@@ -6,7 +6,7 @@ expression: compilation.diagnostics
   {
     "code": "PARSE001",
     "severity": "error",
-    "message": "could not parse SQL: sql parser error: Expected: identifier, found: EOF",
+    "message": "could not parse model SQL: sql parser error: Expected: identifier, found: EOF",
     "path": "workflows/assay/transforms/broken.sql"
   }
 ]

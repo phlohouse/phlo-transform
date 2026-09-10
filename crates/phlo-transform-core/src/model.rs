@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use phlo_transform_sql::Directives;
+use phlo_transform_sql::{Directives, Materialization};
 
 use crate::diagnostics::Diagnostic;
 use crate::identity::{ModelId, Namespace};
@@ -109,6 +109,88 @@ pub struct RootRef {
     pub relative_path: Vec<String>,
 }
 
+/// Effective, resolved configuration for a model.
+///
+/// The frontend computes this by applying the documented precedence
+/// (workspace → transform root → folder → model directive). The compiler only
+/// consumes the result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelConfig {
+    pub materialization: Materialization,
+    pub tags: Vec<String>,
+    pub owner: Option<String>,
+    /// Per-model target schema override, when configured.
+    pub schema: Option<String>,
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            materialization: Materialization::View,
+            tags: Vec::new(),
+            owner: None,
+            schema: None,
+        }
+    }
+}
+
+/// Workspace-wide defaults that affect physical targeting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceDefaults {
+    pub materialization: Materialization,
+    pub catalog: Option<String>,
+    pub schema: Option<String>,
+}
+
+impl Default for WorkspaceDefaults {
+    fn default() -> Self {
+        Self {
+            materialization: Materialization::View,
+            catalog: None,
+            schema: None,
+        }
+    }
+}
+
+/// A resolved physical relation.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Relation {
+    pub catalog: Option<String>,
+    pub schema: String,
+    pub table: String,
+}
+
+impl Relation {
+    /// The relation as a quoted dotted SQL identifier.
+    pub fn sql(&self) -> String {
+        match &self.catalog {
+            Some(catalog) => format!(
+                "{}.{}.{}",
+                quote_identifier(catalog),
+                quote_identifier(&self.schema),
+                quote_identifier(&self.table)
+            ),
+            None => format!(
+                "{}.{}",
+                quote_identifier(&self.schema),
+                quote_identifier(&self.table)
+            ),
+        }
+    }
+
+    /// The dotted display form.
+    pub fn display(&self) -> String {
+        match &self.catalog {
+            Some(catalog) => format!("{}.{}.{}", catalog, self.schema, self.table),
+            None => format!("{}.{}", self.schema, self.table),
+        }
+    }
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
 /// A single semantic model, prior to dependency resolution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SemanticModel {
@@ -122,6 +204,7 @@ pub struct SemanticModel {
     pub root: Option<RootRef>,
     pub sql: String,
     pub directives: Directives,
+    pub config: ModelConfig,
     pub origin: ModelOrigin,
 }
 
@@ -140,9 +223,44 @@ impl SemanticModel {
             root: None,
             sql: sql.into(),
             directives: Directives::default(),
+            config: ModelConfig::default(),
             origin: ModelOrigin::in_memory(),
         }
     }
+}
+
+/// Identifies a workspace test.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TestId {
+    name: String,
+}
+
+impl TestId {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn uri(&self) -> String {
+        format!("test://{}", self.name.replace('.', "/"))
+    }
+}
+
+impl std::fmt::Display for TestId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.name)
+    }
+}
+
+/// A custom SQL test, discovered from `tests/**/*.sql`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemanticTest {
+    pub id: TestId,
+    pub sql: String,
+    pub origin: ModelOrigin,
 }
 
 /// The complete semantic input to the compiler.
@@ -152,6 +270,8 @@ pub struct SemanticProject {
     pub workspace_root: Option<PathBuf>,
     pub roots: Vec<TransformRoot>,
     pub models: Vec<SemanticModel>,
+    pub tests: Vec<SemanticTest>,
+    pub defaults: WorkspaceDefaults,
     /// Diagnostics raised while loading (for example malformed metadata).
     /// The compiler carries these through to its own output.
     pub diagnostics: Vec<Diagnostic>,
@@ -164,6 +284,8 @@ impl SemanticProject {
             workspace_root: None,
             roots: Vec::new(),
             models,
+            tests: Vec::new(),
+            defaults: WorkspaceDefaults::default(),
             diagnostics: Vec::new(),
         }
     }

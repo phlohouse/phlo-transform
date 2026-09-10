@@ -64,12 +64,20 @@ impl Resolver {
             return resolution;
         }
 
+        self.resolve_global(name)
+    }
+
+    /// Resolve `name` without model-local context (used by tests).
+    pub fn resolve_global(&self, name: &RelationName) -> Resolution {
+        let full = name.as_dotted();
+        if let Some(resolution) = self.unique(self.exact(&full)) {
+            return resolution;
+        }
         if let Some(resolution) = self.unique(self.suffix(&full)) {
             return resolution;
         }
-
         // Any relation not produced by the workspace is an external source
-        // candidate. Live catalogue introspection is out of scope for Phase 0.
+        // candidate. Live catalogue introspection is out of scope for Phase 1.
         let parts = name.parts().to_vec();
         Resolution::External(SourceId::new(parts).expect("relation names are non-empty"))
     }

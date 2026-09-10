@@ -21,5 +21,6 @@ expression: "compiled(\"basic-multi-root\").check_report()"
   ],
   "model_count": 3,
   "source_count": 1,
+  "test_count": 0,
   "diagnostics": []
 }

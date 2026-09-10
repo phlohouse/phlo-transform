@@ -33,3 +33,7 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+      # Docker is available on GitHub-hosted Ubuntu runners.
+      - name: Trino integration tests
+        run: cargo test -p phlo-transform-trino --test trino_e2e -- --ignored

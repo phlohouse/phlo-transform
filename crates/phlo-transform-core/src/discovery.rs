@@ -9,15 +9,18 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use phlo_transform_sql::parse_directives;
+use phlo_transform_sql::{parse_directives, Materialization};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::config::{read_phlo_config, read_root_config, PhloConfig};
+use crate::config::{
+    read_phlo_config, read_root_config, FolderConfig, PhloConfig, TransformRootConfig,
+};
 use crate::diagnostics::{codes, Diagnostic};
 use crate::identity::{IdentityError, ModelId, Namespace};
 use crate::model::{
-    FrontendKind, ModelOrigin, RootKind, RootNamespaceStrategy, RootRef, SemanticModel,
-    SemanticProject, TransformRoot, TransformRootId,
+    FrontendKind, ModelConfig, ModelOrigin, RootKind, RootNamespaceStrategy, RootRef,
+    SemanticModel, SemanticProject, SemanticTest, TestId, TransformRoot, TransformRootId,
+    WorkspaceDefaults,
 };
 
 const DEFAULT_INCLUDES: &[&str] = &["transforms/**", "workflows/*/transforms/**"];
@@ -102,10 +105,12 @@ pub fn load_project(workspace_root: &Path) -> Result<SemanticProject, Vec<Diagno
         })
         .collect();
 
+    let defaults = workspace_defaults(&config, &mut diagnostics);
+
     // Second pass: read SQL, lower directives and build semantic models.
     let mut models: Vec<SemanticModel> = Vec::with_capacity(derived.len());
     for file in &derived {
-        match lower_model(workspace_root, file, &root_ids) {
+        match lower_model(workspace_root, file, &root_ids, &defaults) {
             Ok(Some(model)) => models.push(model),
             Ok(None) => {}
             Err(diagnostic) => diagnostics.push(diagnostic),
@@ -114,12 +119,39 @@ pub fn load_project(workspace_root: &Path) -> Result<SemanticProject, Vec<Diagno
 
     models.sort_by(|left, right| left.id.cmp(&right.id));
 
+    let tests = load_tests(workspace_root, &mut diagnostics);
+
     Ok(SemanticProject {
         workspace_root: Some(workspace_root.to_path_buf()),
         roots,
         models,
+        tests,
+        defaults,
         diagnostics,
     })
+}
+
+fn workspace_defaults(config: &PhloConfig, diagnostics: &mut Vec<Diagnostic>) -> WorkspaceDefaults {
+    let materialization = match config.transform.default_materialization.as_deref() {
+        Some(value) => Materialization::parse(value).unwrap_or_else(|| {
+            diagnostics.push(
+                Diagnostic::error(
+                    codes::CONFIG_INVALID,
+                    format!("unknown default_materialization `{value}`"),
+                )
+                .with_path("phlo.toml")
+                .with_help("expected `view` or `table`"),
+            );
+            Materialization::View
+        }),
+        None => Materialization::View,
+    };
+
+    WorkspaceDefaults {
+        materialization,
+        catalog: config.transform.default_catalog.clone(),
+        schema: config.transform.default_schema.clone(),
+    }
 }
 
 fn combined_includes(config: &PhloConfig) -> Vec<String> {
@@ -214,6 +246,84 @@ fn should_descend(entry: &DirEntry) -> bool {
     )
 }
 
+/// Discover custom SQL tests from the conventional `tests/**/*.sql` location.
+fn load_tests(workspace_root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Vec<SemanticTest> {
+    let include = match build_globset(&["tests/**".to_string()]) {
+        Ok(globset) => globset,
+        Err(diagnostic) => {
+            diagnostics.push(diagnostic);
+            return Vec::new();
+        }
+    };
+    let exclude = match build_globset(
+        &DEFAULT_EXCLUDES
+            .iter()
+            .map(|pattern| pattern.to_string())
+            .collect::<Vec<_>>(),
+    ) {
+        Ok(globset) => globset,
+        Err(diagnostic) => {
+            diagnostics.push(diagnostic);
+            return Vec::new();
+        }
+    };
+
+    let files = walk_sql_files(workspace_root, &include, &exclude, diagnostics);
+    let mut tests = Vec::with_capacity(files.len());
+    for relative_path in files {
+        let display = display_path(&relative_path);
+        let full_path = workspace_root.join(&relative_path);
+        let sql = match std::fs::read_to_string(&full_path) {
+            Ok(sql) => sql,
+            Err(error) => {
+                diagnostics.push(
+                    Diagnostic::error(
+                        codes::PROJECT_FILE_READ,
+                        format!("could not read test: {error}"),
+                    )
+                    .with_path(display),
+                );
+                continue;
+            }
+        };
+        let Some(name) = test_name(&relative_path) else {
+            diagnostics.push(
+                Diagnostic::error(
+                    codes::PROJECT_UNRESOLVABLE_PATH,
+                    "could not derive a test name from the path",
+                )
+                .with_path(display),
+            );
+            continue;
+        };
+        tests.push(SemanticTest {
+            id: TestId::new(name),
+            sql,
+            origin: ModelOrigin {
+                frontend: FrontendKind::Native,
+                path: Some(relative_path),
+            },
+        });
+    }
+    tests.sort_by(|left, right| left.id.cmp(&right.id));
+    tests
+}
+
+fn test_name(relative_path: &Path) -> Option<String> {
+    let without_extension = relative_path.with_extension("");
+    let mut components: Vec<String> = without_extension
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect();
+    if components.first().map(String::as_str) == Some("tests") {
+        components.remove(0);
+    }
+    if components.is_empty() {
+        return None;
+    }
+    Some(components.join("."))
+}
+
 struct RootInfo {
     strategy: RootNamespaceStrategy,
     kind: RootKind,
@@ -233,6 +343,7 @@ struct DerivedIdentity {
     root_strategy: RootNamespaceStrategy,
     root_relative: Vec<String>,
     kind: RootKind,
+    root_config: TransformRootConfig,
 }
 
 fn derive_identity(
@@ -263,12 +374,12 @@ fn derive_identity(
         None => derive_from_configured_root(workspace_root, relative_path, &directories, &stem)?,
     };
 
-    // A local transform.toml may override the namespace for the subtree.
+    // A local transform.toml may override the namespace for the subtree and
+    // supplies root/folder configuration for materialisation metadata.
+    let root_config = read_root_config(workspace_root, &derived.namespace_dir)?;
     let mut namespace = derived.namespace;
-    if let Ok(root_config) = read_root_config(workspace_root, &derived.namespace_dir) {
-        if let Some(override_namespace) = root_config.namespace {
-            namespace = validate_namespace(&override_namespace, relative_path)?;
-        }
+    if let Some(override_namespace) = &root_config.namespace {
+        namespace = validate_namespace(override_namespace, relative_path)?;
     }
 
     let root_strategy = match &derived.root_strategy {
@@ -284,6 +395,7 @@ fn derive_identity(
         root_strategy,
         root_relative: derived.root_relative,
         kind: derived.kind,
+        root_config,
     })
 }
 
@@ -455,6 +567,7 @@ fn lower_model(
     workspace_root: &Path,
     file: &DerivedFile,
     root_ids: &BTreeMap<PathBuf, TransformRootId>,
+    defaults: &WorkspaceDefaults,
 ) -> Result<Option<SemanticModel>, Diagnostic> {
     let display = display_path(&file.relative_path);
     let full_path = workspace_root.join(&file.relative_path);
@@ -467,6 +580,7 @@ fn lower_model(
     })?;
 
     let directives = parse_directives(&sql);
+    let config = effective_config(&file.identity, &directives, defaults);
 
     let derived_id = ModelId::new(file.identity.namespace.clone(), file.identity.path.clone());
     let id = match directives.pinned_id.as_deref() {
@@ -496,11 +610,81 @@ fn lower_model(
         }),
         sql,
         directives,
+        config,
         origin: ModelOrigin {
             frontend: FrontendKind::Native,
             path: Some(file.relative_path.clone()),
         },
     }))
+}
+
+/// Apply workspace → root → folder → model precedence to produce the
+/// effective configuration.
+fn effective_config(
+    identity: &DerivedIdentity,
+    directives: &phlo_transform_sql::Directives,
+    defaults: &WorkspaceDefaults,
+) -> ModelConfig {
+    let folder = folder_config_for(&identity.root_config, &identity.root_relative);
+
+    let mut materialization = defaults.materialization;
+    if let Some(value) = identity.root_config.materialized.as_deref() {
+        if let Some(parsed) = Materialization::parse(value) {
+            materialization = parsed;
+        }
+    }
+    if let Some(value) = folder.and_then(|folder| folder.materialized.as_deref()) {
+        if let Some(parsed) = Materialization::parse(value) {
+            materialization = parsed;
+        }
+    }
+    if let Some(parsed) = directives.materialization {
+        materialization = parsed;
+    }
+
+    let mut tags = identity.root_config.tags.clone();
+    if let Some(folder) = folder {
+        tags.extend(folder.tags.iter().cloned());
+    }
+    tags.extend(directives.tags.iter().cloned());
+    tags.sort();
+    tags.dedup();
+
+    let owner = directives
+        .owner
+        .clone()
+        .or_else(|| folder.and_then(|folder| folder.owner.clone()))
+        .or_else(|| identity.root_config.owner.clone());
+
+    let schema = folder.and_then(|folder| folder.schema.clone());
+
+    ModelConfig {
+        materialization,
+        tags,
+        owner,
+        schema,
+    }
+}
+
+/// Find the deepest configured folder that contains the model path.
+fn folder_config_for<'a>(
+    root_config: &'a TransformRootConfig,
+    root_relative: &[String],
+) -> Option<&'a FolderConfig> {
+    let directories = &root_relative[..root_relative.len().saturating_sub(1)];
+    let directory_parts: Vec<&str> = directories.iter().map(String::as_str).collect();
+    let mut best: Option<(usize, &'a FolderConfig)> = None;
+    for (key, config) in &root_config.folder {
+        let parts: Vec<&str> = key.split('/').filter(|part| !part.is_empty()).collect();
+        if directory_parts.starts_with(&parts)
+            && best
+                .map(|(best_len, _)| parts.len() > best_len)
+                .unwrap_or(true)
+        {
+            best = Some((parts.len(), config));
+        }
+    }
+    best.map(|(_, config)| config)
 }
 
 fn invalid_identity(path: &str, error: &IdentityError) -> Diagnostic {

@@ -15,5 +15,6 @@ expression: "compiled(\"custom-roots\").check_report()"
   ],
   "model_count": 2,
   "source_count": 1,
+  "test_count": 0,
   "diagnostics": []
 }

@@ -304,6 +304,13 @@ mod tests {
                 path: None,
             },
             sql: String::new(),
+            config: crate::model::ModelConfig::default(),
+            target: crate::model::Relation {
+                catalog: None,
+                schema: id.namespace().to_string(),
+                table: id.path().join("__"),
+            },
+            compiled_sql: String::new(),
             pinned_id: None,
             dependencies,
             id,

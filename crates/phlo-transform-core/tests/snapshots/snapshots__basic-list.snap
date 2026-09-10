@@ -8,6 +8,8 @@ expression: "compiled(\"basic-multi-root\").list_report()"
       "id": "model://assay/raw",
       "name": "assay.raw",
       "namespace": "assay",
+      "materialization": "view",
+      "target": "assay.raw",
       "path": "workflows/assay/transforms/raw.sql",
       "depends_on": [],
       "sources": [
@@ -18,6 +20,8 @@ expression: "compiled(\"basic-multi-root\").list_report()"
       "id": "model://assay/results",
       "name": "assay.results",
       "namespace": "assay",
+      "materialization": "view",
+      "target": "assay.results",
       "path": "workflows/assay/transforms/results.sql",
       "depends_on": [
         "assay.raw"
@@ -28,6 +32,8 @@ expression: "compiled(\"basic-multi-root\").list_report()"
       "id": "model://reporting/monthly",
       "name": "reporting.monthly",
       "namespace": "reporting",
+      "materialization": "view",
+      "target": "reporting.monthly",
       "path": "workflows/reporting/transforms/monthly.sql",
       "depends_on": [
         "assay.results"
@@ -40,5 +46,6 @@ expression: "compiled(\"basic-multi-root\").list_report()"
       "id": "source://external/raw_assay_results",
       "name": "external.raw_assay_results"
     }
-  ]
+  ],
+  "tests": []
 }

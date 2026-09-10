@@ -3,11 +3,45 @@
 //! Directives are ordinary SQL line comments of the form `-- @name value`.
 //! They are parsed independently of SQL syntax so that malformed metadata is
 //! reported clearly and so that directives never become a programming
-//! language. Phase 0 only gives meaning to `@id`; other directives are
-//! recognised as unknown and reported as warnings rather than silently
+//! language.
+//!
+//! Phase 0 gave meaning to `@id`. Phase 1 adds the declarative metadata needed
+//! by the MVP build engine: `@view`, `@table`, `@materialized`, `@tags` and
+//! `@owner`. Unknown directives are reported as warnings rather than silently
 //! ignored, which keeps typos visible without blocking forward compatibility.
 
 use serde::Serialize;
+
+/// How a model is physically materialised.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Materialization {
+    View,
+    Table,
+}
+
+impl Materialization {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "view" => Some(Materialization::View),
+            "table" => Some(Materialization::Table),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Materialization::View => "view",
+            Materialization::Table => "table",
+        }
+    }
+}
+
+impl std::fmt::Display for Materialization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 /// Directives extracted from a model's SQL text.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -15,7 +49,16 @@ pub struct Directives {
     /// Raw value of a pinned `-- @id <name>` directive.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_id: Option<String>,
-    /// Non-fatal problems encountered while parsing directives.
+    /// Requested materialisation, if declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub materialization: Option<Materialization>,
+    /// `-- @tags a,b` values, in declaration order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// `-- @owner <value>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Non-fatal or fatal problems encountered while parsing directives.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<DirectiveIssue>,
 }
@@ -35,8 +78,13 @@ pub struct DirectiveIssue {
 pub enum DirectiveIssueKind {
     /// A known directive was present but lacked a required value.
     MissingValue,
+    /// A directive carried a value that is not understood.
+    InvalidValue,
     /// The same `@id` directive was declared more than once.
     DuplicateId,
+    /// Conflicting materialisation directives (for example `@view` and
+    /// `@table`).
+    ConflictingMaterialization,
     /// The directive name is not recognised by this compiler version.
     UnknownDirective,
 }
@@ -52,23 +100,45 @@ pub fn parse_directives(sql: &str) -> Directives {
         };
 
         match name.as_str() {
-            "@id" => {
-                let value = value.trim();
-                if value.is_empty() {
-                    directives.issues.push(DirectiveIssue {
-                        kind: DirectiveIssueKind::MissingValue,
-                        name,
-                        line: line_number,
-                    });
-                } else if directives.pinned_id.is_some() {
-                    directives.issues.push(DirectiveIssue {
-                        kind: DirectiveIssueKind::DuplicateId,
-                        name,
-                        line: line_number,
-                    });
+            "@id" => parse_id(&mut directives, name, value, line_number),
+            "@view" => {
+                set_materialization(&mut directives, Materialization::View, name, line_number)
+            }
+            "@table" => {
+                set_materialization(&mut directives, Materialization::Table, name, line_number)
+            }
+            "@materialized" => {
+                if value.trim().is_empty() {
+                    missing_value(&mut directives, name, line_number);
+                } else if let Some(materialization) = Materialization::parse(&value) {
+                    set_materialization(&mut directives, materialization, name, line_number);
                 } else {
-                    // First declaration wins, keeping identity stable.
-                    directives.pinned_id = Some(value.to_string());
+                    directives.issues.push(DirectiveIssue {
+                        kind: DirectiveIssueKind::InvalidValue,
+                        name,
+                        line: line_number,
+                    });
+                }
+            }
+            "@tags" => {
+                let tags: Vec<String> = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if tags.is_empty() {
+                    missing_value(&mut directives, name, line_number);
+                } else {
+                    directives.tags.extend(tags);
+                }
+            }
+            "@owner" => {
+                let owner = value.trim();
+                if owner.is_empty() {
+                    missing_value(&mut directives, name, line_number);
+                } else {
+                    directives.owner = Some(owner.to_string());
                 }
             }
             _ => directives.issues.push(DirectiveIssue {
@@ -79,7 +149,52 @@ pub fn parse_directives(sql: &str) -> Directives {
         }
     }
 
+    directives.tags.sort();
+    directives.tags.dedup();
     directives
+}
+
+fn parse_id(directives: &mut Directives, name: String, value: String, line: usize) {
+    let value = value.trim();
+    if value.is_empty() {
+        missing_value(directives, name, line);
+    } else if directives.pinned_id.is_some() {
+        directives.issues.push(DirectiveIssue {
+            kind: DirectiveIssueKind::DuplicateId,
+            name,
+            line,
+        });
+    } else {
+        // First declaration wins, keeping identity stable.
+        directives.pinned_id = Some(value.to_string());
+    }
+}
+
+fn set_materialization(
+    directives: &mut Directives,
+    materialization: Materialization,
+    name: String,
+    line: usize,
+) {
+    match directives.materialization {
+        Some(existing) if existing != materialization => {
+            directives.issues.push(DirectiveIssue {
+                kind: DirectiveIssueKind::ConflictingMaterialization,
+                name,
+                line,
+            });
+        }
+        Some(_) => {}
+        None => directives.materialization = Some(materialization),
+    }
+}
+
+fn missing_value(directives: &mut Directives, name: String, line: usize) {
+    directives.issues.push(DirectiveIssue {
+        kind: DirectiveIssueKind::MissingValue,
+        name,
+        line,
+    });
 }
 
 /// Parse a single line into `(name, value)` if it is a directive comment.
@@ -139,17 +254,58 @@ mod tests {
 
     #[test]
     fn reports_unknown_directive() {
-        let directives = parse_directives("-- @table\nselect 1");
+        let directives = parse_directives("-- @resource heavy\nselect 1");
         assert_eq!(
             directives.issues[0].kind,
             DirectiveIssueKind::UnknownDirective
         );
-        assert_eq!(directives.issues[0].name, "@table");
+        assert_eq!(directives.issues[0].name, "@resource");
     }
 
     #[test]
     fn requires_at_least_one_name_character() {
         assert!(parse_line("-- @ value").is_none());
         assert!(parse_line("-- @id value").is_some());
+    }
+
+    #[test]
+    fn parses_materialization_short_forms() {
+        assert_eq!(
+            parse_directives("-- @view\nselect 1").materialization,
+            Some(Materialization::View)
+        );
+        assert_eq!(
+            parse_directives("-- @table\nselect 1").materialization,
+            Some(Materialization::Table)
+        );
+    }
+
+    #[test]
+    fn parses_materialization_long_form() {
+        assert_eq!(
+            parse_directives("-- @materialized table\nselect 1").materialization,
+            Some(Materialization::Table)
+        );
+        let directives = parse_directives("-- @materialized nonsense\nselect 1");
+        assert_eq!(directives.materialization, None);
+        assert_eq!(directives.issues[0].kind, DirectiveIssueKind::InvalidValue);
+    }
+
+    #[test]
+    fn reports_conflicting_materialization() {
+        let directives = parse_directives("-- @view\n-- @table\nselect 1");
+        assert_eq!(directives.materialization, Some(Materialization::View));
+        assert_eq!(
+            directives.issues[0].kind,
+            DirectiveIssueKind::ConflictingMaterialization
+        );
+    }
+
+    #[test]
+    fn parses_tags_and_owner() {
+        let directives =
+            parse_directives("-- @tags qc, gold\n-- @owner analytical-development\nselect 1");
+        assert_eq!(directives.tags, vec!["gold", "qc"]);
+        assert_eq!(directives.owner.as_deref(), Some("analytical-development"));
     }
 }

@@ -6,7 +6,7 @@ expression: compilation.diagnostics
   {
     "code": "PARSE003",
     "severity": "warning",
-    "message": "unknown directive `@view`",
+    "message": "unknown directive `@resource`",
     "path": "workflows/assay/transforms/raw.sql:1"
   }
 ]

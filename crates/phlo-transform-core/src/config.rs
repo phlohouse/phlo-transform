@@ -1,8 +1,10 @@
 //! Minimal workspace configuration.
 //!
-//! Phase 0 reads only what it needs: optional discovery includes/excludes and
-//! an optional default namespace. Everything else is inferred.
+//! Phase 1 reads discovery includes/excludes, workspace defaults and the
+//! materialisation metadata needed by the MVP engine. Everything else is
+//! inferred.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -21,6 +23,12 @@ pub struct PhloConfig {
 pub struct TransformConfig {
     /// Namespace used for files directly inside `transforms/`.
     pub default_namespace: Option<String>,
+    /// Workspace default materialisation (`view` or `table`).
+    pub default_materialization: Option<String>,
+    /// Default Trino catalog for physical targets.
+    pub default_catalog: Option<String>,
+    /// Default Trino schema for physical targets.
+    pub default_schema: Option<String>,
     pub discovery: DiscoveryConfig,
 }
 
@@ -38,6 +46,24 @@ pub struct DiscoveryConfig {
 #[serde(default)]
 pub struct TransformRootConfig {
     pub namespace: Option<String>,
+    /// Root-level default materialisation.
+    pub materialized: Option<String>,
+    /// Root-level owner.
+    pub owner: Option<String>,
+    /// Root-level tags.
+    pub tags: Vec<String>,
+    /// Folder-level overrides, keyed by folder path.
+    pub folder: BTreeMap<String, FolderConfig>,
+}
+
+/// A `[folder.<path>]` section inside `transform.toml`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct FolderConfig {
+    pub materialized: Option<String>,
+    pub owner: Option<String>,
+    pub tags: Vec<String>,
+    pub schema: Option<String>,
 }
 
 /// Read `phlo.toml` if present.

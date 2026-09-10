@@ -1,0 +1,8 @@
+materialized = "table"
+owner = "assay-team"
+tags = ["assay"]
+
+[folder.marts]
+materialized = "view"
+tags = ["gold"]
+schema = "marts"

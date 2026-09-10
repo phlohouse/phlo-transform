@@ -313,3 +313,28 @@ Phase 1 is complete when:
 - Nessie/WAP;
 - data diff;
 - daemon/service.
+
+## Implementation notes
+
+Phase 1 is implemented as described in [`docs/engine.md`](../engine.md).
+Decisions worth calling out against this plan:
+
+- The binary remains `phlo-transform`; the `phlo transform` host namespace
+  does not exist yet.
+- Crate layout is `phlo-transform-engine` (adapter trait, planner, scheduler,
+  state, artifacts) and `phlo-transform-trino` (adapter). The compiler core
+  stays synchronous and dependency-free of Tokio/Trino/SQLite.
+- Physical targets use one configured schema and a flattened table name
+  (`namespace__path`), which is an intentional MVP simplification; schema
+  contracts and per-namespace schemas come later.
+- Planning is conservative: existing relations are always `replace`; there is
+  no skip/caching yet.
+- `apply`/`run` plan first, so model mutations never begin when compilation or
+  planning fails.
+- The state store is SQLite (`rusqlite`, bundled) at
+  `.phlo/transform/state.db`.
+- Artifacts carry `schema_version = 1`.
+- Planner/scheduler/state/artifacts are tested with a fake adapter; the Trino
+  adapter is tested against a disposable Trino container and the test is
+  `#[ignore]`d by default but run in CI.
+

@@ -23,23 +23,28 @@ pub mod identity;
 pub mod model;
 pub mod report;
 pub mod resolve;
+pub mod rewrite;
+pub mod select;
 
 use std::path::Path;
 
 pub use compile::compile;
-pub use compiled::{Compilation, CompiledModel};
+pub use compiled::{Compilation, CompiledModel, CompiledTest};
 pub use diagnostics::{codes, Diagnostic, Severity};
 pub use discovery::load_project;
 pub use graph::{Dependency, EdgeKind, GraphNode, TransformGraph};
 pub use identity::{IdentityError, ModelId, Namespace, SourceId};
 pub use model::{
-    FrontendKind, ModelOrigin, RootKind, RootNamespaceStrategy, RootRef, SemanticModel,
-    SemanticProject, TransformRoot, TransformRootId,
+    FrontendKind, ModelConfig, ModelOrigin, Relation, RootKind, RootNamespaceStrategy, RootRef,
+    SemanticModel, SemanticProject, SemanticTest, TestId, TransformRoot, TransformRootId,
+    WorkspaceDefaults,
 };
+pub use phlo_transform_sql::Materialization;
 pub use report::{
     CheckReport, GraphArtifact, GraphEdgeArtifact, GraphNodeArtifact, InspectReport, ListReport,
-    ModelDetail, ModelSummary, RootReport, SourceSummary,
+    ModelDetail, ModelSummary, RootReport, SourceSummary, TestSummary,
 };
+pub use select::{select_models, SelectionOptions};
 
 /// Load a native workspace and compile it in one step.
 pub fn load_and_compile(workspace_root: &Path) -> Result<Compilation, Vec<Diagnostic>> {

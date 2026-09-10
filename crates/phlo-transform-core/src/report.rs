@@ -29,6 +29,7 @@ pub struct CheckReport {
     pub roots: Vec<RootReport>,
     pub model_count: usize,
     pub source_count: usize,
+    pub test_count: usize,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -40,9 +41,25 @@ pub struct ModelSummary {
     /// Dotted logical name, e.g. `assay.staging.raw`.
     pub name: String,
     pub namespace: String,
+    pub materialization: String,
+    /// Physical target relation.
+    pub target: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     pub depends_on: Vec<String>,
+    pub sources: Vec<String>,
+}
+
+/// A custom test in `list`.
+#[derive(Clone, Debug, Serialize)]
+pub struct TestSummary {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<String>,
 }
 
@@ -58,6 +75,7 @@ pub struct SourceSummary {
 pub struct ListReport {
     pub models: Vec<ModelSummary>,
     pub sources: Vec<SourceSummary>,
+    pub tests: Vec<TestSummary>,
 }
 
 /// Full detail for a single model in `inspect`.
@@ -66,13 +84,20 @@ pub struct ModelDetail {
     pub id: String,
     pub name: String,
     pub namespace: String,
+    pub materialization: String,
+    pub target: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_id: Option<String>,
     pub depends_on: Vec<String>,
     pub sources: Vec<String>,
     pub used_by: Vec<String>,
+    pub tests: Vec<String>,
     pub sql: String,
 }
 
@@ -133,6 +158,7 @@ impl Compilation {
             roots,
             model_count: self.models.len(),
             source_count: self.sources().len(),
+            test_count: self.tests.len(),
             diagnostics: self.diagnostics.clone(),
         }
     }
@@ -147,7 +173,12 @@ impl Compilation {
                 name: source.logical_name(),
             })
             .collect();
-        ListReport { models, sources }
+        let tests = self.tests.iter().map(test_summary).collect();
+        ListReport {
+            models,
+            sources,
+            tests,
+        }
     }
 
     pub fn inspect_report(&self, id: &ModelId) -> Option<InspectReport> {
@@ -165,17 +196,27 @@ impl Compilation {
             .into_iter()
             .map(|dependent| dependent.logical_name())
             .collect();
+        let tests = self
+            .tests_for(id)
+            .into_iter()
+            .map(|test| test.id.to_string())
+            .collect();
 
         Some(InspectReport {
             model: ModelDetail {
                 id: model.id.uri(),
                 name: model.id.logical_name(),
                 namespace: model.namespace.to_string(),
+                materialization: model.config.materialization.to_string(),
+                target: model.target.display(),
                 path: model.path_display(),
+                tags: model.config.tags.clone(),
+                owner: model.config.owner.clone(),
                 pinned_id: model.pinned_id.as_ref().map(ModelId::logical_name),
                 depends_on,
                 sources,
                 used_by,
+                tests,
                 sql: model.sql.clone(),
             },
         })
@@ -221,7 +262,10 @@ fn model_summary(model: &CompiledModel) -> ModelSummary {
         id: model.id.uri(),
         name: model.id.logical_name(),
         namespace: model.id.namespace().to_string(),
+        materialization: model.config.materialization.to_string(),
+        target: model.target.display(),
         path: model.path_display(),
+        tags: model.config.tags.clone(),
         depends_on: model
             .model_dependencies()
             .map(|dependency| dependency.logical_name())
@@ -229,6 +273,23 @@ fn model_summary(model: &CompiledModel) -> ModelSummary {
         sources: model
             .source_dependencies()
             .map(|dependency| dependency.logical_name())
+            .collect(),
+    }
+}
+
+fn test_summary(test: &crate::compiled::CompiledTest) -> TestSummary {
+    TestSummary {
+        id: test.id.uri(),
+        name: test.id.to_string(),
+        targets: test
+            .targets
+            .iter()
+            .map(|target| target.logical_name())
+            .collect(),
+        sources: test
+            .sources
+            .iter()
+            .map(|source| source.logical_name())
             .collect(),
     }
 }

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::graph::{Dependency, TransformGraph};
 use crate::identity::{ModelId, Namespace, SourceId};
-use crate::model::{ModelOrigin, TransformRoot};
+use crate::model::{ModelConfig, ModelOrigin, Relation, TestId, TransformRoot};
 
 /// A fully resolved model.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,6 +18,12 @@ pub struct CompiledModel {
     pub path: Vec<String>,
     pub origin: ModelOrigin,
     pub sql: String,
+    /// Effective configuration after precedence resolution.
+    pub config: ModelConfig,
+    /// Physical target relation.
+    pub target: Relation,
+    /// SQL with workspace relations rewritten to physical targets.
+    pub compiled_sql: String,
     /// Pinned identity from `-- @id`, when present and valid.
     pub pinned_id: Option<ModelId>,
     /// Resolved dependencies, sorted and deduplicated.
@@ -52,6 +58,29 @@ impl CompiledModel {
     }
 }
 
+/// A fully resolved custom test.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompiledTest {
+    pub id: TestId,
+    pub origin: ModelOrigin,
+    pub sql: String,
+    /// SQL with workspace relations rewritten to physical targets.
+    pub compiled_sql: String,
+    /// Workspace models the test reads.
+    pub targets: Vec<ModelId>,
+    /// External relations the test reads.
+    pub sources: Vec<SourceId>,
+}
+
+impl CompiledTest {
+    pub fn path_display(&self) -> Option<String> {
+        self.origin
+            .path
+            .as_ref()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+    }
+}
+
 /// The result of compiling a semantic project.
 ///
 /// Compilation is best-effort: even when diagnostics are present the compiler
@@ -63,9 +92,11 @@ pub struct Compilation {
     pub workspace_root: Option<PathBuf>,
     pub roots: Vec<TransformRoot>,
     pub models: Vec<CompiledModel>,
+    pub tests: Vec<CompiledTest>,
     pub graph: TransformGraph,
     pub diagnostics: Vec<Diagnostic>,
     index: BTreeMap<ModelId, usize>,
+    test_index: BTreeMap<TestId, usize>,
 }
 
 impl Compilation {
@@ -73,6 +104,7 @@ impl Compilation {
         workspace_root: Option<PathBuf>,
         roots: Vec<TransformRoot>,
         models: Vec<CompiledModel>,
+        tests: Vec<CompiledTest>,
         diagnostics: Vec<Diagnostic>,
     ) -> Self {
         let index = models
@@ -80,14 +112,21 @@ impl Compilation {
             .enumerate()
             .map(|(position, model)| (model.id.clone(), position))
             .collect();
+        let test_index = tests
+            .iter()
+            .enumerate()
+            .map(|(position, test)| (test.id.clone(), position))
+            .collect();
         let graph = TransformGraph::build(&models);
         Self {
             workspace_root,
             roots,
             models,
+            tests,
             graph,
             diagnostics,
             index,
+            test_index,
         }
     }
 
@@ -113,6 +152,20 @@ impl Compilation {
     pub fn model_by_name(&self, name: &str) -> Option<&CompiledModel> {
         let id = ModelId::parse(name).ok()?;
         self.model(&id)
+    }
+
+    pub fn test(&self, id: &TestId) -> Option<&CompiledTest> {
+        self.test_index
+            .get(id)
+            .map(|position| &self.tests[*position])
+    }
+
+    /// Tests that read the given model.
+    pub fn tests_for(&self, model: &ModelId) -> Vec<&CompiledTest> {
+        self.tests
+            .iter()
+            .filter(|test| test.targets.iter().any(|target| target == model))
+            .collect()
     }
 
     pub fn sources(&self) -> Vec<SourceId> {

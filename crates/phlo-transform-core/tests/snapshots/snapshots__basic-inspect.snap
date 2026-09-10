@@ -7,6 +7,8 @@ expression: "compilation.inspect_report(&id).expect(\"model exists\")"
     "id": "model://assay/results",
     "name": "assay.results",
     "namespace": "assay",
+    "materialization": "view",
+    "target": "assay.results",
     "path": "workflows/assay/transforms/results.sql",
     "depends_on": [
       "assay.raw"
@@ -15,6 +17,7 @@ expression: "compilation.inspect_report(&id).expect(\"model exists\")"
     "used_by": [
       "reporting.monthly"
     ],
+    "tests": [],
     "sql": "select * from assay.raw\n"
   }
 }

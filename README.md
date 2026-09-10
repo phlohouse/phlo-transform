@@ -17,11 +17,16 @@ It is intentionally not a dbt compatibility project. The goal is a smaller, more
 
 ## Status
 
-Phase 0 (compiler spike) is implemented. The compiler discovers multi-root
-workspaces, parses ordinary SQL, resolves relations without `ref()`, and builds
-a deterministic dependency DAG. It does **not** execute anything yet.
+- **Phase 0 — compiler spike: done.** Multi-root discovery, stable IDs,
+  ordinary-SQL dependency resolution without `ref()`, deterministic DAG,
+  `check`/`list`/`inspect` with JSON. See [`docs/architecture.md`](docs/architecture.md).
+- **Phase 1 — MVP build engine: done.** Trino adapter, view/table
+  materialisations, `plan`/`apply`/`run`/`test`, bounded-concurrency scheduler,
+  custom SQL tests, SQLite run history and versioned artifacts. See
+  [`docs/engine.md`](docs/engine.md).
 
-See [`docs/architecture.md`](docs/architecture.md) for the implementation.
+No column lineage, state-aware skipping, incremental models, Nessie, WAP, data
+diff or daemon yet — those are later phases.
 
 ## Toolchain
 
@@ -36,14 +41,26 @@ mise exec -- rustc --version
 ## CLI
 
 ```bash
-cargo run -p phlo-transform-cli -- --root <workspace> check
-cargo run -p phlo-transform-cli -- --root <workspace> list
-cargo run -p phlo-transform-cli -- --root <workspace> inspect assay.results
-cargo run -p phlo-transform-cli -- --root <workspace> --json check
+# Compiler
+phlo-transform --root <workspace> check
+phlo-transform --root <workspace> list
+phlo-transform --root <workspace> inspect assay.results
+
+# Engine (requires a Trino target)
+export PHLO_TRINO_ENDPOINT=http://localhost:8080
+export PHLO_TRINO_CATALOG=memory
+export PHLO_TRINO_SCHEMA=default
+phlo-transform --root <workspace> plan
+phlo-transform --root <workspace> apply
+phlo-transform --root <workspace> run
+phlo-transform --root <workspace> test
+
+# Every command supports --json
+phlo-transform --root <workspace> --json plan
 ```
 
-`--json` is available on every command and exposes the same information as the
-human output. `check` exits non-zero when the workspace has errors.
+Selectors: `--select assay.results`, `--select 'assay.*'`, `--upstream`,
+`--downstream`, `--tag qc`, `--workflow assay`.
 
 ## Development
 
@@ -51,13 +68,17 @@ human output. `check` exits non-zero when the workspace has errors.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+
+# Live Trino integration test (requires Docker)
+cargo test -p phlo-transform-trino --test trino_e2e -- --ignored
 ```
 
-Fixture workspaces live in [`fixtures/`](fixtures) and are exercised by the
-integration and snapshot tests.
+Fixture workspaces live in [`fixtures/`](fixtures). The Trino end-to-end test
+runs a disposable container and is executed explicitly in CI.
 
 ## Documentation
 
 - [Full specification](SPEC.md)
 - [Implementation roadmap](docs/roadmap/README.md)
 - [Phase 0 compiler architecture](docs/architecture.md)
+- [Phase 1 engine architecture](docs/engine.md)

@@ -7,12 +7,15 @@ expression: stdout(&output)
     "id": "model://reporting/monthly",
     "name": "reporting.monthly",
     "namespace": "reporting",
+    "materialization": "view",
+    "target": "reporting.monthly",
     "path": "workflows/reporting/transforms/monthly.sql",
     "depends_on": [
       "assay.results"
     ],
     "sources": [],
     "used_by": [],
+    "tests": [],
     "sql": "select * from assay.results\n"
   }
 }

@@ -1,0 +1,3 @@
+[transform]
+default_catalog = "memory"
+default_schema = "analytics"

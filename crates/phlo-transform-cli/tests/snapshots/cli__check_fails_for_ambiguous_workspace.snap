@@ -6,6 +6,7 @@ Workspace: fixtures/ambiguous
 Roots:     3
 Models:    3
 Sources:   0
+Tests:     0
 
 check failed
 
