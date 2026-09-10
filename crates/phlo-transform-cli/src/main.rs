@@ -427,7 +427,7 @@ fn run_inspect(cli: &Cli, compilation: &Compilation, model: &str) -> Result<Exit
             });
             let status = match &current {
                 None => "new",
-                Some(record) if record.version.hash == desired => "unchanged",
+                Some(record) if record.version.short() == desired => "unchanged",
                 Some(_) => "changed",
             }
             .to_string();
@@ -1742,7 +1742,10 @@ fn run_translate(
             }
         }
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(match &verify_report {
+        Some(report) if !report.ok => ExitCode::FAILURE,
+        _ => ExitCode::SUCCESS,
+    })
 }
 
 /// `init`: scaffold a minimal runnable workspace.

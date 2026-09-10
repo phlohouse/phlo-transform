@@ -1,0 +1,17 @@
+name: shop
+profile: shop
+version: "1.0"
+
+model-paths: ["models"]
+test-paths: ["tests"]
+
+vars:
+  default_region: 'eu'
+
+models:
+  shop:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table
+      +tags: ['mart']

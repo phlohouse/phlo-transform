@@ -2234,6 +2234,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "duckdb",
  "insta",
  "phlo-transform-core",
  "phlo-transform-daemon",

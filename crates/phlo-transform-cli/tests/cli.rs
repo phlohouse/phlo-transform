@@ -19,6 +19,12 @@ fn run(args: &[&str]) -> Output {
             let _ = std::fs::remove_dir_all(PathBuf::from(root).join(".phlo"));
         }
     }
+    run_unchecked(args)
+}
+
+/// Like `run`, but leaves `.phlo` state alone so successive invocations share
+/// run history and materialised-version state.
+fn run_unchecked(args: &[&str]) -> Output {
     Command::cargo_bin("phlo-transform")
         .expect("binary builds")
         .current_dir(workspace_root())
@@ -235,4 +241,122 @@ fn translate_dbt_writes_and_verifies() {
         out.to_str().expect("utf-8"),
     ]);
     assert!(!output.status.success());
+}
+
+#[test]
+fn translate_verify_failure_exits_nonzero() {
+    // dbt-jaffle contains REVIEW models whose residual Jinja cannot compile, so
+    // --verify must surface that as a failing exit code.
+    let out_dir = tempfile::tempdir().expect("tempdir");
+    let out = out_dir.path().join("generated");
+    let output = run(&[
+        "--root",
+        "fixtures/dbt-jaffle",
+        "translate",
+        "--from",
+        "dbt",
+        "--out",
+        out.to_str().expect("utf-8"),
+        "--verify",
+    ]);
+    assert!(!output.status.success());
+    assert!(out.join("transforms/marts/customers.sql").exists());
+}
+
+/// Full migration lifecycle: translate a dbt project, seed the sources in a
+/// DuckDB file, then run it — including an incremental second run.
+#[test]
+fn translated_dbt_project_runs_on_duckdb() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("generated");
+    let duckdb_path = dir.path().join("shop.duckdb");
+
+    let output = run(&[
+        "--root",
+        "fixtures/dbt-shop",
+        "translate",
+        "--from",
+        "dbt",
+        "--out",
+        out.to_str().expect("utf-8"),
+        "--verify",
+    ]);
+    assert!(output.status.success(), "{}", stdout(&output));
+
+    {
+        let connection = duckdb::Connection::open(&duckdb_path).expect("open duckdb");
+        connection
+            .execute_batch(
+                "create schema raw;
+                 create table raw.customers as
+                     select * from (values (1,'Ada','eu'),(2,'Grace',null)) t(id,name,region);
+                 create table raw.orders as
+                     select * from (values
+                         (10,1,50.0,'placed',timestamp '2024-01-01 10:00:00'),
+                         (11,2,25.0,'shipped',timestamp '2024-01-02 11:00:00'))
+                     t(id,customer_id,amount,status,ordered_at);",
+            )
+            .expect("seed sources");
+    }
+
+    let duckdb_arg = duckdb_path.to_str().expect("utf-8").to_string();
+    let out_arg = out.to_str().expect("utf-8").to_string();
+    let run_args = |extra: &[&'static str]| {
+        let mut args = vec![
+            "--root",
+            out_arg.as_str(),
+            "--adapter",
+            "duckdb",
+            "--duckdb-path",
+            duckdb_arg.as_str(),
+        ];
+        args.extend_from_slice(extra);
+        args
+    };
+
+    let output = run_unchecked(&run_args(&["run"]));
+    assert!(output.status.success(), "{}", stdout(&output));
+
+    // New and updated source rows must be picked up: the keyed model merges
+    // and the time-window model appends past its watermark.
+    {
+        let connection = duckdb::Connection::open(&duckdb_path).expect("open duckdb");
+        connection
+            .execute_batch(
+                "insert into raw.orders values
+                     (12,2,99.0,'placed',timestamp '2024-01-03 08:00:00');
+                 update raw.orders set amount = 55.0 where id = 10;",
+            )
+            .expect("mutate sources");
+    }
+
+    let output = run_unchecked(&run_args(&["run"]));
+    assert!(output.status.success(), "{}", stdout(&output));
+
+    {
+        let connection = duckdb::Connection::open(&duckdb_path).expect("open duckdb");
+        let merged: i64 = connection
+            .query_row("select count(*) from marts.orders_incremental", [], |row| {
+                row.get(0)
+            })
+            .expect("count merged");
+        assert_eq!(merged, 3);
+        let windowed: i64 = connection
+            .query_row("select count(*) from marts.daily_revenue", [], |row| {
+                row.get(0)
+            })
+            .expect("count windowed");
+        assert_eq!(windowed, 3);
+    }
+
+    // A third run with no upstream change is a no-op.
+    let output = run_unchecked(&run_args(&["plan"]));
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("SKIP   marts.orders_incremental"), "{body}");
+
+    // inspect agrees with the recorded state.
+    let output = run_unchecked(&run_args(&["inspect", "marts.orders_incremental"]));
+    assert!(output.status.success(), "{}", stdout(&output));
+    assert!(stdout(&output).contains("status:   unchanged"));
 }

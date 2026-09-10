@@ -157,8 +157,8 @@ fn value_to_string(value: ValueRef) -> String {
         ValueRef::Text(v) => String::from_utf8_lossy(v).to_string(),
         ValueRef::Blob(v) => format!("{v:?}"),
         ValueRef::Date32(days) => duckdb_date(days),
-        ValueRef::Time64(unit, v) => format!("{unit:?} {v}"),
-        ValueRef::Timestamp(unit, v) => format!("{unit:?} {v}"),
+        ValueRef::Time64(unit, v) => duckdb_time(unit, v),
+        ValueRef::Timestamp(unit, v) => duckdb_timestamp(unit, v),
         other => format!("{other:?}"),
     }
 }
@@ -169,6 +169,35 @@ fn duckdb_date(days: i32) -> String {
     epoch
         .format(&time::format_description::well_known::Iso8601::DATE)
         .unwrap_or_else(|_| days.to_string())
+}
+
+fn duckdb_duration(unit: duckdb::types::TimeUnit, value: i64) -> time::Duration {
+    match unit {
+        duckdb::types::TimeUnit::Second => time::Duration::seconds(value),
+        duckdb::types::TimeUnit::Millisecond => time::Duration::milliseconds(value),
+        duckdb::types::TimeUnit::Microsecond => time::Duration::microseconds(value),
+        duckdb::types::TimeUnit::Nanosecond => time::Duration::nanoseconds(value),
+    }
+}
+
+/// Count of `unit` since midnight → `HH:MM:SS[.ffffff]`, a valid SQL literal.
+fn duckdb_time(unit: duckdb::types::TimeUnit, value: i64) -> String {
+    let time = (time::OffsetDateTime::UNIX_EPOCH + duckdb_duration(unit, value)).time();
+    time.format(&time::macros::format_description!(
+        "[hour]:[minute]:[second].[subsecond digits:6]"
+    ))
+    .unwrap_or_else(|_| value.to_string())
+}
+
+/// Count of `unit` since 1970-01-01 → `YYYY-MM-DD HH:MM:SS[.ffffff]`, a valid
+/// SQL timestamp literal.
+fn duckdb_timestamp(unit: duckdb::types::TimeUnit, value: i64) -> String {
+    let datetime = time::OffsetDateTime::UNIX_EPOCH + duckdb_duration(unit, value);
+    datetime
+        .format(&time::macros::format_description!(
+            "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:6]"
+        ))
+        .unwrap_or_else(|_| value.to_string())
 }
 
 #[async_trait]
@@ -319,15 +348,26 @@ impl Adapter for DuckDbAdapter {
     }
 
     async fn source_state(&self, relation: &Relation) -> Result<Option<String>, AdapterError> {
-        // No snapshot metadata; fall back to a schema fingerprint so schema
-        // changes remain observable.
+        // No snapshot metadata; fall back to a schema fingerprint plus row
+        // count so appended data — the common incremental case — stays
+        // observable. In-place updates that preserve the row count are not
+        // detected.
         let columns = self.relation_columns(relation).await?;
         if columns.is_empty() {
             return Ok(None);
         }
-        let parts = columns
+        let mut parts: Vec<String> = columns
             .iter()
-            .map(|column| format!("{}:{}", column.name, column.data_type));
+            .map(|column| format!("{}:{}", column.name, column.data_type))
+            .collect();
+        if let Ok(result) = self
+            .execute(&format!("select count(*) as n from {}", relation.display()))
+            .await
+        {
+            if let Some(count) = result.rows.first().and_then(|row| row.first()) {
+                parts.push(format!("count:{count}"));
+            }
+        }
         Ok(Some(format!("schema:{}", fingerprint(parts))))
     }
 
