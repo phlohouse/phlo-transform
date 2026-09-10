@@ -1,0 +1,18 @@
+---
+source: crates/phlo-transform-cli/tests/cli.rs
+expression: stdout(&output)
+---
+{
+  "model": {
+    "id": "model://reporting/monthly",
+    "name": "reporting.monthly",
+    "namespace": "reporting",
+    "path": "workflows/reporting/transforms/monthly.sql",
+    "depends_on": [
+      "assay.results"
+    ],
+    "sources": [],
+    "used_by": [],
+    "sql": "select * from assay.results\n"
+  }
+}

@@ -1,0 +1,16 @@
+---
+source: crates/phlo-transform-cli/tests/cli.rs
+expression: stdout(&output)
+---
+Workspace: fixtures/ambiguous
+Roots:     3
+Models:    3
+Sources:   0
+
+check failed
+
+error[RESOLUTION001]: ambiguous relation `results`
+  assay.results
+  manufacturing.results
+  help: use a qualified model name
+  --> workflows/reporting/transforms/monthly.sql

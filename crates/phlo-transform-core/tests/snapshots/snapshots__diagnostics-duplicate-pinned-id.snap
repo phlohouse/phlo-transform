@@ -1,0 +1,15 @@
+---
+source: crates/phlo-transform-core/tests/snapshots.rs
+expression: compilation.diagnostics
+---
+[
+  {
+    "code": "PROJECT002",
+    "severity": "error",
+    "message": "duplicate model id `shared.thing`",
+    "labels": [
+      "workflows/assay/transforms/a.sql",
+      "workflows/assay/transforms/b.sql"
+    ]
+  }
+]

@@ -1,0 +1,11 @@
+---
+source: crates/phlo-transform-cli/tests/cli.rs
+expression: stdout(&output)
+---
+Models (3)
+  assay.raw                    <- external.raw_assay_results
+  assay.results                <- assay.raw
+  reporting.monthly            <- assay.results
+
+Sources (1)
+  external.raw_assay_results

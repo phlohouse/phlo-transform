@@ -1,0 +1,19 @@
+---
+source: crates/phlo-transform-core/tests/snapshots.rs
+expression: "compiled(\"custom-roots\").check_report()"
+---
+{
+  "ok": true,
+  "workspace_root": "../../fixtures/custom-roots",
+  "roots": [
+    {
+      "path": "domains/assay/transforms",
+      "namespace": "assay",
+      "strategy": "fixed",
+      "kind": "custom"
+    }
+  ],
+  "model_count": 2,
+  "source_count": 1,
+  "diagnostics": []
+}

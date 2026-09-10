@@ -1,0 +1,17 @@
+---
+source: crates/phlo-transform-cli/tests/cli.rs
+expression: stdout(&output)
+---
+Model:  assay.results
+ID:     model://assay/results
+Path:   workflows/assay/transforms/results.sql
+Pinned: (none)
+
+Depends on:
+  assay.raw
+
+Sources:
+  (none)
+
+Used by:
+  reporting.monthly

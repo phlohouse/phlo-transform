@@ -1,0 +1,25 @@
+---
+source: crates/phlo-transform-core/tests/snapshots.rs
+expression: "compiled(\"basic-multi-root\").check_report()"
+---
+{
+  "ok": true,
+  "workspace_root": "../../fixtures/basic-multi-root",
+  "roots": [
+    {
+      "path": "workflows/assay/transforms",
+      "namespace": "assay",
+      "strategy": "fixed",
+      "kind": "workflow"
+    },
+    {
+      "path": "workflows/reporting/transforms",
+      "namespace": "reporting",
+      "strategy": "fixed",
+      "kind": "workflow"
+    }
+  ],
+  "model_count": 3,
+  "source_count": 1,
+  "diagnostics": []
+}

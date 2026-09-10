@@ -1,0 +1,10 @@
+---
+source: crates/phlo-transform-cli/tests/cli.rs
+expression: stdout(&output)
+---
+Workspace: fixtures/basic-multi-root
+Roots:     2
+Models:    3
+Sources:   1
+
+check passed

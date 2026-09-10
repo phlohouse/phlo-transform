@@ -1,0 +1,20 @@
+---
+source: crates/phlo-transform-core/tests/snapshots.rs
+expression: "compilation.inspect_report(&id).expect(\"model exists\")"
+---
+{
+  "model": {
+    "id": "model://assay/results",
+    "name": "assay.results",
+    "namespace": "assay",
+    "path": "workflows/assay/transforms/results.sql",
+    "depends_on": [
+      "assay.raw"
+    ],
+    "sources": [],
+    "used_by": [
+      "reporting.monthly"
+    ],
+    "sql": "select * from assay.raw\n"
+  }
+}

@@ -1,0 +1,12 @@
+---
+source: crates/phlo-transform-core/tests/snapshots.rs
+expression: compilation.diagnostics
+---
+[
+  {
+    "code": "PARSE002",
+    "severity": "error",
+    "message": "directive `@id` requires a value",
+    "path": "workflows/assay/transforms/raw.sql:1"
+  }
+]

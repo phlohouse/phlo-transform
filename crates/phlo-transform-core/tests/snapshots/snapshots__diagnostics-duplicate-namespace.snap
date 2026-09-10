@@ -1,0 +1,16 @@
+---
+source: crates/phlo-transform-core/tests/snapshots.rs
+expression: compilation.diagnostics
+---
+[
+  {
+    "code": "PROJECT003",
+    "severity": "error",
+    "message": "duplicate transform namespace `dup`",
+    "labels": [
+      "workflows/alpha/transforms",
+      "workflows/beta/transforms"
+    ],
+    "help": "give each transform root a distinct namespace or remove the override"
+  }
+]

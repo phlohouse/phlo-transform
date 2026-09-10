@@ -1,0 +1,17 @@
+---
+source: crates/phlo-transform-core/tests/snapshots.rs
+expression: compilation.diagnostics
+---
+[
+  {
+    "code": "RESOLUTION001",
+    "severity": "error",
+    "message": "ambiguous relation `results`",
+    "path": "workflows/reporting/transforms/monthly.sql",
+    "labels": [
+      "assay.results",
+      "manufacturing.results"
+    ],
+    "help": "use a qualified model name"
+  }
+]

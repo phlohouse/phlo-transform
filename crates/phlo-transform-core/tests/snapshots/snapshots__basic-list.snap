@@ -1,0 +1,44 @@
+---
+source: crates/phlo-transform-core/tests/snapshots.rs
+expression: "compiled(\"basic-multi-root\").list_report()"
+---
+{
+  "models": [
+    {
+      "id": "model://assay/raw",
+      "name": "assay.raw",
+      "namespace": "assay",
+      "path": "workflows/assay/transforms/raw.sql",
+      "depends_on": [],
+      "sources": [
+        "external.raw_assay_results"
+      ]
+    },
+    {
+      "id": "model://assay/results",
+      "name": "assay.results",
+      "namespace": "assay",
+      "path": "workflows/assay/transforms/results.sql",
+      "depends_on": [
+        "assay.raw"
+      ],
+      "sources": []
+    },
+    {
+      "id": "model://reporting/monthly",
+      "name": "reporting.monthly",
+      "namespace": "reporting",
+      "path": "workflows/reporting/transforms/monthly.sql",
+      "depends_on": [
+        "assay.results"
+      ],
+      "sources": []
+    }
+  ],
+  "sources": [
+    {
+      "id": "source://external/raw_assay_results",
+      "name": "external.raw_assay_results"
+    }
+  ]
+}

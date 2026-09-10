@@ -1,0 +1,3 @@
+[transform.discovery]
+include = ["domains/*/transforms/**"]
+exclude = ["domains/*/transforms/ignored/**"]

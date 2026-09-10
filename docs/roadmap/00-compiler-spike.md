@@ -293,3 +293,27 @@ Phase 0 is complete when:
 - Nessie;
 - data diff;
 - daemon.
+
+## Implementation notes
+
+Phase 0 is implemented as described in
+[`docs/architecture.md`](../architecture.md). Decisions worth calling out
+against this plan:
+
+- The binary is `phlo-transform` with `check`/`list`/`inspect` subcommands,
+  because the `phlo` host that would provide `phlo transform ...` does not
+  exist yet.
+- Three crates were added: `phlo-transform-sql`, `phlo-transform-core` and
+  `phlo-transform-cli`. No adapter/executor crates were created.
+- The semantic model keeps raw SQL text and parses it in the compiler rather
+  than storing a parsed AST on `SemanticModel`. This keeps the frontend
+  boundary free of parser types; directives are parsed by the frontend because
+  `@id` affects identity.
+- Unresolved relations become external source candidates (`SourceId`), not
+  errors, matching the plan.
+- Unknown model directives are warnings; malformed `@id` directives are
+  errors.
+- `sqlparser` 0.62 parse errors do not expose line/column spans, so parse
+  diagnostics reference the file only. Directive diagnostics include line
+  numbers.
+

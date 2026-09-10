@@ -1,0 +1,45 @@
+---
+source: crates/phlo-transform-core/tests/snapshots.rs
+expression: "compiled(\"basic-multi-root\").graph_artifact()"
+---
+{
+  "nodes": [
+    {
+      "id": "model://assay/raw",
+      "kind": "model",
+      "name": "assay.raw"
+    },
+    {
+      "id": "model://assay/results",
+      "kind": "model",
+      "name": "assay.results"
+    },
+    {
+      "id": "model://reporting/monthly",
+      "kind": "model",
+      "name": "reporting.monthly"
+    },
+    {
+      "id": "source://external/raw_assay_results",
+      "kind": "source",
+      "name": "external.raw_assay_results"
+    }
+  ],
+  "edges": [
+    {
+      "from": "model://assay/raw",
+      "to": "source://external/raw_assay_results",
+      "kind": "source"
+    },
+    {
+      "from": "model://assay/results",
+      "to": "model://assay/raw",
+      "kind": "model"
+    },
+    {
+      "from": "model://reporting/monthly",
+      "to": "model://assay/results",
+      "kind": "model"
+    }
+  ]
+}
