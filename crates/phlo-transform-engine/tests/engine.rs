@@ -15,8 +15,9 @@ use phlo_transform_core::{
     ModelOrigin, Relation, SelectionOptions, SemanticModel, SemanticProject, SemanticTest, TestId,
 };
 use phlo_transform_engine::{
-    Adapter, AdapterError, ArtifactWriter, CancelHandle, ChangeReason, ColumnInfo, ExecutionStatus,
-    Plan, PlanAction, Planner, QueryResult, RunOptions, Runner, SqliteStateStore, StateStore,
+    Adapter, AdapterError, ArtifactWriter, CancelHandle, CatalogRequest, ChangeReason, ColumnInfo,
+    ExecutionStatus, Plan, PlanAction, Planner, QueryResult, RunOptions, Runner, SqliteStateStore,
+    StateStore,
 };
 
 #[derive(Default)]
@@ -151,6 +152,14 @@ impl Adapter for FakeAdapter {
         _relation: &Relation,
     ) -> Result<Vec<ColumnInfo>, AdapterError> {
         Ok(Vec::new())
+    }
+
+    async fn ensure_catalog(&self, _request: &CatalogRequest) -> Result<(), AdapterError> {
+        Ok(())
+    }
+
+    async fn ensure_schema(&self, _relation: &Relation) -> Result<(), AdapterError> {
+        Ok(())
     }
 }
 

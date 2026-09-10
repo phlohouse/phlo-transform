@@ -65,6 +65,13 @@ pub struct DiffArtifact {
     pub diff: crate::diff::DiffReport,
 }
 
+/// `environment.json`.
+#[derive(Clone, Debug, Serialize)]
+pub struct EnvironmentArtifact {
+    pub schema_version: u32,
+    pub environment: crate::environment::EnvironmentSetup,
+}
+
 /// `lineage.json`.
 #[derive(Clone, Debug, Serialize)]
 pub struct LineageArtifact {
@@ -205,6 +212,20 @@ impl ArtifactWriter {
             &DiffArtifact {
                 schema_version: SCHEMA_VERSION,
                 diff: diff.clone(),
+            },
+        )
+    }
+
+    /// Write `environment.json`.
+    pub fn write_environment(
+        &self,
+        environment: &crate::environment::EnvironmentSetup,
+    ) -> Result<(), EngineError> {
+        self.write(
+            "environment",
+            &EnvironmentArtifact {
+                schema_version: SCHEMA_VERSION,
+                environment: environment.clone(),
             },
         )
     }

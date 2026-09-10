@@ -37,3 +37,6 @@ jobs:
       # Docker is available on GitHub-hosted Ubuntu runners.
       - name: Trino integration tests
         run: cargo test -p phlo-transform-trino --test trino_e2e -- --ignored
+
+      - name: Nessie WAP integration tests
+        run: cargo test -p phlo-transform-trino --test nessie_wap_e2e -- --ignored

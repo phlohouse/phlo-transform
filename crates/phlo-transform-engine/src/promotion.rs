@@ -130,6 +130,7 @@ pub async fn promote(
         nessie
             .merge(
                 &request.candidate_ref,
+                Some(candidate.hash.as_str()),
                 &request.target_ref,
                 request.expected_target_hash.as_deref(),
             )
@@ -138,10 +139,15 @@ pub async fn promote(
     };
 
     if !merge.is_clean() {
+        let detail = merge
+            .conflicts
+            .iter()
+            .map(|conflict| format!("{}: {}", conflict.path, conflict.message))
+            .collect::<Vec<_>>()
+            .join("; ");
         record.conflicts = merge.conflicts;
         return Err(EngineError::Promotion(format!(
-            "candidate cannot be promoted: {} conflict(s)",
-            record.conflicts.len()
+            "candidate cannot be promoted: {detail}"
         )));
     }
 
@@ -158,7 +164,7 @@ pub async fn promote(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use phlo_transform_nessie::InMemoryNessie;
+    use phlo_transform_nessie::{InMemoryNessie, ReferenceInfo};
 
     fn request(dry_run: bool) -> PromotionRequest {
         PromotionRequest {
@@ -180,7 +186,10 @@ mod tests {
     async fn promotes_a_clean_candidate() {
         let nessie = InMemoryNessie::new();
         nessie.seed("main", "aaa");
-        nessie.create_branch("ci/pr-1", Some("aaa")).await.unwrap();
+        nessie
+            .create_branch("ci/pr-1", &ReferenceInfo::branch("main", "aaa"))
+            .await
+            .unwrap();
         nessie.assign_reference("ci/pr-1", "bbb").await.unwrap();
 
         let record = promote(&nessie, &request(false)).await.unwrap();
@@ -196,7 +205,10 @@ mod tests {
     async fn blocks_when_quality_gates_failed() {
         let nessie = InMemoryNessie::new();
         nessie.seed("main", "aaa");
-        nessie.create_branch("ci/pr-1", Some("aaa")).await.unwrap();
+        nessie
+            .create_branch("ci/pr-1", &ReferenceInfo::branch("main", "aaa"))
+            .await
+            .unwrap();
         let mut request = request(false);
         request.quality_gates_passed = false;
         assert!(promote(&nessie, &request).await.is_err());
@@ -206,7 +218,10 @@ mod tests {
     async fn blocks_when_target_advanced() {
         let nessie = InMemoryNessie::new();
         nessie.seed("main", "zzz");
-        nessie.create_branch("ci/pr-1", Some("aaa")).await.unwrap();
+        nessie
+            .create_branch("ci/pr-1", &ReferenceInfo::branch("main", "aaa"))
+            .await
+            .unwrap();
         nessie.assign_reference("ci/pr-1", "bbb").await.unwrap();
         let error = promote(&nessie, &request(false)).await.unwrap_err();
         assert!(error.to_string().contains("advanced"));
@@ -216,7 +231,10 @@ mod tests {
     async fn dry_run_reports_without_merging() {
         let nessie = InMemoryNessie::new();
         nessie.seed("main", "aaa");
-        nessie.create_branch("ci/pr-1", Some("aaa")).await.unwrap();
+        nessie
+            .create_branch("ci/pr-1", &ReferenceInfo::branch("main", "aaa"))
+            .await
+            .unwrap();
         nessie.assign_reference("ci/pr-1", "bbb").await.unwrap();
         let record = promote(&nessie, &request(true)).await.unwrap();
         assert!(!record.merged);

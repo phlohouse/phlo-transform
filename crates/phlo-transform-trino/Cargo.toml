@@ -20,3 +20,4 @@ phlo-transform-engine = { workspace = true }
 [dev-dependencies]
 testcontainers = "0.28"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+phlo-transform-nessie = { workspace = true }

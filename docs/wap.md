@@ -34,12 +34,23 @@ There is no separate environment abstraction layered on top of Nessie.
 PLAN → WRITE candidate branch → AUDIT (tests) → PUBLISH (promote)
 ```
 
-**Current limitation:** `apply --ref <ref>` records the environment, but the
-Trino adapter does not yet rewrite relations to a branch-qualified name, so
-execution still targets the configured catalogue/schema. Candidate-branch
-isolation is therefore not yet real; it is modelled at the reference/state
-level and in promotion. A failed run or audit still leaves promotion
-untouched.
+`apply --ref <candidate> --from <base>` provisions the candidate automatically:
+
+1. the Nessie branch is created from `--from` (default `main`) when missing;
+2. a branch-scoped Trino catalog is created dynamically (Trino cannot switch
+   the Nessie reference of an existing catalog at query time), pointing at the
+   branch;
+3. models are compiled with that catalog as the physical target and applied
+   there. `main` is untouched until promotion.
+
+The provisioned catalog name defaults to `phlo_<sanitized ref>` and can be
+overridden with `--catalog`; `--warehouse` sets the Iceberg warehouse (for
+example `local:///tmp/phlo-warehouse` or `s3://bucket/wh`). Provisioning is
+recorded in `.phlo/transform/environment.json`.
+
+A failed run or audit leaves the candidate isolated and does not advance
+`main`. The live `nessie_wap_e2e` test exercises candidate isolation, data
+diff, promotion and stale-promotion rejection against Nessie + Trino/Iceberg.
 
 ## Promotion
 
@@ -79,8 +90,11 @@ keyed by model and environment.
 
 ## Limitations
 
-- The REST client covers the reference/merge operations needed for promotion;
-  it is not exercised against a live Nessie in CI. WAP orchestration is covered
-  by in-memory tests.
-- Schema policy gates and Iceberg snapshot tracking are not yet wired into the
+- Trino's Nessie Iceberg catalog does not support views; candidate environments
+  therefore support table and incremental models, and view models must use a
+  different catalog type.
+- Schema-policy gates and Iceberg snapshot tracking are not yet wired into the
   audit stage.
+- Temporary candidate catalogs/branches are not cleaned up automatically.
+- Promotion merges at the Nessie reference level; a candidate planned against a
+  base that has advanced is rejected rather than rebased.

@@ -1,9 +1,18 @@
 //! Nessie reference management.
 //!
 //! Nessie operations are deliberately separate from SQL execution. The
-//! [`NessieClient`] trait is implemented by a REST client and by an in-memory
-//! client used in tests, so WAP orchestration can be exercised without a live
-//! Nessie instance.
+//! [`NessieClient`] trait is implemented by a REST v2 client and by an
+//! in-memory client used in tests, so WAP orchestration can be exercised
+//! without a live Nessie instance.
+//!
+//! The REST client implements the subset of the Nessie v2 API needed for
+//! environments and WAP (verified against a live Nessie server):
+//!
+//! * `GET  /trees/{ref}` — resolve a reference
+//! * `POST /trees?name=&type=BRANCH` — create a branch from a reference
+//! * `DELETE /trees/{ref}?type=BRANCH` — delete a branch
+//! * `POST /trees/{target}@{expected}/history/merge` — merge
+//! * `PUT  /trees/{ref}?type=BRANCH` — assign/rollback a reference
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -19,6 +28,16 @@ pub struct ReferenceInfo {
     pub hash: String,
     #[serde(default = "default_kind")]
     pub kind: String,
+}
+
+impl ReferenceInfo {
+    pub fn branch(name: impl Into<String>, hash: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            hash: hash.into(),
+            kind: "BRANCH".to_string(),
+        }
+    }
 }
 
 fn default_kind() -> String {
@@ -82,23 +101,25 @@ pub enum NessieError {
 pub trait NessieClient: Send + Sync {
     async fn get_reference(&self, name: &str) -> Result<Option<ReferenceInfo>, NessieError>;
 
+    /// Create `name` from an existing reference (its name and hash).
     async fn create_branch(
         &self,
         name: &str,
-        from_hash: Option<&str>,
+        from: &ReferenceInfo,
     ) -> Result<ReferenceInfo, NessieError>;
 
     async fn delete_branch(&self, name: &str) -> Result<(), NessieError>;
 
-    /// Merge `from_ref` into `to_ref`, optionally asserting the target hash.
+    /// Merge `from_ref` into `to_ref`, asserting the target hash when provided.
     async fn merge(
         &self,
         from_ref: &str,
+        from_hash: Option<&str>,
         to_ref: &str,
         expected_target_hash: Option<&str>,
     ) -> Result<MergeOutcome, NessieError>;
 
-    /// Check whether `from_ref` can merge into `to_ref`.
+    /// Non-destructive check that `from_ref` can merge into `to_ref`.
     async fn can_merge(&self, from_ref: &str, to_ref: &str) -> Result<MergeOutcome, NessieError>;
 
     /// Move a reference to a specific hash (rollback/reset).
@@ -117,14 +138,10 @@ impl InMemoryNessie {
     }
 
     pub fn seed(&self, name: &str, hash: &str) -> &Self {
-        self.references.lock().unwrap().insert(
-            name.to_string(),
-            ReferenceInfo {
-                name: name.to_string(),
-                hash: hash.to_string(),
-                kind: "BRANCH".to_string(),
-            },
-        );
+        self.references
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), ReferenceInfo::branch(name, hash));
         self
     }
 
@@ -143,21 +160,21 @@ impl NessieClient for InMemoryNessie {
     async fn create_branch(
         &self,
         name: &str,
-        from_hash: Option<&str>,
+        from: &ReferenceInfo,
     ) -> Result<ReferenceInfo, NessieError> {
         let mut references = self.references.lock().unwrap();
         if references.contains_key(name) {
             return Err(NessieError::AlreadyExists(name.to_string()));
         }
-        let hash = from_hash
-            .map(str::to_string)
-            .or_else(|| references.get("main").map(|main| main.hash.clone()))
-            .unwrap_or_else(|| Self::next_hash(name));
-        let reference = ReferenceInfo {
-            name: name.to_string(),
-            hash,
-            kind: "BRANCH".to_string(),
+        let hash = if from.hash.is_empty() {
+            references
+                .get(&from.name)
+                .map(|reference| reference.hash.clone())
+                .unwrap_or_else(|| Self::next_hash(name))
+        } else {
+            from.hash.clone()
         };
+        let reference = ReferenceInfo::branch(name, hash);
         references.insert(name.to_string(), reference.clone());
         Ok(reference)
     }
@@ -174,6 +191,7 @@ impl NessieClient for InMemoryNessie {
     async fn merge(
         &self,
         from_ref: &str,
+        _from_hash: Option<&str>,
         to_ref: &str,
         expected_target_hash: Option<&str>,
     ) -> Result<MergeOutcome, NessieError> {
@@ -228,20 +246,25 @@ impl NessieClient for InMemoryNessie {
 /// Configuration for the Nessie REST client.
 #[derive(Clone, Debug)]
 pub struct NessieConfig {
+    /// Base endpoint, e.g. `http://localhost:19120` (the `/api/v2` suffix is
+    /// added by the client).
     pub endpoint: String,
     pub token: Option<String>,
 }
 
 impl NessieConfig {
     pub fn new(endpoint: impl Into<String>) -> Self {
+        let endpoint = endpoint.into();
+        let endpoint = endpoint.trim_end_matches('/');
+        let endpoint = endpoint.strip_suffix("/api/v2").unwrap_or(endpoint);
         Self {
-            endpoint: endpoint.into().trim_end_matches('/').to_string(),
+            endpoint: endpoint.to_string(),
             token: None,
         }
     }
 }
 
-/// A minimal Nessie REST v2 client.
+/// A Nessie REST v2 client.
 pub struct NessieRestClient {
     client: reqwest::Client,
     config: NessieConfig,
@@ -264,19 +287,26 @@ impl NessieRestClient {
         }
     }
 
+    async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, NessieError> {
+        request
+            .send()
+            .await
+            .map_err(|error| NessieError::Transport(error.to_string()))
+    }
+
     async fn json<T: for<'de> Deserialize<'de>>(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<T, NessieError> {
-        let response = request
-            .send()
-            .await
-            .map_err(|error| NessieError::Transport(error.to_string()))?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
+        let response = self.send(request).await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
             return Err(NessieError::NotFound("reference".to_string()));
         }
-        if !response.status().is_success() {
-            let status = response.status();
+        if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(NessieError::Remote(format!("HTTP {status}: {body}")));
         }
@@ -288,15 +318,41 @@ impl NessieRestClient {
 }
 
 #[derive(Deserialize)]
-struct TreeResponse {
+struct SingleReferenceResponse {
     reference: ReferenceInfo,
+}
+
+#[derive(Deserialize)]
+struct MergeResponse {
+    #[serde(rename = "wasSuccessful", default)]
+    was_successful: bool,
+    #[serde(rename = "resultantTargetHash", default)]
+    resultant_target_hash: Option<String>,
+    #[serde(default)]
+    details: Vec<MergeDetail>,
+}
+
+#[derive(Deserialize)]
+struct MergeDetail {
+    #[serde(default)]
+    key: Option<MergeKey>,
+    #[serde(rename = "conflictType", default)]
+    conflict: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MergeKey {
+    #[serde(default)]
+    elements: Vec<String>,
 }
 
 #[async_trait]
 impl NessieClient for NessieRestClient {
     async fn get_reference(&self, name: &str) -> Result<Option<ReferenceInfo>, NessieError> {
         match self
-            .json::<TreeResponse>(self.request(reqwest::Method::GET, &format!("/trees/{name}")))
+            .json::<SingleReferenceResponse>(
+                self.request(reqwest::Method::GET, &format!("/trees/{}", encode(name))),
+            )
             .await
         {
             Ok(response) => Ok(Some(response.reference)),
@@ -308,25 +364,32 @@ impl NessieClient for NessieRestClient {
     async fn create_branch(
         &self,
         name: &str,
-        from_hash: Option<&str>,
+        from: &ReferenceInfo,
     ) -> Result<ReferenceInfo, NessieError> {
         let body = serde_json::json!({
             "type": "BRANCH",
-            "name": name,
-            "hash": from_hash,
+            "name": from.name,
+            "hash": from.hash,
         });
-        let response: TreeResponse = self
-            .json(self.request(reqwest::Method::POST, "/trees").json(&body))
+        let response: SingleReferenceResponse = self
+            .json(
+                self.request(
+                    reqwest::Method::POST,
+                    &format!("/trees?name={}&type=BRANCH", encode(name)),
+                )
+                .json(&body),
+            )
             .await?;
         Ok(response.reference)
     }
 
     async fn delete_branch(&self, name: &str) -> Result<(), NessieError> {
-        let request = self.request(reqwest::Method::DELETE, &format!("/trees/{name}"));
-        let response = request
-            .send()
-            .await
-            .map_err(|error| NessieError::Transport(error.to_string()))?;
+        let response = self
+            .send(self.request(
+                reqwest::Method::DELETE,
+                &format!("/trees/{}?type=BRANCH", encode(name)),
+            ))
+            .await?;
         if response.status().is_success() {
             Ok(())
         } else {
@@ -340,20 +403,38 @@ impl NessieClient for NessieRestClient {
     async fn merge(
         &self,
         from_ref: &str,
+        from_hash: Option<&str>,
         to_ref: &str,
         expected_target_hash: Option<&str>,
     ) -> Result<MergeOutcome, NessieError> {
+        let target = match expected_target_hash {
+            Some(hash) => format!("{}@{hash}", encode(to_ref)),
+            None => encode(to_ref),
+        };
         let body = serde_json::json!({
             "fromRefName": from_ref,
-            "fromHash": expected_target_hash,
+            "fromHash": from_hash,
         });
-        let value: serde_json::Value = self
-            .json(
-                self.request(reqwest::Method::POST, &format!("/trees/{to_ref}/merge"))
-                    .json(&body),
+        let response = self
+            .send(
+                self.request(
+                    reqwest::Method::POST,
+                    &format!("/trees/{target}/history/merge"),
+                )
+                .json(&body),
             )
             .await?;
-        Ok(merge_from_value(value))
+        let status = response.status();
+        let payload = response.text().await.unwrap_or_default();
+        let parsed: Result<MergeResponse, _> = serde_json::from_str(&payload);
+        match parsed {
+            Ok(merge) => Ok(merge_outcome(merge, &payload)),
+            Err(_) if status == reqwest::StatusCode::CONFLICT => Ok(MergeOutcome::conflict(
+                to_ref,
+                format!("merge conflict: {payload}"),
+            )),
+            Err(error) => Err(NessieError::Remote(format!("HTTP {status}: {error}"))),
+        }
     }
 
     async fn can_merge(&self, from_ref: &str, _to_ref: &str) -> Result<MergeOutcome, NessieError> {
@@ -371,43 +452,58 @@ impl NessieClient for NessieRestClient {
             "name": name,
             "hash": hash,
         });
-        let response: TreeResponse = self
+        let response: SingleReferenceResponse = self
             .json(
-                self.request(reqwest::Method::POST, &format!("/trees/{name}"))
-                    .json(&body),
+                self.request(
+                    reqwest::Method::PUT,
+                    &format!("/trees/{}?type=BRANCH", encode(name)),
+                )
+                .json(&body),
             )
             .await?;
         Ok(response.reference)
     }
 }
 
-fn merge_from_value(value: serde_json::Value) -> MergeOutcome {
-    let hash = value
-        .get("hash")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let conflicts = value
-        .get("conflicts")
-        .and_then(serde_json::Value::as_array)
-        .map(|conflicts| {
-            conflicts
-                .iter()
-                .map(|conflict| Conflict {
-                    path: conflict
-                        .get("path")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    message: conflict
-                        .get("message")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("merge conflict")
-                        .to_string(),
-                })
-                .collect()
+/// Percent-encode a reference name for use in a path or query component.
+fn encode(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            output.push(byte as char);
+        } else {
+            output.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    output
+}
+
+fn merge_outcome(merge: MergeResponse, raw: &str) -> MergeOutcome {
+    let mut conflicts: Vec<Conflict> = merge
+        .details
+        .into_iter()
+        .filter_map(|detail| {
+            let kind = detail.conflict?;
+            let path = detail
+                .key
+                .map(|key| key.elements.join("."))
+                .unwrap_or_default();
+            Some(Conflict {
+                path,
+                message: kind,
+            })
         })
-        .unwrap_or_default();
-    MergeOutcome { hash, conflicts }
+        .collect();
+    if !merge.was_successful && conflicts.is_empty() {
+        conflicts.push(Conflict {
+            path: String::new(),
+            message: format!("merge was not applied: {raw}"),
+        });
+    }
+    MergeOutcome {
+        hash: merge.resultant_target_hash,
+        conflicts,
+    }
 }
 
 #[cfg(test)]
@@ -418,12 +514,18 @@ mod tests {
     async fn creates_merges_and_rolls_back() {
         let nessie = InMemoryNessie::new();
         nessie.seed("main", "aaa");
-        let branch = nessie.create_branch("ci/pr-1", None).await.unwrap();
+        let branch = nessie
+            .create_branch("ci/pr-1", &ReferenceInfo::branch("main", "aaa"))
+            .await
+            .unwrap();
         assert_eq!(branch.hash, "aaa");
 
         // Advance the candidate independently.
         nessie.assign_reference("ci/pr-1", "bbb").await.unwrap();
-        let outcome = nessie.merge("ci/pr-1", "main", Some("aaa")).await.unwrap();
+        let outcome = nessie
+            .merge("ci/pr-1", None, "main", Some("aaa"))
+            .await
+            .unwrap();
         assert!(outcome.is_clean());
         assert_eq!(
             nessie.get_reference("main").await.unwrap().unwrap().hash,
@@ -432,7 +534,10 @@ mod tests {
 
         // Stale target is rejected.
         nessie.assign_reference("ci/pr-1", "ccc").await.unwrap();
-        let stale = nessie.merge("ci/pr-1", "main", Some("aaa")).await.unwrap();
+        let stale = nessie
+            .merge("ci/pr-1", None, "main", Some("aaa"))
+            .await
+            .unwrap();
         assert!(!stale.is_clean());
 
         nessie.assign_reference("main", "aaa").await.unwrap();

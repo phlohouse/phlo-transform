@@ -1837,6 +1837,7 @@ dependencies = [
  "async-trait",
  "phlo-transform-core",
  "phlo-transform-engine",
+ "phlo-transform-nessie",
  "reqwest",
  "serde",
  "serde_json",

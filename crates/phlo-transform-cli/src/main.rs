@@ -19,9 +19,10 @@ use phlo_transform_core::{
 };
 use phlo_transform_daemon::{serve, spawn_watcher, WorkspaceService};
 use phlo_transform_engine::{
-    diff, promote, Adapter, ArtifactWriter, CancelHandle, DiffPolicy, DiffRequest, DiffStrategy,
-    ExecutionStatus, Plan, PlanAction, Planner, PromotionRequest, RunOptions, RunResult, Runner,
-    SqliteStateStore, StateStore,
+    diff, ensure_environment, promote, Adapter, ArtifactWriter, CancelHandle, DiffPolicy,
+    DiffRequest, DiffStrategy, EnvironmentSetup, EnvironmentSpec, ExecutionStatus, Plan,
+    PlanAction, Planner, PromotionRequest, RunOptions, RunResult, Runner, SqliteStateStore,
+    StateStore,
 };
 use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -89,6 +90,18 @@ struct Cli {
     #[arg(long = "ref", global = true)]
     reference: Option<String>,
 
+    /// Base Nessie reference to create a candidate from (default `main`).
+    #[arg(long, global = true)]
+    from: Option<String>,
+
+    /// Iceberg warehouse for provisioned catalogs, e.g. `s3://bucket/wh`.
+    #[arg(long, global = true)]
+    warehouse: Option<String>,
+
+    /// Physical catalog for model targets (overrides workspace config).
+    #[arg(long, global = true)]
+    catalog: Option<String>,
+
     /// Nessie endpoint, e.g. http://localhost:19120.
     #[arg(long, global = true)]
     nessie_endpoint: Option<String>,
@@ -144,6 +157,9 @@ enum Command {
         /// Check preconditions without merging.
         #[arg(long)]
         check: bool,
+        /// Require a passing data diff before promoting.
+        #[arg(long)]
+        require_diff: bool,
     },
     /// Move a Nessie reference to a previous hash.
     Rollback {
@@ -208,7 +224,7 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
         return run_daemon(cli, *port, *watch_interval_ms).await;
     }
 
-    let project = match load_project(&cli.root) {
+    let mut project = match load_project(&cli.root) {
         Ok(project) => project,
         Err(diagnostics) => {
             if cli.json {
@@ -219,6 +235,24 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
             return Ok(ExitCode::FAILURE);
         }
     };
+
+    let environment = match &cli.command {
+        Command::Plan | Command::Apply | Command::Run => provision_environment(cli).await?,
+        _ => None,
+    };
+    if let Some(catalog) = cli
+        .catalog
+        .clone()
+        .or_else(|| environment.as_ref().map(|setup| setup.catalog.clone()))
+    {
+        project.defaults.catalog = Some(catalog);
+    }
+    if let Some(setup) = &environment {
+        ArtifactWriter::for_workspace(&cli.root)
+            .write_environment(setup)
+            .map_err(|error| error.to_string())?;
+    }
+
     let compilation = {
         let base = compile(&project);
         if should_enrich(cli) {
@@ -242,7 +276,8 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
             candidate,
             to,
             check,
-        } => run_promote(cli, candidate, to, *check).await,
+            require_diff,
+        } => run_promote(cli, candidate, to, *check, *require_diff).await,
         Command::Rollback { to } => run_rollback(cli, to).await,
         Command::Diff {
             model,
@@ -382,6 +417,77 @@ fn environment(cli: &Cli) -> Option<String> {
     cli.environment.clone().or_else(|| cli.reference.clone())
 }
 
+fn nessie_endpoint(cli: &Cli) -> Option<String> {
+    cli.nessie_endpoint
+        .clone()
+        .or_else(|| std::env::var("PHLO_NESSIE_ENDPOINT").ok())
+}
+
+/// Provision a candidate Nessie branch and its Trino catalog when `--ref`
+/// names a candidate environment and a Nessie endpoint is configured.
+async fn provision_environment(cli: &Cli) -> Result<Option<EnvironmentSetup>, String> {
+    let Some(candidate) = cli.reference.clone() else {
+        return Ok(None);
+    };
+    let base = cli.from.clone().unwrap_or_else(|| "main".to_string());
+    if candidate == base {
+        return Ok(None);
+    }
+    let Some(nessie_uri) = nessie_endpoint(cli) else {
+        return Ok(None);
+    };
+    let nessie = build_nessie(cli)?;
+    let adapter = build_adapter(cli)?;
+    let catalog = cli
+        .catalog
+        .clone()
+        .unwrap_or_else(|| catalog_name(&candidate));
+    let spec = EnvironmentSpec {
+        base_ref: base,
+        candidate_ref: candidate,
+        nessie_uri: Some(nessie_uri),
+        warehouse: cli.warehouse.clone(),
+        catalog,
+    };
+    ensure_environment(nessie.as_ref(), adapter.as_ref(), &spec)
+        .await
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+fn catalog_name(reference: &str) -> String {
+    let mut name = String::from("phlo_");
+    let mut previous_underscore = false;
+    for character in reference.chars() {
+        if character.is_ascii_alphanumeric() {
+            name.push(character.to_ascii_lowercase());
+            previous_underscore = false;
+        } else if !previous_underscore {
+            name.push('_');
+            previous_underscore = true;
+        }
+    }
+    name.trim_end_matches('_').to_string()
+}
+
+fn artifact_path(cli: &Cli, name: &str) -> PathBuf {
+    ArtifactWriter::for_workspace(&cli.root)
+        .directory()
+        .join(name)
+}
+
+fn read_environment(cli: &Cli) -> Option<EnvironmentSetup> {
+    let text = std::fs::read_to_string(artifact_path(cli, "environment.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    serde_json::from_value(value.get("environment")?.clone()).ok()
+}
+
+fn read_diff_passed(cli: &Cli) -> Option<bool> {
+    let text = std::fs::read_to_string(artifact_path(cli, "diff.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value.get("diff")?.get("passed")?.as_bool()
+}
+
 fn build_nessie(cli: &Cli) -> Result<Arc<dyn NessieClient>, String> {
     let endpoint = cli
         .nessie_endpoint
@@ -404,6 +510,7 @@ async fn run_promote(
     candidate: &str,
     to: &str,
     check: bool,
+    require_diff: bool,
 ) -> Result<ExitCode, String> {
     let nessie = build_nessie(cli)?;
     let state = open_state(cli);
@@ -425,16 +532,23 @@ async fn run_promote(
         return Ok(ExitCode::FAILURE);
     }
 
+    let environment = read_environment(cli);
+    let diff_passed = read_diff_passed(cli);
+
     let request = PromotionRequest {
         candidate_ref: candidate.to_string(),
         target_ref: to.to_string(),
-        candidate_hash: None,
-        expected_target_hash: None,
+        candidate_hash: environment
+            .as_ref()
+            .map(|setup| setup.candidate.hash.clone()),
+        // The base hash recorded when the candidate was provisioned pins the
+        // target state the audit was performed against.
+        expected_target_hash: environment.as_ref().map(|setup| setup.base.hash.clone()),
         plan_id: None,
         run_id: None,
         quality_gates_passed: true,
-        diff_passed: None,
-        require_diff: false,
+        diff_passed,
+        require_diff,
         dry_run: check,
         actor: None,
     };

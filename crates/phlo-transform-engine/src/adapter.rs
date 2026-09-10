@@ -28,6 +28,18 @@ pub struct ColumnInfo {
     pub nullable: bool,
 }
 
+/// A request to provision a warehouse catalog for a Nessie reference.
+#[derive(Clone, Debug, Default)]
+pub struct CatalogRequest {
+    pub catalog: String,
+    /// Nessie branch the catalog should read and write.
+    pub reference: Option<String>,
+    /// Nessie API base URI, e.g. `http://nessie:19120`.
+    pub nessie_uri: Option<String>,
+    /// Warehouse location, e.g. `local:///tmp/warehouse` or `s3://bucket/wh`.
+    pub warehouse: Option<String>,
+}
+
 /// A SQL execution target (Trino, or a fake adapter in tests).
 #[async_trait]
 pub trait Adapter: Send + Sync {
@@ -65,4 +77,11 @@ pub trait Adapter: Send + Sync {
 
     /// Read column metadata for an existing relation.
     async fn relation_columns(&self, relation: &Relation) -> Result<Vec<ColumnInfo>, AdapterError>;
+
+    /// Ensure a catalog exists for a Nessie reference. Adapters that do not
+    /// support catalog provisioning treat this as a no-op.
+    async fn ensure_catalog(&self, request: &CatalogRequest) -> Result<(), AdapterError>;
+
+    /// Ensure the schema/namespace containing a relation exists.
+    async fn ensure_schema(&self, relation: &Relation) -> Result<(), AdapterError>;
 }

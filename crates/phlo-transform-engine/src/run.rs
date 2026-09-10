@@ -159,6 +159,25 @@ impl Runner {
             .filter_map(|model| ModelId::parse(&model.id).ok().map(|id| (id, model.clone())))
             .collect();
 
+        // Ensure target schemas/namespaces exist before any write.
+        let mut schemas: BTreeSet<(Option<String>, String)> = BTreeSet::new();
+        for model in &compilation.models {
+            if planned_set.contains(&model.id) {
+                schemas.insert((model.target.catalog.clone(), model.target.schema.clone()));
+            }
+        }
+        for (catalog, schema) in &schemas {
+            let relation = phlo_transform_core::Relation {
+                catalog: catalog.clone(),
+                schema: schema.clone(),
+                table: String::new(),
+            };
+            self.adapter
+                .ensure_schema(&relation)
+                .await
+                .map_err(EngineError::Adapter)?;
+        }
+
         // Dependency bookkeeping restricted to the planned set.
         let mut remaining: BTreeMap<ModelId, usize> = BTreeMap::new();
         let mut dependents: BTreeMap<ModelId, Vec<ModelId>> = BTreeMap::new();

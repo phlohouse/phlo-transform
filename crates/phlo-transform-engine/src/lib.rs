@@ -10,6 +10,7 @@ pub mod adapter;
 pub mod artifacts;
 pub mod cancel;
 pub mod diff;
+pub mod environment;
 pub mod error;
 pub mod events;
 pub mod plan;
@@ -18,16 +19,17 @@ pub mod run;
 pub mod state;
 pub mod util;
 
-pub use adapter::{Adapter, ColumnInfo, QueryResult};
+pub use adapter::{Adapter, CatalogRequest, ColumnInfo, QueryResult};
 pub use artifacts::{
-    ArtifactWriter, ColumnLineageArtifact, DiffArtifact, GraphArtifactFile, LineageArtifact,
-    ManifestArtifact, ModelLineageArtifact, PlanArtifact, PromotionArtifact, RunArtifact,
-    SCHEMA_VERSION,
+    ArtifactWriter, ColumnLineageArtifact, DiffArtifact, EnvironmentArtifact, GraphArtifactFile,
+    LineageArtifact, ManifestArtifact, ModelLineageArtifact, PlanArtifact, PromotionArtifact,
+    RunArtifact, SCHEMA_VERSION,
 };
 pub use cancel::CancelHandle;
 pub use diff::{
     diff, DiffPolicy, DiffReport, DiffRequest, DiffStrategy, PolicyResult, RowSummary, SchemaChange,
 };
+pub use environment::{ensure_environment, EnvironmentSetup, EnvironmentSpec};
 pub use error::{AdapterError, EngineError};
 pub use events::{EngineEvent, ExecutionStatus};
 pub use plan::{

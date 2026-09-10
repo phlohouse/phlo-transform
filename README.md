@@ -47,11 +47,13 @@ implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
   execute as full rebuilds, `merge` is not e2e-tested, schema classification is
   not wired to the planner, and there is no watermark state.
 - **Phase 5 — Nessie and WAP: partial.** `NessieClient` (REST + in-memory),
-  `--ref` environments, audited `promote` with staleness/conflict checks,
-  `rollback`, and a promotion artifact. See [`docs/wap.md`](docs/wap.md).
-  Missing: `apply` does not write to a Nessie branch, candidate branches are
-  not created automatically, the diff/schema gates are not enforced by the
-  CLI, and there is no live Nessie/Iceberg e2e.
+  environment provisioning (`apply --ref <candidate> --from <base>` creates the
+  branch and a branch-scoped Trino catalog), candidate writes isolated from
+  `main`, audited `promote` with staleness/conflict checks and an optional diff
+  gate, `rollback`, and a promotion artifact. See [`docs/wap.md`](docs/wap.md).
+  Missing: schema-policy/Iceberg-snapshot audit gates, candidate cleanup/rebase;
+  Nessie Iceberg catalogs have no view support. Live Nessie + Iceberg E2E is in
+  CI.
 - **Phase 6 — native data diff: partial/deviated.** Keyed diff with per-column
   change counts, policies, `diff.json` and a Trino keyed-diff test. See
   [`docs/diff.md`](docs/diff.md). Gaps: `sampled` is a label (no sampling), no

@@ -44,4 +44,6 @@ pub enum EngineError {
     StalePlan(String),
     #[error("promotion failed: {0}")]
     Promotion(String),
+    #[error("environment error: {0}")]
+    Environment(String),
 }

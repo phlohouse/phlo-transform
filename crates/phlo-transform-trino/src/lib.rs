@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use phlo_transform_core::Relation;
-use phlo_transform_engine::{Adapter, AdapterError, ColumnInfo, QueryResult};
+use phlo_transform_engine::{Adapter, AdapterError, CatalogRequest, ColumnInfo, QueryResult};
 
 /// Configuration for a Trino connection.
 #[derive(Clone, Debug)]
@@ -298,6 +298,58 @@ impl Adapter for TrinoAdapter {
                 })
             })
             .collect())
+    }
+
+    async fn ensure_catalog(&self, request: &CatalogRequest) -> Result<(), AdapterError> {
+        let (Some(reference), Some(nessie_uri)) = (&request.reference, &request.nessie_uri) else {
+            return Ok(());
+        };
+        if self.catalog_exists(&request.catalog).await? {
+            return Ok(());
+        }
+        let warehouse = request
+            .warehouse
+            .clone()
+            .unwrap_or_else(|| "local:///tmp/phlo-warehouse".to_string());
+        let mut properties = vec![
+            "\"iceberg.catalog.type\"='nessie'".to_string(),
+            format!(
+                "\"iceberg.nessie-catalog.uri\"='{}/api/v2'",
+                nessie_uri.trim_end_matches('/')
+            ),
+            format!("\"iceberg.nessie-catalog.ref\"='{reference}'"),
+            format!("\"iceberg.nessie-catalog.default-warehouse-dir\"='{warehouse}'"),
+        ];
+        if warehouse.starts_with("local://") || warehouse.starts_with('/') {
+            properties.push("\"fs.local.enabled\"='true'".to_string());
+        }
+        self.run(&format!(
+            "CREATE CATALOG {} USING iceberg WITH ({})",
+            quote(&request.catalog),
+            properties.join(", ")
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn ensure_schema(&self, relation: &Relation) -> Result<(), AdapterError> {
+        let schema = match &relation.catalog {
+            Some(catalog) => format!("{}.{}", quote(catalog), quote(&relation.schema)),
+            None => quote(&relation.schema),
+        };
+        self.run(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+            .await?;
+        Ok(())
+    }
+}
+
+impl TrinoAdapter {
+    async fn catalog_exists(&self, catalog: &str) -> Result<bool, AdapterError> {
+        let result = self.run("SHOW CATALOGS").await?;
+        Ok(result
+            .rows
+            .iter()
+            .any(|row| row.first().map(String::as_str) == Some(catalog)))
     }
 }
 
