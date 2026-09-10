@@ -84,4 +84,8 @@ pub trait Adapter: Send + Sync {
 
     /// Ensure the schema/namespace containing a relation exists.
     async fn ensure_schema(&self, relation: &Relation) -> Result<(), AdapterError>;
+
+    /// Observe a source state used for model versioning. For Iceberg this is
+    /// the latest snapshot id; for other relations it may be `None`.
+    async fn source_state(&self, relation: &Relation) -> Result<Option<String>, AdapterError>;
 }

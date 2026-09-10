@@ -16,6 +16,7 @@ pub mod events;
 pub mod plan;
 pub mod promotion;
 pub mod run;
+pub mod source_state;
 pub mod state;
 pub mod util;
 
@@ -37,6 +38,7 @@ pub use plan::{
 };
 pub use promotion::{promote, PromotionRecord, PromotionRequest};
 pub use run::{ModelResult, RunOptions, RunResult, Runner, TestResult};
+pub use source_state::{collect_source_states, relation_for_source};
 pub use state::{
     MaterializedRecord, ModelRunRecord, RunRecord, RunSummary, SqliteStateStore, StateStore,
     TestRunRecord,

@@ -354,7 +354,10 @@ Phase 3 is **partially implemented** (audited against code and tests). See
 - `ModelVersion` component hashes computed in dependency order during
   compilation (`core::version`); canonical AST hashing means formatting and
   comments do not rebuild.
-- `SourceStateProvider` interface (empty + static implementations).
+- `SourceStateProvider` interface (empty + static implementations);
+  `Adapter::source_state` reads Iceberg snapshot ids and
+  `collect_source_states` lowers them into a provider, wired into CLI
+  plan/apply/run (and inspect/lineage/impact) enrichment.
 - SQLite `model_versions` table with `record_materialized`,
   `materialized_version` and `materialized_by_hash`.
 - `Planner` is state-aware: `build` / `skip` / `cached` with structured
@@ -362,13 +365,13 @@ Phase 3 is **partially implemented** (audited against code and tests). See
 - Runner records materialisations and rejects stale plans.
 - `inspect` exposes desired/current versions and status.
 
-Audited gaps: `SourceStateProvider` is only reachable through
-`compile_with_options`; the CLI and adapters never supply one, so
-`source_state_hash` is always the empty-input hash and source-state changes
-cannot currently invalidate models. `cached` classification is implemented via
-`materialized_by_hash` but has no test and no cross-environment reuse. There is
-no test exercising a `CONFIG_CHANGE` or `COMPILER_SEMANTICS_CHANGE` reason.
+Tests cover formatting/comment stability, SQL/config/materialisation/upstream
+and source-state invalidation, owner/tag non-invalidation, second-run skip,
+cross-environment `cached` classification, and stale-plan rejection.
 
-Deferred, as listed above: cross-environment reuse, optimiser semantics,
-incremental strategies, Nessie, data diff, daemon.
+Remaining gaps: non-Iceberg sources have no observable state; `cached` is a
+classification only (no cross-environment reuse execution); no direct test for
+`compiler_semantics_change`.
+
+Deferred, as listed above: optimiser semantics.
 

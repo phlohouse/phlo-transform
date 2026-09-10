@@ -37,9 +37,11 @@ implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
   are empty without catalogue schemas, and nested types are coarse.
 - **Phase 3 — state-aware execution: partial.** Content-addressed model
   versions, materialised-version state, state-aware plan
-  (`build`/`skip`/`cached` with reasons) and stale-plan rejection. See
-  [`docs/state.md`](docs/state.md). Gap: no source-state provider is wired in,
-  so source-state changes cannot currently invalidate models.
+  (`build`/`skip`/`cached` with reasons) and stale-plan rejection. Source
+  states are wired through `Adapter::source_state` (Iceberg snapshots) and CLI
+  enrichment; cached classification is tested. See [`docs/state.md`](docs/state.md).
+  Gaps: non-Iceberg sources have no observable state; `cached` is a
+  classification without cross-environment reuse execution.
 - **Phase 4 — incremental models: partial/deviated.** `@incremental`
   append/key/partition/time-window intent, version hashing, full-rebuild
   detection, adapter `append`/`merge` and bootstrap. See

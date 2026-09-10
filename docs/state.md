@@ -37,6 +37,21 @@ hash = H(
 `phlo-transform-core` exposes `compile_with_options(project, schemas,
 source_state)`; `compile` and `compile_with_provider` use empty providers.
 
+Source states are populated from the warehouse: `Adapter::source_state` returns
+the latest Iceberg `snapshot_id` for a relation (via the `$snapshots` metadata
+table), and `collect_source_states` lowers observed states into a provider
+before compilation. `inspect`, `lineage`, `impact` and `plan`/`apply`/`run`
+enrich compilation this way when a target is configured (or with
+`--catalogue`), so an Iceberg source commit invalidates dependent model
+versions and produces a `source_change` build reason.
+
+## Cached reuse
+
+`Planner` classifies a model as `cached` when its desired version is not
+materialised in the current environment but exists for another environment in
+the same state store. This is covered by
+`cache_reuse_across_environments_is_reported_as_cached`.
+
 ## Materialised state
 
 The SQLite state store gains a `model_versions` table recording, per model and

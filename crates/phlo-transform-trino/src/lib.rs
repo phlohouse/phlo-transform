@@ -341,6 +341,25 @@ impl Adapter for TrinoAdapter {
             .await?;
         Ok(())
     }
+
+    async fn source_state(&self, relation: &Relation) -> Result<Option<String>, AdapterError> {
+        // Iceberg snapshot state, when the relation is an Iceberg table.
+        let snapshots = Relation {
+            catalog: relation.catalog.clone(),
+            schema: relation.schema.clone(),
+            table: format!("{}$snapshots", relation.table),
+        };
+        match self
+            .run(&format!(
+                "SELECT snapshot_id FROM {} ORDER BY committed_at DESC LIMIT 1",
+                snapshots.sql()
+            ))
+            .await
+        {
+            Ok(result) => Ok(result.rows.first().and_then(|row| row.first()).cloned()),
+            Err(_) => Ok(None),
+        }
+    }
 }
 
 impl TrinoAdapter {

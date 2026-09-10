@@ -33,7 +33,7 @@ pub mod version;
 
 use std::path::Path;
 
-pub use compile::{compile, compile_with_provider};
+pub use compile::{compile, compile_with_options, compile_with_provider};
 pub use compiled::{Compilation, CompiledModel, CompiledTest};
 pub use config::CrossWorkflowPolicy;
 pub use consumers::{ConsumerRegistry, EmptyConsumerRegistry, StaticConsumerRegistry};

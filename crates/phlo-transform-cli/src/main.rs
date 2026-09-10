@@ -12,17 +12,16 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use phlo_transform_core::{
-    compile, compile_with_provider, load_project, select_models, Assertion, CheckReport,
+    compile, compile_with_options, load_project, select_models, Assertion, CheckReport,
     Compilation, DataType, Diagnostic, IncrementalStrategy, InspectReport, ListReport, ModelId,
-    Nullability, Relation, RelationSchema, SchemaColumn, SelectionOptions, SourceId,
-    StaticSchemaProvider,
+    Nullability, Relation, RelationSchema, SchemaColumn, SelectionOptions, StaticSchemaProvider,
 };
 use phlo_transform_daemon::{serve, spawn_watcher, WorkspaceService};
 use phlo_transform_engine::{
-    diff, ensure_environment, promote, Adapter, ArtifactWriter, CancelHandle, DiffPolicy,
-    DiffRequest, DiffStrategy, EnvironmentSetup, EnvironmentSpec, ExecutionStatus, Plan,
-    PlanAction, Planner, PromotionRequest, RunOptions, RunResult, Runner, SqliteStateStore,
-    StateStore,
+    collect_source_states, diff, ensure_environment, promote, relation_for_source, Adapter,
+    ArtifactWriter, CancelHandle, DiffPolicy, DiffRequest, DiffStrategy, EnvironmentSetup,
+    EnvironmentSpec, ExecutionStatus, Plan, PlanAction, Planner, PromotionRequest, RunOptions,
+    RunResult, Runner, SqliteStateStore, StateStore,
 };
 use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -236,6 +235,9 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
         }
     };
 
+    let original_catalog = project.defaults.catalog.clone();
+    let original_schema = project.defaults.schema.clone();
+
     let environment = match &cli.command {
         Command::Plan | Command::Apply | Command::Run => provision_environment(cli).await?,
         _ => None,
@@ -256,7 +258,15 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
     let compilation = {
         let base = compile(&project);
         if should_enrich(cli) {
-            enrich(cli, &project, &base).await.unwrap_or(base)
+            enrich(
+                cli,
+                &project,
+                original_catalog.as_deref(),
+                original_schema.as_deref(),
+                &base,
+            )
+            .await
+            .unwrap_or(base)
         } else {
             base
         }
@@ -888,20 +898,28 @@ fn should_enrich(cli: &Cli) -> bool {
     cli.catalogue
         || matches!(
             cli.command,
-            Command::Inspect { .. } | Command::Lineage { .. } | Command::Impact { .. }
+            Command::Inspect { .. }
+                | Command::Lineage { .. }
+                | Command::Impact { .. }
+                | Command::Plan
+                | Command::Apply
+                | Command::Run
         )
 }
 
-/// Recompile with external source schemas fetched from the target catalogue.
+/// Recompile with external source schemas and source states from the target.
 async fn enrich(
     cli: &Cli,
     project: &phlo_transform_core::SemanticProject,
+    default_catalog: Option<&str>,
+    default_schema: Option<&str>,
     base: &Compilation,
 ) -> Option<Compilation> {
     let adapter = build_adapter(cli).ok()?;
+    let sources = base.sources();
     let mut provider = StaticSchemaProvider::new();
-    for source in base.sources() {
-        let relation = relation_for_source(cli, &source);
+    for source in &sources {
+        let relation = relation_for_source(source, default_catalog, default_schema);
         let Ok(columns) = adapter.relation_columns(&relation).await else {
             continue;
         };
@@ -924,38 +942,11 @@ async fn enrich(
         );
         provider.insert(&source.logical_name(), schema);
     }
-    Some(compile_with_provider(project, &provider))
-}
-
-fn relation_for_source(cli: &Cli, source: &SourceId) -> Relation {
-    let parts = source.parts();
-    let default_schema = || {
-        cli.trino_schema
-            .clone()
-            .unwrap_or_else(|| "default".to_string())
-    };
-    match parts.len() {
-        0 => Relation {
-            catalog: cli.trino_catalog.clone(),
-            schema: default_schema(),
-            table: String::new(),
-        },
-        1 => Relation {
-            catalog: cli.trino_catalog.clone(),
-            schema: default_schema(),
-            table: parts[0].clone(),
-        },
-        2 => Relation {
-            catalog: cli.trino_catalog.clone(),
-            schema: parts[0].clone(),
-            table: parts[1].clone(),
-        },
-        _ => Relation {
-            catalog: Some(parts[0].clone()),
-            schema: parts[1].clone(),
-            table: parts[2..].join("."),
-        },
-    }
+    let source_states =
+        collect_source_states(adapter.as_ref(), &sources, default_catalog, default_schema)
+            .await
+            .ok()?;
+    Some(compile_with_options(project, &provider, &source_states))
 }
 
 /// Forward Ctrl-C to the running plan as a cooperative cancellation.

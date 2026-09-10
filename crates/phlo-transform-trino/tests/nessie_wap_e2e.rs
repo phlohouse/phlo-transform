@@ -264,4 +264,21 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
     )
     .await;
     assert!(stale.is_err(), "stale promotion must be rejected");
+
+    // Iceberg snapshot state is observable and changes with the data.
+    let state_before = adapter
+        .source_state(&relation("phlo_main", "assay__results"))
+        .await
+        .expect("source state")
+        .expect("snapshot id");
+    adapter
+        .execute("INSERT INTO phlo_main.default.assay__results VALUES (2, 99)")
+        .await
+        .expect("insert");
+    let state_after = adapter
+        .source_state(&relation("phlo_main", "assay__results"))
+        .await
+        .expect("source state")
+        .expect("snapshot id");
+    assert_ne!(state_before, state_after);
 }

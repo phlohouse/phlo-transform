@@ -4,20 +4,22 @@
 //! partial-failure blocking, tests and state persistence without a live
 //! warehouse.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use phlo_transform_core::{
-    compile, select_models, Compilation, IncrementalStrategy, Materialization, ModelId,
-    ModelOrigin, Relation, SelectionOptions, SemanticModel, SemanticProject, SemanticTest, TestId,
+    compile, compile_with_options, select_models, Compilation, EmptySchemaProvider,
+    IncrementalStrategy, Materialization, ModelId, ModelOrigin, Relation, SelectionOptions,
+    SemanticModel, SemanticProject, SemanticTest, SourceId, SourceStateProvider,
+    StaticSourceStateProvider, TestId,
 };
 use phlo_transform_engine::{
-    Adapter, AdapterError, ArtifactWriter, CancelHandle, CatalogRequest, ChangeReason, ColumnInfo,
-    ExecutionStatus, Plan, PlanAction, Planner, QueryResult, RunOptions, Runner, SqliteStateStore,
-    StateStore,
+    collect_source_states, Adapter, AdapterError, ArtifactWriter, CancelHandle, CatalogRequest,
+    ChangeReason, ColumnInfo, ExecutionStatus, Plan, PlanAction, Planner, QueryResult, RunOptions,
+    Runner, SqliteStateStore, StateStore,
 };
 
 #[derive(Default)]
@@ -27,6 +29,7 @@ struct FakeAdapter {
     created: Mutex<Vec<String>>,
     appends: Mutex<Vec<String>>,
     merges: Mutex<Vec<String>>,
+    source_states: Mutex<BTreeMap<String, String>>,
     test_rows: Mutex<u64>,
     delay_ms: u64,
     current: AtomicUsize,
@@ -53,6 +56,13 @@ impl FakeAdapter {
 
     fn set_test_rows(&self, rows: u64) {
         *self.test_rows.lock().unwrap() = rows;
+    }
+
+    fn set_source_state(&self, relation: &str, state: &str) {
+        self.source_states
+            .lock()
+            .unwrap()
+            .insert(relation.to_string(), state.to_string());
     }
 
     async fn create(
@@ -160,6 +170,15 @@ impl Adapter for FakeAdapter {
 
     async fn ensure_schema(&self, _relation: &Relation) -> Result<(), AdapterError> {
         Ok(())
+    }
+
+    async fn source_state(&self, relation: &Relation) -> Result<Option<String>, AdapterError> {
+        Ok(self
+            .source_states
+            .lock()
+            .unwrap()
+            .get(&relation.display())
+            .cloned())
     }
 }
 
@@ -584,4 +603,114 @@ async fn changing_incremental_key_requires_full_rebuild() {
     assert!(plan.models[0]
         .reasons
         .contains(&ChangeReason::IncrementalChange));
+}
+
+#[tokio::test]
+async fn cache_reuse_across_environments_is_reported_as_cached() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let selected = select_models(&compilation, &SelectionOptions::default());
+
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&compilation, &selected, Some("dev".to_string()))
+        .await
+        .unwrap();
+    Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &compilation,
+            &plan,
+            &RunOptions {
+                environment: Some("dev".to_string()),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // `prod` has no recorded materialisation, but the exact desired versions
+    // exist in `dev`, so they are cache candidates.
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&compilation, &selected, Some("prod".to_string()))
+        .await
+        .unwrap();
+    assert!(
+        plan.models
+            .iter()
+            .all(|model| model.action == PlanAction::Cached),
+        "{:?}",
+        plan.models
+            .iter()
+            .map(|model| (model.id.as_str(), model.action))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn source_state_change_marks_model_for_rebuild() {
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+
+    let build = |snapshot: &str| {
+        let mut provider = StaticSourceStateProvider::new();
+        provider.insert("external.raw_assay_results", snapshot);
+        let project = SemanticProject::in_memory(vec![model(
+            "assay.raw",
+            "select * from external.raw_assay_results",
+        )]);
+        let compilation = compile_with_options(&project, &EmptySchemaProvider, &provider);
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+        compilation
+    };
+
+    let first = build("snapshot-1");
+    let selected = select_models(&first, &SelectionOptions::default());
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&first, &selected, Some("dev".to_string()))
+        .await
+        .unwrap();
+    Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &first,
+            &plan,
+            &RunOptions {
+                environment: Some("dev".to_string()),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let second = build("snapshot-2");
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&second, &selected, Some("dev".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(plan.models[0].action, PlanAction::Build);
+    assert!(plan.models[0].reasons.contains(&ChangeReason::SourceChange));
+}
+
+#[tokio::test]
+async fn collects_source_states_from_adapter() {
+    let adapter = FakeAdapter::default();
+    adapter.set_source_state("external.raw_assay_results", "snap-9");
+    let source = SourceId::new(vec![
+        "external".to_string(),
+        "raw_assay_results".to_string(),
+    ])
+    .unwrap();
+
+    let provider = collect_source_states(
+        &adapter,
+        std::slice::from_ref(&source),
+        None,
+        Some("default"),
+    )
+    .await
+    .expect("collect");
+    assert_eq!(provider.source_state(&source).as_deref(), Some("snap-9"));
 }

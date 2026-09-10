@@ -1,6 +1,9 @@
 //! Model version invalidation tests.
 
-use phlo_transform_core::{compile, Materialization, ModelId, SemanticModel, SemanticProject};
+use phlo_transform_core::{
+    compile, compile_with_options, EmptySchemaProvider, Materialization, ModelId, SemanticModel,
+    SemanticProject, StaticSourceStateProvider,
+};
 
 fn model(name: &str, sql: &str) -> SemanticModel {
     SemanticModel::in_memory(ModelId::parse(name).unwrap(), sql)
@@ -86,4 +89,29 @@ fn upstream_change_invalidates_downstream() {
     assert_eq!(before.sql_hash, after.sql_hash);
     assert_ne!(before.dependency_hash, after.dependency_hash);
     assert_ne!(before.hash, after.hash);
+}
+
+#[test]
+fn source_state_change_invalidates_version() {
+    let build = |state: &str| {
+        let mut provider = StaticSourceStateProvider::new();
+        provider.insert("external.raw_results", state);
+        let project = SemanticProject::in_memory(vec![model(
+            "assay.raw",
+            "select * from external.raw_results",
+        )]);
+        let compilation = compile_with_options(&project, &EmptySchemaProvider, &provider);
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+        compilation
+            .model(&ModelId::parse("assay.raw").unwrap())
+            .unwrap()
+            .version
+            .clone()
+    };
+
+    let before = build("snapshot-1");
+    let after = build("snapshot-2");
+    assert_ne!(before.source_state_hash, after.source_state_hash);
+    assert_ne!(before.hash, after.hash);
+    assert_eq!(before.sql_hash, after.sql_hash);
 }
