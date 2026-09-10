@@ -337,4 +337,8 @@ Decisions worth calling out against this plan:
 - Planner/scheduler/state/artifacts are tested with a fake adapter; the Trino
   adapter is tested against a disposable Trino container and the test is
   `#[ignore]`d by default but run in CI.
+- Cancellation is cooperative via a `CancelHandle`; the CLI wires Ctrl-C and
+  the runner aborts in-flight models, marks them `cancelled` and skips tests.
+- Retries are not automated yet; `AdapterError.retryable` is recorded for a
+  later phase.
 

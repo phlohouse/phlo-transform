@@ -132,6 +132,11 @@ pending ready running passed failed skipped blocked cancelled
 After models, custom tests whose target models all passed are executed; a test
 passes when it returns zero rows. Any failed model or test fails the run.
 
+Cancellation is cooperative: `Runner::apply` races its scheduling loop against
+a `CancelHandle`. On cancellation it aborts in-flight model tasks, marks every
+unfinished model `cancelled`, skips tests and reports the run as `cancelled`.
+The CLI wires `Ctrl-C` to the handle; tests can drive it programmatically.
+
 ## Tests
 
 Custom SQL tests are discovered from `tests/**/*.sql`. A test is associated

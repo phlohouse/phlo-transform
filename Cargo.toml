@@ -35,7 +35,7 @@ sha2 = "0.10"
 sqlparser = { version = "0.62", features = ["visitor"] }
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "macros"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "1"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"

@@ -8,6 +8,7 @@
 
 pub mod adapter;
 pub mod artifacts;
+pub mod cancel;
 pub mod error;
 pub mod events;
 pub mod plan;
@@ -19,6 +20,7 @@ pub use adapter::{Adapter, ColumnInfo, QueryResult};
 pub use artifacts::{
     ArtifactWriter, GraphArtifactFile, ManifestArtifact, PlanArtifact, RunArtifact, SCHEMA_VERSION,
 };
+pub use cancel::CancelHandle;
 pub use error::{AdapterError, EngineError};
 pub use events::{EngineEvent, ExecutionStatus};
 pub use plan::{dependency_closure, Plan, PlanAction, PlannedModel, PlannedTest, Planner};

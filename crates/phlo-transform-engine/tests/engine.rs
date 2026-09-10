@@ -15,8 +15,8 @@ use phlo_transform_core::{
     SemanticModel, SemanticProject, SemanticTest, TestId,
 };
 use phlo_transform_engine::{
-    Adapter, AdapterError, ArtifactWriter, ColumnInfo, ExecutionStatus, Plan, Planner, QueryResult,
-    RunOptions, Runner, SqliteStateStore, StateStore,
+    Adapter, AdapterError, ArtifactWriter, CancelHandle, ColumnInfo, ExecutionStatus, Plan,
+    Planner, QueryResult, RunOptions, Runner, SqliteStateStore, StateStore,
 };
 
 #[derive(Default)]
@@ -298,4 +298,43 @@ async fn persists_run_history_and_writes_artifacts() {
             "missing artifact {name}"
         );
     }
+}
+
+#[tokio::test]
+async fn cancellation_marks_unfinished_models_cancelled() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::with_delay(80));
+    let plan = plan_all(&compilation, adapter.clone()).await;
+
+    let cancel = CancelHandle::default();
+    let cancel_signal = cancel.clone();
+    let runner = Runner::new(adapter.clone(), None);
+    let options = RunOptions {
+        concurrency: 1,
+        run_tests: false,
+        cancel: cancel.clone(),
+        ..Default::default()
+    };
+
+    let handle = tokio::spawn(async move { runner.apply(&compilation, &plan, &options).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    cancel_signal.cancel();
+
+    let result = handle.await.unwrap().unwrap();
+    assert_eq!(result.status, ExecutionStatus::Cancelled);
+    assert!(
+        result
+            .models
+            .iter()
+            .any(|model| model.status == ExecutionStatus::Cancelled),
+        "{:?}",
+        result.models
+    );
+    assert!(
+        result
+            .tests
+            .iter()
+            .all(|test| test.status != ExecutionStatus::Passed),
+        "tests should not pass after cancellation"
+    );
 }

@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 use phlo_transform_core::{Compilation, Materialization, ModelId};
 
 use crate::adapter::Adapter;
+use crate::cancel::CancelHandle;
 use crate::error::{AdapterError, EngineError};
 use crate::events::{EngineEvent, ExecutionStatus};
 use crate::plan::Plan;
@@ -24,6 +25,8 @@ pub struct RunOptions {
     pub concurrency: usize,
     /// Run custom tests after the models.
     pub run_tests: bool,
+    /// Cooperative cancellation signal.
+    pub cancel: CancelHandle,
 }
 
 impl Default for RunOptions {
@@ -32,6 +35,7 @@ impl Default for RunOptions {
             environment: None,
             concurrency: 4,
             run_tests: true,
+            cancel: CancelHandle::default(),
         }
     }
 }
@@ -148,8 +152,13 @@ impl Runner {
         let semaphore = Arc::new(Semaphore::new(options.concurrency.max(1)));
         let concurrency = options.concurrency.max(1);
         let mut inflight = 0usize;
+        let mut cancelled = false;
 
         while inflight > 0 || !ready.is_empty() {
+            if options.cancel.is_cancelled() {
+                cancelled = true;
+                break;
+            }
             while inflight < concurrency {
                 let Some(id) = ready.pop_front() else {
                     break;
@@ -193,7 +202,17 @@ impl Runner {
                 inflight += 1;
             }
 
-            let Some(joined) = join_set.join_next().await else {
+            let joined = tokio::select! {
+                joined = join_set.join_next() => joined,
+                _ = options.cancel.cancelled() => {
+                    cancelled = true;
+                    None
+                }
+            };
+            if cancelled {
+                break;
+            }
+            let Some(joined) = joined else {
                 break;
             };
             inflight -= 1;
@@ -267,6 +286,40 @@ impl Runner {
             }
         }
 
+        // Abort in-flight work and mark anything unfinished as cancelled.
+        if cancelled {
+            join_set.abort_all();
+            while join_set.join_next().await.is_some() {}
+            for id in &planned {
+                let current = status.get(id).copied().unwrap_or_default();
+                if current.is_terminal() {
+                    continue;
+                }
+                status.insert(id.clone(), ExecutionStatus::Cancelled);
+                if let Some(model) = compilation.model(id) {
+                    events.push(EngineEvent::ModelFinished {
+                        model: id.logical_name(),
+                        status: ExecutionStatus::Cancelled,
+                        query_id: None,
+                        duration_ms: 0,
+                    });
+                    results.insert(
+                        id.clone(),
+                        ModelResult {
+                            model: id.logical_name(),
+                            target: model.target.display(),
+                            materialization: model.config.materialization.to_string(),
+                            status: ExecutionStatus::Cancelled,
+                            query_id: None,
+                            error: Some("run cancelled".to_string()),
+                            duration_ms: 0,
+                            sql_hash: sha256_hex(&model.compiled_sql),
+                        },
+                    );
+                }
+            }
+        }
+
         // Any model still pending was blocked indirectly.
         for id in &planned {
             if !status.get(id).copied().unwrap_or_default().is_terminal() {
@@ -289,7 +342,7 @@ impl Runner {
             }
         }
 
-        let tests = if options.run_tests {
+        let tests = if options.run_tests && !cancelled {
             self.run_tests(compilation, plan, &status, &mut events)
                 .await
         } else {
@@ -302,7 +355,9 @@ impl Runner {
             || tests
                 .iter()
                 .any(|result| result.status == ExecutionStatus::Failed);
-        let run_status = if failed {
+        let run_status = if cancelled {
+            ExecutionStatus::Cancelled
+        } else if failed {
             ExecutionStatus::Failed
         } else {
             ExecutionStatus::Passed

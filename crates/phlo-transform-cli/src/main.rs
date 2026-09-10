@@ -14,8 +14,8 @@ use phlo_transform_core::{
     ListReport, ModelId, SelectionOptions,
 };
 use phlo_transform_engine::{
-    Adapter, ArtifactWriter, ExecutionStatus, Plan, PlanAction, Planner, RunOptions, RunResult,
-    Runner, SqliteStateStore,
+    Adapter, ArtifactWriter, CancelHandle, ExecutionStatus, Plan, PlanAction, Planner, RunOptions,
+    RunResult, Runner, SqliteStateStore,
 };
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
 
@@ -265,11 +265,14 @@ async fn run_apply(
 
     let adapter = build_adapter(cli)?;
     let state = SqliteStateStore::open(&state_path(cli)).map_err(|error| error.to_string())?;
+    let cancel = CancelHandle::default();
+    spawn_ctrl_c_listener(cancel.clone());
     let runner = Runner::new(adapter, Some(Arc::new(state)));
     let options = RunOptions {
         environment: cli.environment.clone(),
         concurrency: cli.concurrency,
         run_tests: true,
+        cancel,
     };
     let result = runner
         .apply(compilation, &plan, &options)
@@ -394,6 +397,16 @@ fn build_adapter(cli: &Cli) -> Result<Arc<dyn Adapter>, String> {
 
 fn state_path(cli: &Cli) -> PathBuf {
     cli.root.join(".phlo").join("transform").join("state.db")
+}
+
+/// Forward Ctrl-C to the running plan as a cooperative cancellation.
+fn spawn_ctrl_c_listener(cancel: CancelHandle) {
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("cancelling...");
+            cancel.cancel();
+        }
+    });
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> Result<(), String> {
