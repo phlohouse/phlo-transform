@@ -18,6 +18,14 @@ The roadmap is ordered by architectural dependency rather than by marketing rele
 | [7 — Workflow integration](07-workflow-integration.md) | Merge transform DAGs into wider Phlo workflow/data lineage | 2, 5 |
 | [8 — Daemon and agent APIs](08-daemon-agent-apis.md) | Incremental compiler service, editor/UI integration and agent-native queries | 2, 3 |
 
+## Parallel roadmap
+
+| Track | Outcome | Relationship to core roadmap |
+|---|---|---|
+| [dbt migration and translation](dbt-migration.md) | Analyse dbt projects and emit the simplest equivalent native Phlo Transform project | Design the frontend/semantic boundary in Phase 0; implementation can begin after Phase 1 and improve after Phase 2 |
+
+The dbt translator is deliberately **not** part of the critical path. It is a one-way migration frontend, not a dbt compatibility runtime. The core engine must remain free of dbt-specific semantics.
+
 ## Milestones
 
 ### M0 — Architecture proven
@@ -26,17 +34,23 @@ Phases 0 complete.
 
 We can discover a multi-root workspace and derive a valid graph from ordinary SQL relations without `ref()`.
 
+The compiler also has a clean semantic boundary that can be targeted by non-native project frontends such as the dbt translator without adding dbt concepts to the core model.
+
 ### M1 — Useful transform runner
 
 Phases 0–1 complete.
 
 A developer can run `check`, `plan`, `apply`, `run`, `test`, `inspect` and `list` against Trino using table/view models.
 
+At this point, initial dbt translation work may begin in parallel because the native project/config/materialisation surface is sufficiently stable to emit against.
+
 ### M2 — Compiler differentiator
 
 Phases 2–3 complete.
 
 The engine understands columns and types, can explain lineage and impact, and uses content-addressed state to avoid unnecessary work.
+
+The dbt translator can now improve conversion of contracts, tests, types and more complex model metadata against the typed semantic model.
 
 ### M3 — Production-capable lakehouse engine
 
@@ -64,6 +78,8 @@ These rules apply to every phase:
 8. **Prefer semantic/AST hashes to raw text hashes.** Formatting-only changes should not rebuild data once canonicalisation exists.
 9. **Keep Trino first.** Add adapters only after the adapter contract is proven by a real second implementation.
 10. **Keep crates coarse until boundaries are demonstrated by implementation.**
+11. **Keep project frontends separate from the semantic core.** Native Phlo discovery and future importers such as dbt must lower into the same compiler representation without adding source-system-specific fields to core types.
+12. **Migration tools translate intent, not syntax.** A dbt feature should become the smallest equivalent native Phlo construct rather than a recreated dbt abstraction.
 
 ## Suggested repository shape during early development
 
@@ -78,6 +94,8 @@ crates/
 ```
 
 Split additional crates only when ownership and dependency direction are clear.
+
+An importer crate such as `phlo-transform-dbt` should be added only when implementation begins; do not create empty abstraction crates during the compiler spike.
 
 ## Definition of done for a phase
 
