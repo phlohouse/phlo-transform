@@ -182,6 +182,56 @@ fn translation_is_deterministic() {
     );
 }
 
+/// Regression: `ref()` to a seed must resolve to the relation dbt would
+/// materialise it as (not "no known target"), modern `arguments:` test
+/// syntax must convert, and `dbt.date_trunc` lowers to the native function.
+#[test]
+fn seed_refs_arguments_syntax_and_dbt_builtins() {
+    let translation = translate_project(&fixture("dbt-seeds")).expect("dbt project loads");
+    let report = &translation.report;
+
+    let model = report
+        .resources
+        .iter()
+        .find(|r| r.kind == ResourceKind::Model && r.name.ends_with("stg_events"))
+        .expect("stg_events outcome");
+    assert_eq!(model.classification, Classification::Review);
+    assert!(
+        model.issues.iter().all(|issue| issue.code != "DBT001"),
+        "seed ref must resolve: {:?}",
+        model.issues
+    );
+    assert!(
+        model
+            .issues
+            .iter()
+            .any(|issue| issue.code == "DBT015" && issue.message.contains("raw_events")),
+        "expected a seed-hosting note: {:?}",
+        model.issues
+    );
+
+    let file = |path: &str| {
+        translation
+            .files
+            .iter()
+            .find(|file| file.rel_path == path)
+            .unwrap_or_else(|| panic!("no emitted file {path}"))
+            .contents
+            .clone()
+    };
+
+    let stg = file("transforms/staging/stg_events.sql");
+    assert!(stg.contains("from raw_events"), "{stg}");
+    assert!(stg.contains("date_trunc('day', ts)"), "{stg}");
+    assert!(!stg.contains("{{"), "{stg}");
+
+    // `arguments:`-style tests must produce generated test files.
+    let accepted = file("tests/generated/staging__stg_events__status__accepted_values.sql");
+    assert!(accepted.contains("'placed'"), "{accepted}");
+    let relationships = file("tests/generated/staging__stg_events__event_id__relationships.sql");
+    assert!(relationships.contains("raw_events"), "{relationships}");
+}
+
 #[test]
 fn clean_fixture_verifies_with_the_native_compiler() {
     let translation = translate_project(&fixture("dbt-clean")).expect("load");

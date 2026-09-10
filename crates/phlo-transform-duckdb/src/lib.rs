@@ -310,9 +310,13 @@ impl Adapter for DuckDbAdapter {
     }
 
     async fn relation_columns(&self, relation: &Relation) -> Result<Vec<ColumnInfo>, AdapterError> {
-        let result = self
-            .run_sql(&format!("DESCRIBE {}", relation.sql()))
-            .await?;
+        let result = match self.run_sql(&format!("DESCRIBE {}", relation.sql())).await {
+            Ok(result) => result,
+            // A missing relation is "no columns", not an adapter failure —
+            // callers use emptiness to mean "unresolvable".
+            Err(error) if error.code == "TABLE_NOT_FOUND" => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
         Ok(result
             .rows
             .into_iter()

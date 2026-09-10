@@ -360,3 +360,66 @@ fn translated_dbt_project_runs_on_duckdb() {
     assert!(output.status.success(), "{}", stdout(&output));
     assert!(stdout(&output).contains("status:   unchanged"));
 }
+
+/// Regression: an unqualified source (`from raw_events`) resolves through
+/// DuckDB's search path to `main.raw_events`. Source-state enrichment must
+/// use the same resolution or appended source rows stay invisible and plans
+/// SKIP forever.
+#[test]
+fn unqualified_source_appends_trigger_rebuilds_on_duckdb() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let duckdb_path = root.join("local.duckdb");
+
+    std::fs::create_dir_all(root.join("transforms/shop")).expect("mkdir");
+    std::fs::write(
+        root.join("transforms/shop/events.sql"),
+        "select * from raw_events\n",
+    )
+    .expect("write model");
+
+    {
+        let connection = duckdb::Connection::open(&duckdb_path).expect("open duckdb");
+        connection
+            .execute_batch(
+                "create table main.raw_events as
+                     select * from (values (1,'placed'),(2,'shipped')) t(id,status);",
+            )
+            .expect("seed source");
+    }
+
+    let duckdb_arg = duckdb_path.to_str().expect("utf-8").to_string();
+    let root_arg = root.to_str().expect("utf-8").to_string();
+    let run_args = |extra: &[&'static str]| {
+        let mut args = vec![
+            "--root",
+            root_arg.as_str(),
+            "--adapter",
+            "duckdb",
+            "--duckdb-path",
+            duckdb_arg.as_str(),
+        ];
+        args.extend_from_slice(extra);
+        args
+    };
+
+    let output = run_unchecked(&run_args(&["run"]));
+    assert!(output.status.success(), "{}", stdout(&output));
+
+    {
+        let connection = duckdb::Connection::open(&duckdb_path).expect("open duckdb");
+        connection
+            .execute_batch("insert into main.raw_events values (3,'returned')")
+            .expect("append source row");
+    }
+
+    // The appended row must reclassify the model — a SKIP here means the
+    // source-state fingerprint missed the change.
+    let output = run_unchecked(&run_args(&["plan"]));
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(
+        body.contains("BUILD  shop.events"),
+        "expected a rebuild after source append: {body}"
+    );
+}

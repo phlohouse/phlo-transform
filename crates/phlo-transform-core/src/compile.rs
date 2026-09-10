@@ -80,21 +80,21 @@ pub fn compile_with_options(
 
     // Detect duplicate identities; keep the first deterministically.
     let mut unique: Vec<&LoweredModel> = Vec::with_capacity(lowered.len());
+    let mut seen: std::collections::HashMap<&ModelId, usize> =
+        std::collections::HashMap::with_capacity(lowered.len());
+    let mut duplicate_group: std::collections::HashMap<&ModelId, usize> =
+        std::collections::HashMap::new();
     let mut duplicates: Vec<Vec<&LoweredModel>> = Vec::new();
     for lowered_model in &lowered {
-        if let Some(previous) = unique
-            .iter()
-            .find(|entry| entry.model.id == lowered_model.model.id)
-        {
-            if let Some(group) = duplicates
-                .iter_mut()
-                .find(|group| group[0].model.id == previous.model.id)
-            {
-                group.push(lowered_model);
+        if let Some(&first) = seen.get(&lowered_model.model.id) {
+            if let Some(&group_index) = duplicate_group.get(&lowered_model.model.id) {
+                duplicates[group_index].push(lowered_model);
             } else {
-                duplicates.push(vec![*previous, lowered_model]);
+                duplicate_group.insert(&lowered_model.model.id, duplicates.len());
+                duplicates.push(vec![unique[first], lowered_model]);
             }
         } else {
+            seen.insert(&lowered_model.model.id, unique.len());
             unique.push(lowered_model);
         }
     }
@@ -239,11 +239,15 @@ pub fn compile_with_options(
     // Type, column and lineage analysis in dependency order. A cyclic graph is
     // already an error, so analysis is skipped in that case.
     if let Some(order) = compilation.topological_order() {
+        let lowered_by_id: std::collections::HashMap<&ModelId, &LoweredModel> = unique
+            .iter()
+            .map(|entry| (&entry.model.id, *entry))
+            .collect();
         let mut model_schemas: BTreeMap<ModelId, ModelSchema> = BTreeMap::new();
         let mut model_versions: ModelVersions = BTreeMap::new();
         let mut generated_tests: Vec<CompiledTest> = Vec::new();
         for id in order {
-            let Some(lowered) = unique.iter().find(|entry| entry.model.id == id) else {
+            let Some(lowered) = lowered_by_id.get(&id).copied() else {
                 continue;
             };
             let entry = entry_for(lowered);
@@ -275,7 +279,7 @@ pub fn compile_with_options(
             };
             model_versions.insert(id.clone(), version.clone());
 
-            if let Some(position) = compilation.models.iter().position(|model| model.id == id) {
+            if let Some(position) = compilation.model_position(&id) {
                 compilation.models[position].schema = analysis.schema.clone();
                 compilation.models[position].limitations = analysis.limitations;
                 compilation.models[position].assertions = assertions;

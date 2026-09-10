@@ -162,6 +162,11 @@ impl Compilation {
         self.index.get(id).map(|position| &self.models[*position])
     }
 
+    /// Position of a model in `self.models`, for in-place updates.
+    pub(crate) fn model_position(&self, id: &ModelId) -> Option<usize> {
+        self.index.get(id).copied()
+    }
+
     /// Look a model up by dotted name or `model://` URI.
     pub fn model_by_name(&self, name: &str) -> Option<&CompiledModel> {
         let id = ModelId::parse(name).ok()?;

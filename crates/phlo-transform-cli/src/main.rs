@@ -1181,6 +1181,13 @@ async fn enrich(
 ) -> Option<Compilation> {
     let adapter = build_adapter(cli).ok()?;
     let sources = base.sources();
+    // Unqualified sources resolve through the engine's search path, so a
+    // bare `raw_orders` lands in the adapter's own default schema — `main`
+    // on DuckDB. Match that here or state/schema lookups miss entirely.
+    let default_schema = default_schema.or(match adapter.name() {
+        "duckdb" => Some("main"),
+        _ => None,
+    });
     let mut provider = StaticSchemaProvider::new();
     for source in &sources {
         let relation = relation_for_source(source, default_catalog, default_schema);
@@ -1206,10 +1213,12 @@ async fn enrich(
         );
         provider.insert(&source.logical_name(), schema);
     }
+    // A source whose state cannot be observed must not discard the schema
+    // enrichment already gathered for the others.
     let source_states =
         collect_source_states(adapter.as_ref(), &sources, default_catalog, default_schema)
             .await
-            .ok()?;
+            .unwrap_or_default();
     Some(compile_with_options(project, &provider, &source_states))
 }
 

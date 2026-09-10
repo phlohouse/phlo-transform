@@ -1,0 +1,8 @@
+name: seedshop
+model-paths: ["models"]
+seed-paths: ["seeds"]
+
+models:
+  seedshop:
+    staging:
+      +materialized: view

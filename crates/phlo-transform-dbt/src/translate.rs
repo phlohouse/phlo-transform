@@ -114,6 +114,22 @@ pub fn translate(project: &DbtProject) -> Translation {
     }
 
     ctx.model_targets = model_targets.clone();
+    // `ref('seed_name')` targets the relation dbt would materialise the CSV
+    // as: the file stem in the target schema (unqualified when no schema is
+    // known, matching how a bare name resolves in the warehouse).
+    let seed_schema = project.profile.as_ref().and_then(|p| p.schema.as_deref());
+    ctx.seed_targets = project
+        .seeds
+        .iter()
+        .filter_map(|seed| seed.file_stem().and_then(|stem| stem.to_str()))
+        .map(|stem| {
+            let relation = match seed_schema {
+                Some(schema) => format!("{schema}.{stem}"),
+                None => stem.to_string(),
+            };
+            (stem.to_string(), relation)
+        })
+        .collect();
     ctx.collided_names = collisions;
     ctx.disabled_models = disabled_models(project);
     ctx.sources = collect_sources(project);
@@ -362,6 +378,8 @@ struct Context<'a> {
     project: &'a DbtProject,
     /// dbt model name → emitted logical name (`staging.users`).
     model_targets: BTreeMap<String, String>,
+    /// dbt seed name → the physical relation `ref()` to it resolves to.
+    seed_targets: BTreeMap<String, String>,
     /// Names of models disabled via `enabled: false`.
     disabled_models: Vec<String>,
     /// `(source_name, table_name)` → physical relation.
@@ -422,6 +440,7 @@ impl<'a> Context<'a> {
         Self {
             project,
             model_targets: BTreeMap::new(),
+            seed_targets: BTreeMap::new(),
             disabled_models: Vec::new(),
             sources: BTreeMap::new(),
             model_properties: BTreeMap::new(),
@@ -905,6 +924,18 @@ fn translate_call(
             ));
             raw.to_string()
         }
+        // `dbt.date_trunc('day', 'col')` is a portability shim over the
+        // native `date_trunc`; the string-literal column argument becomes a
+        // bare identifier in SQL.
+        "dbt.date_trunc"
+            if call.positional.len() == 2 && call.arg(0).is_some() && call.arg(1).is_some() =>
+        {
+            let (part, column) = (call.arg(0).unwrap(), call.arg(1).unwrap());
+            lowered.transformations.push(format!(
+                "dbt.date_trunc('{part}', '{column}') → date_trunc('{part}', {column})"
+            ));
+            format!("date_trunc('{part}', {column})")
+        }
         name if name == "this" || name.starts_with("target.") || name.starts_with("adapter.") => {
             lowered.review(MigrationIssue::new(
                 codes::ENVIRONMENT_DEPENDENT,
@@ -998,13 +1029,27 @@ fn resolve_model(name: &str, raw: &str, ctx: &Context, lowered: &mut Lowered) ->
                 .push(format!("ref('{name}') → {logical}"));
             logical.clone()
         }
-        None => {
-            lowered.review(MigrationIssue::new(
-                codes::UNRESOLVED_REF,
-                format!("`ref('{name}')` has no known target"),
-            ));
-            raw.to_string()
-        }
+        None => match ctx.seed_targets.get(name) {
+            Some(relation) => {
+                lowered
+                    .transformations
+                    .push(format!("ref('{name}') → {relation} (seed)"));
+                lowered.review(MigrationIssue::new(
+                    codes::SEED,
+                    format!(
+                        "`ref('{name}')` targets seed `{name}`; load the CSV into relation `{relation}` before running"
+                    ),
+                ));
+                relation.clone()
+            }
+            None => {
+                lowered.review(MigrationIssue::new(
+                    codes::UNRESOLVED_REF,
+                    format!("`ref('{name}')` has no known target"),
+                ));
+                raw.to_string()
+            }
+        },
     }
 }
 
@@ -1829,6 +1874,23 @@ fn emit_property_tests(
     directives
 }
 
+/// dbt's modern test syntax puts test arguments under an `arguments:` key
+/// (`accepted_values: {arguments: {values: [...]}}`) while the legacy form
+/// inlines them; merge `arguments` into the top-level map so both spellings
+/// resolve.
+fn merged_test_args(args: &Mapping) -> Mapping {
+    let mut merged = args.clone();
+    if let Some(arguments) = args
+        .get(Value::String("arguments".into()))
+        .and_then(Value::as_mapping)
+    {
+        for (key, value) in arguments {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    merged
+}
+
 /// Convert one generic test entry (string or `{name: {args}}`) into either a
 /// native directive, a generated `tests/` file, or a review issue.
 fn translate_generic_test(
@@ -1855,6 +1917,7 @@ fn translate_generic_test(
             return;
         }
     };
+    let args = merged_test_args(&args);
 
     let where_clause = args
         .get(Value::String("where".into()))
@@ -2057,6 +2120,7 @@ fn emit_source_tests(
                         .unwrap_or_default(),
                     _ => Mapping::new(),
                 };
+                let args = merged_test_args(&args);
                 match test_name.as_str() {
                     "unique" => emit(
                         ctx,
@@ -2135,7 +2199,13 @@ fn resolve_test_target(spec: &str, ctx: &Context) -> Option<String> {
         .trim();
     let call = jinja::parse_call(inner)?;
     match call.name.as_str() {
-        "ref" => ctx.model_targets.get(call.arg(0)?).cloned(),
+        "ref" => {
+            let name = call.arg(0)?;
+            ctx.model_targets
+                .get(name)
+                .or_else(|| ctx.seed_targets.get(name))
+                .cloned()
+        }
         "source" => ctx
             .sources
             .get(&(call.arg(0)?.to_string(), call.arg(1)?.to_string()))

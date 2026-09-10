@@ -48,6 +48,9 @@ existing files unless `--overwrite` is passed. The manifest lands at
 | `{{ ref('m') }}` | the model's logical name (`staging.stg_orders`) |
 | `{{ ref('pkg', 'm') }}` (same project) | the model's logical name |
 | `{{ source('s', 't') }}` | the physical `db.schema.identifier` relation |
+| `{{ ref('seed_name') }}` | the relation the CSV lands as (`<schema>.<name>`, or bare `<name>` when no target schema is known); flagged REVIEW — the seed still needs hosting |
+| `{{ dbt.date_trunc('p', 'col') }}` | `date_trunc('p', col)` |
+| `test: {arguments: {...}}` (modern) and `test: {...}` (legacy) | both argument spellings are read |
 | `{{ var('x') }}` / `var('x', default)` | the literal value from `vars:` |
 | `{{ config(...) }}` | removed; its values become directives/config |
 | `materialized: table/view` | `-- @table` / `-- @view` (or inherited) |
@@ -97,4 +100,7 @@ idempotence auditing.
   kept) and the model degrades to a correct full-refresh, flagged `REVIEW`.
 - `profiles.yml` credentials are never read; only non-secret target fields are
   used as workspace defaults.
-- Seeds, macros, and packages are reported but not translated.
+- Seeds, macros, and packages are reported but not translated. `ref()` calls
+  *to* a seed do resolve — to the relation the CSV would materialise as — so
+  dependent models emit valid SQL; the model is still REVIEW because nothing
+  loads the CSV for you.

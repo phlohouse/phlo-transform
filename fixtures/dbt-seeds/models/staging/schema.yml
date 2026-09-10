@@ -1,0 +1,18 @@
+version: 2
+
+models:
+  - name: stg_events
+    columns:
+      - name: event_id
+        tests:
+          - unique
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('raw_events')
+                field: id
+      - name: status
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['placed', 'shipped']

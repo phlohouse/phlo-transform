@@ -4,10 +4,12 @@
 //! precedence level the result is [`Resolution::Ambiguous`], which the
 //! compiler turns into an error listing every candidate.
 
+use std::collections::HashMap;
+
 use phlo_transform_sql::RelationName;
 
 use crate::identity::{ModelId, Namespace, SourceId};
-use crate::model::RootRef;
+use crate::model::{RootRef, TransformRootId};
 
 /// A model known to the resolver, before its own dependencies are resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,15 +32,57 @@ pub enum Resolution {
 }
 
 /// Resolves relations against a fixed set of models.
-#[derive(Clone, Debug)]
+///
+/// Resolution runs once per relation reference in every model, so the
+/// precedence levels are indexed rather than scanned — a linear scan here is
+/// O(models²) on large workspaces.
+#[derive(Clone, Debug, Default)]
 pub struct Resolver {
-    entries: Vec<RegistryEntry>,
+    by_logical: HashMap<String, Vec<ModelId>>,
+    by_namespace: HashMap<(Namespace, String), Vec<ModelId>>,
+    by_root: HashMap<(TransformRootId, String), Vec<ModelId>>,
+    /// Every dotted suffix of each logical name → the models carrying it.
+    by_suffix: HashMap<String, Vec<ModelId>>,
 }
 
 impl Resolver {
-    pub fn new(mut entries: Vec<RegistryEntry>) -> Self {
-        entries.sort_by(|left, right| left.id.cmp(&right.id));
-        Self { entries }
+    pub fn new(entries: Vec<RegistryEntry>) -> Self {
+        let mut resolver = Self::default();
+        for entry in entries {
+            let logical = entry.id.logical_name();
+            resolver
+                .by_logical
+                .entry(logical.clone())
+                .or_default()
+                .push(entry.id.clone());
+            resolver
+                .by_namespace
+                .entry((entry.namespace.clone(), entry.id.local_name()))
+                .or_default()
+                .push(entry.id.clone());
+            if let Some(root) = &entry.root {
+                resolver
+                    .by_root
+                    .entry((root.id, root.relative_path.join(".")))
+                    .or_default()
+                    .push(entry.id.clone());
+            }
+            // `logical == name` and `logical.ends_with(".{name}")` both mean
+            // `name` is a dotted suffix of the logical name.
+            resolver
+                .by_suffix
+                .entry(logical.clone())
+                .or_default()
+                .push(entry.id.clone());
+            for (position, _) in logical.match_indices('.') {
+                resolver
+                    .by_suffix
+                    .entry(logical[position + 1..].to_string())
+                    .or_default()
+                    .push(entry.id.clone());
+            }
+        }
+        resolver
     }
 
     /// Resolve `name` in the context of `current`.
@@ -83,48 +127,28 @@ impl Resolver {
     }
 
     fn exact(&self, full: &str) -> Vec<ModelId> {
-        self.entries
-            .iter()
-            .filter(|entry| entry.id.logical_name() == full)
-            .map(|entry| entry.id.clone())
-            .collect()
+        self.by_logical.get(full).cloned().unwrap_or_default()
     }
 
     fn in_namespace(&self, current: &RegistryEntry, full: &str) -> Vec<ModelId> {
-        self.entries
-            .iter()
-            .filter(|entry| entry.namespace == current.namespace && entry.id.local_name() == full)
-            .map(|entry| entry.id.clone())
-            .collect()
+        self.by_namespace
+            .get(&(current.namespace.clone(), full.to_string()))
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn in_root(&self, current: &RegistryEntry, full: &str) -> Vec<ModelId> {
         let Some(current_root) = &current.root else {
             return Vec::new();
         };
-        self.entries
-            .iter()
-            .filter(|entry| {
-                entry
-                    .root
-                    .as_ref()
-                    .map(|root| root.id == current_root.id && root.relative_path.join(".") == full)
-                    .unwrap_or(false)
-            })
-            .map(|entry| entry.id.clone())
-            .collect()
+        self.by_root
+            .get(&(current_root.id, full.to_string()))
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn suffix(&self, full: &str) -> Vec<ModelId> {
-        let suffix = format!(".{full}");
-        self.entries
-            .iter()
-            .filter(|entry| {
-                let logical = entry.id.logical_name();
-                logical == full || logical.ends_with(&suffix)
-            })
-            .map(|entry| entry.id.clone())
-            .collect()
+        self.by_suffix.get(full).cloned().unwrap_or_default()
     }
 
     /// Turn a candidate set into a resolution. Zero candidates means "no
