@@ -1034,11 +1034,11 @@ fn resolve_model(name: &str, raw: &str, ctx: &Context, lowered: &mut Lowered) ->
                 lowered
                     .transformations
                     .push(format!("ref('{name}') → {relation} (seed)"));
-                lowered.review(MigrationIssue::new(
-                    codes::SEED,
-                    format!(
-                        "`ref('{name}')` targets seed `{name}`; load the CSV into relation `{relation}` before running"
-                    ),
+                // The seed itself is already reported REVIEW; the model SQL
+                // is correct, so this is a note rather than a downgrade —
+                // same contract as a source the warehouse must contain.
+                lowered.notes.push(format!(
+                    "references seed `{name}`; load the CSV into relation `{relation}` before running"
                 ));
                 relation.clone()
             }

@@ -51,17 +51,14 @@ counts.
 
 | | Before fixes | After fixes |
 |---|---|---|
-| CLEAN models | 1 | 1 |
-| REVIEW models | 4 | 4 |
+| CLEAN models | 1 (20%) | 4 (80%) |
+| REVIEW models | 4 | 1 (`orders` — a real `{% for %}` pivot a human must unroll) |
 
-The count is unchanged but the *reasons* are now correct. Before,
-`ref('raw_customers')`-style seed references failed with DBT001 "no known
-target" and modern `arguments:` test syntax produced false DBT014s. Now seed
-refs resolve to the physical relation with an explicit DBT015 note ("load the
-CSV into relation `raw_orders` before running"), and the `arguments:` tests
-generate real test files. The remaining REVIEWs are honest: `orders.sql`
-contains a genuine Jinja `{% for %}` pivot that needs a human rewrite, and
-the three seeds need hosting.
+Before the fixes, `ref('raw_customers')`-style seed references failed with
+DBT001 "no known target" and modern `arguments:` test syntax produced false
+DBT014s. Now seed refs resolve to the physical relation; the seed resource
+itself stays REVIEW ("nothing loads the CSV for you") while the dependent
+model is CLEAN — the same contract as a source the warehouse must contain.
 
 ## End-to-end execution (jaffle_shop_duckdb → DuckDB)
 
@@ -96,9 +93,10 @@ catalogue probes, which is inherent to a state-aware planner.
 
 1. **`ref()` to seeds failed to resolve (DBT001).** Seed names are known
    resources; a ref now resolves to the relation dbt would materialise the
-   CSV as (file stem in the target schema), flagged REVIEW with an
-   actionable DBT015 message. `relationships` test targets pointing at seeds
-   resolve the same way.
+   CSV as (file stem in the target schema). The seed resource is REVIEW;
+   the referencing model is CLEAN with a note — the same contract as
+   sources. `relationships` test targets pointing at seeds resolve the same
+   way.
 2. **dbt `arguments:` test syntax unsupported.** The modern form
    `accepted_values: {arguments: {values: [...]}}` (and `relationships:
    {arguments: {to, field}}`) produced false "lacks a column or values" /
@@ -154,7 +152,8 @@ catalogue probes, which is inherent to a state-aware planner.
 **Ready for v0.1.0.** The documented install and getting-started path works
 in a clean container with no undocumented steps; the dbt translator produces
 honest, actionable classifications on a realistic project (64% of
-canvas-exemplar's models convert CLEAN; every remaining REVIEW is a real
+canvas-exemplar's and 80% of jaffle_shop_duckdb's models convert CLEAN;
+every remaining REVIEW is a real
 Jinja construct a human must decide on); the DuckDB lifecycle — plan, run,
 test, state-aware re-runs — is verified end-to-end; and compile performance
 is comfortable to at least 5,000 models. The version number already says

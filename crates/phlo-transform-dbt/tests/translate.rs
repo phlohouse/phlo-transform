@@ -195,19 +195,18 @@ fn seed_refs_arguments_syntax_and_dbt_builtins() {
         .iter()
         .find(|r| r.kind == ResourceKind::Model && r.name.ends_with("stg_events"))
         .expect("stg_events outcome");
-    assert_eq!(model.classification, Classification::Review);
+    // The model itself is CLEAN — the emitted SQL is correct; the seed
+    // resource carries the REVIEW. A note records the hosting requirement.
+    assert_eq!(model.classification, Classification::Clean);
     assert!(
         model.issues.iter().all(|issue| issue.code != "DBT001"),
         "seed ref must resolve: {:?}",
         model.issues
     );
     assert!(
-        model
-            .issues
-            .iter()
-            .any(|issue| issue.code == "DBT015" && issue.message.contains("raw_events")),
+        model.notes.iter().any(|note| note.contains("raw_events")),
         "expected a seed-hosting note: {:?}",
-        model.issues
+        model.notes
     );
 
     let file = |path: &str| {
