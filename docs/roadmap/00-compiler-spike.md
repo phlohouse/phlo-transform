@@ -55,6 +55,26 @@ Use `sqlparser-rs` as the initial parser unless implementation evidence shows it
 
 Parse each model into an AST. Preserve useful source spans for diagnostics.
 
+### Frontend-agnostic semantic boundary
+
+Native Phlo file discovery/parsing must feed a semantic model that is not intrinsically tied to the filesystem frontend.
+
+The immediate implementation remains native-Phlo-only, but the boundary should allow a later importer such as [`dbt-migration.md`](dbt-migration.md) to produce the same semantic inputs without teaching the compiler core about dbt.
+
+Conceptually:
+
+```text
+native Phlo files ── native frontend ──┐
+                                      │
+future dbt project ─── dbt frontend ──┼──> semantic project/model representation ──> resolver/DAG/compiler
+                                      │
+future importer ───── other frontend ─┘
+```
+
+Do **not** build a generalized plugin system or dbt importer in Phase 0. The requirement is only to avoid making core types depend on assumptions such as "every model originated as a native `.sql` file discovered from a Phlo transform root" where that assumption is not semantically necessary.
+
+Core semantic types must not contain dbt-specific fields or Jinja-specific concepts.
+
 ### Relation extraction
 
 Extract relation references from parsed SQL, including:
@@ -192,6 +212,8 @@ struct Workspace {
 
 Keep these types small; do not add future state/execution fields until needed.
 
+Where practical, keep frontend/source metadata separate from the semantic model rather than letting filesystem-specific concerns define compiler APIs.
+
 ## Tests
 
 ### Unit
@@ -214,6 +236,12 @@ Fixture repositories covering:
 - custom transform roots;
 - cycle detection.
 
+### Architecture test
+
+Add a small test/factory path that constructs the semantic project/model representation without going through filesystem discovery, then runs the same resolver/DAG logic.
+
+This does not need to represent dbt. It simply proves that the compiler core is not inseparable from the native file frontend.
+
 ### Snapshot tests
 
 Useful for:
@@ -230,6 +258,7 @@ Useful for:
 - model registry;
 - relation resolver;
 - DAG builder;
+- frontend-to-semantic-model boundary;
 - typed diagnostic framework foundation;
 - `check`, `list`, `inspect`;
 - fixture projects and integration tests;
@@ -247,10 +276,14 @@ Phase 0 is complete when:
 6. cycles fail with an understandable cycle path;
 7. `phlo transform check` exits successfully for a valid fixture and non-zero for invalid fixtures;
 8. `list` and `inspect` expose equivalent semantic information in human and JSON formats;
-9. all behaviour is covered by CI tests.
+9. resolver/DAG compilation can be exercised from an in-memory semantic project representation without filesystem discovery;
+10. core semantic types contain no dbt-specific compatibility fields;
+11. all behaviour is covered by CI tests.
 
 ## Explicitly deferred
 
+- dbt translation implementation (see [`dbt-migration.md`](dbt-migration.md));
+- generalized project frontend/plugin discovery;
 - warehouse writes;
 - live Trino catalogue introspection beyond an optional exploratory spike;
 - types/column lineage;
