@@ -177,6 +177,15 @@ exits non-zero when any error-severity diagnostic exists.
   for JSON reports, diagnostics and human CLI output.
 - An architecture test compiles an in-memory `SemanticProject` with no
   filesystem discovery.
+- A Trino syntax suite (`crates/phlo-transform-sql/tests/trino.rs` plus the
+  `trino-syntax` fixture) proves the generic dialect parses the Trino
+  constructs we expect (CTEs, `UNNEST ... WITH ORDINALITY`, `LATERAL`,
+  `QUALIFY`, `TABLESAMPLE`, `GROUPING SETS`/`CUBE`/`ROLLUP`, `FILTER`,
+  `TRY_CAST`, `ROW`/`MAP`/`ARRAY`, intervals and more) and that relation
+  extraction still behaves.
+
+CI runs `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` via
+`.github/workflows/ci.yml`, using the mise-pinned toolchain.
 
 ## Deferred
 

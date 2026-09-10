@@ -266,6 +266,35 @@ fn unresolved_relations_are_registered_as_sources() {
     assert_eq!(sources, vec!["external.raw_assay_results"]);
 }
 
+#[test]
+fn trino_syntax_workspace_compiles() {
+    let compilation = compile_fixture("trino-syntax");
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+    assert_eq!(
+        model_names(&compilation),
+        vec!["trino.items", "trino.marts", "trino.raw"]
+    );
+    assert_eq!(
+        dependency_names(&compilation, "trino.raw"),
+        vec!["tpch.tiny.orders"]
+    );
+    assert_eq!(
+        dependency_names(&compilation, "trino.items"),
+        vec!["trino.raw"]
+    );
+    assert_eq!(
+        dependency_names(&compilation, "trino.marts"),
+        vec!["trino.items"]
+    );
+    let order: Vec<String> = compilation
+        .topological_order()
+        .expect("acyclic")
+        .into_iter()
+        .map(|id| id.logical_name())
+        .collect();
+    assert_eq!(order, vec!["trino.raw", "trino.items", "trino.marts"]);
+}
+
 /// Architecture test: the resolver and DAG are usable without filesystem
 /// discovery, proving the semantic core is not coupled to the native
 /// frontend.

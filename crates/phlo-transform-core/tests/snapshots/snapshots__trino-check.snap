@@ -1,0 +1,19 @@
+---
+source: crates/phlo-transform-core/tests/snapshots.rs
+expression: "compiled(\"trino-syntax\").check_report()"
+---
+{
+  "ok": true,
+  "workspace_root": "../../fixtures/trino-syntax",
+  "roots": [
+    {
+      "path": "workflows/trino/transforms",
+      "namespace": "trino",
+      "strategy": "fixed",
+      "kind": "workflow"
+    }
+  ],
+  "model_count": 3,
+  "source_count": 1,
+  "diagnostics": []
+}

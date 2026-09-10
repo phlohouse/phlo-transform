@@ -51,6 +51,11 @@ fn custom_roots_check_report() {
 }
 
 #[test]
+fn trino_syntax_check_report() {
+    assert_json_snapshot!("trino-check", compiled("trino-syntax").check_report());
+}
+
+#[test]
 fn diagnostics_for_invalid_workspaces() {
     let cases = [
         ("ambiguous", "ambiguous"),
