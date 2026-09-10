@@ -483,3 +483,24 @@ fn discovery_attaches_contracts_and_generates_tests() {
         diagnostic.code == "TYPE005" && diagnostic.severity == Severity::Warning
     }));
 }
+
+#[test]
+fn models_expose_workflow_ownership() {
+    let compilation = compile_fixture("cross-workflow");
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+    let batches = compilation
+        .model(&ModelId::parse("manufacturing.batches").unwrap())
+        .unwrap();
+    assert_eq!(batches.workflow.as_deref(), Some("manufacturing"));
+}
+
+#[test]
+fn cross_workflow_policy_can_error() {
+    let compilation = compile_fixture("cross-workflow-policy");
+    assert!(!compilation.is_ok());
+    assert!(codes(&compilation).contains(&"DEPENDENCIES001".to_string()));
+    assert!(compilation
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == Severity::Error));
+}

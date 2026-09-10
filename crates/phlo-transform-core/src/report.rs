@@ -103,6 +103,8 @@ pub struct ModelDetail {
     pub id: String,
     pub name: String,
     pub namespace: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
     pub materialization: String,
     pub target: String,
     /// Short desired version hash.
@@ -151,6 +153,8 @@ pub struct ImpactReport {
     pub downstream_columns: Vec<String>,
     pub downstream_models: Vec<String>,
     pub tests: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub consumers: Vec<String>,
 }
 
 /// The result of `inspect`.
@@ -165,6 +169,8 @@ pub struct GraphNodeArtifact {
     pub id: String,
     pub kind: &'static str,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
 }
 
 /// An edge in the serialised graph artifact.
@@ -259,6 +265,7 @@ impl Compilation {
                 id: model.id.uri(),
                 name: model.id.logical_name(),
                 namespace: model.namespace.to_string(),
+                workflow: model.workflow.clone(),
                 materialization: model.config.materialization.to_string(),
                 target: model.target.display(),
                 version: model.version.short().to_string(),
@@ -325,6 +332,15 @@ impl Compilation {
 
     /// Downstream impact of a column.
     pub fn impact_report(&self, target: &ColumnRef) -> ImpactReport {
+        self.impact_report_with(target, &crate::consumers::EmptyConsumerRegistry)
+    }
+
+    /// Impact including registered non-transform consumers.
+    pub fn impact_report_with(
+        &self,
+        target: &ColumnRef,
+        consumers: &dyn crate::consumers::ConsumerRegistry,
+    ) -> ImpactReport {
         let mut dependents: std::collections::BTreeMap<ColumnRef, Vec<ColumnRef>> =
             std::collections::BTreeMap::new();
         for model in &self.models {
@@ -375,6 +391,7 @@ impl Compilation {
             downstream_columns: affected.iter().map(ColumnRef::display).collect(),
             downstream_models: models.into_iter().collect(),
             tests: tests.into_iter().collect(),
+            consumers: consumers.consumers(target),
         }
     }
 
@@ -423,6 +440,15 @@ impl Compilation {
                 id: source.uri(),
                 kind: "source",
                 name: source.logical_name(),
+                workflow: None,
+            });
+        }
+        for test in &self.tests {
+            nodes.push(GraphNodeArtifact {
+                id: test.id.uri(),
+                kind: "quality_gate",
+                name: test.id.to_string(),
+                workflow: None,
             });
         }
 
@@ -441,6 +467,13 @@ impl Compilation {
                         kind: "source",
                     }),
                 }
+            }
+            for test in self.tests_for(&model.id) {
+                edges.push(GraphEdgeArtifact {
+                    from: model.id.uri(),
+                    to: test.id.uri(),
+                    kind: "quality_gate",
+                });
             }
         }
 
@@ -492,6 +525,7 @@ fn model_node(model: &CompiledModel) -> GraphNodeArtifact {
         id: model.id.uri(),
         kind: "model",
         name: model.id.logical_name(),
+        workflow: model.workflow.clone(),
     }
 }
 

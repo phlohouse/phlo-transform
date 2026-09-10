@@ -12,6 +12,7 @@ use sqlparser::ast::Statement;
 
 use crate::analyze::Analyzer;
 use crate::compiled::{Compilation, CompiledModel, CompiledTest};
+use crate::config::CrossWorkflowPolicy;
 use crate::diagnostics::{codes, Diagnostic, Severity};
 use crate::graph::Dependency;
 use crate::identity::ModelId;
@@ -129,6 +130,11 @@ pub fn compile_with_options(
     detect_target_collisions(&unique, &targets, &mut diagnostics);
 
     // Resolve dependencies and compile SQL for each unique model.
+    let workflows: BTreeMap<ModelId, Option<String>> = unique
+        .iter()
+        .map(|entry| (entry.model.id.clone(), entry.model.workflow.clone()))
+        .collect();
+
     let mut compiled_models: Vec<CompiledModel> = Vec::with_capacity(unique.len());
     for entry in &unique {
         let registry_entry = entry_for(entry);
@@ -152,6 +158,37 @@ pub fn compile_with_options(
         dependencies.sort();
         dependencies.dedup();
 
+        // Cross-workflow dependency policy.
+        if let Some(current_workflow) = &entry.model.workflow {
+            for dependency in &dependencies {
+                if let Dependency::Model(dependency_id) = dependency {
+                    if let Some(Some(dependency_workflow)) = workflows.get(dependency_id) {
+                        if dependency_workflow != current_workflow {
+                            let message = format!(
+                                "model `{}` in workflow `{current_workflow}` depends on `{}` in workflow `{dependency_workflow}`",
+                                entry.model.id.logical_name(),
+                                dependency_id.logical_name()
+                            );
+                            match project.cross_workflow {
+                                CrossWorkflowPolicy::Allow => {}
+                                CrossWorkflowPolicy::Warn => diagnostics.push(
+                                    Diagnostic::warning(
+                                        codes::DEPENDENCIES_CROSS_WORKFLOW,
+                                        message,
+                                    )
+                                    .with_path(entry.path.clone().unwrap_or_default()),
+                                ),
+                                CrossWorkflowPolicy::Error => diagnostics.push(
+                                    Diagnostic::error(codes::DEPENDENCIES_CROSS_WORKFLOW, message)
+                                        .with_path(entry.path.clone().unwrap_or_default()),
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let mut statements = entry.statements.clone();
         let compiled_sql =
             rewrite_statements(&mut statements, Some(&registry_entry), &resolver, &targets);
@@ -162,6 +199,7 @@ pub fn compile_with_options(
             path: entry.model.path.clone(),
             origin: entry.model.origin.clone(),
             sql: entry.model.sql.clone(),
+            workflow: entry.model.workflow.clone(),
             config: entry.model.config.clone(),
             target: targets[&entry.model.id].clone(),
             compiled_sql,

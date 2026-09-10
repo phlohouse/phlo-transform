@@ -304,6 +304,7 @@ mod tests {
                 path: None,
             },
             sql: String::new(),
+            workflow: None,
             config: crate::model::ModelConfig::default(),
             target: crate::model::Relation {
                 catalog: None,

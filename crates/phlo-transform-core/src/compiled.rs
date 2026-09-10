@@ -18,6 +18,8 @@ pub struct CompiledModel {
     pub path: Vec<String>,
     pub origin: ModelOrigin,
     pub sql: String,
+    /// Owning workflow, when the model lives in a workflow transform root.
+    pub workflow: Option<String>,
     /// Effective configuration after precedence resolution.
     pub config: ModelConfig,
     /// Physical target relation.

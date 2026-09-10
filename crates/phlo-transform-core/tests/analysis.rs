@@ -376,3 +376,16 @@ fn key_directive_generates_runtime_tests() {
         .iter()
         .any(|test| test.compiled_sql.contains("having count(*) > 1")));
 }
+
+#[test]
+fn impact_includes_registered_consumers() {
+    let compilation = compile(vec![
+        model("assay.raw_results", "select * from external.raw_results"),
+        model("assay.results", "select sample_id from assay.raw_results"),
+    ]);
+    let target = ColumnRef::model(id("assay.results"), "sample_id");
+    let mut registry = phlo_transform_core::StaticConsumerRegistry::new();
+    registry.insert(&target, vec!["api: assay-results".to_string()]);
+    let report = compilation.impact_report_with(&target, &registry);
+    assert_eq!(report.consumers, vec!["api: assay-results"]);
+}

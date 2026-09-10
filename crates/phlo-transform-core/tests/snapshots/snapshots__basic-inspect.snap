@@ -7,6 +7,7 @@ expression: "compilation.inspect_report(&id).expect(\"model exists\")"
     "id": "model://assay/results",
     "name": "assay.results",
     "namespace": "assay",
+    "workflow": "assay",
     "materialization": "view",
     "target": "assay.results",
     "version": "ea19693",

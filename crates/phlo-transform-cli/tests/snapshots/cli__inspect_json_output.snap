@@ -18,7 +18,8 @@ expression: stdout(&output)
     "target": "reporting.monthly",
     "tests": [],
     "used_by": [],
-    "version": "4e889bb"
+    "version": "4e889bb",
+    "workflow": "reporting"
   },
   "state": {
     "current": null,

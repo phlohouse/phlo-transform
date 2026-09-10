@@ -1,6 +1,6 @@
 ---
 source: crates/phlo-transform-core/tests/snapshots.rs
-expression: "compiled(\"basic-multi-root\").graph_artifact()"
+expression: "compiled(\"tests-suite\").graph_artifact()"
 ---
 {
   "nodes": [
@@ -17,15 +17,19 @@ expression: "compiled(\"basic-multi-root\").graph_artifact()"
       "workflow": "assay"
     },
     {
-      "id": "model://reporting/monthly",
-      "kind": "model",
-      "name": "reporting.monthly",
-      "workflow": "reporting"
-    },
-    {
       "id": "source://external/raw_assay_results",
       "kind": "source",
       "name": "external.raw_assay_results"
+    },
+    {
+      "id": "test://raw_not_null",
+      "kind": "quality_gate",
+      "name": "raw_not_null"
+    },
+    {
+      "id": "test://results_positive",
+      "kind": "quality_gate",
+      "name": "results_positive"
     }
   ],
   "edges": [
@@ -35,14 +39,19 @@ expression: "compiled(\"basic-multi-root\").graph_artifact()"
       "kind": "source"
     },
     {
+      "from": "model://assay/raw",
+      "to": "test://raw_not_null",
+      "kind": "quality_gate"
+    },
+    {
       "from": "model://assay/results",
       "to": "model://assay/raw",
       "kind": "model"
     },
     {
-      "from": "model://reporting/monthly",
-      "to": "model://assay/results",
-      "kind": "model"
+      "from": "model://assay/results",
+      "to": "test://results_positive",
+      "kind": "quality_gate"
     }
   ]
 }

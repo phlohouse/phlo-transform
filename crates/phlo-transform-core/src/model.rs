@@ -209,6 +209,9 @@ pub struct SemanticModel {
     pub sql: String,
     pub directives: Directives,
     pub config: ModelConfig,
+    /// Owning workflow, when the model lives in a `workflows/<name>/transforms`
+    /// root.
+    pub workflow: Option<String>,
     /// Explicit contract, when declared in `phlo.toml`.
     pub contract: Option<ModelContract>,
     pub origin: ModelOrigin,
@@ -230,6 +233,7 @@ impl SemanticModel {
             sql: sql.into(),
             directives: Directives::default(),
             config: ModelConfig::default(),
+            workflow: None,
             contract: None,
             origin: ModelOrigin::in_memory(),
         }
@@ -279,6 +283,8 @@ pub struct SemanticProject {
     pub models: Vec<SemanticModel>,
     pub tests: Vec<SemanticTest>,
     pub defaults: WorkspaceDefaults,
+    /// Policy for cross-workflow model dependencies.
+    pub cross_workflow: crate::config::CrossWorkflowPolicy,
     /// Diagnostics raised while loading (for example malformed metadata).
     /// The compiler carries these through to its own output.
     pub diagnostics: Vec<Diagnostic>,
@@ -293,6 +299,7 @@ impl SemanticProject {
             models,
             tests: Vec::new(),
             defaults: WorkspaceDefaults::default(),
+            cross_workflow: crate::config::CrossWorkflowPolicy::default(),
             diagnostics: Vec::new(),
         }
     }

@@ -25,6 +25,8 @@ pub mod codes {
 
     pub const RESOLUTION_AMBIGUOUS: &str = "RESOLUTION001";
 
+    pub const DEPENDENCIES_CROSS_WORKFLOW: &str = "DEPENDENCIES001";
+
     pub const TYPE_UNKNOWN_COLUMN: &str = "TYPE001";
     pub const TYPE_AMBIGUOUS_COLUMN: &str = "TYPE002";
     pub const TYPE_DUPLICATE_COLUMN: &str = "TYPE003";

@@ -45,8 +45,13 @@ It is intentionally not a dbt compatibility project. The goal is a smaller, more
 - **Phase 6 — native data diff: done.** Keyed/aggregate/full/sampled diff
   strategies, per-column change counts, declarative policy gates, `diff.json`,
   and a promotion diff gate. See [`docs/diff.md`](docs/diff.md).
+- **Phase 7 — workflow integration: done (transform-side).** Workflow
+  ownership, a unified typed graph artifact (`model`/`source`/`quality_gate`),
+  cross-workflow dependency policy, and registered consumers in impact. See
+  [`docs/workflow.md`](docs/workflow.md). Host-side tasks/`workflow.toml`
+  remain with the wider Phlo host.
 
-No workflow integration or daemon yet — those are later phases.
+No daemon yet — Phase 8.
 
 ## Toolchain
 
@@ -107,3 +112,4 @@ runs a disposable container and is executed explicitly in CI.
 - [Phase 4 incremental models](docs/incremental.md)
 - [Phase 5 Nessie and WAP](docs/wap.md)
 - [Phase 6 native data diff](docs/diff.md)
+- [Phase 7 workflow integration](docs/workflow.md)

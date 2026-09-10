@@ -17,6 +17,7 @@ pub mod analyze;
 pub mod compile;
 pub mod compiled;
 pub mod config;
+pub mod consumers;
 pub mod diagnostics;
 pub mod discovery;
 pub mod graph;
@@ -34,6 +35,8 @@ use std::path::Path;
 
 pub use compile::{compile, compile_with_provider};
 pub use compiled::{Compilation, CompiledModel, CompiledTest};
+pub use config::CrossWorkflowPolicy;
+pub use consumers::{ConsumerRegistry, EmptyConsumerRegistry, StaticConsumerRegistry};
 pub use diagnostics::{codes, Diagnostic, Severity};
 pub use discovery::load_project;
 pub use graph::{Dependency, EdgeKind, GraphNode, TransformGraph};

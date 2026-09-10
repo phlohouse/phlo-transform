@@ -137,6 +137,7 @@ pub fn load_project(workspace_root: &Path) -> Result<SemanticProject, Vec<Diagno
         models,
         tests,
         defaults,
+        cross_workflow: config.dependencies.cross_workflow,
         diagnostics,
     })
 }
@@ -734,6 +735,8 @@ fn lower_model(
         sql,
         directives,
         config,
+        workflow: (file.identity.kind == RootKind::Workflow)
+            .then(|| file.identity.namespace.to_string()),
         contract: None,
         origin: ModelOrigin {
             frontend: FrontendKind::Native,

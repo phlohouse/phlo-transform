@@ -18,6 +18,23 @@ pub struct PhloConfig {
     pub transform: TransformConfig,
     /// Per-model contracts, keyed by model name (dots or underscores).
     pub model: BTreeMap<String, ModelContractConfig>,
+    pub dependencies: DependenciesConfig,
+}
+
+/// Cross-workflow dependency policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossWorkflowPolicy {
+    #[default]
+    Allow,
+    Warn,
+    Error,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct DependenciesConfig {
+    pub cross_workflow: CrossWorkflowPolicy,
 }
 
 /// A `[model.<name>]` section.

@@ -47,6 +47,14 @@ fn basic_graph_artifact() {
 }
 
 #[test]
+fn tests_suite_graph_artifact() {
+    assert_json_snapshot!(
+        "tests-suite-graph",
+        compiled("tests-suite").graph_artifact()
+    );
+}
+
+#[test]
 fn custom_roots_check_report() {
     assert_json_snapshot!(
         "custom-roots-check",

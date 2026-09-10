@@ -364,3 +364,20 @@ Phase 7 is complete when:
 - generalized package registry;
 - visual graph editor;
 - distributed workflow scheduler design unrelated to transforms.
+
+## Implementation notes
+
+Phase 7 transform-side integration is implemented. See
+[`docs/workflow.md`](../workflow.md).
+
+- workflow ownership derived from `workflows/<name>/transforms` roots, exposed
+  in compiled models and `inspect`;
+- unified graph artifact with `model`, `source` and `quality_gate` node kinds
+  and a `workflow` field on model nodes;
+- cross-workflow dependency policy (`allow`/`warn`/`error`, `DEPENDENCIES001`);
+- `ConsumerRegistry` for host-registered non-transform consumers in impact;
+- tests for ownership, policy and consumers.
+
+Host-side workflow tasks, `workflow.toml`, visibility and `workflow_run_id`
+correlation remain with the wider Phlo host.
+
