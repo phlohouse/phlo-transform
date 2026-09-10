@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use phlo_transform_core::{
-    compile, load_project, select_models, CheckReport, Compilation, Diagnostic, InspectReport,
-    ListReport, ModelId, SelectionOptions,
+    compile, compile_with_provider, load_project, select_models, CheckReport, Compilation,
+    DataType, Diagnostic, InspectReport, ListReport, ModelId, Nullability, Relation,
+    RelationSchema, SchemaColumn, SelectionOptions, SourceId, StaticSchemaProvider,
 };
 use phlo_transform_engine::{
     Adapter, ArtifactWriter, CancelHandle, ExecutionStatus, Plan, PlanAction, Planner, RunOptions,
@@ -77,6 +78,10 @@ struct Cli {
     /// Environment label recorded in plans and run history.
     #[arg(long, global = true)]
     environment: Option<String>,
+
+    /// Enrich compilation with Trino catalogue schemas for external sources.
+    #[arg(long, global = true)]
+    catalogue: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -145,7 +150,14 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
             return Ok(ExitCode::FAILURE);
         }
     };
-    let compilation = compile(&project);
+    let compilation = {
+        let base = compile(&project);
+        if should_enrich(cli) {
+            enrich(cli, &project, &base).await.unwrap_or(base)
+        } else {
+            base
+        }
+    };
 
     match &cli.command {
         Command::Check => run_check(cli, &compilation),
@@ -490,6 +502,81 @@ fn build_adapter(cli: &Cli) -> Result<Arc<dyn Adapter>, String> {
 
 fn state_path(cli: &Cli) -> PathBuf {
     cli.root.join(".phlo").join("transform").join("state.db")
+}
+
+/// Whether a command benefits from catalogue-enriched schemas.
+fn should_enrich(cli: &Cli) -> bool {
+    cli.catalogue
+        || matches!(
+            cli.command,
+            Command::Inspect { .. } | Command::Lineage { .. } | Command::Impact { .. }
+        )
+}
+
+/// Recompile with external source schemas fetched from the target catalogue.
+async fn enrich(
+    cli: &Cli,
+    project: &phlo_transform_core::SemanticProject,
+    base: &Compilation,
+) -> Option<Compilation> {
+    let adapter = build_adapter(cli).ok()?;
+    let mut provider = StaticSchemaProvider::new();
+    for source in base.sources() {
+        let relation = relation_for_source(cli, &source);
+        let Ok(columns) = adapter.relation_columns(&relation).await else {
+            continue;
+        };
+        if columns.is_empty() {
+            continue;
+        }
+        let schema = RelationSchema::new(
+            columns
+                .into_iter()
+                .map(|column| SchemaColumn {
+                    name: column.name,
+                    data_type: DataType::parse_trino(&column.data_type),
+                    nullability: if column.nullable {
+                        Nullability::Unknown
+                    } else {
+                        Nullability::NotNull
+                    },
+                })
+                .collect(),
+        );
+        provider.insert(&source.logical_name(), schema);
+    }
+    Some(compile_with_provider(project, &provider))
+}
+
+fn relation_for_source(cli: &Cli, source: &SourceId) -> Relation {
+    let parts = source.parts();
+    let default_schema = || {
+        cli.trino_schema
+            .clone()
+            .unwrap_or_else(|| "default".to_string())
+    };
+    match parts.len() {
+        0 => Relation {
+            catalog: cli.trino_catalog.clone(),
+            schema: default_schema(),
+            table: String::new(),
+        },
+        1 => Relation {
+            catalog: cli.trino_catalog.clone(),
+            schema: default_schema(),
+            table: parts[0].clone(),
+        },
+        2 => Relation {
+            catalog: cli.trino_catalog.clone(),
+            schema: parts[0].clone(),
+            table: parts[1].clone(),
+        },
+        _ => Relation {
+            catalog: Some(parts[0].clone()),
+            schema: parts[1].clone(),
+            table: parts[2..].join("."),
+        },
+    }
 }
 
 /// Forward Ctrl-C to the running plan as a cooperative cancellation.

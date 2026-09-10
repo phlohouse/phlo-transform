@@ -58,10 +58,16 @@ pub struct ModelSummary {
 pub struct TestSummary {
     pub id: String,
     pub name: String,
+    #[serde(skip_serializing_if = "is_false")]
+    pub generated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub targets: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// An external source in `list`.
@@ -461,6 +467,7 @@ fn test_summary(test: &crate::compiled::CompiledTest) -> TestSummary {
     TestSummary {
         id: test.id.uri(),
         name: test.id.to_string(),
+        generated: test.generated,
         targets: test
             .targets
             .iter()

@@ -15,11 +15,13 @@ use crate::compiled::{Compilation, CompiledModel, CompiledTest};
 use crate::diagnostics::{codes, Diagnostic, Severity};
 use crate::graph::Dependency;
 use crate::identity::ModelId;
-use crate::model::{Relation, SemanticModel, SemanticProject, WorkspaceDefaults};
+use crate::model::{
+    FrontendKind, ModelOrigin, Relation, SemanticModel, SemanticProject, TestId, WorkspaceDefaults,
+};
 use crate::resolve::{RegistryEntry, Resolution, Resolver};
 use crate::rewrite::rewrite_statements;
 use crate::schema::{EmptySchemaProvider, SchemaProvider};
-use crate::semantic::{Assertion, ModelSchema};
+use crate::semantic::{Assertion, ModelContract, ModelSchema, Nullability};
 
 /// Compile a semantic project into models and a dependency graph.
 pub fn compile(project: &SemanticProject) -> Compilation {
@@ -154,6 +156,7 @@ pub fn compile_with_provider(
             schema: ModelSchema::default(),
             limitations: Vec::new(),
             assertions: Vec::new(),
+            contract: entry.model.contract.clone(),
             pinned_id: entry.pinned_id.clone(),
             dependencies,
         });
@@ -186,6 +189,7 @@ pub fn compile_with_provider(
     // already an error, so analysis is skipped in that case.
     if let Some(order) = compilation.topological_order() {
         let mut model_schemas: BTreeMap<ModelId, ModelSchema> = BTreeMap::new();
+        let mut generated_tests: Vec<CompiledTest> = Vec::new();
         for id in order {
             let Some(lowered) = unique.iter().find(|entry| entry.model.id == id) else {
                 continue;
@@ -194,6 +198,19 @@ pub fn compile_with_provider(
             let analyzer = Analyzer::new(&resolver, &model_schemas, provider);
             let analysis = analyzer.analyze(&entry, &lowered.statements, &id);
             let assertions = assertions_for(lowered.model);
+
+            if let Some(contract) = &lowered.model.contract {
+                validate_contract(
+                    &id,
+                    &analysis.schema,
+                    contract,
+                    &mut compilation.diagnostics,
+                );
+            }
+            if let Some(model) = compilation.model(&id) {
+                generated_tests.extend(generate_tests(&id, &assertions, &model.target));
+            }
+
             if let Some(position) = compilation.models.iter().position(|model| model.id == id) {
                 compilation.models[position].schema = analysis.schema.clone();
                 compilation.models[position].limitations = analysis.limitations;
@@ -202,6 +219,7 @@ pub fn compile_with_provider(
             compilation.diagnostics.extend(analysis.diagnostics);
             model_schemas.insert(id, analysis.schema);
         }
+        compilation.add_generated_tests(generated_tests);
     }
 
     compilation
@@ -227,6 +245,116 @@ fn assertions_for(model: &SemanticModel) -> Vec<Assertion> {
         }
     }
     assertions
+}
+
+/// Validate an explicit contract against an inferred schema.
+fn validate_contract(
+    id: &ModelId,
+    schema: &ModelSchema,
+    contract: &ModelContract,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let severity = if contract.enforced {
+        Severity::Error
+    } else {
+        Severity::Warning
+    };
+    if !schema.known {
+        diagnostics.push(
+            Diagnostic::warning(
+                codes::TYPE_CONTRACT,
+                "contract could not be fully validated because the schema is unknown",
+            )
+            .with_path(id.logical_name()),
+        );
+    }
+
+    let mut push = |message: String| {
+        let diagnostic = match severity {
+            Severity::Error => Diagnostic::error(codes::TYPE_CONTRACT, message),
+            _ => Diagnostic::warning(codes::TYPE_CONTRACT, message),
+        };
+        diagnostics.push(diagnostic.with_path(id.logical_name()));
+    };
+
+    for column in &contract.columns {
+        match schema.column(&column.name) {
+            None => {
+                if schema.known {
+                    push(format!("contract column `{}` is missing", column.name));
+                }
+            }
+            Some(output) => {
+                if let Some(expected) = &column.data_type {
+                    if output.data_type.is_known() && &output.data_type != expected {
+                        push(format!(
+                            "column `{}` has type {} but contract expects {}",
+                            column.name, output.data_type, expected
+                        ));
+                    }
+                }
+                if column.nullable == Some(false) && output.nullability == Nullability::Nullable {
+                    push(format!(
+                        "column `{}` is nullable but the contract requires not null",
+                        column.name
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Generate logical runtime tests from assertions.
+fn generate_tests(id: &ModelId, assertions: &[Assertion], target: &Relation) -> Vec<CompiledTest> {
+    assertions
+        .iter()
+        .map(|assertion| {
+            let slug = assertion_slug(assertion);
+            let compiled_sql = assertion_sql(assertion, target);
+            CompiledTest {
+                id: TestId::new(format!("{}.generated.{slug}", id.logical_name())),
+                origin: ModelOrigin {
+                    frontend: FrontendKind::InMemory,
+                    path: None,
+                },
+                sql: compiled_sql.clone(),
+                compiled_sql,
+                targets: vec![id.clone()],
+                sources: Vec::new(),
+                generated: true,
+            }
+        })
+        .collect()
+}
+
+fn assertion_slug(assertion: &Assertion) -> String {
+    match assertion {
+        Assertion::NotNull { column } => format!("not_null_{column}"),
+        Assertion::Unique { columns } => format!("unique_{}", columns.join("_")),
+    }
+}
+
+fn assertion_sql(assertion: &Assertion, target: &Relation) -> String {
+    match assertion {
+        Assertion::NotNull { column } => format!(
+            "select * from {} where {} is null",
+            target.sql(),
+            quote_ident(column)
+        ),
+        Assertion::Unique { columns } => {
+            let quoted: Vec<String> = columns.iter().map(|column| quote_ident(column)).collect();
+            format!(
+                "select {}, count(*) as __phlo_count from {} group by {} having count(*) > 1",
+                quoted.join(", "),
+                target.sql(),
+                quoted.join(", ")
+            )
+        }
+    }
+}
+
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 struct LoweredModel<'a> {
@@ -354,6 +482,7 @@ fn compile_tests(
             compiled_sql,
             targets: model_targets.into_iter().collect(),
             sources: sources.into_iter().collect(),
+            generated: false,
         });
     }
     tests.sort_by(|left, right| left.id.cmp(&right.id));

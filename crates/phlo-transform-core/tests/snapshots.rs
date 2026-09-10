@@ -72,6 +72,7 @@ fn diagnostics_for_invalid_workspaces() {
         ("duplicate-model-id", "duplicate-model-id"),
         ("duplicate-pinned-id", "duplicate-pinned-id"),
         ("duplicate-namespace", "duplicate-namespace"),
+        ("contracts", "contracts"),
     ];
     for (fixture_name, snapshot_name) in cases {
         let compilation = compiled(fixture_name);

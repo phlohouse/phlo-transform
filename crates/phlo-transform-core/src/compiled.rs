@@ -30,6 +30,8 @@ pub struct CompiledModel {
     pub limitations: Vec<String>,
     /// Logical assertions derived from directives/contracts.
     pub assertions: Vec<crate::semantic::Assertion>,
+    /// Explicit contract, when declared.
+    pub contract: Option<crate::semantic::ModelContract>,
     /// Pinned identity from `-- @id`, when present and valid.
     pub pinned_id: Option<ModelId>,
     /// Resolved dependencies, sorted and deduplicated.
@@ -76,6 +78,8 @@ pub struct CompiledTest {
     pub targets: Vec<ModelId>,
     /// External relations the test reads.
     pub sources: Vec<SourceId>,
+    /// True when the test was generated from assertions/contracts.
+    pub generated: bool,
 }
 
 impl CompiledTest {
@@ -164,6 +168,21 @@ impl Compilation {
         self.test_index
             .get(id)
             .map(|position| &self.tests[*position])
+    }
+
+    /// Append generated tests and rebuild the test index.
+    pub(crate) fn add_generated_tests(&mut self, generated: Vec<CompiledTest>) {
+        if generated.is_empty() {
+            return;
+        }
+        self.tests.extend(generated);
+        self.tests.sort_by(|left, right| left.id.cmp(&right.id));
+        self.test_index = self
+            .tests
+            .iter()
+            .enumerate()
+            .map(|(position, test)| (test.id.clone(), position))
+            .collect();
     }
 
     /// Tests that read the given model.

@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use phlo_transform_core::{compile, load_project, Dependency, IdentityError, ModelId};
+use phlo_transform_core::{compile, load_project, Dependency, IdentityError, ModelId, Severity};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from("../../fixtures").join(name)
@@ -454,4 +454,32 @@ fn colliding_physical_targets_are_reported() {
     let compilation = compile_fixture("target-collision");
     assert!(!compilation.is_ok());
     assert!(codes(&compilation).contains(&"PROJECT007".to_string()));
+}
+
+#[test]
+fn discovery_attaches_contracts_and_generates_tests() {
+    let compilation = compile_fixture("contracts");
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let model = compilation
+        .model(&ModelId::parse("assay.results").unwrap())
+        .expect("model");
+    let contract = model.contract.as_ref().expect("contract attached");
+    assert!(contract.enforced);
+    assert_eq!(contract.columns.len(), 1);
+    assert_eq!(contract.columns[0].name, "sample_id");
+
+    // @key generates not_null + unique tests.
+    let generated: Vec<String> = compilation
+        .tests
+        .iter()
+        .filter(|test| test.generated)
+        .map(|test| test.id.to_string())
+        .collect();
+    assert_eq!(generated.len(), 2, "{generated:?}");
+
+    // Unknown schema makes the contract a warning, not an error.
+    assert!(compilation.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "TYPE005" && diagnostic.severity == Severity::Warning
+    }));
 }

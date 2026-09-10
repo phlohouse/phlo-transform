@@ -292,7 +292,13 @@ async fn persists_run_history_and_writes_artifacts() {
     writer.write_project(&compilation).unwrap();
     writer.write_plan(&plan).unwrap();
     writer.write_run(&result).unwrap();
-    for name in ["manifest.json", "graph.json", "plan.json", "run.json"] {
+    for name in [
+        "manifest.json",
+        "graph.json",
+        "lineage.json",
+        "plan.json",
+        "run.json",
+    ] {
         assert!(
             directory.path().join(name).is_file(),
             "missing artifact {name}"

@@ -53,7 +53,8 @@ pub use schema::{
 };
 pub use select::{select_models, SelectionOptions};
 pub use semantic::{
-    Assertion, ColumnRef, DataType, ModelSchema, Nullability, OutputColumn, RelationRef,
+    Assertion, ColumnContract, ColumnRef, DataType, ModelContract, ModelSchema, Nullability,
+    OutputColumn, RelationRef,
 };
 
 /// Load a native workspace and compile it in one step.

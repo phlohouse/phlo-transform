@@ -24,11 +24,11 @@ It is intentionally not a dbt compatibility project. The goal is a smaller, more
   materialisations, `plan`/`apply`/`run`/`test`, bounded-concurrency scheduler,
   custom SQL tests, SQLite run history and versioned artifacts. See
   [`docs/engine.md`](docs/engine.md).
-- **Phase 2 — typed compiler and lineage: in progress.** Typed semantic IR,
-  schema provider boundary, column resolution and type inference, inferred
-  output schemas, `lineage`/`impact`, and `@key`/`@not-null` assertions. See
-  [`docs/semantic.md`](docs/semantic.md). Remaining: config contracts,
-  catalogue-enriched CLI compilation, `lineage.json`, generated runtime tests.
+- **Phase 2 — typed compiler and lineage: done.** Typed semantic IR, schema
+  provider boundary and catalogue enrichment, column resolution and type
+  inference, inferred output schemas, `lineage`/`impact`, config-file schema
+  contracts, `@key`/`@not-null` assertions with generated SQL tests, and a
+  `lineage.json` artifact. See [`docs/semantic.md`](docs/semantic.md).
 
 No state-aware skipping, incremental models, Nessie, WAP, data diff or daemon
 yet — those are later phases.

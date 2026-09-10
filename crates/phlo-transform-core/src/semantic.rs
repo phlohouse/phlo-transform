@@ -250,7 +250,6 @@ pub enum Assertion {
     NotNull { column: String },
     Unique { columns: Vec<String> },
 }
-
 impl Assertion {
     pub fn describe(&self) -> String {
         match self {
@@ -258,4 +257,19 @@ impl Assertion {
             Assertion::Unique { columns } => format!("unique {}", columns.join(", ")),
         }
     }
+}
+
+/// An explicit column-level contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnContract {
+    pub name: String,
+    pub data_type: Option<DataType>,
+    pub nullable: Option<bool>,
+}
+
+/// An explicit model contract.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelContract {
+    pub enforced: bool,
+    pub columns: Vec<ColumnContract>,
 }

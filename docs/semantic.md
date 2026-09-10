@@ -73,12 +73,50 @@ representation as execution; there is no separate lineage parser.
 `inspect`. Runtime execution of these assertions is deferred to the test
 runtime.
 
-## Explicit limitations
+## Contracts
 
-- Catalogue-enriched compilation is available through `SchemaProvider`; the
-  CLI currently compiles offline, so `lineage`/`impact` are only as precise as
-  known schemas. Wiring the Trino provider into the CLI is a follow-up.
-- Config-file schema contracts (`[model.…contract]`) are not implemented yet;
-  directive-derived assertions are.
+Explicit contracts are declared in `phlo.toml`:
+
+```toml
+[model.assay_results.contract]
+enforced = true
+
+[model.assay_results.columns.experiment_id]
+type = "VARCHAR"
+nullable = false
+```
+
+Model keys accept dots (`assay.results`) or underscores (`assay_results`).
+Contracts validate the inferred output schema: missing columns, type
+mismatches and `nullable = false` violations. Violations are errors when
+`enforced = true`, warnings otherwise. A contract whose input schema is unknown
+produces a "cannot be fully validated" diagnostic rather than a false failure.
+
+## Generated runtime tests
+
+`@key x` implies `unique x` and `not_null x`; `@not-null a,b` implies
+`not_null` for each. These are represented as `Assertion`s on the compiled
+model **and** lowered into generated SQL tests:
+
+- `not_null`: `select * from <target> where "x" is null`;
+- `unique`: `select "x", count(*) from <target> group by "x" having count(*) > 1`.
+
+Generated tests appear in `list`, `plan` and `run`, and are marked `generated`
+in reports.
+
+## Catalogue-enriched compilation
+
+The CLI compiles offline by default. `inspect`, `lineage` and `impact`
+automatically enrich compilation by fetching external source schemas from the
+configured Trino target (or use `--catalogue` on any command). The fetch builds
+a `StaticSchemaProvider`, so the analyzer and its tests remain
+warehouse-independent.
+
+## Remaining limitations
+
 - Full Trino type-system parity is out of scope; nested types are coarse.
-- `lineage.json` artifact emission is not yet added.
+- The analyzer covers common transformation SQL; unsupported constructs are
+  `Unknown` plus recorded limitations rather than errors.
+- Runtime execution of contract-derived assertions happens through the
+  generated SQL tests; richer assertion types can be added later.
+

@@ -171,6 +171,7 @@ Written under `.phlo/transform/` with `schema_version = 1`:
 |---|---|
 | `manifest.json` | workspace root, roots, models, sources, tests |
 | `graph.json` | graph nodes and edges |
+| `lineage.json` | inferred columns and column inputs per model |
 | `plan.json` | plan id, adapter, environment, planned models/tests, diagnostics |
 | `run.json` | run id, plan id, status, model/test results, events |
 

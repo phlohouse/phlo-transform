@@ -3,8 +3,9 @@
 use std::collections::BTreeSet;
 
 use phlo_transform_core::{
-    compile_with_provider, ColumnRef, Compilation, DataType, ModelId, Nullability, RelationSchema,
-    SchemaColumn, SelectionOptions, SemanticModel, SemanticProject, SourceId, StaticSchemaProvider,
+    compile_with_provider, ColumnContract, ColumnRef, Compilation, DataType, ModelContract,
+    ModelId, Nullability, RelationSchema, SchemaColumn, SelectionOptions, SemanticModel,
+    SemanticProject, SourceId, StaticSchemaProvider,
 };
 
 fn column(name: &str, data_type: DataType, nullability: Nullability) -> SchemaColumn {
@@ -311,4 +312,67 @@ fn computes_column_lineage_and_impact() {
         impact.downstream_columns,
         vec!["assay.summary.concentration"]
     );
+}
+
+#[test]
+fn enforced_contract_violation_is_an_error() {
+    let mut model = model("assay.raw_results", "select * from external.raw_results");
+    model.contract = Some(ModelContract {
+        enforced: true,
+        columns: vec![ColumnContract {
+            name: "missing".to_string(),
+            data_type: None,
+            nullable: None,
+        }],
+    });
+    let compilation = compile(vec![model]);
+    assert!(!compilation.is_ok());
+    assert!(compilation
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "TYPE005"));
+}
+
+#[test]
+fn contract_type_mismatch_is_reported() {
+    let mut model = model("assay.raw_results", "select * from external.raw_results");
+    model.contract = Some(ModelContract {
+        enforced: true,
+        columns: vec![ColumnContract {
+            name: "signal".to_string(),
+            data_type: Some(DataType::Varchar),
+            nullable: Some(false),
+        }],
+    });
+    let compilation = compile(vec![model]);
+    assert!(!compilation.is_ok());
+    let messages: Vec<&str> = compilation
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert!(messages
+        .iter()
+        .any(|message| message.contains("contract expects")));
+}
+
+#[test]
+fn key_directive_generates_runtime_tests() {
+    let mut model = model("assay.raw_results", "select * from external.raw_results");
+    model.directives.keys = vec!["sample_id".to_string()];
+    let compilation = compile(vec![model]);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let generated: Vec<&phlo_transform_core::CompiledTest> = compilation
+        .tests
+        .iter()
+        .filter(|test| test.generated)
+        .collect();
+    assert_eq!(generated.len(), 2, "expected not_null + unique");
+    assert!(generated
+        .iter()
+        .any(|test| test.compiled_sql.contains("is null")));
+    assert!(generated
+        .iter()
+        .any(|test| test.compiled_sql.contains("having count(*) > 1")));
 }

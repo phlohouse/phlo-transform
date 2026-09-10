@@ -312,13 +312,13 @@ Phase 2 is complete when:
 
 ## Implementation notes
 
-Phase 2 is partially implemented. See [`docs/semantic.md`](../semantic.md).
+Phase 2 is implemented. See [`docs/semantic.md`](../semantic.md).
 
 Implemented:
 
 - typed semantic IR with explicit `Unknown` type/nullability states;
-- `SchemaProvider` boundary (empty + static providers; Trino adapter already
-  exposes `relation_columns`);
+- `SchemaProvider` boundary (empty + static providers; Trino adapter exposes
+  `relation_columns` and the CLI enriches compilation from the catalogue);
 - column resolution (qualified/unqualified, aliases, `USING`, `SELECT *` and
   `alias.*`, CTEs, subqueries, set operations);
 - type inference for common expressions and functions, with limitations
@@ -326,13 +326,13 @@ Implemented:
 - inferred output schema on every compiled model, with `known` tracking so
   unknown source schemas do not cause false errors;
 - `lineage` and `impact` commands (human + JSON);
-- `@key` and `@not-null` represented as logical assertions;
+- config-file contracts (`[model.…contract]`) and `@key` / `@not-null`
+  directives, both represented as assertions;
+- generated SQL tests from assertions, executed by the Phase 1 runtime;
+- `lineage.json` artifact;
 - integration test comparing inferred and real Trino schemas.
 
-Not yet implemented:
+Remaining (explicit): full Trino type-system parity and broader SQL coverage;
+richer assertion types.
 
-- config-file schema contracts (`[model.…contract]`);
-- catalogue-enriched CLI compilation (commands currently compile offline);
-- `lineage.json` artifact;
-- generated runtime tests from inferred assertions.
 

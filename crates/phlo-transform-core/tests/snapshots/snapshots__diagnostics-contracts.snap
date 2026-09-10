@@ -1,0 +1,12 @@
+---
+source: crates/phlo-transform-core/tests/snapshots.rs
+expression: compilation.diagnostics
+---
+[
+  {
+    "code": "TYPE005",
+    "severity": "warning",
+    "message": "contract could not be fully validated because the schema is unknown",
+    "path": "assay.results"
+  }
+]

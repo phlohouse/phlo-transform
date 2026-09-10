@@ -1,0 +1,10 @@
+[transform]
+default_catalog = "memory"
+default_schema = "default"
+
+[model."assay.results".contract]
+enforced = true
+
+[model."assay.results".columns.sample_id]
+type = "VARCHAR"
+nullable = false

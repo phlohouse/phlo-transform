@@ -22,6 +22,7 @@ use crate::model::{
     SemanticModel, SemanticProject, SemanticTest, TestId, TransformRoot, TransformRootId,
     WorkspaceDefaults,
 };
+use crate::semantic::{ColumnContract, DataType, ModelContract};
 
 const DEFAULT_INCLUDES: &[&str] = &["transforms/**", "workflows/*/transforms/**"];
 const DEFAULT_EXCLUDES: &[&str] = &[
@@ -119,6 +120,13 @@ pub fn load_project(workspace_root: &Path) -> Result<SemanticProject, Vec<Diagno
 
     models.sort_by(|left, right| left.id.cmp(&right.id));
 
+    let contracts = model_contracts(&config);
+    for model in &mut models {
+        if let Some(contract) = contracts.get(&model.id.logical_name()) {
+            model.contract = Some(contract.clone());
+        }
+    }
+
     let tests = load_tests(workspace_root, &mut diagnostics);
 
     Ok(SemanticProject {
@@ -152,6 +160,35 @@ fn workspace_defaults(config: &PhloConfig, diagnostics: &mut Vec<Diagnostic>) ->
         catalog: config.transform.default_catalog.clone(),
         schema: config.transform.default_schema.clone(),
     }
+}
+
+/// Normalise `[model.<name>...]` sections into contracts keyed by logical name.
+///
+/// Both `assay_results` and `assay.results` keys are accepted.
+fn model_contracts(config: &PhloConfig) -> BTreeMap<String, ModelContract> {
+    let mut contracts = BTreeMap::new();
+    for (key, section) in &config.model {
+        let contract = ModelContract {
+            enforced: section.contract.enforced,
+            columns: section
+                .columns
+                .iter()
+                .map(|(name, column)| ColumnContract {
+                    name: name.clone(),
+                    data_type: column.data_type.as_deref().and_then(|text| {
+                        let data_type = DataType::parse_trino(text);
+                        data_type.is_known().then_some(data_type)
+                    }),
+                    nullable: column.nullable,
+                })
+                .collect(),
+        };
+        contracts.insert(key.clone(), contract.clone());
+        if key.contains('_') {
+            contracts.insert(key.replace('_', "."), contract);
+        }
+    }
+    contracts
 }
 
 fn combined_includes(config: &PhloConfig) -> Vec<String> {
@@ -611,6 +648,7 @@ fn lower_model(
         sql,
         directives,
         config,
+        contract: None,
         origin: ModelOrigin {
             frontend: FrontendKind::Native,
             path: Some(file.relative_path.clone()),

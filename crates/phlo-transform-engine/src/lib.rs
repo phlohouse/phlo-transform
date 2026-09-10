@@ -18,7 +18,8 @@ pub mod util;
 
 pub use adapter::{Adapter, ColumnInfo, QueryResult};
 pub use artifacts::{
-    ArtifactWriter, GraphArtifactFile, ManifestArtifact, PlanArtifact, RunArtifact, SCHEMA_VERSION,
+    ArtifactWriter, ColumnLineageArtifact, GraphArtifactFile, LineageArtifact, ManifestArtifact,
+    ModelLineageArtifact, PlanArtifact, RunArtifact, SCHEMA_VERSION,
 };
 pub use cancel::CancelHandle;
 pub use error::{AdapterError, EngineError};

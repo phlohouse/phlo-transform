@@ -16,6 +16,35 @@ use crate::diagnostics::{codes, Diagnostic};
 #[serde(default)]
 pub struct PhloConfig {
     pub transform: TransformConfig,
+    /// Per-model contracts, keyed by model name (dots or underscores).
+    pub model: BTreeMap<String, ModelContractConfig>,
+}
+
+/// A `[model.<name>]` section.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ModelContractConfig {
+    /// `[model.<name>.contract]`.
+    pub contract: ContractSettings,
+    /// `[model.<name>.columns.<column>]`.
+    pub columns: BTreeMap<String, ColumnContractConfig>,
+}
+
+/// The `[model.<name>.contract]` settings.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ContractSettings {
+    /// When true, contract violations are errors; otherwise warnings.
+    pub enforced: bool,
+}
+
+/// A `[model.<name>.columns.<column>]` section.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ColumnContractConfig {
+    #[serde(rename = "type")]
+    pub data_type: Option<String>,
+    pub nullable: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

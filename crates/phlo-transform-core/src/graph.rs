@@ -314,6 +314,7 @@ mod tests {
             schema: Default::default(),
             limitations: Vec::new(),
             assertions: Vec::new(),
+            contract: None,
             pinned_id: None,
             dependencies,
             id,

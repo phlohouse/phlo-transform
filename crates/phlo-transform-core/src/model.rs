@@ -12,6 +12,7 @@ use phlo_transform_sql::{Directives, Materialization};
 
 use crate::diagnostics::Diagnostic;
 use crate::identity::{ModelId, Namespace};
+use crate::semantic::ModelContract;
 
 /// Identifies a transform root within a project.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -205,6 +206,8 @@ pub struct SemanticModel {
     pub sql: String,
     pub directives: Directives,
     pub config: ModelConfig,
+    /// Explicit contract, when declared in `phlo.toml`.
+    pub contract: Option<ModelContract>,
     pub origin: ModelOrigin,
 }
 
@@ -224,6 +227,7 @@ impl SemanticModel {
             sql: sql.into(),
             directives: Directives::default(),
             config: ModelConfig::default(),
+            contract: None,
             origin: ModelOrigin::in_memory(),
         }
     }

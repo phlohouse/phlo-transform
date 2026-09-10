@@ -51,6 +51,56 @@ pub struct RunArtifact {
     pub run: RunResult,
 }
 
+/// `lineage.json`.
+#[derive(Clone, Debug, Serialize)]
+pub struct LineageArtifact {
+    pub schema_version: u32,
+    pub models: Vec<ModelLineageArtifact>,
+}
+
+/// Column lineage for one model.
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelLineageArtifact {
+    pub model: String,
+    pub columns: Vec<ColumnLineageArtifact>,
+}
+
+/// Lineage of one output column.
+#[derive(Clone, Debug, Serialize)]
+pub struct ColumnLineageArtifact {
+    pub column: String,
+    pub data_type: String,
+    pub nullability: String,
+    pub inputs: Vec<String>,
+}
+
+impl LineageArtifact {
+    pub fn from_compilation(compilation: &Compilation) -> Self {
+        let models = compilation
+            .models
+            .iter()
+            .map(|model| ModelLineageArtifact {
+                model: model.id.logical_name(),
+                columns: model
+                    .schema
+                    .columns
+                    .iter()
+                    .map(|column| ColumnLineageArtifact {
+                        column: column.name.clone(),
+                        data_type: column.data_type.to_string(),
+                        nullability: column.nullability.to_string(),
+                        inputs: column.inputs.iter().map(|input| input.display()).collect(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        Self {
+            schema_version: SCHEMA_VERSION,
+            models,
+        }
+    }
+}
+
 /// Writes execution artifacts to a directory.
 pub struct ArtifactWriter {
     directory: PathBuf,
@@ -94,7 +144,8 @@ impl ArtifactWriter {
                 schema_version: SCHEMA_VERSION,
                 graph: compilation.graph_artifact(),
             },
-        )
+        )?;
+        self.write("lineage", &LineageArtifact::from_compilation(compilation))
     }
 
     /// Write `plan.json`.
