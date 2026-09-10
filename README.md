@@ -47,7 +47,8 @@ phlo-transform -r path/to/dbt-project translate --from dbt --check   # analyse
 phlo-transform -r path/to/dbt-project translate --from dbt --out generated/ --verify
 ```
 
-See [`docs/dbt-migration.md`](docs/dbt-migration.md) for what is translated,
+See [`docs/dbt-migration-guide.md`](docs/dbt-migration-guide.md) for a guided
+walkthrough and [`docs/dbt-migration.md`](docs/dbt-migration.md) for what is translated,
 the `CLEAN`/`REVIEW`/`UNSUPPORTED` classification, and the report format.
 
 ## Status
@@ -186,7 +187,7 @@ runs a disposable container and is executed explicitly in CI.
 - [Phase 1 engine architecture](docs/engine.md)
 - [Phase 2 semantic compiler](docs/semantic.md)
 - [Phase 3 state-aware execution](docs/state.md)
-- [dbt migration](docs/dbt-migration.md)
+- [dbt migration](docs/dbt-migration.md) and the [migration guide](docs/dbt-migration-guide.md)
 - [Phase 4 incremental models](docs/incremental.md)
 - [Phase 5 Nessie and WAP](docs/wap.md)
 - [Phase 6 native data diff](docs/diff.md)

@@ -1,5 +1,8 @@
 # dbt migration
 
+> For a guided end-to-end walkthrough (analysis → translation → running on
+> DuckDB), see [`dbt-migration-guide.md`](dbt-migration-guide.md).
+
 `phlo-transform translate --from dbt` analyses a dbt project and emits the
 smallest equivalent native Phlo workspace. It is a one-way translator, not a
 dbt compatibility runtime: all dbt semantics live in the
