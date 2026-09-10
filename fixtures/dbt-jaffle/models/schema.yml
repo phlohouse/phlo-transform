@@ -1,0 +1,31 @@
+version: 2
+
+sources:
+  - name: raw
+    database: warehouse
+    schema: raw_lims
+    tables:
+      - name: customers
+        identifier: raw_customers
+        description: LIMS customer export
+      - name: orders
+        columns:
+          - name: id
+            tests: [unique, not_null]
+          - name: status
+            tests:
+              - accepted_values:
+                  values: ['placed', 'shipped', 'cancelled']
+
+models:
+  - name: customers
+    description: Customer mart with order counts
+    meta:
+      owner: analytics
+    columns:
+      - name: customer_id
+        tests: [unique, not_null]
+  - name: orders_incremental
+    columns:
+      - name: order_id
+        tests: [unique, not_null]

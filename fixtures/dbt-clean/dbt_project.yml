@@ -1,0 +1,7 @@
+name: cleanproj
+model-paths: ["models"]
+
+models:
+  cleanproj:
+    staging:
+      +materialized: view

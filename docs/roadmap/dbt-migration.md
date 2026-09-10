@@ -1,5 +1,10 @@
 # Parallel roadmap — dbt migration and translation
 
+> **Status: implemented.** `phlo-transform translate --from dbt` is shipped in
+> `phlo-transform-dbt`. See [`../dbt-migration.md`](../dbt-migration.md) for
+> the implemented command surface, translation table, classification rules and
+> remaining gaps. This document is the original design brief.
+
 ## Objective
 
 Provide a one-way migration tool that analyses an existing dbt project and emits the simplest equivalent native Phlo Transform project.

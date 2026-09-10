@@ -17,6 +17,7 @@ use phlo_transform_core::{
     Nullability, Relation, RelationSchema, SchemaColumn, SelectionOptions, StaticSchemaProvider,
 };
 use phlo_transform_daemon::{serve, spawn_watcher, WorkspaceService};
+use phlo_transform_duckdb::DuckDbAdapter;
 use phlo_transform_engine::{
     collect_source_states, diff, ensure_environment, promote, relation_for_source, Adapter,
     ArtifactWriter, CancelHandle, DiffPolicy, DiffRequest, DiffStrategy, EnvironmentSetup,
@@ -61,6 +62,16 @@ struct Cli {
     #[arg(long, global = true)]
     workflow: Option<String>,
 
+    /// Execution adapter: `trino` or `duckdb`. Defaults to `trino` when a
+    /// Trino endpoint is configured.
+    #[arg(long, global = true)]
+    adapter: Option<String>,
+
+    /// DuckDB database file for `--adapter duckdb`
+    /// (default `.phlo/transform/local.duckdb`; `:memory:` for transient).
+    #[arg(long, global = true)]
+    duckdb_path: Option<String>,
+
     /// Trino endpoint, e.g. http://localhost:8080.
     #[arg(long, global = true)]
     trino_endpoint: Option<String>,
@@ -89,7 +100,8 @@ struct Cli {
     #[arg(long = "ref", global = true)]
     reference: Option<String>,
 
-    /// Base Nessie reference to create a candidate from (default `main`).
+    /// Base Nessie reference to create a candidate from (default `main`);
+    /// for `translate`, the source format (e.g. `--from dbt`).
     #[arg(long, global = true)]
     from: Option<String>,
 
@@ -192,6 +204,33 @@ enum Command {
         #[arg(long)]
         sample: Option<f64>,
     },
+    /// Translate a foreign project into a native Phlo workspace
+    /// (`--from dbt`; `--from` is a global flag).
+    Translate {
+        /// Analysis only: print the migration report, write nothing.
+        #[arg(long)]
+        check: bool,
+        /// Directory to write the translated workspace into.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Overwrite existing files in the output directory.
+        #[arg(long)]
+        overwrite: bool,
+        /// Run `phlo-transform check` on the generated workspace afterwards.
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Explain a model: identity, dependencies, planned action and reasons.
+    Explain {
+        /// Model name (`assay.results`) or URI (`model://assay/results`).
+        model: String,
+    },
+    /// Diagnose the workspace and execution environment.
+    Doctor,
+    /// Scaffold a new Phlo workspace at `--root`.
+    Init,
+    /// Print the last generated manifest artifact.
+    Manifest,
     /// Run the local semantic service.
     Daemon {
         /// Local port to bind.
@@ -224,12 +263,22 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: &Cli) -> Result<ExitCode, String> {
-    if let Command::Daemon {
-        port,
-        watch_interval_ms,
-    } = &cli.command
-    {
-        return run_daemon(cli, *port, *watch_interval_ms).await;
+    // Commands that do not need a valid Phlo workspace at --root.
+    match &cli.command {
+        Command::Daemon {
+            port,
+            watch_interval_ms,
+        } => return run_daemon(cli, *port, *watch_interval_ms).await,
+        Command::Translate {
+            check,
+            out,
+            overwrite,
+            verify,
+        } => return run_translate(cli, *check, out.as_ref(), *overwrite, *verify),
+        Command::Init => return run_init(cli),
+        Command::Doctor => return run_doctor(cli).await,
+        Command::Manifest => return run_manifest(cli),
+        _ => {}
     }
 
     let mut project = match load_project(&cli.root) {
@@ -291,6 +340,10 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
         Command::Test => run_test(cli, &compilation).await,
         Command::Lineage { target } => run_lineage(cli, &compilation, target),
         Command::Impact { column } => run_impact(cli, &compilation, column),
+        Command::Explain { model } => run_explain(cli, &compilation, model).await,
+        Command::Translate { .. } | Command::Doctor | Command::Init | Command::Manifest => {
+            unreachable!("handled before workspace load")
+        }
         Command::Promote {
             candidate,
             to,
@@ -1022,12 +1075,26 @@ struct TestOutcome {
 }
 
 fn build_adapter(cli: &Cli) -> Result<Arc<dyn Adapter>, String> {
+    match cli.adapter.as_deref() {
+        Some("duckdb") => return build_duckdb(cli),
+        Some("trino") | None => {}
+        Some(other) => {
+            return Err(format!(
+                "unknown adapter `{other}` (expected `trino` or `duckdb`)"
+            ));
+        }
+    }
+    // `--duckdb-path` implies the DuckDB adapter for convenience.
+    if cli.duckdb_path.is_some() {
+        return build_duckdb(cli);
+    }
     let endpoint = cli
         .trino_endpoint
         .clone()
         .or_else(|| std::env::var("PHLO_TRINO_ENDPOINT").ok())
         .ok_or_else(|| {
-            "no target configured: pass --trino-endpoint or set PHLO_TRINO_ENDPOINT".to_string()
+            "no target configured: pass --trino-endpoint/--adapter trino, or --adapter duckdb for local execution"
+                .to_string()
         })?;
     let user = cli
         .trino_user
@@ -1056,6 +1123,29 @@ fn build_adapter(cli: &Cli) -> Result<Arc<dyn Adapter>, String> {
     Ok(Arc::new(adapter))
 }
 
+fn build_duckdb(cli: &Cli) -> Result<Arc<dyn Adapter>, String> {
+    let adapter = match cli.duckdb_path.as_deref() {
+        Some(":memory:") => DuckDbAdapter::in_memory(),
+        Some(path) => {
+            let path = PathBuf::from(path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                cli.root.join(path)
+            };
+            DuckDbAdapter::open(&path)
+        }
+        None => DuckDbAdapter::open(
+            &cli.root
+                .join(".phlo")
+                .join("transform")
+                .join("local.duckdb"),
+        ),
+    }
+    .map_err(|error| error.to_string())?;
+    Ok(Arc::new(adapter))
+}
+
 fn state_path(cli: &Cli) -> PathBuf {
     cli.root.join(".phlo").join("transform").join("state.db")
 }
@@ -1068,6 +1158,7 @@ fn should_enrich(cli: &Cli) -> bool {
             Command::Inspect { .. }
                 | Command::Lineage { .. }
                 | Command::Impact { .. }
+                | Command::Explain { .. }
                 | Command::Plan
                 | Command::Apply
                 | Command::Run
@@ -1555,5 +1646,409 @@ async fn run_daemon(cli: &Cli, port: u16, watch_interval_ms: u64) -> Result<Exit
     serve(service, address)
         .await
         .map_err(|error| error.to_string())?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `translate --from dbt`: analyse a dbt project and optionally emit a native
+/// Phlo workspace. Analysis is the default; writing requires `--out`.
+fn run_translate(
+    cli: &Cli,
+    check: bool,
+    out: Option<&PathBuf>,
+    overwrite: bool,
+    verify: bool,
+) -> Result<ExitCode, String> {
+    match cli.from.as_deref() {
+        Some("dbt") => {}
+        Some(other) => {
+            return Err(format!(
+                "unknown translation source `{other}`; only `--from dbt` is supported"
+            ));
+        }
+        None => return Err("translate requires --from <format> (e.g. --from dbt)".to_string()),
+    }
+
+    let project = phlo_transform_dbt::load(&cli.root).map_err(|error| error.to_string())?;
+    let translation = phlo_transform_dbt::translate(&project);
+
+    let mut wrote = false;
+    let mut verify_report: Option<CheckReport> = None;
+    if !check {
+        let out = out.ok_or_else(|| {
+            "writing requires --out <dir> (or use --check for analysis only)".to_string()
+        })?;
+        let conflicts: Vec<String> = translation
+            .files
+            .iter()
+            .map(|file| file.rel_path.clone())
+            .filter(|rel| out.join(rel).exists())
+            .collect();
+        if !overwrite && !conflicts.is_empty() {
+            return Err(format!(
+                "refusing to overwrite {} existing file(s) in {}: {} (pass --overwrite)",
+                conflicts.len(),
+                out.display(),
+                conflicts.join(", ")
+            ));
+        }
+        phlo_transform_dbt::write_translation(out, &translation)
+            .map_err(|error| error.to_string())?;
+        wrote = true;
+
+        if verify {
+            match load_project(out) {
+                Ok(generated) => {
+                    verify_report = Some(compile(&generated).check_report());
+                }
+                Err(diagnostics) => {
+                    verify_report = Some(CheckReport {
+                        ok: false,
+                        workspace_root: out.to_string_lossy().to_string(),
+                        roots: Vec::new(),
+                        model_count: 0,
+                        source_count: 0,
+                        test_count: 0,
+                        diagnostics,
+                    });
+                }
+            }
+        }
+    }
+
+    if cli.json {
+        let mut value = serde_json::to_value(&translation.report)
+            .map_err(|error| format!("could not serialise JSON: {error}"))?;
+        value["wrote_files"] = serde_json::json!(wrote);
+        if let Some(report) = &verify_report {
+            value["generated_check"] = serde_json::to_value(report)
+                .map_err(|error| format!("could not serialise JSON: {error}"))?;
+        }
+        print_json(&value)?;
+    } else {
+        print!("{}", translation.report.render_human());
+        if wrote {
+            println!(
+                "\nWrote {} file(s) to {}",
+                translation.files.len(),
+                out.map(|o| o.display().to_string()).unwrap_or_default()
+            );
+            println!("Manifest: .phlo/migration/dbt-translation.json");
+        }
+        if let Some(report) = &verify_report {
+            println!();
+            print_check_human(report);
+            if !report.ok {
+                render_diagnostics(&report.diagnostics);
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `init`: scaffold a minimal runnable workspace.
+fn run_init(cli: &Cli) -> Result<ExitCode, String> {
+    let root = &cli.root;
+    if root.join("phlo.toml").exists() || root.join("transforms").exists() {
+        return Err(format!(
+            "{} already looks like a Phlo workspace (phlo.toml or transforms/ exists)",
+            root.display()
+        ));
+    }
+    std::fs::create_dir_all(root.join("transforms/example"))
+        .and_then(|_| std::fs::create_dir_all(root.join("tests")))
+        .map_err(|error| format!("could not create workspace: {error}"))?;
+
+    std::fs::write(
+        root.join("phlo.toml"),
+        "[transform]\n# default_namespace = \"main\"   # for models directly under transforms/\n# default_materialization = \"view\"\n",
+    )
+    .map_err(|error| error.to_string())?;
+    std::fs::write(
+        root.join("transforms/example/raw_events.sql"),
+        "-- @table\n-- @key id\n\nselect 1 as id, 'signup' as kind, date '2024-01-01' as ts\nunion all\nselect 2, 'purchase', date '2024-01-01'\nunion all\nselect 3, 'signup', date '2024-01-02'\n",
+    )
+    .map_err(|error| error.to_string())?;
+    std::fs::write(
+        root.join("transforms/example/daily_events.sql"),
+        "select\n    ts,\n    kind,\n    count(*) as events\nfrom example.raw_events\ngroup by ts, kind\n",
+    )
+    .map_err(|error| error.to_string())?;
+    std::fs::write(
+        root.join("tests/daily_events_id_present.sql"),
+        "select * from example.daily_events where ts is null or kind is null\n",
+    )
+    .map_err(|error| error.to_string())?;
+
+    // Keep the state database and generated artifacts out of version control.
+    let gitignore = root.join(".gitignore");
+    let existing = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    if !existing.lines().any(|line| line.trim() == ".phlo/") {
+        let mut contents = existing;
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            contents.push('\n');
+        }
+        contents.push_str(".phlo/\n");
+        std::fs::write(&gitignore, contents).map_err(|error| error.to_string())?;
+    }
+
+    let payload = serde_json::json!({
+        "ok": true,
+        "root": root.display().to_string(),
+        "files": [
+            "phlo.toml",
+            "transforms/example/raw_events.sql",
+            "transforms/example/daily_events.sql",
+            "tests/daily_events_id_present.sql",
+        ],
+        "next": [
+            "phlo-transform check",
+            "phlo-transform run --adapter duckdb",
+        ],
+    });
+    if cli.json {
+        print_json(&payload)?;
+    } else {
+        println!("Initialised a Phlo workspace at {}", root.display());
+        println!();
+        println!("Next:");
+        println!("  phlo-transform check");
+        println!("  phlo-transform run --adapter duckdb");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A single doctor check result.
+#[derive(serde::Serialize)]
+struct DoctorCheck {
+    name: &'static str,
+    /// `ok`, `warn`, or `fail`.
+    status: &'static str,
+    detail: String,
+}
+
+/// `doctor`: diagnose the workspace, configuration, and adapter.
+async fn run_doctor(cli: &Cli) -> Result<ExitCode, String> {
+    let mut checks = Vec::new();
+    let mut failed = false;
+
+    let mut record = |check: DoctorCheck| {
+        if check.status == "fail" {
+            failed = true;
+        }
+        checks.push(check);
+    };
+
+    // 1. Workspace root.
+    let looks_like_workspace = cli.root.join("phlo.toml").exists()
+        || cli.root.join("transforms").is_dir()
+        || cli.root.join("workflows").is_dir();
+    record(DoctorCheck {
+        name: "workspace",
+        status: if cli.root.is_dir() && looks_like_workspace {
+            "ok"
+        } else {
+            "fail"
+        },
+        detail: if looks_like_workspace {
+            format!("{}", cli.root.display())
+        } else {
+            format!(
+                "no phlo.toml, transforms/ or workflows/ under {}; run `phlo-transform init`",
+                cli.root.display()
+            )
+        },
+    });
+
+    // 2. Project discovery + compilation.
+    match load_project(&cli.root) {
+        Ok(project) => {
+            let compilation = compile(&project);
+            let check = compilation.check_report();
+            let errors = compilation
+                .diagnostics
+                .iter()
+                .filter(|d| matches!(d.severity, phlo_transform_core::Severity::Error))
+                .count();
+            record(DoctorCheck {
+                name: "compile",
+                status: if compilation.is_ok() { "ok" } else { "fail" },
+                detail: format!(
+                    "{} models, {} sources, {} tests; {} error(s)",
+                    check.model_count, check.source_count, check.test_count, errors
+                ),
+            });
+        }
+        Err(diagnostics) => {
+            record(DoctorCheck {
+                name: "compile",
+                status: "fail",
+                detail: format!("project failed to load ({} diagnostics)", diagnostics.len()),
+            });
+        }
+    }
+
+    // 3. Adapter connectivity.
+    match build_adapter(cli) {
+        Ok(adapter) => {
+            let name = adapter.name().to_string();
+            match adapter.execute("select 1").await {
+                Ok(_) => record(DoctorCheck {
+                    name: "adapter",
+                    status: "ok",
+                    detail: format!("{name} is reachable"),
+                }),
+                Err(error) => record(DoctorCheck {
+                    name: "adapter",
+                    status: "fail",
+                    detail: format!("{name} connection failed: {error}"),
+                }),
+            }
+        }
+        Err(error) => record(DoctorCheck {
+            name: "adapter",
+            status: "warn",
+            detail: format!("{error} (only needed for plan/apply/test)"),
+        }),
+    }
+
+    // 4. State store.
+    match SqliteStateStore::open(&state_path(cli)) {
+        Ok(_) => record(DoctorCheck {
+            name: "state",
+            status: "ok",
+            detail: state_path(cli).display().to_string(),
+        }),
+        Err(error) => record(DoctorCheck {
+            name: "state",
+            status: "fail",
+            detail: format!("could not open state store: {error}"),
+        }),
+    }
+
+    if cli.json {
+        print_json(&serde_json::json!({ "ok": !failed, "checks": checks }))?;
+    } else {
+        for check in &checks {
+            println!(
+                "  {:<4} {:<10} {}",
+                check.status.to_uppercase(),
+                check.name,
+                check.detail
+            );
+        }
+        println!();
+        println!(
+            "{}",
+            if failed {
+                "doctor found problems"
+            } else {
+                "everything looks healthy"
+            }
+        );
+    }
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// `manifest`: print the generated manifest artifact.
+fn run_manifest(cli: &Cli) -> Result<ExitCode, String> {
+    let path = artifact_path(cli, "manifest.json");
+    let text = std::fs::read_to_string(&path).map_err(|_| {
+        format!(
+            "no manifest at {}; run `phlo-transform plan` first",
+            path.display()
+        )
+    })?;
+    if cli.json {
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|error| format!("invalid manifest: {error}"))?;
+        print_json(&value)?;
+    } else {
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|error| format!("invalid manifest: {error}"))?;
+        println!("Manifest: {}", path.display());
+        if let Some(models) = value.get("models").and_then(|m| m.as_array()) {
+            println!("Models ({})", models.len());
+            for model in models {
+                println!(
+                    "  {:<28} [{}] {}",
+                    model.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                    model
+                        .get("materialization")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?"),
+                    model.get("target").and_then(|v| v.as_str()).unwrap_or("?")
+                );
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `explain <model>`: identity, dependencies, state and planned action.
+async fn run_explain(
+    cli: &Cli,
+    compilation: &Compilation,
+    model: &str,
+) -> Result<ExitCode, String> {
+    let id = ModelId::parse(model)
+        .map_err(|error| format!("invalid model reference `{model}`: {error}"))?;
+    let Some(report) = compilation.inspect_report(&id) else {
+        return Err(format!("no such model: {}", id.logical_name()));
+    };
+    let compiled = compilation.model(&id).expect("inspect report exists");
+
+    // Scope a plan to this model when an adapter is available.
+    let mut plan_model: Option<serde_json::Value> = None;
+    if build_adapter(cli).is_ok() {
+        let mut sel = selection(cli);
+        sel.select = vec![id.logical_name()];
+        let selected = select_models(compilation, &sel);
+        if let Ok(adapter) = build_adapter(cli) {
+            let planner = Planner::new(adapter, open_state(cli));
+            if let Ok(plan) = planner.plan(compilation, &selected, environment(cli)).await {
+                if let Some(entry) = plan
+                    .models
+                    .iter()
+                    .find(|entry| entry.id == id.to_string() || entry.id == id.logical_name())
+                {
+                    plan_model = Some(
+                        serde_json::to_value(entry)
+                            .map_err(|error| format!("could not serialise JSON: {error}"))?,
+                    );
+                }
+            }
+        }
+    }
+
+    if cli.json {
+        print_json(&serde_json::json!({
+            "model": report,
+            "version": compiled.version.hash,
+            "plan": plan_model,
+        }))?;
+    } else {
+        print_inspect_human(&report);
+        println!("Version:       {}", compiled.version.short());
+        if let Some(plan) = &plan_model {
+            println!(
+                "Action:        {}",
+                plan.get("action").and_then(|v| v.as_str()).unwrap_or("?")
+            );
+            if let Some(reasons) = plan.get("reasons").and_then(|v| v.as_array()) {
+                for reason in reasons {
+                    if let Some(label) = reason.as_str() {
+                        println!("  reason: {label}");
+                    }
+                }
+            }
+        } else {
+            println!("Action:        (unknown — no adapter configured)");
+        }
+        println!();
+    }
     Ok(ExitCode::SUCCESS)
 }

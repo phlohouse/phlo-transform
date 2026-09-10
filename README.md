@@ -15,6 +15,41 @@ It is intentionally not a dbt compatibility project. The goal is a smaller, more
 - Iceberg/Nessie-native: use versioned table state and branches for environments, WAP and promotion.
 - Agent-native: expose structured compiler truth through JSON artifacts and APIs.
 
+## Getting started
+
+Build the CLI:
+
+```bash
+cargo install --path crates/phlo-transform-cli   # installs `phlo-transform`
+# or: cargo build --release -p phlo-transform-cli
+```
+
+Scaffold and run a workspace locally — no external services required, the
+bundled DuckDB adapter executes in-process:
+
+```bash
+phlo-transform init                       # creates phlo.toml, transforms/, tests/
+phlo-transform check                      # compile and diagnose the workspace
+phlo-transform plan --adapter duckdb      # what would change, and why
+phlo-transform run --adapter duckdb       # plan + apply + tests
+phlo-transform explain example.daily_events
+phlo-transform doctor                     # workspace/config/adapter health
+```
+
+To target Trino instead, set `PHLO_TRINO_ENDPOINT` (plus
+`PHLO_TRINO_USER`/`PHLO_TRINO_CATALOG`/`PHLO_TRINO_SCHEMA`) or pass
+`--trino-endpoint` and friends; see [`docs/engine.md`](docs/engine.md).
+
+Migrating a dbt project:
+
+```bash
+phlo-transform -r path/to/dbt-project translate --from dbt --check   # analyse
+phlo-transform -r path/to/dbt-project translate --from dbt --out generated/ --verify
+```
+
+See [`docs/dbt-migration.md`](docs/dbt-migration.md) for what is translated,
+the `CLEAN`/`REVIEW`/`UNSUPPORTED` classification, and the report format.
+
 ## Status
 
 Audited against code and tests. Phases 0–1 are complete; Phases 2–8 are
@@ -74,9 +109,15 @@ implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
   reload. See [`docs/daemon.md`](docs/daemon.md). Missing: a plan endpoint,
   dependency-aware targeted invalidation (reload is a full recompile), the
   benchmark, and push diagnostics.
-- **dbt migration (parallel): not started.** The frontend-agnostic
-  `SemanticProject` boundary from Phase 0 exists; there is no importer or
-  `translate` command.
+- **dbt migration: implemented.** `translate --from dbt` lowers dbt
+  projects (`ref()`/`source()`/`var()`, materialisations, keys, tests, tags,
+  config inheritance) into native `.sql` directives + `phlo.toml`/
+  `transform.toml`, classifies every resource `CLEAN`/`REVIEW`/`UNSUPPORTED`,
+  and writes a report + `.phlo/migration/dbt-translation.json` manifest. See
+  [`docs/dbt-migration.md`](docs/dbt-migration.md).
+- **Adapters: Trino + DuckDB.** `--adapter duckdb` runs everything locally
+  with no infrastructure; `--adapter trino` targets a Trino cluster. See the
+  adapter boundary in [`docs/engine.md`](docs/engine.md).
 
 All eight numbered phases have implementations; only Phases 0–1 are complete
 against their acceptance criteria.
@@ -98,15 +139,23 @@ mise exec -- rustc --version
 phlo-transform --root <workspace> check
 phlo-transform --root <workspace> list
 phlo-transform --root <workspace> inspect assay.results
+phlo-transform --root <workspace> explain assay.results
 
-# Engine (requires a Trino target)
+# Engine — local, no infrastructure (DuckDB)
+phlo-transform --root <workspace> plan --adapter duckdb
+phlo-transform --root <workspace> apply --adapter duckdb
+phlo-transform --root <workspace> run --adapter duckdb
+phlo-transform --root <workspace> test --adapter duckdb
+
+# Engine — Trino target
 export PHLO_TRINO_ENDPOINT=http://localhost:8080
 export PHLO_TRINO_CATALOG=memory
 export PHLO_TRINO_SCHEMA=default
 phlo-transform --root <workspace> plan
-phlo-transform --root <workspace> apply
-phlo-transform --root <workspace> run
-phlo-transform --root <workspace> test
+
+# Migration and diagnostics
+phlo-transform --root <dbt-project> translate --from dbt --check
+phlo-transform doctor
 
 # Every command supports --json
 phlo-transform --root <workspace> --json plan
@@ -137,6 +186,7 @@ runs a disposable container and is executed explicitly in CI.
 - [Phase 1 engine architecture](docs/engine.md)
 - [Phase 2 semantic compiler](docs/semantic.md)
 - [Phase 3 state-aware execution](docs/state.md)
+- [dbt migration](docs/dbt-migration.md)
 - [Phase 4 incremental models](docs/incremental.md)
 - [Phase 5 Nessie and WAP](docs/wap.md)
 - [Phase 6 native data diff](docs/diff.md)

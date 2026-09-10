@@ -85,8 +85,15 @@ pub trait Adapter: Send + Sync {
     async fn execute(&self, sql: &str) -> Result<QueryResult, AdapterError>;
     async fn create_or_replace_view(&self, relation: &Relation, sql: &str) -> Result<QueryResult, AdapterError>;
     async fn create_or_replace_table(&self, relation: &Relation, sql: &str) -> Result<QueryResult, AdapterError>;
+    async fn append(&self, relation: &Relation, sql: &str) -> Result<QueryResult, AdapterError>;
+    async fn merge(&self, relation: &Relation, key_columns: &[String], sql: &str) -> Result<QueryResult, AdapterError>;
+    async fn replace_partitions(&self, relation: &Relation, partition_columns: &[String], sql: &str) -> Result<QueryResult, AdapterError>;
     async fn cancel(&self, query_id: &str) -> Result<(), AdapterError>;
     async fn relation_columns(&self, relation: &Relation) -> Result<Vec<ColumnInfo>, AdapterError>;
+    async fn ensure_catalog(&self, request: &CatalogRequest) -> Result<(), AdapterError>;
+    async fn ensure_schema(&self, relation: &Relation) -> Result<(), AdapterError>;
+    async fn source_state(&self, relation: &Relation) -> Result<Option<String>, AdapterError>;
+    async fn partition_counts(&self, relation: &Relation, partition_columns: &[String]) -> Result<Option<Vec<(String, i64)>>, AdapterError>;
 }
 ```
 
@@ -97,6 +104,18 @@ directly (`POST /v1/statement`, follow `nextUri`), supports optional basic
 auth and session catalog/schema, returns query IDs, and maps Trino error names
 into adapter error codes. `create_or_replace_table` performs
 `DROP TABLE IF EXISTS` then `CREATE TABLE ... AS`.
+
+The DuckDB adapter (`phlo-transform-duckdb`) embeds DuckDB in-process and is
+the zero-infrastructure local path. `merge` is emulated as delete-then-insert
+on the key columns so behaviour does not depend on the bundled DuckDB
+version; `source_state` falls back to a schema fingerprint. Select it with
+`--adapter duckdb` (or `--duckdb-path <file>`; `:memory:` is transient). The
+default database file is `.phlo/transform/local.duckdb`.
+
+```bash
+phlo-transform run --adapter duckdb
+phlo-transform plan --adapter duckdb --duckdb-path /tmp/demo.duckdb
+```
 
 Configuration is supplied by the CLI and environment, not committed project
 files:

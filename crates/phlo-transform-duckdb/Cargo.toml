@@ -1,0 +1,20 @@
+[package]
+name = "phlo-transform-duckdb"
+description = "Embedded DuckDB adapter for Phlo Transform — the local execution path."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+duckdb = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+phlo-transform-core = { workspace = true }
+phlo-transform-engine = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

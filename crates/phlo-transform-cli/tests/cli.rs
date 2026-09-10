@@ -153,3 +153,86 @@ fn impact_accepts_a_model_argument() {
     assert!(body.contains("assay.results"), "{body}");
     assert!(body.contains("reporting.monthly"), "{body}");
 }
+
+#[test]
+fn init_scaffolds_a_runnable_workspace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_str().expect("utf-8 path");
+    let output = run(&["--root", root, "init"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+
+    let output = run(&["--root", root, "check"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+
+    let output = run(&["--root", root, "--json", "list"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    assert!(stdout(&output).contains("example.raw_events"));
+}
+
+#[test]
+fn doctor_reports_on_a_workspace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_str().expect("utf-8 path");
+    // Uninitialised directory: workspace check fails.
+    let output = run(&["--root", root, "--json", "doctor"]);
+    assert!(!output.status.success());
+    assert!(stdout(&output).contains("\"workspace\""));
+}
+
+#[test]
+fn translate_dbt_check_reports_classification() {
+    let output = run(&[
+        "--root",
+        "fixtures/dbt-jaffle",
+        "--json",
+        "translate",
+        "--from",
+        "dbt",
+        "--check",
+    ]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("report JSON");
+    let resources = report["resources"].as_array().expect("resources");
+    let class_of = |name: &str| {
+        resources
+            .iter()
+            .find(|r| r["name"].as_str().unwrap_or_default().ends_with(name))
+            .map(|r| r["classification"].as_str().unwrap_or_default().to_string())
+            .unwrap_or_else(|| format!("missing {name}"))
+    };
+    assert_eq!(class_of("customers"), "CLEAN");
+    assert_eq!(class_of("orders_incremental"), "CLEAN");
+    assert_eq!(class_of("labelled"), "REVIEW");
+    assert_eq!(class_of("orders_snapshot"), "UNSUPPORTED");
+}
+
+#[test]
+fn translate_dbt_writes_and_verifies() {
+    let out_dir = tempfile::tempdir().expect("tempdir");
+    let out = out_dir.path().join("generated");
+    let output = run(&[
+        "--root",
+        "fixtures/dbt-clean",
+        "translate",
+        "--from",
+        "dbt",
+        "--out",
+        out.to_str().expect("utf-8"),
+        "--verify",
+    ]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    assert!(out.join("transforms/staging/stg_events.sql").exists());
+    assert!(out.join(".phlo/migration/dbt-translation.json").exists());
+
+    // Rerun without --overwrite must refuse.
+    let output = run(&[
+        "--root",
+        "fixtures/dbt-clean",
+        "translate",
+        "--from",
+        "dbt",
+        "--out",
+        out.to_str().expect("utf-8"),
+    ]);
+    assert!(!output.status.success());
+}

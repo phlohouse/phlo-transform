@@ -1,0 +1,22 @@
+[package]
+name = "phlo-transform-dbt"
+description = "dbt-to-Phlo migration frontend for Phlo Transform."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+walkdir = { workspace = true }
+phlo-transform-sql = { workspace = true }
+
+[dev-dependencies]
+insta = { version = "1", features = ["json"] }
+tempfile = "3"
+phlo-transform-core = { workspace = true }

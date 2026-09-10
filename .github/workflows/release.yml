@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install target
+        run: rustup target add ${{ matrix.target }}
+
+      # The bundled DuckDB C++ build is heavy; release builds take a while.
+      - name: Build
+        run: cargo build --release --locked -p phlo-transform-cli --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          name=phlo-transform-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/phlo-transform" "dist/$name/"
+          cp README.md LICENSE "dist/$name/" 2>/dev/null || true
+          cd dist && tar -czf "$name.tar.gz" "$name"
+          echo "artifact=$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phlo-transform-${{ matrix.target }}
+          path: dist/${{ steps.package.outputs.artifact }}
+
+  release:
+    name: Create GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: phlo-transform-*
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.tar.gz"
+          generate_release_notes: true
