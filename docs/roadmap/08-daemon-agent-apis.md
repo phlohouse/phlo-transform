@@ -436,8 +436,10 @@ Phase 8 is complete when:
 
 ## Implementation notes
 
-Phase 8 is implemented as a local semantic HTTP/JSON service. See
+Phase 8 is **partially implemented** (audited against code and tests). See
 [`docs/daemon.md`](../daemon.md).
+
+Implemented:
 
 - `phlo-transform-daemon`: `WorkspaceService` holding an immutable compiled
   snapshot, versioned `/v1` routes for status/check/models/inspect/lineage/
@@ -447,7 +449,13 @@ Phase 8 is implemented as a local semantic HTTP/JSON service. See
 - Tests cover the HTTP surface, explicit reload and watcher-driven reload
   without restart.
 
-Not implemented: dependency-aware targeted invalidation (reload is a coherent
-full recompile), push/subscription diagnostics, LSP bridge, remote security,
-and a tracked 1,000-model benchmark.
+Missing / deviated:
+
+- No plan endpoint on the API (the roadmap lists plan information).
+- Reload is a **coherent full recompile**, not dependency-aware targeted
+  invalidation (acceptance criterion 2 is deviated).
+- No concurrency/snapshot-consistency test under simultaneous reads and writes.
+- No 1,000-model benchmark (acceptance criterion 8 unmet).
+- No push/subscription diagnostics (polling reload only), no LSP bridge and no
+  remote security model.
 

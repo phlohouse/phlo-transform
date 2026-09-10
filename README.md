@@ -17,49 +17,63 @@ It is intentionally not a dbt compatibility project. The goal is a smaller, more
 
 ## Status
 
+Audited against code and tests. Phases 0–1 are complete; Phases 2–8 are
+implemented but **partial**, with gaps documented in each roadmap phase's
+implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
+
 - **Phase 0 — compiler spike: done.** Multi-root discovery, stable IDs,
   ordinary-SQL dependency resolution without `ref()`, deterministic DAG,
   `check`/`list`/`inspect` with JSON. See [`docs/architecture.md`](docs/architecture.md).
 - **Phase 1 — MVP build engine: done.** Trino adapter, view/table
   materialisations, `plan`/`apply`/`run`/`test`, bounded-concurrency scheduler,
-  custom SQL tests, SQLite run history and versioned artifacts. See
-  [`docs/engine.md`](docs/engine.md).
-- **Phase 2 — typed compiler and lineage: done.** Typed semantic IR, schema
+  custom SQL tests, SQLite run history, cancellation and versioned artifacts.
+  See [`docs/engine.md`](docs/engine.md). Retries are not automated.
+- **Phase 2 — typed compiler and lineage: partial.** Typed semantic IR, schema
   provider boundary and catalogue enrichment, column resolution and type
   inference, inferred output schemas, `lineage`/`impact`, config-file schema
   contracts, `@key`/`@not-null` assertions with generated SQL tests, and a
-  `lineage.json` artifact. See [`docs/semantic.md`](docs/semantic.md).
-- **Phase 3 — state-aware execution: done.** Content-addressed model versions,
-  `SourceStateProvider`, materialised-version state, state-aware plan
+  `lineage.json` artifact. See [`docs/semantic.md`](docs/semantic.md). Gaps:
+  `lineage --upstream/--downstream` flags are ignored, offline lineage/impact
+  are empty without catalogue schemas, and nested types are coarse.
+- **Phase 3 — state-aware execution: partial.** Content-addressed model
+  versions, materialised-version state, state-aware plan
   (`build`/`skip`/`cached` with reasons) and stale-plan rejection. See
-  [`docs/state.md`](docs/state.md).
-- **Phase 4 — incremental models: done.** `@incremental`
+  [`docs/state.md`](docs/state.md). Gap: no source-state provider is wired in,
+  so source-state changes cannot currently invalidate models.
+- **Phase 4 — incremental models: partial/deviated.** `@incremental`
   append/key/partition/time-window intent, version hashing, full-rebuild
-  detection, adapter `append`/`merge`, bootstrap and schema-change
-  classification. See [`docs/incremental.md`](docs/incremental.md).
-- **Phase 5 — Nessie and WAP: done (boundary + orchestration).** `NessieClient`
-  (REST + in-memory), `--ref` environments, candidate writes, audited
-  `promote` with staleness/conflict checks, `rollback`, and a promotion
-  artifact. See [`docs/wap.md`](docs/wap.md). Live Nessie/Iceberg CI coverage
-  is not included.
-- **Phase 6 — native data diff: done.** Keyed/aggregate/full/sampled diff
-  strategies, per-column change counts, declarative policy gates, `diff.json`,
-  and a promotion diff gate. See [`docs/diff.md`](docs/diff.md).
-- **Phase 7 — workflow integration: done (transform-side).** Workflow
+  detection, adapter `append`/`merge` and bootstrap. See
+  [`docs/incremental.md`](docs/incremental.md). Gaps: partition/time-window
+  execute as full rebuilds, `merge` is not e2e-tested, schema classification is
+  not wired to the planner, and there is no watermark state.
+- **Phase 5 — Nessie and WAP: partial.** `NessieClient` (REST + in-memory),
+  `--ref` environments, audited `promote` with staleness/conflict checks,
+  `rollback`, and a promotion artifact. See [`docs/wap.md`](docs/wap.md).
+  Missing: `apply` does not write to a Nessie branch, candidate branches are
+  not created automatically, the diff/schema gates are not enforced by the
+  CLI, and there is no live Nessie/Iceberg e2e.
+- **Phase 6 — native data diff: partial/deviated.** Keyed diff with per-column
+  change counts, policies, `diff.json` and a Trino keyed-diff test. See
+  [`docs/diff.md`](docs/diff.md). Gaps: `sampled` is a label (no sampling), no
+  partition strategy, `full` equals keyed, schema changes are never populated,
+  config policies/tolerances are unparsed, and stale-diff invalidation is
+  missing.
+- **Phase 7 — workflow integration: partial (transform-side).** Workflow
   ownership, a unified typed graph artifact (`model`/`source`/`quality_gate`),
   cross-workflow dependency policy, and registered consumers in impact. See
-  [`docs/workflow.md`](docs/workflow.md). Host-side tasks/`workflow.toml`
-  remain with the wider Phlo host.
-- **Phase 8 — daemon and agent APIs: done (local service).** A versioned
+  [`docs/workflow.md`](docs/workflow.md). Missing: host workflow graph/tasks, a
+  transform-group invocation API, run correlation, gating API and e2e.
+- **Phase 8 — daemon and agent APIs: partial (local service).** A versioned
   local HTTP/JSON semantic service with a coherent snapshot, file watcher and
-  reload. See [`docs/daemon.md`](docs/daemon.md). Targeted invalidation, LSP and
-  remote security are deferred.
+  reload. See [`docs/daemon.md`](docs/daemon.md). Missing: a plan endpoint,
+  dependency-aware targeted invalidation (reload is a full recompile), the
+  benchmark, and push diagnostics.
+- **dbt migration (parallel): not started.** The frontend-agnostic
+  `SemanticProject` boundary from Phase 0 exists; there is no importer or
+  `translate` command.
 
-All eight roadmap phases are implemented.
-
-All eight roadmap phases are implemented. Later opportunities (targeted
-invalidation, LSP, remote service security, distribution statistics) are noted
-in the phase docs.
+All eight numbered phases have implementations; only Phases 0–1 are complete
+against their acceptance criteria.
 
 ## Toolchain
 

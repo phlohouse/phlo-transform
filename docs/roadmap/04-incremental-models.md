@@ -278,8 +278,8 @@ Phase 4 is complete when:
 
 ## Implementation notes
 
-Phase 4 is implemented at the representation/planning/execution level. See
-[`docs/incremental.md`](../incremental.md).
+Phase 4 is **partially implemented and partly deviated** (audited against code
+and tests). See [`docs/incremental.md`](../incremental.md).
 
 - `@incremental` directives and `[model.<name>.incremental]` config parse into
   `IncrementalStrategy` (`append`/`key`/`partition`/`time-window`); key
@@ -290,6 +290,15 @@ Phase 4 is implemented at the representation/planning/execution level. See
   append, merge, or a safe full rebuild.
 - `classify_schema_change` classifies evolving schemas.
 
-Not yet implemented: precise partition/time-window execution and watermarks;
-dedicated watermark state.
+Audited gaps and deviations:
+
+- `partition` and `time-window` are represented and planned but execute as a
+  full rebuild; no partition replacement or watermark query exists.
+- `merge` SQL generation is not exercised by any test; the live Trino e2e uses
+  the memory connector, which does not support `MERGE`.
+- `classify_schema_change` is not called by the planner or diff; it exists and
+  is unit-tested only.
+- No dedicated watermark state table; failed runs simply do not record a
+  materialisation.
+- Idempotence under retry is not tested.
 

@@ -28,11 +28,13 @@ relations, the strategy, cover/part columns and coverage.
   `IS DISTINCT FROM` (null-safe).
 - **aggregate** — row-count comparison when no key is known; coverage is
   marked as aggregate only.
-- **full** — explicit full keyed comparison.
-- **sampled** — deterministic sample; coverage is recorded.
+- **full** — currently identical to keyed (no distinct full-scan strategy).
+- **sampled** — currently a **label only**: the requested `--sample` fraction
+  is recorded in the report but not applied to the generated SQL. There is no
+  `TABLESAMPLE` or recorded sampling seed yet.
 
-Keys are never configured twice: the same declaration drives incremental merge,
-assertions and diffing.
+There is no partition-based strategy. Keys are never configured twice: the
+same declaration drives incremental merge, assertions and diffing.
 
 ## Policies
 

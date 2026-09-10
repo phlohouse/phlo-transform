@@ -312,7 +312,8 @@ Phase 2 is complete when:
 
 ## Implementation notes
 
-Phase 2 is implemented. See [`docs/semantic.md`](../semantic.md).
+Phase 2 is **partially implemented** (audited against code and tests). See
+[`docs/semantic.md`](../semantic.md).
 
 Implemented:
 
@@ -333,6 +334,11 @@ Implemented:
 - integration test comparing inferred and real Trino schemas.
 
 Remaining (explicit): full Trino type-system parity and broader SQL coverage;
-richer assertion types.
+richer assertion types. Additional audited gaps: the `lineage
+--upstream/--downstream` flags are accepted but ignored (the report always
+contains both directions); `impact` human output omits registered consumers;
+offline `lineage`/`impact` return empty column results unless catalogue
+enrichment is available; nested types are coarse (`array`/`map`/`row` element
+types are unknown).
 
 

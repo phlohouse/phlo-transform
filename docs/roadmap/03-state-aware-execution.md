@@ -348,7 +348,8 @@ Phase 3 is complete when:
 
 ## Implementation notes
 
-Phase 3 is implemented. See [`docs/state.md`](../state.md).
+Phase 3 is **partially implemented** (audited against code and tests). See
+[`docs/state.md`](../state.md).
 
 - `ModelVersion` component hashes computed in dependency order during
   compilation (`core::version`); canonical AST hashing means formatting and
@@ -360,6 +361,13 @@ Phase 3 is implemented. See [`docs/state.md`](../state.md).
   `ChangeReason`s.
 - Runner records materialisations and rejects stale plans.
 - `inspect` exposes desired/current versions and status.
+
+Audited gaps: `SourceStateProvider` is only reachable through
+`compile_with_options`; the CLI and adapters never supply one, so
+`source_state_hash` is always the empty-input hash and source-state changes
+cannot currently invalidate models. `cached` classification is implemented via
+`materialized_by_hash` but has no test and no cross-environment reuse. There is
+no test exercising a `CONFIG_CHANGE` or `COMPILER_SEMANTICS_CHANGE` reason.
 
 Deferred, as listed above: cross-environment reuse, optimiser semantics,
 incremental strategies, Nessie, data diff, daemon.

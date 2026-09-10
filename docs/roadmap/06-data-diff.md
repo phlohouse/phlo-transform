@@ -402,17 +402,32 @@ Phase 6 is complete when:
 
 ## Implementation notes
 
-Phase 6 is implemented at the engine/CLI level. See [`docs/diff.md`](../diff.md).
+Phase 6 is **partially implemented and partly deviated** (audited against code
+and tests). See [`docs/diff.md`](../diff.md).
+
+Implemented:
 
 - keyed diff via warehouse-side `FULL OUTER JOIN` + `IS DISTINCT FROM`,
   reporting added/removed/modified/unchanged and per-column change counts;
-- aggregate fallback without a key, explicit `full`, and `sampled` labels with
-  coverage recorded;
+- aggregate fallback without a key, plus explicit `full` and `sampled` labels;
 - keys reused from `@incremental key=`/`@key`;
-- declarative policy gates and a `diff.json` artifact;
-- promotion gate flags (`diff_passed`/`require_diff`);
-- keyed diff correctness validated against live Trino.
+- policy evaluation (`max_*`, `require_keyed_diff`, `require_full_diff`) and a
+  `diff.json` artifact;
+- promotion request flags (`diff_passed`/`require_diff`);
+- keyed diff correctness validated against live Trino (memory connector).
 
-Deferred: partition pruning, distribution statistics, value redaction, and
-stale-diff invalidation beyond the promotion gate.
+Audited gaps and deviations:
+
+- **`sampled` is a label only**: `sample_fraction` is recorded but never applied
+  to the SQL, and no `TABLESAMPLE`/seed is used. `full` is identical to keyed.
+- **No partition strategy** exists (`DiffStrategy` has keyed/aggregate/full/
+  sampled only).
+- `schema_changes` is never populated — `attach_schema_changes` is defined but
+  unused, and `classify_schema_change` is not invoked.
+- Diff policies are not parsed from `phlo.toml` and (with `--base-relation`
+  absent) the CLI compares the model target against itself.
+- Promotion does not read a diff artifact; the diff gate flags are never set by
+  the CLI, and a changed candidate does not invalidate an earlier diff.
+- No example values and therefore no redaction (trivially safe, but the
+  bounded/redacted output requirement is unmet).
 

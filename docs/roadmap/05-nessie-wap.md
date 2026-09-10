@@ -350,18 +350,35 @@ Phase 5 is complete when:
 
 ## Implementation notes
 
-Phase 5 is implemented at the boundary and orchestration level. See
-[`docs/wap.md`](../wap.md).
+Phase 5 is **partially implemented** — the Nessie boundary and WAP orchestration
+exist, but candidate-branch execution is not wired (audited against code and
+tests). See [`docs/wap.md`](../wap.md).
+
+Implemented:
 
 - `phlo-transform-nessie`: `NessieClient` trait, REST v2 client and in-memory
   client; references, branch creation, non-destructive merge checks, merge with
   expected target hash, assign (rollback).
-- `--ref` selects the environment for plan/apply/run; state is keyed by
+- `--ref` records the environment for plan/apply/run; state is keyed by
   environment.
 - `promote` enforces a successful candidate run, target staleness and conflicts,
   and writes `promotion.json`.
 - `rollback --ref <ref> --to <hash>` moves a reference.
 
-Not covered in CI: a live Nessie/Iceberg environment (WAP orchestration is
-tested in-memory); schema-policy and Iceberg snapshot audit gates.
+Missing / deviated:
+
+- **`apply` does not write to a Nessie branch.** The Trino adapter has no
+  branch-qualified relation or session wiring; `--ref` is only an environment
+  label. Acceptance criterion 3 (apply writes candidate without changing
+  `main`) and 9 (table/view/incremental models on candidate references) are not
+  met.
+- Candidate branches are not created by Phlo; there is no `branch` command and
+  no lifecycle metadata attached to a plan/run.
+- Only a successful recorded candidate run gates promotion; schema policy is not
+  wired, and the CLI does not enforce the data-diff gate (`diff_passed` is
+  always `None`, `require_diff` always `false`).
+- No live Nessie/Iceberg integration test (WAP is tested against the in-memory
+  client only); promotion state is written to an artifact but not persisted in
+  the state store.
+- `rollback` has no test.
 

@@ -367,17 +367,26 @@ Phase 7 is complete when:
 
 ## Implementation notes
 
-Phase 7 transform-side integration is implemented. See
-[`docs/workflow.md`](../workflow.md).
+Phase 7 is **partially implemented** (transform-side only; audited against code
+and tests). See [`docs/workflow.md`](../workflow.md).
+
+Implemented:
 
 - workflow ownership derived from `workflows/<name>/transforms` roots, exposed
   in compiled models and `inspect`;
 - unified graph artifact with `model`, `source` and `quality_gate` node kinds
   and a `workflow` field on model nodes;
 - cross-workflow dependency policy (`allow`/`warn`/`error`, `DEPENDENCIES001`);
-- `ConsumerRegistry` for host-registered non-transform consumers in impact;
+- `ConsumerRegistry` for host-registered non-transform consumers in impact
+  (API only; the CLI `impact` output does not render them);
 - tests for ownership, policy and consumers.
 
-Host-side workflow tasks, `workflow.toml`, visibility and `workflow_run_id`
-correlation remain with the wider Phlo host.
+Missing: the wider Phlo workflow graph and tasks (there is no workflow engine or
+`workflow.toml` parsing in this repository); a dedicated transform-group
+invocation API (callers use `Planner`/`Runner` directly); a quality-gate
+continuation API for downstream workflow tasks; `workflow_run_id` correlation
+(runs record only an environment/reference); and end-to-end
+workflow/transform integration tests.
+
+Visibility boundaries (`@visibility`) are not implemented.
 

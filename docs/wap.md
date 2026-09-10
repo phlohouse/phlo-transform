@@ -34,8 +34,12 @@ There is no separate environment abstraction layered on top of Nessie.
 PLAN → WRITE candidate branch → AUDIT (tests) → PUBLISH (promote)
 ```
 
-`apply --ref ci/pr-1` writes the candidate; a failed run or audit leaves the
-candidate isolated and does not advance `main`.
+**Current limitation:** `apply --ref <ref>` records the environment, but the
+Trino adapter does not yet rewrite relations to a branch-qualified name, so
+execution still targets the configured catalogue/schema. Candidate-branch
+isolation is therefore not yet real; it is modelled at the reference/state
+level and in promotion. A failed run or audit still leaves promotion
+untouched.
 
 ## Promotion
 

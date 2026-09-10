@@ -26,6 +26,27 @@ The roadmap is ordered by architectural dependency rather than by marketing rele
 
 The dbt translator is deliberately **not** part of the critical path. It is a one-way migration frontend, not a dbt compatibility runtime. The core engine must remain free of dbt-specific semantics.
 
+## Implementation status
+
+Audited against code and tests (not commit messages). Legend: **done**,
+**partial** (works but with documented gaps), **missing**, **deviated**
+(implemented differently from the plan).
+
+| Phase | Status | Verified coverage / gaps |
+|---|---|---|
+| 0 compiler spike | done | discovery, IDs, `sqlparser-rs`, CTE-aware relations, resolver, DAG, diagnostics, CLI JSON; parse errors carry file but not spans |
+| 1 MVP engine | partial | Trino adapter + plan/apply/run/test, scheduler, state, artifacts, cancellation. Gaps: partition-level scheduler tests absent; retries not automated |
+| 2 typed compiler/lineage | partial | semantic IR, resolver, type inference, contracts, generated tests, lineage/impact. Gaps: `lineage --upstream/--downstream` flags ignored; offline impact/lineage empty without catalogue; nested types coarse |
+| 3 state-aware execution | partial | versions, skip/build/cached, stale plans. Gaps: `SourceStateProvider` never populated by CLI/adapters (source-state hash always empty); cached reuse untested |
+| 4 incremental models | partial/deviated | `@incremental` strategies, append/merge, bootstrap, key-change rebuild. Gaps: partition/time-window execute as full rebuild; Trino `MERGE` not e2e-verified; no watermark state; schema classification not wired to the planner |
+| 5 Nessie + WAP | partial/missing | Nessie client boundary, `promote`/`rollback`, promotion artifact. Missing: `apply` does not write to a Nessie branch; no automatic candidate branch creation; schema-policy/diff gates not enforced by CLI; no live Nessie/Iceberg e2e |
+| 6 data diff | partial/deviated | keyed diff + per-column counts + policies + Trino e2e. Deviated/missing: `sampled` is a label (no sampling); no partition strategy; `full` == keyed; schema changes never populated; config policies/tolerances unparsed; stale-diff invalidation missing |
+| 7 workflow integration | partial | ownership, typed graph with `quality_gate`, cross-workflow policy, registered consumers. Missing: host workflow tasks/graph, transform-group invocation API, run correlation, gating API, e2e |
+| 8 daemon + agent APIs | partial | versioned local HTTP API, coherent snapshot, watcher/reload, API tests. Missing: plan endpoint, targeted invalidation (full reload), benchmark, push diagnostics |
+| dbt migration | missing | Frontend-agnostic `SemanticProject` boundary exists (Phase 0); no importer or `translate` command implemented |
+
+M0 and M1 are met. M2–M4 are met only at the documented partial level above.
+
 ## Milestones
 
 ### M0 — Architecture proven
