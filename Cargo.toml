@@ -4,6 +4,7 @@ members = [
     "crates/phlo-transform-sql",
     "crates/phlo-transform-core",
     "crates/phlo-transform-engine",
+    "crates/phlo-transform-nessie",
     "crates/phlo-transform-trino",
     "crates/phlo-transform-cli",
 ]
@@ -19,6 +20,7 @@ rust-version = "1.93"
 # Internal crates.
 phlo-transform-core = { path = "crates/phlo-transform-core", version = "0.0.0" }
 phlo-transform-engine = { path = "crates/phlo-transform-engine", version = "0.0.0" }
+phlo-transform-nessie = { path = "crates/phlo-transform-nessie", version = "0.0.0" }
 phlo-transform-sql = { path = "crates/phlo-transform-sql", version = "0.0.0" }
 phlo-transform-trino = { path = "crates/phlo-transform-trino", version = "0.0.0" }
 

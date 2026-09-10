@@ -18,6 +18,7 @@ time = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 phlo-transform-core = { workspace = true }
+phlo-transform-nessie = { workspace = true }
 phlo-transform-sql = { workspace = true }
 
 [dev-dependencies]

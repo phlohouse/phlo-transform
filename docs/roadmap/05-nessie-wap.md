@@ -347,3 +347,21 @@ Phase 5 is complete when:
 - cross-catalog publication semantics;
 - data diff gates, added in Phase 6;
 - deployment UI.
+
+## Implementation notes
+
+Phase 5 is implemented at the boundary and orchestration level. See
+[`docs/wap.md`](../wap.md).
+
+- `phlo-transform-nessie`: `NessieClient` trait, REST v2 client and in-memory
+  client; references, branch creation, non-destructive merge checks, merge with
+  expected target hash, assign (rollback).
+- `--ref` selects the environment for plan/apply/run; state is keyed by
+  environment.
+- `promote` enforces a successful candidate run, target staleness and conflicts,
+  and writes `promotion.json`.
+- `rollback --ref <ref> --to <hash>` moves a reference.
+
+Not covered in CI: a live Nessie/Iceberg environment (WAP orchestration is
+tested in-memory); schema-policy and Iceberg snapshot audit gates.
+

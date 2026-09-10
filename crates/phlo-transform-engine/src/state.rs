@@ -95,6 +95,8 @@ pub trait StateStore: Send + Sync {
     fn record_model(&self, record: &ModelRunRecord) -> Result<(), EngineError>;
     fn record_test(&self, record: &TestRunRecord) -> Result<(), EngineError>;
     fn runs(&self) -> Result<Vec<RunSummary>, EngineError>;
+    /// The most recent run for an environment, if any.
+    fn latest_run(&self, environment: Option<&str>) -> Result<Option<RunSummary>, EngineError>;
 
     /// Record the version attached to a successful materialisation.
     fn record_materialized(&self, record: &MaterializedRecord) -> Result<(), EngineError>;
@@ -340,6 +342,38 @@ impl StateStore for SqliteStateStore {
             .map_err(|error| EngineError::State(error.to_string()))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| EngineError::State(error.to_string()))
+    }
+
+    fn latest_run(&self, environment: Option<&str>) -> Result<Option<RunSummary>, EngineError> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT run_id, plan_id, started_at, finished_at, status, model_count, failed_count
+                 FROM runs WHERE environment = ?1 ORDER BY started_at DESC LIMIT 1",
+            )
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        let mut rows = statement
+            .query(rusqlite::params![environment.unwrap_or("")])
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        match rows
+            .next()
+            .map_err(|error| EngineError::State(error.to_string()))?
+        {
+            Some(row) => {
+                let map = |error: rusqlite::Error| EngineError::State(error.to_string());
+                let status: String = row.get(4).map_err(map)?;
+                Ok(Some(RunSummary {
+                    run_id: row.get(0).map_err(map)?,
+                    plan_id: row.get(1).map_err(map)?,
+                    started_at: row.get(2).map_err(map)?,
+                    finished_at: row.get(3).map_err(map)?,
+                    status: parse_status(&status),
+                    model_count: row.get::<_, i64>(5).map_err(map)? as usize,
+                    failed_count: row.get::<_, i64>(6).map_err(map)? as usize,
+                }))
+            }
+            None => Ok(None),
+        }
     }
 
     fn record_materialized(&self, record: &MaterializedRecord) -> Result<(), EngineError> {

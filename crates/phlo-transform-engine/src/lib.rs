@@ -12,6 +12,7 @@ pub mod cancel;
 pub mod error;
 pub mod events;
 pub mod plan;
+pub mod promotion;
 pub mod run;
 pub mod state;
 pub mod util;
@@ -19,7 +20,7 @@ pub mod util;
 pub use adapter::{Adapter, ColumnInfo, QueryResult};
 pub use artifacts::{
     ArtifactWriter, ColumnLineageArtifact, GraphArtifactFile, LineageArtifact, ManifestArtifact,
-    ModelLineageArtifact, PlanArtifact, RunArtifact, SCHEMA_VERSION,
+    ModelLineageArtifact, PlanArtifact, PromotionArtifact, RunArtifact, SCHEMA_VERSION,
 };
 pub use cancel::CancelHandle;
 pub use error::{AdapterError, EngineError};
@@ -27,6 +28,7 @@ pub use events::{EngineEvent, ExecutionStatus};
 pub use plan::{
     dependency_closure, ChangeReason, Plan, PlanAction, PlannedModel, PlannedTest, Planner,
 };
+pub use promotion::{promote, PromotionRecord, PromotionRequest};
 pub use run::{ModelResult, RunOptions, RunResult, Runner, TestResult};
 pub use state::{
     MaterializedRecord, ModelRunRecord, RunRecord, RunSummary, SqliteStateStore, StateStore,

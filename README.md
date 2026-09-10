@@ -37,9 +37,13 @@ It is intentionally not a dbt compatibility project. The goal is a smaller, more
   append/key/partition/time-window intent, version hashing, full-rebuild
   detection, adapter `append`/`merge`, bootstrap and schema-change
   classification. See [`docs/incremental.md`](docs/incremental.md).
+- **Phase 5 — Nessie and WAP: done (boundary + orchestration).** `NessieClient`
+  (REST + in-memory), `--ref` environments, candidate writes, audited
+  `promote` with staleness/conflict checks, `rollback`, and a promotion
+  artifact. See [`docs/wap.md`](docs/wap.md). Live Nessie/Iceberg CI coverage
+  is not included.
 
-No Nessie, WAP, data diff, workflow integration or daemon yet — those are
-later phases.
+No data diff, workflow integration or daemon yet — those are later phases.
 
 ## Toolchain
 
@@ -98,3 +102,4 @@ runs a disposable container and is executed explicitly in CI.
 - [Phase 2 semantic compiler](docs/semantic.md)
 - [Phase 3 state-aware execution](docs/state.md)
 - [Phase 4 incremental models](docs/incremental.md)
+- [Phase 5 Nessie and WAP](docs/wap.md)

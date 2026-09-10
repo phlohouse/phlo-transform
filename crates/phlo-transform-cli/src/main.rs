@@ -15,9 +15,10 @@ use phlo_transform_core::{
     RelationSchema, SchemaColumn, SelectionOptions, SourceId, StaticSchemaProvider,
 };
 use phlo_transform_engine::{
-    Adapter, ArtifactWriter, CancelHandle, ExecutionStatus, Plan, PlanAction, Planner, RunOptions,
-    RunResult, Runner, SqliteStateStore, StateStore,
+    promote, Adapter, ArtifactWriter, CancelHandle, ExecutionStatus, Plan, PlanAction, Planner,
+    PromotionRequest, RunOptions, RunResult, Runner, SqliteStateStore, StateStore,
 };
+use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
 
 #[derive(Debug, Parser)]
@@ -79,6 +80,18 @@ struct Cli {
     #[arg(long, global = true)]
     environment: Option<String>,
 
+    /// Nessie reference (environment) for plan/apply.
+    #[arg(long = "ref", global = true)]
+    reference: Option<String>,
+
+    /// Nessie endpoint, e.g. http://localhost:19120.
+    #[arg(long, global = true)]
+    nessie_endpoint: Option<String>,
+
+    /// Nessie bearer token.
+    #[arg(long, global = true)]
+    nessie_token: Option<String>,
+
     /// Enrich compilation with Trino catalogue schemas for external sources.
     #[arg(long, global = true)]
     catalogue: bool,
@@ -115,6 +128,23 @@ enum Command {
     Impact {
         /// Column reference (`assay.results.concentration`).
         column: String,
+    },
+    /// Promote an audited candidate Nessie reference to a target.
+    Promote {
+        /// Candidate reference, e.g. `ci/pr-1`.
+        candidate: String,
+        /// Target reference, e.g. `main`.
+        #[arg(long)]
+        to: String,
+        /// Check preconditions without merging.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Move a Nessie reference to a previous hash.
+    Rollback {
+        /// Target hash to restore.
+        #[arg(long)]
+        to: String,
     },
 }
 
@@ -169,6 +199,12 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
         Command::Test => run_test(cli, &compilation).await,
         Command::Lineage { target } => run_lineage(cli, &compilation, target),
         Command::Impact { column } => run_impact(cli, &compilation, column),
+        Command::Promote {
+            candidate,
+            to,
+            check,
+        } => run_promote(cli, candidate, to, *check).await,
+        Command::Rollback { to } => run_rollback(cli, to).await,
     }
 }
 
@@ -205,7 +241,7 @@ fn run_inspect(cli: &Cli, compilation: &Compilation, model: &str) -> Result<Exit
             let desired = report.model.version.clone();
             let current = open_state(cli).and_then(|state| {
                 state
-                    .materialized_version(&id.logical_name(), cli.environment.as_deref())
+                    .materialized_version(&id.logical_name(), environment(cli).as_deref())
                     .ok()
                     .flatten()
             });
@@ -271,7 +307,7 @@ async fn build_plan(
     let selected = select_models(compilation, &selection(cli));
     let planner = Planner::new(adapter, state);
     let plan = planner
-        .plan(compilation, &selected, cli.environment.clone())
+        .plan(compilation, &selected, environment(cli))
         .await
         .map_err(|error| error.to_string())?;
     Ok((plan, ArtifactWriter::for_workspace(&cli.root)))
@@ -281,6 +317,137 @@ fn open_state(cli: &Cli) -> Option<Arc<dyn StateStore>> {
     SqliteStateStore::open(&state_path(cli))
         .ok()
         .map(|store| Arc::new(store) as Arc<dyn StateStore>)
+}
+
+/// The effective environment: `--environment`, else `--ref`.
+fn environment(cli: &Cli) -> Option<String> {
+    cli.environment.clone().or_else(|| cli.reference.clone())
+}
+
+fn build_nessie(cli: &Cli) -> Result<Arc<dyn NessieClient>, String> {
+    let endpoint = cli
+        .nessie_endpoint
+        .clone()
+        .or_else(|| std::env::var("PHLO_NESSIE_ENDPOINT").ok())
+        .ok_or_else(|| {
+            "no Nessie configured: pass --nessie-endpoint or set PHLO_NESSIE_ENDPOINT".to_string()
+        })?;
+    let mut config = NessieConfig::new(endpoint);
+    config.token = cli
+        .nessie_token
+        .clone()
+        .or_else(|| std::env::var("PHLO_NESSIE_TOKEN").ok());
+    let client = NessieRestClient::new(config).map_err(|error| error.to_string())?;
+    Ok(Arc::new(client))
+}
+
+async fn run_promote(
+    cli: &Cli,
+    candidate: &str,
+    to: &str,
+    check: bool,
+) -> Result<ExitCode, String> {
+    let nessie = build_nessie(cli)?;
+    let state = open_state(cli);
+    let gates_passed = match &state {
+        Some(state) => state
+            .latest_run(Some(candidate))
+            .map_err(|error| error.to_string())?
+            .map(|run| run.status == ExecutionStatus::Passed && run.failed_count == 0)
+            .unwrap_or(false),
+        None => false,
+    };
+    if !gates_passed {
+        let message = format!("candidate `{candidate}` has no successful run; apply it first");
+        if cli.json {
+            print_json(&serde_json::json!({ "ok": false, "error": message }))?;
+        } else {
+            eprintln!("error: {message}");
+        }
+        return Ok(ExitCode::FAILURE);
+    }
+
+    let request = PromotionRequest {
+        candidate_ref: candidate.to_string(),
+        target_ref: to.to_string(),
+        candidate_hash: None,
+        expected_target_hash: None,
+        plan_id: None,
+        run_id: None,
+        quality_gates_passed: true,
+        dry_run: check,
+        actor: None,
+    };
+    match promote(nessie.as_ref(), &request).await {
+        Ok(record) => {
+            ArtifactWriter::for_workspace(&cli.root)
+                .write_promotion(&record)
+                .map_err(|error| error.to_string())?;
+            if cli.json {
+                print_json(&record)?;
+            } else {
+                print_promotion_human(&record);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if cli.json {
+                print_json(&serde_json::json!({ "ok": false, "error": message }))?;
+            } else {
+                eprintln!("error: {message}");
+            }
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+async fn run_rollback(cli: &Cli, to: &str) -> Result<ExitCode, String> {
+    let nessie = build_nessie(cli)?;
+    let name = environment(cli).ok_or_else(|| "rollback requires --ref <reference>".to_string())?;
+    match nessie.assign_reference(&name, to).await {
+        Ok(reference) => {
+            if cli.json {
+                print_json(&reference)?;
+            } else {
+                println!("Rolled back {} to {}", reference.name, reference.hash);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if cli.json {
+                print_json(&serde_json::json!({ "ok": false, "error": message }))?;
+            } else {
+                eprintln!("error: {message}");
+            }
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn print_promotion_human(record: &phlo_transform_engine::PromotionRecord) {
+    println!("Promotion: {}", record.promotion_id);
+    println!(
+        "Candidate: {} @ {:?}",
+        record.candidate_ref, record.candidate_hash
+    );
+    println!(
+        "Target:    {} @ {}",
+        record.target_ref, record.target_hash_before
+    );
+    if record.dry_run {
+        println!("Mode:      check (not merged)");
+    } else {
+        println!("Merged:    {}", record.merged);
+    }
+    if let Some(after) = &record.target_hash_after {
+        println!("After:     {after}");
+    }
+    for conflict in &record.conflicts {
+        println!("Conflict:  {} — {}", conflict.path, conflict.message);
+    }
+    println!();
 }
 
 async fn run_plan(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, String> {
@@ -331,7 +498,7 @@ async fn run_apply(
     spawn_ctrl_c_listener(cancel.clone());
     let runner = Runner::new(adapter, state);
     let options = RunOptions {
-        environment: cli.environment.clone(),
+        environment: environment(cli),
         concurrency: cli.concurrency,
         run_tests: true,
         cancel,

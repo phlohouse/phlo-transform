@@ -51,6 +51,13 @@ pub struct RunArtifact {
     pub run: RunResult,
 }
 
+/// `promotion.json`.
+#[derive(Clone, Debug, Serialize)]
+pub struct PromotionArtifact {
+    pub schema_version: u32,
+    pub promotion: crate::promotion::PromotionRecord,
+}
+
 /// `lineage.json`.
 #[derive(Clone, Debug, Serialize)]
 pub struct LineageArtifact {
@@ -166,6 +173,20 @@ impl ArtifactWriter {
             &RunArtifact {
                 schema_version: SCHEMA_VERSION,
                 run: run.clone(),
+            },
+        )
+    }
+
+    /// Write `promotion.json`.
+    pub fn write_promotion(
+        &self,
+        promotion: &crate::promotion::PromotionRecord,
+    ) -> Result<(), EngineError> {
+        self.write(
+            "promotion",
+            &PromotionArtifact {
+                schema_version: SCHEMA_VERSION,
+                promotion: promotion.clone(),
             },
         )
     }

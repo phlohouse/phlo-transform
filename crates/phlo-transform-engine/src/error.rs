@@ -42,4 +42,6 @@ pub enum EngineError {
     InvalidPlan(String),
     #[error("plan is stale: {0}; run `phlo-transform plan` again")]
     StalePlan(String),
+    #[error("promotion failed: {0}")]
+    Promotion(String),
 }
