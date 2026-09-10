@@ -6,7 +6,11 @@
 use std::path::PathBuf;
 
 use insta::assert_json_snapshot;
-use phlo_transform_core::{compile, load_project, Compilation, ModelId};
+use phlo_transform_core::{
+    compile, compile_with_provider, load_project, ColumnRef, Compilation, DataType, ModelId,
+    Nullability, RelationSchema, SchemaColumn, SemanticModel, SemanticProject,
+    StaticSchemaProvider,
+};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from("../../fixtures").join(name)
@@ -76,4 +80,70 @@ fn diagnostics_for_invalid_workspaces() {
             compilation.diagnostics
         );
     }
+}
+
+#[test]
+fn lineage_and_impact_reports() {
+    let mut provider = StaticSchemaProvider::new();
+    provider.insert(
+        "external.raw_results",
+        RelationSchema::new(vec![
+            SchemaColumn {
+                name: "sample_id".to_string(),
+                data_type: DataType::Varchar,
+                nullability: Nullability::NotNull,
+            },
+            SchemaColumn {
+                name: "signal".to_string(),
+                data_type: DataType::Double,
+                nullability: Nullability::Nullable,
+            },
+        ]),
+    );
+    provider.insert(
+        "external.samples",
+        RelationSchema::new(vec![
+            SchemaColumn {
+                name: "sample_id".to_string(),
+                data_type: DataType::Varchar,
+                nullability: Nullability::NotNull,
+            },
+            SchemaColumn {
+                name: "volume".to_string(),
+                data_type: DataType::Double,
+                nullability: Nullability::Nullable,
+            },
+        ]),
+    );
+
+    let models = vec![
+        SemanticModel::in_memory(
+            ModelId::parse("assay.raw_results").unwrap(),
+            "select * from external.raw_results",
+        ),
+        SemanticModel::in_memory(
+            ModelId::parse("assay.results").unwrap(),
+            "select r.signal / s.volume as concentration \
+             from assay.raw_results r \
+             join external.samples s on r.sample_id = s.sample_id",
+        ),
+        SemanticModel::in_memory(
+            ModelId::parse("assay.summary").unwrap(),
+            "select concentration from assay.results",
+        ),
+    ];
+    let compilation = compile_with_provider(&SemanticProject::in_memory(models), &provider);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let results = ModelId::parse("assay.results").unwrap();
+    assert_json_snapshot!(
+        "lineage",
+        compilation
+            .column_lineage_report(&results, "concentration")
+            .unwrap()
+    );
+    assert_json_snapshot!(
+        "impact",
+        compilation.impact_report(&ColumnRef::model(results, "concentration"))
+    );
 }

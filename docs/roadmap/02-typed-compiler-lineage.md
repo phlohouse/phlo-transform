@@ -309,3 +309,30 @@ Phase 2 is complete when:
 - Nessie;
 - data diff;
 - daemon.
+
+## Implementation notes
+
+Phase 2 is partially implemented. See [`docs/semantic.md`](../semantic.md).
+
+Implemented:
+
+- typed semantic IR with explicit `Unknown` type/nullability states;
+- `SchemaProvider` boundary (empty + static providers; Trino adapter already
+  exposes `relation_columns`);
+- column resolution (qualified/unqualified, aliases, `USING`, `SELECT *` and
+  `alias.*`, CTEs, subqueries, set operations);
+- type inference for common expressions and functions, with limitations
+  recorded rather than guessed;
+- inferred output schema on every compiled model, with `known` tracking so
+  unknown source schemas do not cause false errors;
+- `lineage` and `impact` commands (human + JSON);
+- `@key` and `@not-null` represented as logical assertions;
+- integration test comparing inferred and real Trino schemas.
+
+Not yet implemented:
+
+- config-file schema contracts (`[model.…contract]`);
+- catalogue-enriched CLI compilation (commands currently compile offline);
+- `lineage.json` artifact;
+- generated runtime tests from inferred assertions.
+

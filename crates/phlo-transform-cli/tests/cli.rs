@@ -97,3 +97,28 @@ fn missing_workspace_reports_json_error() {
     let body = stdout(&output);
     assert!(body.contains("PROJECT001"), "{body}");
 }
+
+#[test]
+fn lineage_model_human_output() {
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "lineage",
+        "assay.results",
+    ]);
+    assert!(output.status.success());
+    assert_snapshot!(stdout(&output));
+}
+
+#[test]
+fn impact_json_output() {
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "--json",
+        "impact",
+        "assay.raw.sample_id",
+    ]);
+    assert!(output.status.success());
+    assert_snapshot!(stdout(&output));
+}

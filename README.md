@@ -24,9 +24,14 @@ It is intentionally not a dbt compatibility project. The goal is a smaller, more
   materialisations, `plan`/`apply`/`run`/`test`, bounded-concurrency scheduler,
   custom SQL tests, SQLite run history and versioned artifacts. See
   [`docs/engine.md`](docs/engine.md).
+- **Phase 2 — typed compiler and lineage: in progress.** Typed semantic IR,
+  schema provider boundary, column resolution and type inference, inferred
+  output schemas, `lineage`/`impact`, and `@key`/`@not-null` assertions. See
+  [`docs/semantic.md`](docs/semantic.md). Remaining: config contracts,
+  catalogue-enriched CLI compilation, `lineage.json`, generated runtime tests.
 
-No column lineage, state-aware skipping, incremental models, Nessie, WAP, data
-diff or daemon yet — those are later phases.
+No state-aware skipping, incremental models, Nessie, WAP, data diff or daemon
+yet — those are later phases.
 
 ## Toolchain
 
@@ -82,3 +87,4 @@ runs a disposable container and is executed explicitly in CI.
 - [Implementation roadmap](docs/roadmap/README.md)
 - [Phase 0 compiler architecture](docs/architecture.md)
 - [Phase 1 engine architecture](docs/engine.md)
+- [Phase 2 semantic compiler](docs/semantic.md)

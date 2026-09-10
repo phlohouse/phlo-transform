@@ -25,6 +25,12 @@ pub mod codes {
 
     pub const RESOLUTION_AMBIGUOUS: &str = "RESOLUTION001";
 
+    pub const TYPE_UNKNOWN_COLUMN: &str = "TYPE001";
+    pub const TYPE_AMBIGUOUS_COLUMN: &str = "TYPE002";
+    pub const TYPE_DUPLICATE_COLUMN: &str = "TYPE003";
+    pub const TYPE_INCOMPATIBLE_UNION: &str = "TYPE004";
+    pub const TYPE_CONTRACT: &str = "TYPE005";
+
     pub const GRAPH_CYCLE: &str = "GRAPH001";
 }
 

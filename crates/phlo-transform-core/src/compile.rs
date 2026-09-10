@@ -10,6 +10,7 @@ use phlo_transform_sql::{
 };
 use sqlparser::ast::Statement;
 
+use crate::analyze::Analyzer;
 use crate::compiled::{Compilation, CompiledModel, CompiledTest};
 use crate::diagnostics::{codes, Diagnostic, Severity};
 use crate::graph::Dependency;
@@ -17,9 +18,19 @@ use crate::identity::ModelId;
 use crate::model::{Relation, SemanticModel, SemanticProject, WorkspaceDefaults};
 use crate::resolve::{RegistryEntry, Resolution, Resolver};
 use crate::rewrite::rewrite_statements;
+use crate::schema::{EmptySchemaProvider, SchemaProvider};
+use crate::semantic::{Assertion, ModelSchema};
 
 /// Compile a semantic project into models and a dependency graph.
 pub fn compile(project: &SemanticProject) -> Compilation {
+    compile_with_provider(project, &EmptySchemaProvider)
+}
+
+/// Compile a semantic project, using a schema provider for external sources.
+pub fn compile_with_provider(
+    project: &SemanticProject,
+    provider: &dyn SchemaProvider,
+) -> Compilation {
     let mut diagnostics: Vec<Diagnostic> = project.diagnostics.clone();
 
     // Lower directives and parse SQL for each model.
@@ -140,6 +151,9 @@ pub fn compile(project: &SemanticProject) -> Compilation {
             config: entry.model.config.clone(),
             target: targets[&entry.model.id].clone(),
             compiled_sql,
+            schema: ModelSchema::default(),
+            limitations: Vec::new(),
+            assertions: Vec::new(),
             pinned_id: entry.pinned_id.clone(),
             dependencies,
         });
@@ -168,7 +182,51 @@ pub fn compile(project: &SemanticProject) -> Compilation {
         );
     }
 
+    // Type, column and lineage analysis in dependency order. A cyclic graph is
+    // already an error, so analysis is skipped in that case.
+    if let Some(order) = compilation.topological_order() {
+        let mut model_schemas: BTreeMap<ModelId, ModelSchema> = BTreeMap::new();
+        for id in order {
+            let Some(lowered) = unique.iter().find(|entry| entry.model.id == id) else {
+                continue;
+            };
+            let entry = entry_for(lowered);
+            let analyzer = Analyzer::new(&resolver, &model_schemas, provider);
+            let analysis = analyzer.analyze(&entry, &lowered.statements, &id);
+            let assertions = assertions_for(lowered.model);
+            if let Some(position) = compilation.models.iter().position(|model| model.id == id) {
+                compilation.models[position].schema = analysis.schema.clone();
+                compilation.models[position].limitations = analysis.limitations;
+                compilation.models[position].assertions = assertions;
+            }
+            compilation.diagnostics.extend(analysis.diagnostics);
+            model_schemas.insert(id, analysis.schema);
+        }
+    }
+
     compilation
+}
+
+/// Derive logical assertions from model directives.
+fn assertions_for(model: &SemanticModel) -> Vec<Assertion> {
+    let mut assertions = Vec::new();
+    for column in &model.directives.keys {
+        assertions.push(Assertion::NotNull {
+            column: column.clone(),
+        });
+        assertions.push(Assertion::Unique {
+            columns: vec![column.clone()],
+        });
+    }
+    for column in &model.directives.not_null {
+        let assertion = Assertion::NotNull {
+            column: column.clone(),
+        };
+        if !assertions.contains(&assertion) {
+            assertions.push(assertion);
+        }
+    }
+    assertions
 }
 
 struct LoweredModel<'a> {

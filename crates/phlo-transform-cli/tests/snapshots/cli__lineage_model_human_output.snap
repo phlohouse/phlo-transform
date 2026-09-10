@@ -1,0 +1,7 @@
+---
+source: crates/phlo-transform-cli/tests/cli.rs
+expression: stdout(&output)
+---
+Model:      assay.results
+Upstream:   assay.raw
+Downstream: reporting.monthly

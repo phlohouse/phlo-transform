@@ -58,6 +58,12 @@ pub struct Directives {
     /// `-- @owner <value>`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// `-- @key <column>` identity columns.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    /// `-- @not-null a,b` columns asserted non-null.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub not_null: Vec<String>,
     /// Non-fatal or fatal problems encountered while parsing directives.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub issues: Vec<DirectiveIssue>,
@@ -141,6 +147,22 @@ pub fn parse_directives(sql: &str) -> Directives {
                     directives.owner = Some(owner.to_string());
                 }
             }
+            "@key" => {
+                let columns = split_columns(&value);
+                if columns.is_empty() {
+                    missing_value(&mut directives, name, line_number);
+                } else {
+                    directives.keys.extend(columns);
+                }
+            }
+            "@not-null" => {
+                let columns = split_columns(&value);
+                if columns.is_empty() {
+                    missing_value(&mut directives, name, line_number);
+                } else {
+                    directives.not_null.extend(columns);
+                }
+            }
             _ => directives.issues.push(DirectiveIssue {
                 kind: DirectiveIssueKind::UnknownDirective,
                 name,
@@ -151,7 +173,22 @@ pub fn parse_directives(sql: &str) -> Directives {
 
     directives.tags.sort();
     directives.tags.dedup();
+    directives.keys.sort();
+    directives.keys.dedup();
+    directives.not_null.sort();
+    directives.not_null.dedup();
     directives
+}
+
+/// Split a comma/whitespace separated column list into trimmed, non-empty names.
+fn split_columns(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .flat_map(|part| part.split_whitespace())
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn parse_id(directives: &mut Directives, name: String, value: String, line: usize) {
@@ -307,5 +344,19 @@ mod tests {
             parse_directives("-- @tags qc, gold\n-- @owner analytical-development\nselect 1");
         assert_eq!(directives.tags, vec!["gold", "qc"]);
         assert_eq!(directives.owner.as_deref(), Some("analytical-development"));
+    }
+
+    #[test]
+    fn parses_key_and_not_null() {
+        let directives =
+            parse_directives("-- @key experiment_id\n-- @not-null sample_id,result\nselect 1");
+        assert_eq!(directives.keys, vec!["experiment_id"]);
+        assert_eq!(directives.not_null, vec!["result", "sample_id"]);
+    }
+
+    #[test]
+    fn reports_key_without_value() {
+        let directives = parse_directives("-- @key\nselect 1");
+        assert_eq!(directives.issues[0].kind, DirectiveIssueKind::MissingValue);
     }
 }

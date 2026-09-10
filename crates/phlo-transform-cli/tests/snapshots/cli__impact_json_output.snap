@@ -1,0 +1,10 @@
+---
+source: crates/phlo-transform-cli/tests/cli.rs
+expression: stdout(&output)
+---
+{
+  "column": "assay.raw.sample_id",
+  "downstream_columns": [],
+  "downstream_models": [],
+  "tests": []
+}

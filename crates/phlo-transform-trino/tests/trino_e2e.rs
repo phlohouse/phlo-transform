@@ -128,6 +128,27 @@ async fn executes_models_and_tests_against_trino() {
     assert_eq!(count.row_count, 1);
     assert_eq!(count.rows[0][0], "2");
 
+    // Inferred schema matches the real Trino relation schema.
+    let model = compilation
+        .model(&ModelId::parse("assay.results").unwrap())
+        .expect("model exists");
+    assert!(model.schema.known, "{:?}", model.limitations);
+    let inferred: Vec<String> = model
+        .schema
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect();
+    let real = adapter
+        .relation_columns(&results)
+        .await
+        .expect("describe relation");
+    let real_names: Vec<String> = real.iter().map(|column| column.name.clone()).collect();
+    assert_eq!(
+        inferred, real_names,
+        "inferred={inferred:?} real={real_names:?}"
+    );
+
     // A passing test returns no rows.
     let passing = adapter
         .execute("SELECT * FROM memory.default.assay__results WHERE value < 0")

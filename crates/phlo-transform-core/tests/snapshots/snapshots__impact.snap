@@ -1,0 +1,14 @@
+---
+source: crates/phlo-transform-core/tests/snapshots.rs
+expression: "compilation.impact_report(&ColumnRef::model(results, \"concentration\"))"
+---
+{
+  "column": "assay.results.concentration",
+  "downstream_columns": [
+    "assay.summary.concentration"
+  ],
+  "downstream_models": [
+    "assay.summary"
+  ],
+  "tests": []
+}

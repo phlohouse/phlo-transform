@@ -24,6 +24,12 @@ pub struct CompiledModel {
     pub target: Relation,
     /// SQL with workspace relations rewritten to physical targets.
     pub compiled_sql: String,
+    /// Inferred output schema, when analysis succeeded.
+    pub schema: crate::semantic::ModelSchema,
+    /// Explicit compiler limitations encountered while analysing this model.
+    pub limitations: Vec<String>,
+    /// Logical assertions derived from directives/contracts.
+    pub assertions: Vec<crate::semantic::Assertion>,
     /// Pinned identity from `-- @id`, when present and valid.
     pub pinned_id: Option<ModelId>,
     /// Resolved dependencies, sorted and deduplicated.

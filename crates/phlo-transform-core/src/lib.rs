@@ -13,6 +13,7 @@
 // add noise for little benefit.
 #![allow(clippy::result_large_err)]
 
+pub mod analyze;
 pub mod compile;
 pub mod compiled;
 pub mod config;
@@ -24,11 +25,13 @@ pub mod model;
 pub mod report;
 pub mod resolve;
 pub mod rewrite;
+pub mod schema;
 pub mod select;
+pub mod semantic;
 
 use std::path::Path;
 
-pub use compile::compile;
+pub use compile::{compile, compile_with_provider};
 pub use compiled::{Compilation, CompiledModel, CompiledTest};
 pub use diagnostics::{codes, Diagnostic, Severity};
 pub use discovery::load_project;
@@ -41,10 +44,17 @@ pub use model::{
 };
 pub use phlo_transform_sql::Materialization;
 pub use report::{
-    CheckReport, GraphArtifact, GraphEdgeArtifact, GraphNodeArtifact, InspectReport, ListReport,
-    ModelDetail, ModelSummary, RootReport, SourceSummary, TestSummary,
+    CheckReport, ColumnLineageReport, ColumnReport, GraphArtifact, GraphEdgeArtifact,
+    GraphNodeArtifact, ImpactReport, InspectReport, ListReport, ModelDetail, ModelLineageReport,
+    ModelSummary, RootReport, SourceSummary, TestSummary,
+};
+pub use schema::{
+    EmptySchemaProvider, RelationSchema, SchemaColumn, SchemaProvider, StaticSchemaProvider,
 };
 pub use select::{select_models, SelectionOptions};
+pub use semantic::{
+    Assertion, ColumnRef, DataType, ModelSchema, Nullability, OutputColumn, RelationRef,
+};
 
 /// Load a native workspace and compile it in one step.
 pub fn load_and_compile(workspace_root: &Path) -> Result<Compilation, Vec<Diagnostic>> {

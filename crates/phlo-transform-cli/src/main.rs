@@ -101,6 +101,16 @@ enum Command {
     Run,
     /// Run custom SQL tests against the current target.
     Test,
+    /// Show upstream/downstream model lineage or a column's lineage.
+    Lineage {
+        /// Model (`assay.results`) or column (`assay.results.concentration`).
+        target: String,
+    },
+    /// Show downstream impact of a column.
+    Impact {
+        /// Column reference (`assay.results.concentration`).
+        column: String,
+    },
 }
 
 #[tokio::main]
@@ -145,6 +155,8 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
         Command::Apply => run_apply(cli, &compilation, false).await,
         Command::Run => run_apply(cli, &compilation, true).await,
         Command::Test => run_test(cli, &compilation).await,
+        Command::Lineage { target } => run_lineage(cli, &compilation, target),
+        Command::Impact { column } => run_impact(cli, &compilation, column),
     }
 }
 
@@ -347,6 +359,87 @@ async fn run_test(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, Stri
     })
 }
 
+fn run_lineage(cli: &Cli, compilation: &Compilation, target: &str) -> Result<ExitCode, String> {
+    // A model target shows model lineage; otherwise the last segment is a
+    // column and the prefix is the model.
+    if let Ok(id) = ModelId::parse(target) {
+        if compilation.model(&id).is_some() {
+            let report = compilation.model_lineage_report(&id).expect("model exists");
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                println!("Model:      {}", report.model);
+                println!("Upstream:   {}", join_or_none(&report.upstream));
+                println!("Downstream: {}", join_or_none(&report.downstream));
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+
+    let Some((model, column)) = target.rsplit_once('.') else {
+        return Err(format!(
+            "invalid lineage target `{target}`; expected a model or model.column"
+        ));
+    };
+    let id = ModelId::parse(model).map_err(|error| format!("invalid model `{model}`: {error}"))?;
+    match compilation.column_lineage_report(&id, column) {
+        Some(report) => {
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                println!("Column:     {}", report.column);
+                println!("Direct:     {}", join_or_none(&report.direct));
+                println!("Transitive: {}", join_or_none(&report.transitive));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        None => {
+            let message = format!("no column lineage for `{target}`");
+            if cli.json {
+                print_json(&serde_json::json!({ "ok": false, "error": message }))?;
+            } else {
+                eprintln!("error: {message}");
+            }
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn run_impact(cli: &Cli, compilation: &Compilation, column: &str) -> Result<ExitCode, String> {
+    let Some((model, name)) = column.rsplit_once('.') else {
+        return Err(format!("invalid column `{column}`; expected model.column"));
+    };
+    let id = ModelId::parse(model).map_err(|error| format!("invalid model `{model}`: {error}"))?;
+    if compilation.model(&id).is_none() {
+        return Err(format!("no such model: {}", id.logical_name()));
+    }
+    let target = phlo_transform_core::ColumnRef::model(id, name);
+    let report = compilation.impact_report(&target);
+    if cli.json {
+        print_json(&report)?;
+    } else {
+        println!("Column:             {}", report.column);
+        println!(
+            "Downstream columns: {}",
+            join_or_none(&report.downstream_columns)
+        );
+        println!(
+            "Downstream models:  {}",
+            join_or_none(&report.downstream_models)
+        );
+        println!("Tests:              {}", join_or_none(&report.tests));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn join_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "(none)".to_string()
+    } else {
+        values.join(", ")
+    }
+}
+
 #[derive(serde::Serialize)]
 struct TestReport {
     tests: Vec<TestOutcome>,
@@ -502,6 +595,31 @@ fn print_inspect_human(report: &InspectReport) {
     }
     if let Some(owner) = &model.owner {
         println!("Owner: {owner}\n");
+    }
+
+    println!("Columns ({}):", model.columns.len());
+    if model.columns.is_empty() {
+        println!("  (none inferred)");
+    } else {
+        for column in &model.columns {
+            let inputs = if column.inputs.is_empty() {
+                String::new()
+            } else {
+                format!(" <- {}", column.inputs.join(", "))
+            };
+            println!(
+                "  {:<20} {:<28} {}{}",
+                column.name, column.data_type, column.nullability, inputs
+            );
+        }
+    }
+    println!();
+
+    if !model.assertions.is_empty() {
+        print_section("Assertions", &model.assertions);
+    }
+    if !model.limitations.is_empty() {
+        print_section("Limitations", &model.limitations);
     }
 }
 

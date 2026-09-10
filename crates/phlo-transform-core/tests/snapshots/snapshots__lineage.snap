@@ -1,0 +1,15 @@
+---
+source: crates/phlo-transform-core/tests/snapshots.rs
+expression: "compilation.column_lineage_report(&results, \"concentration\").unwrap()"
+---
+{
+  "column": "assay.results.concentration",
+  "direct": [
+    "assay.raw_results.signal",
+    "external.samples.volume"
+  ],
+  "transitive": [
+    "external.raw_results.signal",
+    "external.samples.volume"
+  ]
+}

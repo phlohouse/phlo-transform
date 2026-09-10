@@ -18,6 +18,7 @@ expression: "compilation.inspect_report(&id).expect(\"model exists\")"
       "reporting.monthly"
     ],
     "tests": [],
+    "columns": [],
     "sql": "select * from assay.raw\n"
   }
 }

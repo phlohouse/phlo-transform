@@ -10,6 +10,7 @@ use crate::diagnostics::Diagnostic;
 use crate::graph::Dependency;
 use crate::identity::ModelId;
 use crate::model::RootNamespaceStrategy;
+use crate::semantic::{ColumnRef, RelationRef};
 
 /// A transform root in a report.
 #[derive(Clone, Debug, Serialize)]
@@ -78,6 +79,16 @@ pub struct ListReport {
     pub tests: Vec<TestSummary>,
 }
 
+/// A column in a model's inferred schema.
+#[derive(Clone, Debug, Serialize)]
+pub struct ColumnReport {
+    pub name: String,
+    pub data_type: String,
+    pub nullability: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<String>,
+}
+
 /// Full detail for a single model in `inspect`.
 #[derive(Clone, Debug, Serialize)]
 pub struct ModelDetail {
@@ -98,7 +109,38 @@ pub struct ModelDetail {
     pub sources: Vec<String>,
     pub used_by: Vec<String>,
     pub tests: Vec<String>,
+    /// Inferred output columns.
+    pub columns: Vec<ColumnReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub limitations: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub assertions: Vec<String>,
     pub sql: String,
+}
+
+/// Model-level lineage.
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelLineageReport {
+    pub model: String,
+    pub upstream: Vec<String>,
+    pub downstream: Vec<String>,
+}
+
+/// Column-level lineage.
+#[derive(Clone, Debug, Serialize)]
+pub struct ColumnLineageReport {
+    pub column: String,
+    pub direct: Vec<String>,
+    pub transitive: Vec<String>,
+}
+
+/// Downstream impact of a column.
+#[derive(Clone, Debug, Serialize)]
+pub struct ImpactReport {
+    pub column: String,
+    pub downstream_columns: Vec<String>,
+    pub downstream_models: Vec<String>,
+    pub tests: Vec<String>,
 }
 
 /// The result of `inspect`.
@@ -217,9 +259,147 @@ impl Compilation {
                 sources,
                 used_by,
                 tests,
+                columns: model
+                    .schema
+                    .columns
+                    .iter()
+                    .map(|column| ColumnReport {
+                        name: column.name.clone(),
+                        data_type: column.data_type.to_string(),
+                        nullability: column.nullability.to_string(),
+                        inputs: column.inputs.iter().map(ColumnRef::display).collect(),
+                    })
+                    .collect(),
+                limitations: model.limitations.clone(),
+                assertions: model
+                    .assertions
+                    .iter()
+                    .map(|assertion| assertion.describe())
+                    .collect(),
                 sql: model.sql.clone(),
             },
         })
+    }
+
+    /// Model-level upstream/downstream lineage.
+    pub fn model_lineage_report(&self, id: &ModelId) -> Option<ModelLineageReport> {
+        self.model(id)?;
+        let upstream = transitive_models(self, id, true);
+        let downstream = transitive_models(self, id, false);
+        Some(ModelLineageReport {
+            model: id.logical_name(),
+            upstream: upstream.into_iter().map(|id| id.logical_name()).collect(),
+            downstream: downstream.into_iter().map(|id| id.logical_name()).collect(),
+        })
+    }
+
+    /// Direct and transitive lineage for one output column.
+    pub fn column_lineage_report(&self, id: &ModelId, column: &str) -> Option<ColumnLineageReport> {
+        let model = self.model(id)?;
+        let output = model.schema.column(column)?;
+        let direct: Vec<String> = output.inputs.iter().map(ColumnRef::display).collect();
+        let mut transitive: Vec<String> = self
+            .transitive_inputs(&ColumnRef::model(id.clone(), column))
+            .into_iter()
+            .map(|input| input.display())
+            .collect();
+        transitive.sort();
+        transitive.dedup();
+        Some(ColumnLineageReport {
+            column: format!("{}.{}", id.logical_name(), column),
+            direct,
+            transitive,
+        })
+    }
+
+    /// Downstream impact of a column.
+    pub fn impact_report(&self, target: &ColumnRef) -> ImpactReport {
+        let mut dependents: std::collections::BTreeMap<ColumnRef, Vec<ColumnRef>> =
+            std::collections::BTreeMap::new();
+        for model in &self.models {
+            for column in &model.schema.columns {
+                let output = ColumnRef::model(model.id.clone(), &column.name);
+                for input in &column.inputs {
+                    dependents
+                        .entry(input.clone())
+                        .or_default()
+                        .push(output.clone());
+                }
+            }
+        }
+
+        let mut affected: std::collections::BTreeSet<ColumnRef> = std::collections::BTreeSet::new();
+        let mut frontier = vec![target.clone()];
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(column) = frontier.pop() {
+            if !visited.insert(column.clone()) {
+                continue;
+            }
+            if let Some(children) = dependents.get(&column) {
+                for child in children {
+                    if affected.insert(child.clone()) {
+                        frontier.push(child.clone());
+                    }
+                }
+            }
+        }
+
+        let mut models: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for column in &affected {
+            if let RelationRef::Model(id) = &column.relation {
+                models.insert(id.logical_name());
+            }
+        }
+        let mut tests: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for model in &models {
+            if let Ok(id) = ModelId::parse(model) {
+                for test in self.tests_for(&id) {
+                    tests.insert(test.id.to_string());
+                }
+            }
+        }
+
+        ImpactReport {
+            column: target.display(),
+            downstream_columns: affected.iter().map(ColumnRef::display).collect(),
+            downstream_models: models.into_iter().collect(),
+            tests: tests.into_iter().collect(),
+        }
+    }
+
+    /// Recursively expand a column's inputs to leaf columns.
+    fn transitive_inputs(&self, root: &ColumnRef) -> Vec<ColumnRef> {
+        let mut visited = std::collections::BTreeSet::new();
+        let mut leaves = std::collections::BTreeSet::new();
+        let mut stack = vec![root.clone()];
+        while let Some(column) = stack.pop() {
+            if !visited.insert(column.clone()) {
+                continue;
+            }
+            let inputs = self.direct_inputs(&column);
+            if inputs.is_empty() {
+                if &column != root {
+                    leaves.insert(column);
+                }
+            } else {
+                stack.extend(inputs);
+            }
+        }
+        if leaves.is_empty() {
+            leaves.insert(root.clone());
+        }
+        leaves.into_iter().collect()
+    }
+
+    fn direct_inputs(&self, column: &ColumnRef) -> Vec<ColumnRef> {
+        match &column.relation {
+            RelationRef::Model(id) => self
+                .model(id)
+                .and_then(|model| model.schema.column(&column.column))
+                .map(|output| output.inputs.clone())
+                .unwrap_or_default(),
+            RelationRef::Source(_) => Vec::new(),
+        }
     }
 
     pub fn graph_artifact(&self) -> GraphArtifact {
@@ -300,4 +480,42 @@ fn model_node(model: &CompiledModel) -> GraphNodeArtifact {
         kind: "model",
         name: model.id.logical_name(),
     }
+}
+
+fn transitive_models(compilation: &Compilation, id: &ModelId, upstream: bool) -> Vec<ModelId> {
+    use std::collections::BTreeSet;
+    let mut visited: BTreeSet<ModelId> = BTreeSet::new();
+    let mut frontier: Vec<ModelId> = if upstream {
+        compilation
+            .dependencies(id)
+            .into_iter()
+            .filter_map(|dependency| match dependency {
+                Dependency::Model(id) => Some(id),
+                Dependency::Source(_) => None,
+            })
+            .collect()
+    } else {
+        compilation.dependents(id)
+    };
+    while let Some(current) = frontier.pop() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        let next: Vec<ModelId> = if upstream {
+            compilation
+                .dependencies(&current)
+                .into_iter()
+                .filter_map(|dependency| match dependency {
+                    Dependency::Model(id) => Some(id),
+                    Dependency::Source(_) => None,
+                })
+                .collect()
+        } else {
+            compilation.dependents(&current)
+        };
+        frontier.extend(next);
+    }
+    let mut result: Vec<ModelId> = visited.into_iter().collect();
+    result.sort();
+    result
 }

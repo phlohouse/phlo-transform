@@ -16,6 +16,7 @@ expression: stdout(&output)
     "sources": [],
     "used_by": [],
     "tests": [],
+    "columns": [],
     "sql": "select * from assay.results\n"
   }
 }
