@@ -12,10 +12,13 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 use phlo_transform_core::{
-    compile, select_models, Compilation, Materialization, ModelId, ModelOrigin, SemanticModel,
-    SemanticProject, SemanticTest, TestId, WorkspaceDefaults,
+    compile, select_models, Compilation, Materialization, ModelId, ModelOrigin, Relation,
+    SemanticModel, SemanticProject, SemanticTest, TestId, WorkspaceDefaults,
 };
-use phlo_transform_engine::{Adapter, ExecutionStatus, Planner, RunOptions, Runner};
+use phlo_transform_engine::{
+    diff, Adapter, DiffPolicy, DiffRequest, DiffStrategy, ExecutionStatus, Planner, RunOptions,
+    Runner,
+};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
 
 async fn start_trino() -> (testcontainers::ContainerAsync<GenericImage>, TrinoAdapter) {
@@ -163,4 +166,66 @@ fn relation(catalog: &str, schema: &str, table: &str) -> phlo_transform_core::Re
         schema: schema.to_string(),
         table: table.to_string(),
     }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker; run with --ignored"]
+async fn computes_keyed_data_diff_against_trino() {
+    let (_container, adapter) = start_trino().await;
+    let adapter = Arc::new(adapter);
+    adapter
+        .execute("CREATE SCHEMA IF NOT EXISTS memory.default")
+        .await
+        .expect("schema created");
+
+    let tables = [
+        (
+            "diff_base",
+            "select 1 as id, 10 as value \
+             union all select 2, 20 union all select 3, 30",
+        ),
+        (
+            "diff_candidate",
+            "select 1 as id, 10 as value \
+             union all select 2, 25 union all select 4, 40",
+        ),
+    ];
+    for (name, sql) in tables {
+        let _ = adapter
+            .execute(&format!("DROP TABLE IF EXISTS memory.default.{name}"))
+            .await;
+        adapter
+            .execute(&format!("CREATE TABLE memory.default.{name} AS {sql}"))
+            .await
+            .expect("table created");
+    }
+
+    let relation = |table: &str| Relation {
+        catalog: Some("memory".to_string()),
+        schema: "default".to_string(),
+        table: table.to_string(),
+    };
+    let request = DiffRequest {
+        model: "assay.results".to_string(),
+        candidate_relation: relation("diff_candidate"),
+        base_relation: relation("diff_base"),
+        candidate_ref: Some("candidate".to_string()),
+        base_ref: Some("base".to_string()),
+        candidate_version: None,
+        base_version: None,
+        key_columns: vec!["id".to_string()],
+        columns: vec!["value".to_string()],
+        strategy: DiffStrategy::Keyed,
+        policy: DiffPolicy::default(),
+        sample_fraction: None,
+    };
+
+    let report = diff(adapter, &request).await.expect("diff runs");
+    assert_eq!(report.row_summary.base_rows, 3);
+    assert_eq!(report.row_summary.candidate_rows, 3);
+    assert_eq!(report.row_summary.added, 1);
+    assert_eq!(report.row_summary.removed, 1);
+    assert_eq!(report.row_summary.modified, 1);
+    assert_eq!(report.row_summary.unchanged, 1);
+    assert_eq!(report.column_changes.get("value"), Some(&1));
 }

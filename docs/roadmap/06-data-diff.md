@@ -399,3 +399,20 @@ Phase 6 is complete when:
 - visual diff UI;
 - arbitrary policy scripting;
 - cross-warehouse diffing.
+
+## Implementation notes
+
+Phase 6 is implemented at the engine/CLI level. See [`docs/diff.md`](../diff.md).
+
+- keyed diff via warehouse-side `FULL OUTER JOIN` + `IS DISTINCT FROM`,
+  reporting added/removed/modified/unchanged and per-column change counts;
+- aggregate fallback without a key, explicit `full`, and `sampled` labels with
+  coverage recorded;
+- keys reused from `@incremental key=`/`@key`;
+- declarative policy gates and a `diff.json` artifact;
+- promotion gate flags (`diff_passed`/`require_diff`);
+- keyed diff correctness validated against live Trino.
+
+Deferred: partition pruning, distribution statistics, value redaction, and
+stale-diff invalidation beyond the promotion gate.
+

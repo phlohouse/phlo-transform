@@ -58,6 +58,13 @@ pub struct PromotionArtifact {
     pub promotion: crate::promotion::PromotionRecord,
 }
 
+/// `diff.json`.
+#[derive(Clone, Debug, Serialize)]
+pub struct DiffArtifact {
+    pub schema_version: u32,
+    pub diff: crate::diff::DiffReport,
+}
+
 /// `lineage.json`.
 #[derive(Clone, Debug, Serialize)]
 pub struct LineageArtifact {
@@ -187,6 +194,17 @@ impl ArtifactWriter {
             &PromotionArtifact {
                 schema_version: SCHEMA_VERSION,
                 promotion: promotion.clone(),
+            },
+        )
+    }
+
+    /// Write `diff.json`.
+    pub fn write_diff(&self, diff: &crate::diff::DiffReport) -> Result<(), EngineError> {
+        self.write(
+            "diff",
+            &DiffArtifact {
+                schema_version: SCHEMA_VERSION,
+                diff: diff.clone(),
             },
         )
     }

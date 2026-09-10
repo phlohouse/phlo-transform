@@ -24,6 +24,9 @@ pub struct PromotionRequest {
     pub run_id: Option<String>,
     /// Whether the candidate run completed successfully with tests passing.
     pub quality_gates_passed: bool,
+    /// Whether a required data diff passed, when a diff gate applies.
+    pub diff_passed: Option<bool>,
+    pub require_diff: bool,
     /// Only check preconditions; do not merge.
     pub dry_run: bool,
     pub actor: Option<String>,
@@ -59,6 +62,11 @@ pub async fn promote(
     if !request.quality_gates_passed {
         return Err(EngineError::Promotion(
             "quality gates have not passed; refusing to promote".to_string(),
+        ));
+    }
+    if request.require_diff && request.diff_passed != Some(true) {
+        return Err(EngineError::Promotion(
+            "a passing data diff is required before promotion".to_string(),
         ));
     }
 
@@ -161,6 +169,8 @@ mod tests {
             plan_id: Some("plan-1".to_string()),
             run_id: Some("run-1".to_string()),
             quality_gates_passed: true,
+            diff_passed: None,
+            require_diff: false,
             dry_run,
             actor: None,
         }

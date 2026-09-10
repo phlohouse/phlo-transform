@@ -42,8 +42,11 @@ It is intentionally not a dbt compatibility project. The goal is a smaller, more
   `promote` with staleness/conflict checks, `rollback`, and a promotion
   artifact. See [`docs/wap.md`](docs/wap.md). Live Nessie/Iceberg CI coverage
   is not included.
+- **Phase 6 — native data diff: done.** Keyed/aggregate/full/sampled diff
+  strategies, per-column change counts, declarative policy gates, `diff.json`,
+  and a promotion diff gate. See [`docs/diff.md`](docs/diff.md).
 
-No data diff, workflow integration or daemon yet — those are later phases.
+No workflow integration or daemon yet — those are later phases.
 
 ## Toolchain
 
@@ -103,3 +106,4 @@ runs a disposable container and is executed explicitly in CI.
 - [Phase 3 state-aware execution](docs/state.md)
 - [Phase 4 incremental models](docs/incremental.md)
 - [Phase 5 Nessie and WAP](docs/wap.md)
+- [Phase 6 native data diff](docs/diff.md)

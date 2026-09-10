@@ -10,13 +10,15 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use phlo_transform_core::{
-    compile, compile_with_provider, load_project, select_models, CheckReport, Compilation,
-    DataType, Diagnostic, InspectReport, ListReport, ModelId, Nullability, Relation,
-    RelationSchema, SchemaColumn, SelectionOptions, SourceId, StaticSchemaProvider,
+    compile, compile_with_provider, load_project, select_models, Assertion, CheckReport,
+    Compilation, DataType, Diagnostic, IncrementalStrategy, InspectReport, ListReport, ModelId,
+    Nullability, Relation, RelationSchema, SchemaColumn, SelectionOptions, SourceId,
+    StaticSchemaProvider,
 };
 use phlo_transform_engine::{
-    promote, Adapter, ArtifactWriter, CancelHandle, ExecutionStatus, Plan, PlanAction, Planner,
-    PromotionRequest, RunOptions, RunResult, Runner, SqliteStateStore, StateStore,
+    diff, promote, Adapter, ArtifactWriter, CancelHandle, DiffPolicy, DiffRequest, DiffStrategy,
+    ExecutionStatus, Plan, PlanAction, Planner, PromotionRequest, RunOptions, RunResult, Runner,
+    SqliteStateStore, StateStore,
 };
 use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -146,6 +148,23 @@ enum Command {
         #[arg(long)]
         to: String,
     },
+    /// Compare a model's candidate and base data.
+    Diff {
+        /// Model name (`assay.results`).
+        model: String,
+        /// Base reference label (defaults to the candidate reference).
+        #[arg(long)]
+        base: Option<String>,
+        /// Base physical relation (`catalog.schema.table`).
+        #[arg(long)]
+        base_relation: Option<String>,
+        /// Force a full keyed comparison.
+        #[arg(long)]
+        full: bool,
+        /// Deterministic sample fraction (0..1).
+        #[arg(long)]
+        sample: Option<f64>,
+    },
 }
 
 #[tokio::main]
@@ -205,6 +224,24 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
             check,
         } => run_promote(cli, candidate, to, *check).await,
         Command::Rollback { to } => run_rollback(cli, to).await,
+        Command::Diff {
+            model,
+            base,
+            base_relation,
+            full,
+            sample,
+        } => {
+            run_diff(
+                cli,
+                &compilation,
+                model,
+                base,
+                base_relation,
+                *full,
+                *sample,
+            )
+            .await
+        }
     }
 }
 
@@ -375,6 +412,8 @@ async fn run_promote(
         plan_id: None,
         run_id: None,
         quality_gates_passed: true,
+        diff_passed: None,
+        require_diff: false,
         dry_run: check,
         actor: None,
     };
@@ -998,6 +1037,158 @@ fn print_section(title: &str, values: &[String]) {
         for value in values {
             println!("  {value}");
         }
+    }
+    println!();
+}
+
+async fn run_diff(
+    cli: &Cli,
+    compilation: &Compilation,
+    model: &str,
+    base: &Option<String>,
+    base_relation: &Option<String>,
+    full: bool,
+    sample: Option<f64>,
+) -> Result<ExitCode, String> {
+    let id = ModelId::parse(model).map_err(|error| format!("invalid model `{model}`: {error}"))?;
+    let compiled = compilation
+        .model(&id)
+        .ok_or_else(|| format!("no such model: {}", id.logical_name()))?;
+
+    let adapter = build_adapter(cli)?;
+    let key_columns = model_keys(compiled);
+    let columns: Vec<String> = if compiled.schema.known {
+        compiled
+            .schema
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .filter(|name| !key_columns.contains(name))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let candidate_relation = compiled.target.clone();
+    let base_relation = match base_relation {
+        Some(spec) => parse_relation(spec),
+        None => candidate_relation.clone(),
+    };
+    let strategy = if full {
+        DiffStrategy::Full
+    } else if sample.is_some() {
+        DiffStrategy::Sampled
+    } else if key_columns.is_empty() {
+        DiffStrategy::Aggregate
+    } else {
+        DiffStrategy::Keyed
+    };
+
+    let request = DiffRequest {
+        model: id.logical_name(),
+        candidate_relation,
+        base_relation,
+        candidate_ref: environment(cli),
+        base_ref: base.clone(),
+        candidate_version: Some(compiled.version.hash.clone()),
+        base_version: None,
+        key_columns,
+        columns,
+        strategy,
+        policy: DiffPolicy::default(),
+        sample_fraction: sample,
+    };
+
+    match diff(adapter, &request).await {
+        Ok(report) => {
+            ArtifactWriter::for_workspace(&cli.root)
+                .write_diff(&report)
+                .map_err(|error| error.to_string())?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                print_diff_human(&report);
+            }
+            Ok(if report.passed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if cli.json {
+                print_json(&serde_json::json!({ "ok": false, "error": message }))?;
+            } else {
+                eprintln!("error: {message}");
+            }
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn model_keys(model: &phlo_transform_core::CompiledModel) -> Vec<String> {
+    if let Some(IncrementalStrategy::Key { columns }) = &model.config.incremental {
+        return columns.clone();
+    }
+    for assertion in &model.assertions {
+        if let Assertion::Unique { columns } = assertion {
+            return columns.clone();
+        }
+    }
+    Vec::new()
+}
+
+fn parse_relation(spec: &str) -> Relation {
+    let parts: Vec<&str> = spec.split('.').collect();
+    match parts.as_slice() {
+        [schema, table] => Relation {
+            catalog: None,
+            schema: (*schema).to_string(),
+            table: (*table).to_string(),
+        },
+        [catalog, schema, table] => Relation {
+            catalog: Some((*catalog).to_string()),
+            schema: (*schema).to_string(),
+            table: (*table).to_string(),
+        },
+        _ => Relation {
+            catalog: None,
+            schema: "default".to_string(),
+            table: spec.to_string(),
+        },
+    }
+}
+
+fn print_diff_human(report: &phlo_transform_engine::DiffReport) {
+    println!("{}", report.model);
+    println!("  candidate: {}", report.candidate_relation);
+    println!("  base:      {}", report.base_relation);
+    println!("  strategy:  {:?} ({})", report.strategy, report.coverage);
+    println!();
+    println!("Rows");
+    println!("  base       {}", report.row_summary.base_rows);
+    println!("  candidate  {}", report.row_summary.candidate_rows);
+    println!("  delta      {}", report.row_summary.delta);
+    println!();
+    println!("Records");
+    println!("  added      {}", report.row_summary.added);
+    println!("  removed    {}", report.row_summary.removed);
+    println!("  modified   {}", report.row_summary.modified);
+    if !report.column_changes.is_empty() {
+        println!();
+        println!("Changed values");
+        for (column, count) in &report.column_changes {
+            println!("  {column:<20} {count}");
+        }
+    }
+    for result in &report.policy_results {
+        println!(
+            "  policy {:<22} {} ({})",
+            result.policy,
+            if result.passed { "pass" } else { "FAIL" },
+            result.detail
+        );
     }
     println!();
 }
