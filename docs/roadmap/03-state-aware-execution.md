@@ -355,9 +355,9 @@ Phase 3 is **partially implemented** (audited against code and tests). See
   compilation (`core::version`); canonical AST hashing means formatting and
   comments do not rebuild.
 - `SourceStateProvider` interface (empty + static implementations);
-  `Adapter::source_state` reads Iceberg snapshot ids and
-  `collect_source_states` lowers them into a provider, wired into CLI
-  plan/apply/run (and inspect/lineage/impact) enrichment.
+  `Adapter::source_state` reads Iceberg snapshot ids (falling back to a schema
+  fingerprint) and `collect_source_states` lowers them into a provider, wired
+  into CLI plan/apply/run (and inspect/lineage/impact) enrichment.
 - SQLite `model_versions` table with `record_materialized`,
   `materialized_version` and `materialized_by_hash`.
 - `Planner` is state-aware: `build` / `skip` / `cached` with structured
@@ -369,9 +369,9 @@ Tests cover formatting/comment stability, SQL/config/materialisation/upstream
 and source-state invalidation, owner/tag non-invalidation, second-run skip,
 cross-environment `cached` classification, and stale-plan rejection.
 
-Remaining gaps: non-Iceberg sources have no observable state; `cached` is a
-classification only (no cross-environment reuse execution); no direct test for
-`compiler_semantics_change`.
+Remaining gaps: `cached` is a classification only (no cross-environment reuse
+execution); no direct test for `compiler_semantics_change`. Non-Iceberg sources
+fall back to a schema fingerprint rather than data state.
 
 Deferred, as listed above: optimiser semantics.
 

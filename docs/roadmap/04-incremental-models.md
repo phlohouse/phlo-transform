@@ -289,8 +289,9 @@ Phase 4 is **partially implemented** (audited against code and tests). See
 - Adapter gains `append`, `merge` and `replace_partitions`; the engine chooses
   bootstrap CTAS, append, key `MERGE`, partition replacement, a typed
   time-window append, or a safe full rebuild.
-- Time-window watermarks are persisted (`incremental_state`) and advanced only
-  on success.
+- Time-window watermarks are persisted (`incremental_state`), advanced only on
+  success, and the configured overlap is applied to the predicate for
+  timestamp columns.
 - `classify_schema_change` is wired into planning: removed/incompatible columns
   force a full rebuild with a `schema_change` reason.
 - Trino `MERGE` and idempotent re-application are verified live on Iceberg.

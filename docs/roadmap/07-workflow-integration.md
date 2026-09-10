@@ -378,7 +378,7 @@ Implemented:
   and a `workflow` field on model nodes;
 - cross-workflow dependency policy (`allow`/`warn`/`error`, `DEPENDENCIES001`);
 - `ConsumerRegistry` for host-registered non-transform consumers in impact
-  (API only; the CLI `impact` output does not render them);
+  (rendered by the CLI `impact` command);
 - tests for ownership, policy and consumers.
 
 Missing: the wider Phlo workflow graph and tasks (there is no workflow engine or

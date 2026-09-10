@@ -366,15 +366,18 @@ Implemented:
   cannot switch Nessie refs at query time) and compiles/applies against it, so
   candidate data is isolated from `main`.
 - `promote` enforces a successful candidate run, target staleness via the
-  recorded base hash (`environment.json`), merge conflicts, and an optional
-  data-diff gate (`--require-diff`); it writes `promotion.json`.
+  recorded base hash (`environment.json`), merge conflicts, an optional
+  data-diff gate (`--require-diff`) and a breaking-schema gate
+  (`--allow-breaking-schema`), and can remove the candidate with `--cleanup`;
+  it writes `promotion.json`.
 - `rollback --ref <ref> --to <hash>` moves a reference.
 
 Missing / deviated:
 
-- No schema-policy audit gate, and no Iceberg snapshot tracking in the audit.
-- Candidate catalogs/branches are not cleaned up automatically and there is no
-  rebase; an advanced target is rejected rather than reconciled.
+- No Iceberg snapshot tracking in the promotion record (reference hashes are
+  recorded).
+- An advanced target is rejected rather than rebased; candidate cleanup is
+  opt-in (`--cleanup`) rather than automatic.
 - Views are unsupported by Trino's Nessie Iceberg catalog, so view models
   cannot run in a Nessie candidate environment.
 - Promotion state is written to an artifact but not persisted in the state

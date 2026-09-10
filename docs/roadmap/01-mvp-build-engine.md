@@ -325,10 +325,10 @@ Decisions worth calling out against this plan:
   state, artifacts) and `phlo-transform-trino` (adapter). The compiler core
   stays synchronous and dependency-free of Tokio/Trino/SQLite.
 - Physical targets use one configured schema and a flattened table name
-  (`namespace__path`), which is an intentional MVP simplification; schema
-  contracts and per-namespace schemas come later.
-- Planning is conservative: existing relations are always `replace`; there is
-  no skip/caching yet.
+  (`namespace__path`), an intentional MVP simplification. Per-namespace
+  schemas remain unimplemented; schema contracts were added in Phase 2.
+- Planning became state-aware in Phase 3 (skip/build/cached); Phase 1 itself
+  rebuilt selected models conservatively.
 - `apply`/`run` plan first, so model mutations never begin when compilation or
   planning fails.
 - The state store is SQLite (`rusqlite`, bundled) at

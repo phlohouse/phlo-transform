@@ -174,6 +174,9 @@ Written under `.phlo/transform/` with `schema_version = 1`:
 | `lineage.json` | inferred columns and column inputs per model |
 | `plan.json` | plan id, adapter, environment, planned models/tests, diagnostics |
 | `run.json` | run id, plan id, status, model/test results, events |
+| `environment.json` | provisioned base/candidate references and candidate catalog |
+| `diff.json` | data/schema diff report (strategy, rows, columns, partitions, policies) |
+| `promotion.json` | promotion id, references/hashes, gates, conflicts, timestamp |
 
 `schema_version` makes the interface explicit and versionable.
 

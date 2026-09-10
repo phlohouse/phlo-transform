@@ -39,8 +39,9 @@ source_state)`; `compile` and `compile_with_provider` use empty providers.
 
 Source states are populated from the warehouse: `Adapter::source_state` returns
 the latest Iceberg `snapshot_id` for a relation (via the `$snapshots` metadata
-table), and `collect_source_states` lowers observed states into a provider
-before compilation. `inspect`, `lineage`, `impact` and `plan`/`apply`/`run`
+table), falling back to a stable schema fingerprint for non-Iceberg relations,
+and `collect_source_states` lowers observed states into a provider before
+compilation. `inspect`, `lineage`, `impact` and `plan`/`apply`/`run`
 enrich compilation this way when a target is configured (or with
 `--catalogue`), so an Iceberg source commit invalidates dependent model
 versions and produces a `source_change` build reason.
