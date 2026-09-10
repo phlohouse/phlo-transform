@@ -222,6 +222,14 @@ impl Adapter for FakeAdapter {
             .get(&relation.display())
             .cloned())
     }
+
+    async fn partition_counts(
+        &self,
+        _relation: &Relation,
+        _partition_columns: &[String],
+    ) -> Result<Option<Vec<(String, i64)>>, AdapterError> {
+        Ok(None)
+    }
 }
 
 fn model(name: &str, sql: &str) -> SemanticModel {
@@ -915,4 +923,36 @@ async fn schema_removal_forces_full_rebuild() {
         .unwrap();
     assert!(plan.models[0].full_rebuild, "{:?}", plan.models[0]);
     assert!(plan.models[0].reasons.contains(&ChangeReason::SchemaChange));
+}
+
+#[tokio::test]
+async fn time_window_overlap_widens_the_predicate() {
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_max_value("2026-09-10 00:00:00.000");
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let provider = events_provider();
+
+    let build = |sql: &str| {
+        let project = SemanticProject::in_memory(vec![incremental_with(
+            sql,
+            IncrementalStrategy::TimeWindow {
+                column: "updated_at".to_string(),
+                overlap_seconds: Some(3600),
+            },
+        )]);
+        compile_with_options(&project, &provider, &EmptySourceStateProvider)
+    };
+
+    let first = build("select id, updated_at from external.events");
+    run_once(adapter.clone(), state.clone(), &first, "dev").await;
+    let second = build("select id, updated_at from external.events where id > 0");
+    run_once(adapter.clone(), state.clone(), &second, "dev").await;
+
+    let appends = adapter.append_sqls.lock().unwrap().clone();
+    assert_eq!(appends.len(), 1, "{appends:?}");
+    assert!(
+        appends[0].contains("INTERVAL '3600' SECOND"),
+        "{}",
+        appends[0]
+    );
 }

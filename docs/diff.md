@@ -31,9 +31,10 @@ relations, the strategy, cover/part columns and coverage.
 - **full** — full keyed comparison.
 - **sampled** — compares `TABLESAMPLE BERNOULLI (<fraction*100>)`; the
   fraction is recorded in the report for reproducibility.
-- **partition** — compares partitions by `(partition columns)`:
-  `partitions_added`, `partitions_removed` and `partitions_changed` (partitions
-  present on both sides with different row counts).
+- **partition** — compares partitions using Iceberg `$partitions` metadata
+  (`partition`, `record_count`) where available, falling back to grouped
+  partition row counts. Reports `partitions_added`, `partitions_removed` and
+  `partitions_changed`.
 
 Keys are never configured twice: the same declaration drives incremental merge,
 assertions and diffing.
@@ -95,6 +96,6 @@ coverage, promotion blocks.
 
 ## Deferred
 
-Partition-metadata pruning (the current partition strategy compares partition
-row counts), statistical distribution summaries, and example-value redaction
-(no example values are emitted).
+Statistical distribution summaries and example-value redaction (no example
+values are emitted; partition comparison uses Iceberg metadata rather than
+scanning data).

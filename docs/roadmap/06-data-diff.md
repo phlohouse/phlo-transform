@@ -418,7 +418,7 @@ Implemented:
   diff whose candidate version no longer matches;
 - live Trino coverage for keyed, tolerance, partition-aware and sampled diffs.
 
-Remaining gaps: the partition strategy compares partition row counts rather
-than pruning by partition metadata; no example values are emitted, so there is
-no redaction policy to exercise.
+Remaining gaps: statistical distribution summaries and an example-value
+redaction policy (partition comparison now uses Iceberg metadata where
+available).
 

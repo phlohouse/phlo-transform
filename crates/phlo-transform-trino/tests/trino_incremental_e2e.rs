@@ -16,7 +16,8 @@ use phlo_transform_core::{
     SemanticProject, WorkspaceDefaults,
 };
 use phlo_transform_engine::{
-    Adapter, CatalogRequest, Planner, RunOptions, Runner, SqliteStateStore,
+    diff, Adapter, CatalogRequest, DiffPolicy, DiffRequest, DiffStrategy, Planner, RunOptions,
+    Runner, SqliteStateStore,
 };
 use phlo_transform_nessie::{NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -188,4 +189,54 @@ async fn incremental_key_merges_on_trino_iceberg() {
     let run = apply(adapter.clone(), state.clone(), &third).await;
     assert_eq!(run.status, phlo_transform_engine::ExecutionStatus::Passed);
     assert_eq!(rows(&adapter).await.len(), 3);
+
+    // Partition-aware diff uses Iceberg partition metadata ($partitions).
+    adapter
+        .execute(
+            "CREATE TABLE phlo.default.part_base WITH (partitioning = ARRAY['d']) AS \
+             SELECT 1 AS id, DATE '2026-09-09' AS d UNION ALL SELECT 2, DATE '2026-09-10'",
+        )
+        .await
+        .expect("partitioned base");
+    adapter
+        .execute(
+            "CREATE TABLE phlo.default.part_candidate WITH (partitioning = ARRAY['d']) AS \
+             SELECT 1 AS id, DATE '2026-09-09' AS d UNION ALL SELECT 3, DATE '2026-09-11'",
+        )
+        .await
+        .expect("partitioned candidate");
+
+    let relation = |table: &str| phlo_transform_core::Relation {
+        catalog: Some("phlo".to_string()),
+        schema: "default".to_string(),
+        table: table.to_string(),
+    };
+    let report = diff(
+        adapter.clone(),
+        &DiffRequest {
+            model: "assay.partitioned".to_string(),
+            candidate_relation: relation("part_candidate"),
+            base_relation: relation("part_base"),
+            candidate_ref: None,
+            base_ref: None,
+            candidate_version: None,
+            base_version: None,
+            key_columns: Vec::new(),
+            columns: Vec::new(),
+            strategy: DiffStrategy::Partition {
+                columns: vec!["d".to_string()],
+            },
+            policy: DiffPolicy::default(),
+            sample_fraction: None,
+        },
+    )
+    .await
+    .expect("partition diff");
+    assert!(
+        report.coverage.contains("partition metadata"),
+        "{}",
+        report.coverage
+    );
+    assert_eq!(report.partitions_added.len(), 1);
+    assert_eq!(report.partitions_removed.len(), 1);
 }

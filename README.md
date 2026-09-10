@@ -48,22 +48,22 @@ implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
   detection, adapter `append`/`merge`/`replace_partitions`, typed time-window
   watermarks and planner schema-change classification. Trino `MERGE` is
   verified live on Iceberg. See [`docs/incremental.md`](docs/incremental.md).
-  Gaps: partition replacement is column-list based (no metadata pruning);
-  configured window overlap is not applied.
+  Gaps: incremental partition replacement is column-list based (no metadata
+  pruning).
 - **Phase 5 — Nessie and WAP: partial.** `NessieClient` (REST + in-memory),
   environment provisioning (`apply --ref <candidate> --from <base>` creates the
   branch and a branch-scoped Trino catalog), candidate writes isolated from
-  `main`, audited `promote` with staleness/conflict checks and an optional diff
-  gate, `rollback`, and a promotion artifact. See [`docs/wap.md`](docs/wap.md).
-  Missing: schema-policy/Iceberg-snapshot audit gates, candidate cleanup/rebase;
-  Nessie Iceberg catalogs have no view support. Live Nessie + Iceberg E2E is in
-  CI.
+  `main`, audited `promote` with staleness/conflict checks, a diff gate and a
+  breaking-schema gate, candidate `--cleanup`, `rollback`, and a promotion
+  artifact. See [`docs/wap.md`](docs/wap.md). Missing: Iceberg snapshot in the
+  promotion record, automatic rebase; Nessie Iceberg catalogs have no view
+  support. Live Nessie + Iceberg E2E is in CI.
 - **Phase 6 — native data diff: partial.** Keyed diff with per-column change
   counts, config-driven policies and numeric tolerances, real sampling,
-  partition-aware summaries, populated schema diffs, `diff.json`, and
-  stale-aware promotion gating. See [`docs/diff.md`](docs/diff.md). Gaps:
-  partition strategy compares partition row counts (no metadata pruning); no
-  example-value redaction.
+  Iceberg `$partitions` metadata comparison (row-count fallback), populated
+  schema diffs, `diff.json`, and stale-aware promotion gating. See
+  [`docs/diff.md`](docs/diff.md). Gaps: no statistical distribution summaries;
+  no example-value redaction.
 - **Phase 7 — workflow integration: partial (transform-side).** Workflow
   ownership, a unified typed graph artifact (`model`/`source`/`quality_gate`),
   cross-workflow dependency policy, and registered consumers in impact. See

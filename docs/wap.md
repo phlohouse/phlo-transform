@@ -65,8 +65,12 @@ phlo-transform promote ci/pr-1 --to main --check
    gate);
 2. checks the candidate can merge and that the target has not advanced when an
    expected target hash is supplied;
-3. merges, or reports without merging for `--check`;
-4. writes `promotion.json` to `.phlo/transform/`.
+3. blocks promotion on breaking schema changes from the audited diff unless
+   `--allow-breaking-schema` is passed;
+4. merges, or reports without merging for `--check`;
+5. writes `promotion.json` to `.phlo/transform/`;
+6. with `--cleanup`, deletes the candidate branch and drops its catalog after a
+   successful merge.
 
 The promotion record captures promotion id, candidate/target refs and hashes,
 plan/run ids, dry-run/merged flags, conflicts, timestamp and actor.
@@ -93,8 +97,8 @@ keyed by model and environment.
 - Trino's Nessie Iceberg catalog does not support views; candidate environments
   therefore support table and incremental models, and view models must use a
   different catalog type.
-- Schema-policy gates and Iceberg snapshot tracking are not yet wired into the
-  audit stage.
-- Temporary candidate catalogs/branches are not cleaned up automatically.
+- Iceberg snapshot tracking is used for source state but is not recorded in the
+  promotion record itself.
 - Promotion merges at the Nessie reference level; a candidate planned against a
-  base that has advanced is rejected rather than rebased.
+  base that has advanced is rejected rather than rebased. `--cleanup` removes
+  the candidate after a successful merge.

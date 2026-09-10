@@ -115,11 +115,15 @@ fn exec_op(model: &phlo_transform_core::CompiledModel, info: Option<&PlannedMode
                 Some(IncrementalStrategy::Partition { columns }) => {
                     ExecOp::ReplacePartitions(columns.clone())
                 }
-                Some(IncrementalStrategy::TimeWindow { column, .. }) => {
+                Some(IncrementalStrategy::TimeWindow {
+                    column,
+                    overlap_seconds,
+                }) => {
                     match info
                         .and_then(|model| model.watermark.as_deref())
-                        .and_then(|watermark| time_window_predicate(model, column, watermark))
-                    {
+                        .and_then(|watermark| {
+                            time_window_predicate(model, column, watermark, *overlap_seconds)
+                        }) {
                         Some(predicate) => ExecOp::TimeWindow { predicate },
                         // Without a usable watermark/type, rebuild safely.
                         None => ExecOp::Table,
@@ -131,19 +135,30 @@ fn exec_op(model: &phlo_transform_core::CompiledModel, info: Option<&PlannedMode
     }
 }
 
-/// Build a typed predicate `"col" > CAST('<watermark>' AS <type>)`.
+/// Build a typed predicate `"col" > CAST('<watermark>' AS <type>)`, optionally
+/// backing the watermark off by a configured overlap.
 fn time_window_predicate(
     model: &phlo_transform_core::CompiledModel,
     column: &str,
     watermark: &str,
+    overlap_seconds: Option<u64>,
 ) -> Option<String> {
     let data_type = model.schema.column(column)?.data_type.clone();
     let sql_type = sql_type(&data_type)?;
     let escaped = watermark.replace('\'', "''");
-    Some(format!(
-        "{} > CAST('{escaped}' AS {sql_type})",
-        quote_ident(column)
-    ))
+    let mut lower_bound = format!("CAST('{escaped}' AS {sql_type})");
+    if let Some(overlap) = overlap_seconds {
+        if overlap > 0
+            && matches!(
+                data_type,
+                phlo_transform_core::DataType::Timestamp
+                    | phlo_transform_core::DataType::TimestampTz
+            )
+        {
+            lower_bound = format!("({lower_bound} - INTERVAL '{overlap}' SECOND)");
+        }
+    }
+    Some(format!("{} > {lower_bound}", quote_ident(column)))
 }
 
 fn sql_type(data_type: &phlo_transform_core::DataType) -> Option<&'static str> {

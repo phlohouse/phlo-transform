@@ -295,8 +295,7 @@ Phase 4 is **partially implemented** (audited against code and tests). See
   force a full rebuild with a `schema_change` reason.
 - Trino `MERGE` and idempotent re-application are verified live on Iceberg.
 
-Remaining gaps: partition replacement uses a column-list `DELETE ... IN`
-rather than partition-metadata pruning; the configured time-window overlap is
-stored but not yet applied to the predicate; schema classification is not part
-of data diff.
+Remaining gaps: incremental partition replacement uses a column-list
+`DELETE ... IN` rather than partition-metadata pruning; schema classification is
+not part of data diff.
 

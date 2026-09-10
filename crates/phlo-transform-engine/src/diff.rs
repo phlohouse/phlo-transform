@@ -146,13 +146,37 @@ pub async fn diff(
 
     match &request.strategy {
         DiffStrategy::Partition { columns } => {
-            let (added, removed, changed) =
-                partition_summary(adapter.as_ref(), &base_sql, &candidate_sql, columns).await?;
-            partitions_added = added;
-            partitions_removed = removed;
-            partitions_changed = changed;
+            let base_metadata = adapter
+                .partition_counts(&request.base_relation, columns)
+                .await
+                .ok()
+                .flatten();
+            let candidate_metadata = adapter
+                .partition_counts(&request.candidate_relation, columns)
+                .await
+                .ok()
+                .flatten();
+            let source;
+            match (base_metadata, candidate_metadata) {
+                (Some(base), Some(candidate)) => {
+                    let (added, removed, changed) = partition_delta(&base, &candidate);
+                    partitions_added = added;
+                    partitions_removed = removed;
+                    partitions_changed = changed;
+                    source = "partition metadata";
+                }
+                _ => {
+                    let (added, removed, changed) =
+                        partition_summary(adapter.as_ref(), &base_sql, &candidate_sql, columns)
+                            .await?;
+                    partitions_added = added;
+                    partitions_removed = removed;
+                    partitions_changed = changed;
+                    source = "partition row counts";
+                }
+            }
             coverage = format!(
-                "partition-aware ({} partitions changed)",
+                "partition-aware ({source}, {} partitions changed)",
                 partitions_changed.len()
             );
         }
@@ -371,6 +395,39 @@ async fn partition_summary(
 
 fn column_values(rows: &[Vec<String>]) -> Vec<String> {
     rows.iter().filter_map(|row| row.first().cloned()).collect()
+}
+
+fn partition_delta(
+    base: &[(String, i64)],
+    candidate: &[(String, i64)],
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let base_map: BTreeMap<&str, i64> = base
+        .iter()
+        .map(|(key, count)| (key.as_str(), *count))
+        .collect();
+    let candidate_map: BTreeMap<&str, i64> = candidate
+        .iter()
+        .map(|(key, count)| (key.as_str(), *count))
+        .collect();
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut changed = Vec::new();
+    for (key, count) in &candidate_map {
+        match base_map.get(key) {
+            None => added.push((*key).to_string()),
+            Some(base_count) if base_count != count => changed.push((*key).to_string()),
+            Some(_) => {}
+        }
+    }
+    for key in base_map.keys() {
+        if !candidate_map.contains_key(key) {
+            removed.push((*key).to_string());
+        }
+    }
+    added.sort();
+    removed.sort();
+    changed.sort();
+    (added, removed, changed)
 }
 
 async fn schema_changes(adapter: &dyn Adapter, request: &DiffRequest) -> Vec<SchemaChange> {

@@ -27,6 +27,10 @@ pub struct PromotionRequest {
     /// Whether a required data diff passed, when a diff gate applies.
     pub diff_passed: Option<bool>,
     pub require_diff: bool,
+    /// Breaking schema changes observed in the audit (removed/incompatible
+    /// columns). Promotion is blocked unless `allow_breaking_schema` is set.
+    pub breaking_schema_changes: Vec<String>,
+    pub allow_breaking_schema: bool,
     /// Only check preconditions; do not merge.
     pub dry_run: bool,
     pub actor: Option<String>,
@@ -68,6 +72,12 @@ pub async fn promote(
         return Err(EngineError::Promotion(
             "a passing data diff is required before promotion".to_string(),
         ));
+    }
+    if !request.allow_breaking_schema && !request.breaking_schema_changes.is_empty() {
+        return Err(EngineError::Promotion(format!(
+            "breaking schema changes block promotion: {}",
+            request.breaking_schema_changes.join(", ")
+        )));
     }
 
     let candidate = nessie
@@ -177,6 +187,8 @@ mod tests {
             quality_gates_passed: true,
             diff_passed: None,
             require_diff: false,
+            breaking_schema_changes: Vec::new(),
+            allow_breaking_schema: false,
             dry_run,
             actor: None,
         }
@@ -242,5 +254,43 @@ mod tests {
             nessie.get_reference("main").await.unwrap().unwrap().hash,
             "aaa"
         );
+    }
+}
+
+#[cfg(test)]
+mod schema_gate_tests {
+    use super::*;
+    use phlo_transform_nessie::InMemoryNessie;
+
+    #[tokio::test]
+    async fn breaking_schema_changes_block_promotion() {
+        let nessie = InMemoryNessie::new();
+        nessie.seed("main", "aaa");
+        nessie
+            .create_branch(
+                "ci/pr-1",
+                &phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
+            )
+            .await
+            .unwrap();
+
+        let make = |allow: bool| PromotionRequest {
+            candidate_ref: "ci/pr-1".to_string(),
+            target_ref: "main".to_string(),
+            candidate_hash: None,
+            expected_target_hash: Some("aaa".to_string()),
+            plan_id: None,
+            run_id: None,
+            quality_gates_passed: true,
+            diff_passed: None,
+            require_diff: false,
+            breaking_schema_changes: vec!["legacy: removed".to_string()],
+            allow_breaking_schema: allow,
+            dry_run: true,
+            actor: None,
+        };
+
+        assert!(promote(&nessie, &make(false)).await.is_err());
+        assert!(promote(&nessie, &make(true)).await.is_ok());
     }
 }

@@ -56,8 +56,10 @@ bootstrap.
   FROM source)` followed by `INSERT`, so only partitions present in the source
   are replaced and other partitions are untouched.
 - **time-window**: appends rows where the window column is greater than the
-  last committed watermark (`CAST('<watermark>' AS <type>`), then advances the
-  watermark to `max(column)`. Watermarks are committed only on success.
+  last committed watermark, optionally backed off by the configured `overlap`
+  (`CAST('<watermark>' AS <type>) - INTERVAL '<overlap>' SECOND` for timestamp
+  columns), then advances the watermark to `max(column)`. Watermarks are
+  committed only on success.
 
 The chosen operation is computed by the engine; adapters implement
 `append`, `merge`, `replace_partitions` and `create_or_replace_table`.
@@ -100,5 +102,6 @@ and only advance it after a successful build.
 
 ## Deferred
 
-Partition-metadata pruning; applying the configured time-window overlap;
-arbitrary user-defined incremental algorithms; streaming.
+Partition-metadata pruning for the *incremental* partition strategy (the
+diff partition strategy does use Iceberg `$partitions`); arbitrary
+user-defined incremental algorithms; streaming.

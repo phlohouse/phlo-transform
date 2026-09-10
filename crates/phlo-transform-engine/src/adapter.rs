@@ -97,4 +97,12 @@ pub trait Adapter: Send + Sync {
     /// Observe a source state used for model versioning. For Iceberg this is
     /// the latest snapshot id; for other relations it may be `None`.
     async fn source_state(&self, relation: &Relation) -> Result<Option<String>, AdapterError>;
+
+    /// Per-partition record counts from metadata, when the adapter supports it
+    /// (for example Iceberg `$partitions`). `None` means unsupported.
+    async fn partition_counts(
+        &self,
+        relation: &Relation,
+        partition_columns: &[String],
+    ) -> Result<Option<Vec<(String, i64)>>, AdapterError>;
 }

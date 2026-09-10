@@ -159,6 +159,12 @@ enum Command {
         /// Require a passing data diff before promoting.
         #[arg(long)]
         require_diff: bool,
+        /// Allow breaking schema changes (removed/incompatible columns).
+        #[arg(long)]
+        allow_breaking_schema: bool,
+        /// Delete the candidate branch and drop its catalog after promoting.
+        #[arg(long)]
+        cleanup: bool,
     },
     /// Move a Nessie reference to a previous hash.
     Rollback {
@@ -290,7 +296,20 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
             to,
             check,
             require_diff,
-        } => run_promote(cli, candidate, to, *check, *require_diff).await,
+            allow_breaking_schema,
+            cleanup,
+        } => {
+            run_promote(
+                cli,
+                candidate,
+                to,
+                *check,
+                *require_diff,
+                *allow_breaking_schema,
+                *cleanup,
+            )
+            .await
+        }
         Command::Rollback { to } => run_rollback(cli, to).await,
         Command::Diff {
             model,
@@ -547,6 +566,8 @@ async fn run_promote(
     to: &str,
     check: bool,
     require_diff: bool,
+    allow_breaking_schema: bool,
+    cleanup: bool,
 ) -> Result<ExitCode, String> {
     let nessie = build_nessie(cli)?;
     let state = open_state(cli);
@@ -596,6 +617,39 @@ async fn run_promote(
         }
     }
 
+    // Breaking schema changes from the audited diff block promotion unless
+    // explicitly allowed (enforced by the engine).
+    let breaking_schema_changes: Vec<String> = diff
+        .as_ref()
+        .and_then(|value| value.get("diff"))
+        .and_then(|diff| diff.get("schema_changes"))
+        .and_then(|changes| changes.as_array())
+        .map(|changes| {
+            changes
+                .iter()
+                .filter(|change| {
+                    matches!(
+                        change.get("safety").and_then(|safety| safety.as_str()),
+                        Some("error" | "full_rebuild_required")
+                    )
+                })
+                .map(|change| {
+                    format!(
+                        "{} ({})",
+                        change
+                            .get("column")
+                            .and_then(|column| column.as_str())
+                            .unwrap_or("*"),
+                        change
+                            .get("detail")
+                            .and_then(|detail| detail.as_str())
+                            .unwrap_or("schema change")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let request = PromotionRequest {
         candidate_ref: candidate.to_string(),
         target_ref: to.to_string(),
@@ -610,6 +664,8 @@ async fn run_promote(
         quality_gates_passed: true,
         diff_passed,
         require_diff,
+        breaking_schema_changes,
+        allow_breaking_schema,
         dry_run: check,
         actor: None,
     };
@@ -623,6 +679,9 @@ async fn run_promote(
             } else {
                 print_promotion_human(&record);
             }
+            if cleanup && record.merged {
+                cleanup_candidate(cli, &nessie, candidate, environment.as_ref()).await;
+            }
             Ok(ExitCode::SUCCESS)
         }
         Err(error) => {
@@ -635,6 +694,24 @@ async fn run_promote(
             Ok(ExitCode::FAILURE)
         }
     }
+}
+
+/// Best-effort removal of a promoted candidate's branch and catalog.
+async fn cleanup_candidate(
+    cli: &Cli,
+    nessie: &Arc<dyn NessieClient>,
+    candidate: &str,
+    environment: Option<&EnvironmentSetup>,
+) {
+    let catalog = environment
+        .map(|setup| setup.catalog.clone())
+        .unwrap_or_else(|| catalog_name(candidate));
+    if let Ok(adapter) = build_adapter(cli) {
+        let _ = adapter
+            .execute(&format!("DROP CATALOG IF EXISTS {}", catalog))
+            .await;
+    }
+    let _ = nessie.delete_branch(candidate).await;
 }
 
 async fn run_rollback(cli: &Cli, to: &str) -> Result<ExitCode, String> {

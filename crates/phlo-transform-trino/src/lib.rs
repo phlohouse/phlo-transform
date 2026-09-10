@@ -372,14 +372,61 @@ impl Adapter for TrinoAdapter {
             schema: relation.schema.clone(),
             table: format!("{}$snapshots", relation.table),
         };
-        match self
+        if let Ok(result) = self
             .run(&format!(
                 "SELECT snapshot_id FROM {} ORDER BY committed_at DESC LIMIT 1",
                 snapshots.sql()
             ))
             .await
         {
-            Ok(result) => Ok(result.rows.first().and_then(|row| row.first()).cloned()),
+            if let Some(value) = result.rows.first().and_then(|row| row.first()) {
+                return Ok(Some(format!("snapshot:{value}")));
+            }
+        }
+
+        // Fallback: a stable fingerprint of the relation's schema, so schema
+        // changes remain observable for non-Iceberg sources.
+        if let Ok(columns) = self.relation_columns(relation).await {
+            if !columns.is_empty() {
+                let parts = columns
+                    .iter()
+                    .map(|column| format!("{}:{}", column.name, column.data_type));
+                return Ok(Some(format!("schema:{}", fingerprint(parts))));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn partition_counts(
+        &self,
+        relation: &Relation,
+        _partition_columns: &[String],
+    ) -> Result<Option<Vec<(String, i64)>>, AdapterError> {
+        let partitions = Relation {
+            catalog: relation.catalog.clone(),
+            schema: relation.schema.clone(),
+            table: format!("{}$partitions", relation.table),
+        };
+        // Trino exposes the partition tuple as a `partition` column plus
+        // `record_count` from Iceberg metadata.
+        match self
+            .run(&format!(
+                "SELECT partition, record_count FROM {}",
+                partitions.sql()
+            ))
+            .await
+        {
+            Ok(result) => Ok(Some(
+                result
+                    .rows
+                    .iter()
+                    .filter_map(|row| {
+                        let key = row.first()?.clone();
+                        let count: i64 = row.get(1)?.parse().ok()?;
+                        Some((key, count))
+                    })
+                    .collect(),
+            )),
             Err(_) => Ok(None),
         }
     }
@@ -397,6 +444,22 @@ impl TrinoAdapter {
 
 fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// Deterministic FNV-1a fingerprint of a sequence of strings.
+fn fingerprint<I, S>(parts: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for part in parts {
+        for byte in part.as_ref().bytes().chain(std::iter::once(b'\n')) {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("{hash:016x}")
 }
 
 fn is_missing_relation(error: &AdapterError) -> bool {
