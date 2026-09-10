@@ -22,16 +22,28 @@ use crate::resolve::{RegistryEntry, Resolution, Resolver};
 use crate::rewrite::rewrite_statements;
 use crate::schema::{EmptySchemaProvider, SchemaProvider};
 use crate::semantic::{Assertion, ModelContract, ModelSchema, Nullability};
+use crate::version::{
+    model_version, EmptySourceStateProvider, ModelVersions, SourceStateProvider, VersionInputs,
+};
 
 /// Compile a semantic project into models and a dependency graph.
 pub fn compile(project: &SemanticProject) -> Compilation {
-    compile_with_provider(project, &EmptySchemaProvider)
+    compile_with_options(project, &EmptySchemaProvider, &EmptySourceStateProvider)
 }
 
 /// Compile a semantic project, using a schema provider for external sources.
 pub fn compile_with_provider(
     project: &SemanticProject,
     provider: &dyn SchemaProvider,
+) -> Compilation {
+    compile_with_options(project, provider, &EmptySourceStateProvider)
+}
+
+/// Compile a semantic project with schema and source-state providers.
+pub fn compile_with_options(
+    project: &SemanticProject,
+    provider: &dyn SchemaProvider,
+    source_states: &dyn SourceStateProvider,
 ) -> Compilation {
     let mut diagnostics: Vec<Diagnostic> = project.diagnostics.clone();
 
@@ -157,6 +169,7 @@ pub fn compile_with_provider(
             limitations: Vec::new(),
             assertions: Vec::new(),
             contract: entry.model.contract.clone(),
+            version: Default::default(),
             pinned_id: entry.pinned_id.clone(),
             dependencies,
         });
@@ -189,6 +202,7 @@ pub fn compile_with_provider(
     // already an error, so analysis is skipped in that case.
     if let Some(order) = compilation.topological_order() {
         let mut model_schemas: BTreeMap<ModelId, ModelSchema> = BTreeMap::new();
+        let mut model_versions: ModelVersions = BTreeMap::new();
         let mut generated_tests: Vec<CompiledTest> = Vec::new();
         for id in order {
             let Some(lowered) = unique.iter().find(|entry| entry.model.id == id) else {
@@ -211,10 +225,23 @@ pub fn compile_with_provider(
                 generated_tests.extend(generate_tests(&id, &assertions, &model.target));
             }
 
+            // Compute the content-addressed version from upstream versions.
+            let version = match compilation.model(&id) {
+                Some(model) => model_version(&version_inputs(
+                    lowered,
+                    model,
+                    source_states,
+                    &model_versions,
+                )),
+                None => Default::default(),
+            };
+            model_versions.insert(id.clone(), version.clone());
+
             if let Some(position) = compilation.models.iter().position(|model| model.id == id) {
                 compilation.models[position].schema = analysis.schema.clone();
                 compilation.models[position].limitations = analysis.limitations;
                 compilation.models[position].assertions = assertions;
+                compilation.models[position].version = version;
             }
             compilation.diagnostics.extend(analysis.diagnostics);
             model_schemas.insert(id, analysis.schema);
@@ -223,6 +250,95 @@ pub fn compile_with_provider(
     }
 
     compilation
+}
+
+/// Assemble the version inputs for a model.
+fn version_inputs(
+    lowered: &LoweredModel<'_>,
+    model: &CompiledModel,
+    source_states: &dyn SourceStateProvider,
+    model_versions: &ModelVersions,
+) -> VersionInputs {
+    let canonical_sql = lowered
+        .statements
+        .iter()
+        .map(|statement| statement.to_string())
+        .collect::<Vec<_>>()
+        .join(";\n");
+
+    // Only semantics-affecting configuration participates; tags and owner do
+    // not change the physical output.
+    let config = format!(
+        "materialization={};schema={}",
+        model.config.materialization,
+        model.config.schema.clone().unwrap_or_default()
+    );
+
+    let contract = model
+        .contract
+        .as_ref()
+        .map(|contract| {
+            let columns: Vec<String> = contract
+                .columns
+                .iter()
+                .map(|column| {
+                    format!(
+                        "{}:{:?}:{:?}",
+                        column.name, column.data_type, column.nullable
+                    )
+                })
+                .collect();
+            format!(
+                "enforced={};columns={}",
+                contract.enforced,
+                columns.join(",")
+            )
+        })
+        .unwrap_or_default();
+    let assertions: Vec<String> = model
+        .assertions
+        .iter()
+        .map(|assertion| assertion.describe())
+        .collect();
+    let contract = format!("{contract};assertions={}", assertions.join(","));
+
+    let dependencies = model
+        .model_dependencies()
+        .map(|dependency| {
+            (
+                dependency.logical_name(),
+                model_versions
+                    .get(dependency)
+                    .map(|version| version.hash.clone())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+
+    let sources = model
+        .source_dependencies()
+        .map(|source| {
+            (
+                source.logical_name(),
+                source_states.source_state(source).unwrap_or_default(),
+            )
+        })
+        .collect();
+
+    let target = format!(
+        "{}|{}",
+        model.target.display(),
+        model.config.materialization
+    );
+
+    VersionInputs {
+        canonical_sql,
+        config,
+        contract,
+        dependencies,
+        sources,
+        target,
+    }
 }
 
 /// Derive logical assertions from model directives.

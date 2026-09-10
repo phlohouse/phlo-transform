@@ -16,7 +16,7 @@ use phlo_transform_core::{
 };
 use phlo_transform_engine::{
     Adapter, ArtifactWriter, CancelHandle, ExecutionStatus, Plan, PlanAction, Planner, RunOptions,
-    RunResult, Runner, SqliteStateStore,
+    RunResult, Runner, SqliteStateStore, StateStore,
 };
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
 
@@ -202,10 +202,41 @@ fn run_inspect(cli: &Cli, compilation: &Compilation, model: &str) -> Result<Exit
         .map_err(|error| format!("invalid model reference `{model}`: {error}"))?;
     match compilation.inspect_report(&id) {
         Some(report) => {
+            let desired = report.model.version.clone();
+            let current = open_state(cli).and_then(|state| {
+                state
+                    .materialized_version(&id.logical_name(), cli.environment.as_deref())
+                    .ok()
+                    .flatten()
+            });
+            let status = match &current {
+                None => "new",
+                Some(record) if record.version.hash == desired => "unchanged",
+                Some(_) => "changed",
+            }
+            .to_string();
             if cli.json {
-                print_json(&report)?;
+                let mut value = serde_json::to_value(&report)
+                    .map_err(|error| format!("could not serialise JSON: {error}"))?;
+                value["state"] = serde_json::json!({
+                    "desired": desired,
+                    "current": current.as_ref().map(|record| record.version.hash.clone()),
+                    "status": status,
+                });
+                print_json(&value)?;
             } else {
                 print_inspect_human(&report);
+                println!("State:");
+                println!("  desired:  {desired}");
+                println!(
+                    "  current:  {}",
+                    current
+                        .as_ref()
+                        .map(|record| record.version.short().to_string())
+                        .unwrap_or_else(|| "(none)".to_string())
+                );
+                println!("  status:   {status}");
+                println!();
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -234,10 +265,11 @@ fn selection(cli: &Cli) -> SelectionOptions {
 async fn build_plan(
     cli: &Cli,
     compilation: &Compilation,
+    state: Option<Arc<dyn StateStore>>,
 ) -> Result<(Plan, ArtifactWriter), String> {
     let adapter = build_adapter(cli)?;
     let selected = select_models(compilation, &selection(cli));
-    let planner = Planner::new(adapter);
+    let planner = Planner::new(adapter, state);
     let plan = planner
         .plan(compilation, &selected, cli.environment.clone())
         .await
@@ -245,8 +277,14 @@ async fn build_plan(
     Ok((plan, ArtifactWriter::for_workspace(&cli.root)))
 }
 
+fn open_state(cli: &Cli) -> Option<Arc<dyn StateStore>> {
+    SqliteStateStore::open(&state_path(cli))
+        .ok()
+        .map(|store| Arc::new(store) as Arc<dyn StateStore>)
+}
+
 async fn run_plan(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, String> {
-    let (plan, writer) = build_plan(cli, compilation).await?;
+    let (plan, writer) = build_plan(cli, compilation, open_state(cli)).await?;
     writer
         .write_project(compilation)
         .and_then(|_| writer.write_plan(&plan))
@@ -271,7 +309,8 @@ async fn run_apply(
     compilation: &Compilation,
     convenience_run: bool,
 ) -> Result<ExitCode, String> {
-    let (plan, writer) = build_plan(cli, compilation).await?;
+    let state = open_state(cli);
+    let (plan, writer) = build_plan(cli, compilation, state.clone()).await?;
     writer
         .write_project(compilation)
         .and_then(|_| writer.write_plan(&plan))
@@ -288,10 +327,9 @@ async fn run_apply(
     }
 
     let adapter = build_adapter(cli)?;
-    let state = SqliteStateStore::open(&state_path(cli)).map_err(|error| error.to_string())?;
     let cancel = CancelHandle::default();
     spawn_ctrl_c_listener(cancel.clone());
-    let runner = Runner::new(adapter, Some(Arc::new(state)));
+    let runner = Runner::new(adapter, state);
     let options = RunOptions {
         environment: cli.environment.clone(),
         concurrency: cli.concurrency,
@@ -725,15 +763,18 @@ fn print_plan_human(plan: &Plan) {
     println!("Models ({})", plan.models.len());
     for model in &plan.models {
         let action = match model.action {
-            PlanAction::Create => "CREATE",
-            PlanAction::Replace => "REPLACE",
-            PlanAction::NoOp => "NOOP",
+            PlanAction::Build => "BUILD",
+            PlanAction::Skip => "SKIP",
+            PlanAction::Cached => "CACHED",
             PlanAction::Unknown => "UNKNOWN",
         };
         println!(
             "  {:<6} {:<28} [{}] {}",
             action, model.id, model.materialization, model.target
         );
+        for reason in &model.reasons {
+            println!("           reason: {}", reason.label());
+        }
     }
 
     println!();

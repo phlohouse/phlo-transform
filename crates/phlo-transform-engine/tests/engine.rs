@@ -16,7 +16,7 @@ use phlo_transform_core::{
 };
 use phlo_transform_engine::{
     Adapter, AdapterError, ArtifactWriter, CancelHandle, ColumnInfo, ExecutionStatus, Plan,
-    Planner, QueryResult, RunOptions, Runner, SqliteStateStore, StateStore,
+    PlanAction, Planner, QueryResult, RunOptions, Runner, SqliteStateStore, StateStore,
 };
 
 #[derive(Default)]
@@ -71,7 +71,8 @@ impl FakeAdapter {
                 format!("simulated failure for {display}"),
             ));
         }
-        self.created.lock().unwrap().push(display);
+        self.created.lock().unwrap().push(display.clone());
+        self.existing.lock().unwrap().insert(display);
         Ok(QueryResult {
             query_id: Some(query_id.to_string()),
             ..Default::default()
@@ -157,7 +158,7 @@ fn project_with_tests() -> Compilation {
 
 async fn plan_all(compilation: &Compilation, adapter: Arc<FakeAdapter>) -> Plan {
     let selected = select_models(compilation, &SelectionOptions::default());
-    Planner::new(adapter)
+    Planner::new(adapter, None)
         .plan(compilation, &selected, None)
         .await
         .expect("plan succeeds")
@@ -343,4 +344,102 @@ async fn cancellation_marks_unfinished_models_cancelled() {
             .all(|test| test.status != ExecutionStatus::Passed),
         "tests should not pass after cancellation"
     );
+}
+
+#[tokio::test]
+async fn state_aware_second_run_skips_unchanged_models() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let selected = select_models(&compilation, &SelectionOptions::default());
+    let environment = Some("dev".to_string());
+
+    let first = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&compilation, &selected, environment.clone())
+        .await
+        .unwrap();
+    assert!(
+        first
+            .models
+            .iter()
+            .all(|model| model.action == PlanAction::Build),
+        "{:?}",
+        first.models
+    );
+
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+    let run = runner
+        .apply(
+            &compilation,
+            &first,
+            &RunOptions {
+                environment: environment.clone(),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(run.status, ExecutionStatus::Passed);
+
+    let second = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&compilation, &selected, environment.clone())
+        .await
+        .unwrap();
+    assert!(
+        second
+            .models
+            .iter()
+            .all(|model| model.action == PlanAction::Skip),
+        "{:?}",
+        second.models
+    );
+
+    let rerun = runner
+        .apply(
+            &compilation,
+            &second,
+            &RunOptions {
+                environment,
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        rerun
+            .models
+            .iter()
+            .all(|model| model.status == ExecutionStatus::Skipped),
+        "{:?}",
+        rerun.models
+    );
+}
+
+#[tokio::test]
+async fn stale_plan_is_rejected() {
+    let first_compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    let plan = plan_all(&first_compilation, adapter.clone()).await;
+
+    // A different workspace (changed SQL) makes the plan stale.
+    let mut changed = SemanticProject::in_memory(vec![
+        model("assay.raw", "select 1 as id"),
+        model("assay.results", "select * from assay.raw"),
+    ]);
+    changed.tests = Vec::new();
+    let changed_compilation = compile(&changed);
+    assert!(changed_compilation.is_ok());
+
+    let runner = Runner::new(adapter, None);
+    let error = runner
+        .apply(&changed_compilation, &plan, &RunOptions::default())
+        .await
+        .expect_err("stale plan rejected");
+    assert!(matches!(
+        error,
+        phlo_transform_engine::EngineError::StalePlan(_)
+    ));
 }

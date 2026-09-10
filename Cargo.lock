@@ -1757,6 +1757,7 @@ dependencies = [
  "petgraph",
  "phlo-transform-sql",
  "serde",
+ "sha2",
  "sqlparser",
  "thiserror",
  "toml",

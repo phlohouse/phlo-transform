@@ -85,7 +85,7 @@ async fn executes_models_and_tests_against_trino() {
 
     let compilation = fixture_project();
     let selected = select_models(&compilation, &Default::default());
-    let plan = Planner::new(adapter.clone())
+    let plan = Planner::new(adapter.clone(), None)
         .plan(&compilation, &selected, Some("ci".to_string()))
         .await
         .expect("plan succeeds");

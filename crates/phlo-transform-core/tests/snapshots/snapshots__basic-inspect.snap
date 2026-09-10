@@ -9,6 +9,7 @@ expression: "compilation.inspect_report(&id).expect(\"model exists\")"
     "namespace": "assay",
     "materialization": "view",
     "target": "assay.results",
+    "version": "a7057b0",
     "path": "workflows/assay/transforms/results.sql",
     "depends_on": [
       "assay.raw"

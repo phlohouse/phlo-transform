@@ -14,8 +14,8 @@ use crate::adapter::Adapter;
 use crate::cancel::CancelHandle;
 use crate::error::{AdapterError, EngineError};
 use crate::events::{EngineEvent, ExecutionStatus};
-use crate::plan::Plan;
-use crate::state::{ModelRunRecord, RunRecord, StateStore, TestRunRecord};
+use crate::plan::{Plan, PlanAction, PlannedModel};
+use crate::state::{MaterializedRecord, ModelRunRecord, RunRecord, StateStore, TestRunRecord};
 use crate::util::{now_rfc3339, sha256_hex};
 
 /// Options controlling a run.
@@ -47,6 +47,11 @@ pub struct ModelResult {
     pub target: String,
     pub materialization: String,
     pub status: ExecutionStatus,
+    pub desired_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
     pub query_id: Option<String>,
     pub error: Option<String>,
     pub duration_ms: u64,
@@ -103,6 +108,9 @@ impl Runner {
         if plan.blocked {
             return Err(EngineError::Compilation);
         }
+        if let Some(reason) = plan.staleness(compilation) {
+            return Err(EngineError::StalePlan(reason));
+        }
 
         let run_id = uuid::Uuid::new_v4().to_string();
         let started_at = now_rfc3339();
@@ -114,6 +122,11 @@ impl Runner {
             .filter_map(|model| ModelId::parse(&model.id).ok())
             .collect();
         let planned_set: BTreeSet<ModelId> = planned.iter().cloned().collect();
+        let plan_info: BTreeMap<ModelId, PlannedModel> = plan
+            .models
+            .iter()
+            .filter_map(|model| ModelId::parse(&model.id).ok().map(|id| (id, model.clone())))
+            .collect();
 
         // Dependency bookkeeping restricted to the planned set.
         let mut remaining: BTreeMap<ModelId, usize> = BTreeMap::new();
@@ -142,10 +155,46 @@ impl Runner {
             .map(|id| (id.clone(), ExecutionStatus::Pending))
             .collect();
         let mut results: BTreeMap<ModelId, ModelResult> = BTreeMap::new();
-        let mut ready: VecDeque<ModelId> = remaining
+
+        // Skip or reuse models that do not need building, releasing dependents.
+        for id in &planned {
+            let action = plan_info
+                .get(id)
+                .map(|model| model.action)
+                .unwrap_or(PlanAction::Build);
+            if action == PlanAction::Build || action == PlanAction::Unknown {
+                continue;
+            }
+            status.insert(id.clone(), ExecutionStatus::Skipped);
+            if let Some(model) = compilation.model(id) {
+                events.push(EngineEvent::ModelFinished {
+                    model: id.logical_name(),
+                    status: ExecutionStatus::Skipped,
+                    query_id: None,
+                    duration_ms: 0,
+                });
+                results.insert(
+                    id.clone(),
+                    model_result(
+                        model,
+                        ExecutionStatus::Skipped,
+                        None,
+                        None,
+                        0,
+                        plan_info.get(id),
+                    ),
+                );
+            }
+            release_dependents(id, &dependents, &mut remaining);
+        }
+
+        let mut ready: VecDeque<ModelId> = planned
             .iter()
-            .filter(|(_, count)| **count == 0)
-            .map(|(id, _)| id.clone())
+            .filter(|id| {
+                remaining.get(id).copied().unwrap_or(0) == 0
+                    && status.get(id) == Some(&ExecutionStatus::Pending)
+            })
+            .cloned()
             .collect();
 
         let mut join_set: JoinSet<Completion> = JoinSet::new();
@@ -219,6 +268,7 @@ impl Runner {
             let completion = joined.map_err(|error| EngineError::State(error.to_string()))?;
             let id = completion.id.clone();
             let model = compilation.model(&id).expect("planned model exists");
+            let info = plan_info.get(&id);
             match completion.result {
                 Ok(query) => {
                     status.insert(id.clone(), ExecutionStatus::Passed);
@@ -230,28 +280,26 @@ impl Runner {
                     });
                     results.insert(
                         id.clone(),
-                        ModelResult {
-                            model: id.logical_name(),
-                            target: model.target.display(),
-                            materialization: model.config.materialization.to_string(),
-                            status: ExecutionStatus::Passed,
-                            query_id: query.query_id,
-                            error: None,
-                            duration_ms: completion.duration_ms,
-                            sql_hash: sha256_hex(&model.compiled_sql),
-                        },
+                        model_result(
+                            model,
+                            ExecutionStatus::Passed,
+                            query.query_id,
+                            None,
+                            completion.duration_ms,
+                            info,
+                        ),
                     );
-
-                    for dependent in dependents.get(&id).cloned().unwrap_or_default() {
-                        if let Some(count) = remaining.get_mut(&dependent) {
-                            *count = count.saturating_sub(1);
-                            if *count == 0
-                                && status.get(&dependent) == Some(&ExecutionStatus::Pending)
-                            {
-                                ready.push_back(dependent);
-                            }
-                        }
-                    }
+                    release_dependents(&id, &dependents, &mut remaining);
+                    let new_ready = dependents
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|child| {
+                            remaining.get(child).copied().unwrap_or(0) == 0
+                                && status.get(child) == Some(&ExecutionStatus::Pending)
+                        });
+                    ready.extend(new_ready);
                 }
                 Err(error) => {
                     status.insert(id.clone(), ExecutionStatus::Failed);
@@ -263,16 +311,14 @@ impl Runner {
                     });
                     results.insert(
                         id.clone(),
-                        ModelResult {
-                            model: id.logical_name(),
-                            target: model.target.display(),
-                            materialization: model.config.materialization.to_string(),
-                            status: ExecutionStatus::Failed,
-                            query_id: None,
-                            error: Some(error.to_string()),
-                            duration_ms: completion.duration_ms,
-                            sql_hash: sha256_hex(&model.compiled_sql),
-                        },
+                        model_result(
+                            model,
+                            ExecutionStatus::Failed,
+                            None,
+                            Some(error.to_string()),
+                            completion.duration_ms,
+                            info,
+                        ),
                     );
                     block_dependents(
                         &id,
@@ -280,19 +326,18 @@ impl Runner {
                         &mut status,
                         &mut results,
                         compilation,
+                        &plan_info,
                         &mut events,
                     );
                 }
             }
         }
 
-        // Abort in-flight work and mark anything unfinished as cancelled.
         if cancelled {
             join_set.abort_all();
             while join_set.join_next().await.is_some() {}
             for id in &planned {
-                let current = status.get(id).copied().unwrap_or_default();
-                if current.is_terminal() {
+                if status.get(id).copied().unwrap_or_default().is_terminal() {
                     continue;
                 }
                 status.insert(id.clone(), ExecutionStatus::Cancelled);
@@ -305,38 +350,33 @@ impl Runner {
                     });
                     results.insert(
                         id.clone(),
-                        ModelResult {
-                            model: id.logical_name(),
-                            target: model.target.display(),
-                            materialization: model.config.materialization.to_string(),
-                            status: ExecutionStatus::Cancelled,
-                            query_id: None,
-                            error: Some("run cancelled".to_string()),
-                            duration_ms: 0,
-                            sql_hash: sha256_hex(&model.compiled_sql),
-                        },
+                        model_result(
+                            model,
+                            ExecutionStatus::Cancelled,
+                            None,
+                            Some("run cancelled".to_string()),
+                            0,
+                            plan_info.get(id),
+                        ),
                     );
                 }
             }
         }
 
-        // Any model still pending was blocked indirectly.
         for id in &planned {
             if !status.get(id).copied().unwrap_or_default().is_terminal() {
                 status.insert(id.clone(), ExecutionStatus::Blocked);
                 if let Some(model) = compilation.model(id) {
                     results.insert(
                         id.clone(),
-                        ModelResult {
-                            model: id.logical_name(),
-                            target: model.target.display(),
-                            materialization: model.config.materialization.to_string(),
-                            status: ExecutionStatus::Blocked,
-                            query_id: None,
-                            error: Some("blocked by an upstream failure".to_string()),
-                            duration_ms: 0,
-                            sql_hash: sha256_hex(&model.compiled_sql),
-                        },
+                        model_result(
+                            model,
+                            ExecutionStatus::Blocked,
+                            None,
+                            Some("blocked by an upstream failure".to_string()),
+                            0,
+                            plan_info.get(id),
+                        ),
                     );
                 }
             }
@@ -393,6 +433,21 @@ impl Runner {
                     query_id: result.query_id.clone(),
                     error: result.error.clone(),
                 })?;
+                // Record the materialised version after a successful build.
+                if result.status == ExecutionStatus::Passed {
+                    if let Ok(id) = ModelId::parse(&result.model) {
+                        if let Some(model) = compilation.model(&id) {
+                            state.record_materialized(&MaterializedRecord {
+                                model_id: result.model.clone(),
+                                environment: options.environment.clone(),
+                                version: model.version.clone(),
+                                target: result.target.clone(),
+                                run_id: run_id.clone(),
+                                materialized_at: finished_at.clone(),
+                            })?;
+                        }
+                    }
+                }
             }
             for result in &tests {
                 state.record_test(&TestRunRecord {
@@ -451,11 +506,12 @@ impl Runner {
             if !planned_tests.contains(test.id.to_string().as_str()) {
                 continue;
             }
-            // Skip tests whose targets did not all pass.
-            let targets_ready = test
-                .targets
-                .iter()
-                .all(|target| model_status.get(target) == Some(&ExecutionStatus::Passed));
+            let targets_ready = test.targets.iter().all(|target| {
+                matches!(
+                    model_status.get(target),
+                    Some(ExecutionStatus::Passed) | Some(ExecutionStatus::Skipped)
+                )
+            });
             if !targets_ready {
                 continue;
             }
@@ -510,12 +566,66 @@ impl Runner {
     }
 }
 
+fn plan_result_fields(info: Option<&PlannedModel>) -> (String, Option<String>, Vec<String>) {
+    match info {
+        Some(model) => (
+            model.desired_version.clone(),
+            model.current_version.clone(),
+            model
+                .reasons
+                .iter()
+                .map(|reason| reason.label().to_string())
+                .collect(),
+        ),
+        None => (String::new(), None, Vec::new()),
+    }
+}
+
+fn model_result(
+    model: &phlo_transform_core::CompiledModel,
+    status: ExecutionStatus,
+    query_id: Option<String>,
+    error: Option<String>,
+    duration_ms: u64,
+    info: Option<&PlannedModel>,
+) -> ModelResult {
+    let (desired_version, previous_version, reasons) = plan_result_fields(info);
+    ModelResult {
+        model: model.id.logical_name(),
+        target: model.target.display(),
+        materialization: model.config.materialization.to_string(),
+        status,
+        desired_version,
+        previous_version,
+        reasons,
+        query_id,
+        error,
+        duration_ms,
+        sql_hash: sha256_hex(&model.compiled_sql),
+    }
+}
+
+fn release_dependents(
+    id: &ModelId,
+    dependents: &BTreeMap<ModelId, Vec<ModelId>>,
+    remaining: &mut BTreeMap<ModelId, usize>,
+) {
+    if let Some(children) = dependents.get(id) {
+        for child in children {
+            if let Some(count) = remaining.get_mut(child) {
+                *count = count.saturating_sub(1);
+            }
+        }
+    }
+}
+
 fn block_dependents(
     id: &ModelId,
     dependents: &BTreeMap<ModelId, Vec<ModelId>>,
     status: &mut BTreeMap<ModelId, ExecutionStatus>,
     results: &mut BTreeMap<ModelId, ModelResult>,
     compilation: &Compilation,
+    plan_info: &BTreeMap<ModelId, PlannedModel>,
     events: &mut Vec<EngineEvent>,
 ) {
     let Some(children) = dependents.get(id) else {
@@ -536,18 +646,24 @@ fn block_dependents(
             });
             results.insert(
                 child.clone(),
-                ModelResult {
-                    model: child.logical_name(),
-                    target: model.target.display(),
-                    materialization: model.config.materialization.to_string(),
-                    status: ExecutionStatus::Blocked,
-                    query_id: None,
-                    error: Some(format!("blocked by {}", id.logical_name())),
-                    duration_ms: 0,
-                    sql_hash: sha256_hex(&model.compiled_sql),
-                },
+                model_result(
+                    model,
+                    ExecutionStatus::Blocked,
+                    None,
+                    Some(format!("blocked by {}", id.logical_name())),
+                    0,
+                    plan_info.get(child),
+                ),
             );
         }
-        block_dependents(child, dependents, status, results, compilation, events);
+        block_dependents(
+            child,
+            dependents,
+            status,
+            results,
+            compilation,
+            plan_info,
+            events,
+        );
     }
 }

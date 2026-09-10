@@ -29,8 +29,12 @@ It is intentionally not a dbt compatibility project. The goal is a smaller, more
   inference, inferred output schemas, `lineage`/`impact`, config-file schema
   contracts, `@key`/`@not-null` assertions with generated SQL tests, and a
   `lineage.json` artifact. See [`docs/semantic.md`](docs/semantic.md).
+- **Phase 3 — state-aware execution: done.** Content-addressed model versions,
+  `SourceStateProvider`, materialised-version state, state-aware plan
+  (`build`/`skip`/`cached` with reasons) and stale-plan rejection. See
+  [`docs/state.md`](docs/state.md).
 
-No state-aware skipping, incremental models, Nessie, WAP, data diff or daemon
+No incremental models, Nessie, WAP, data diff, workflow integration or daemon
 yet — those are later phases.
 
 ## Toolchain
@@ -88,3 +92,4 @@ runs a disposable container and is executed explicitly in CI.
 - [Phase 0 compiler architecture](docs/architecture.md)
 - [Phase 1 engine architecture](docs/engine.md)
 - [Phase 2 semantic compiler](docs/semantic.md)
+- [Phase 3 state-aware execution](docs/state.md)

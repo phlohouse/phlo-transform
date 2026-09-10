@@ -4,19 +4,25 @@ expression: stdout(&output)
 ---
 {
   "model": {
-    "id": "model://reporting/monthly",
-    "name": "reporting.monthly",
-    "namespace": "reporting",
-    "materialization": "view",
-    "target": "reporting.monthly",
-    "path": "workflows/reporting/transforms/monthly.sql",
+    "columns": [],
     "depends_on": [
       "assay.results"
     ],
+    "id": "model://reporting/monthly",
+    "materialization": "view",
+    "name": "reporting.monthly",
+    "namespace": "reporting",
+    "path": "workflows/reporting/transforms/monthly.sql",
     "sources": [],
-    "used_by": [],
+    "sql": "select * from assay.results\n",
+    "target": "reporting.monthly",
     "tests": [],
-    "columns": [],
-    "sql": "select * from assay.results\n"
+    "used_by": [],
+    "version": "cd67970"
+  },
+  "state": {
+    "current": null,
+    "desired": "cd67970",
+    "status": "new"
   }
 }

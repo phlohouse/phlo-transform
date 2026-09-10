@@ -45,6 +45,8 @@ pub struct ModelSummary {
     pub materialization: String,
     /// Physical target relation.
     pub target: String,
+    /// Short desired version hash.
+    pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -103,6 +105,8 @@ pub struct ModelDetail {
     pub namespace: String,
     pub materialization: String,
     pub target: String,
+    /// Short desired version hash.
+    pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -257,6 +261,7 @@ impl Compilation {
                 namespace: model.namespace.to_string(),
                 materialization: model.config.materialization.to_string(),
                 target: model.target.display(),
+                version: model.version.short().to_string(),
                 path: model.path_display(),
                 tags: model.config.tags.clone(),
                 owner: model.config.owner.clone(),
@@ -450,6 +455,7 @@ fn model_summary(model: &CompiledModel) -> ModelSummary {
         namespace: model.id.namespace().to_string(),
         materialization: model.config.materialization.to_string(),
         target: model.target.display(),
+        version: model.version.short().to_string(),
         path: model.path_display(),
         tags: model.config.tags.clone(),
         depends_on: model

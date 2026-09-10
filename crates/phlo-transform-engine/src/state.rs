@@ -10,6 +10,8 @@ use std::sync::Mutex;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use phlo_transform_core::ModelVersion;
+
 use crate::error::EngineError;
 use crate::events::ExecutionStatus;
 
@@ -66,6 +68,17 @@ pub struct RunSummary {
     pub failed_count: usize,
 }
 
+/// The version recorded against a physical materialisation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MaterializedRecord {
+    pub model_id: String,
+    pub environment: Option<String>,
+    pub version: ModelVersion,
+    pub target: String,
+    pub run_id: String,
+    pub materialized_at: String,
+}
+
 /// Persists run history.
 pub trait StateStore: Send + Sync {
     fn start_run(&self, run: &RunRecord) -> Result<(), EngineError>;
@@ -78,6 +91,20 @@ pub trait StateStore: Send + Sync {
     fn record_model(&self, record: &ModelRunRecord) -> Result<(), EngineError>;
     fn record_test(&self, record: &TestRunRecord) -> Result<(), EngineError>;
     fn runs(&self) -> Result<Vec<RunSummary>, EngineError>;
+
+    /// Record the version attached to a successful materialisation.
+    fn record_materialized(&self, record: &MaterializedRecord) -> Result<(), EngineError>;
+    /// The materialised version for a model in an environment.
+    fn materialized_version(
+        &self,
+        model_id: &str,
+        environment: Option<&str>,
+    ) -> Result<Option<MaterializedRecord>, EngineError>;
+    /// All materialisations of a given version hash (for cache reuse checks).
+    fn materialized_by_hash(
+        &self,
+        version_hash: &str,
+    ) -> Result<Vec<MaterializedRecord>, EngineError>;
 }
 
 /// SQLite-backed local state store.
@@ -141,6 +168,22 @@ impl SqliteStateStore {
                     started_at TEXT NOT NULL,
                     finished_at TEXT NOT NULL,
                     PRIMARY KEY (run_id, test_id)
+                );
+                CREATE TABLE IF NOT EXISTS model_versions (
+                    model_id TEXT NOT NULL,
+                    environment TEXT NOT NULL,
+                    version_hash TEXT NOT NULL,
+                    sql_hash TEXT NOT NULL,
+                    config_hash TEXT NOT NULL,
+                    contract_hash TEXT NOT NULL,
+                    dependency_hash TEXT NOT NULL,
+                    source_state_hash TEXT NOT NULL,
+                    compiler_version TEXT NOT NULL,
+                    target_hash TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    materialized_at TEXT NOT NULL,
+                    PRIMARY KEY (model_id, environment)
                 );
                 ",
             )
@@ -283,6 +326,107 @@ impl StateStore for SqliteStateStore {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| EngineError::State(error.to_string()))
     }
+
+    fn record_materialized(&self, record: &MaterializedRecord) -> Result<(), EngineError> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO model_versions
+                 (model_id, environment, version_hash, sql_hash, config_hash, contract_hash,
+                  dependency_hash, source_state_hash, compiler_version, target_hash, target,
+                  run_id, materialized_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    record.model_id,
+                    record.environment.clone().unwrap_or_default(),
+                    record.version.hash,
+                    record.version.sql_hash,
+                    record.version.config_hash,
+                    record.version.contract_hash,
+                    record.version.dependency_hash,
+                    record.version.source_state_hash,
+                    record.version.compiler_version,
+                    record.version.target_hash,
+                    record.target,
+                    record.run_id,
+                    record.materialized_at,
+                ],
+            )
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        Ok(())
+    }
+
+    fn materialized_version(
+        &self,
+        model_id: &str,
+        environment: Option<&str>,
+    ) -> Result<Option<MaterializedRecord>, EngineError> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT {MATERIALIZED_COLUMNS} FROM model_versions WHERE model_id = ?1 AND environment = ?2"
+            ))
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        let mut rows = statement
+            .query(rusqlite::params![model_id, environment.unwrap_or("")])
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        match rows
+            .next()
+            .map_err(|error| EngineError::State(error.to_string()))?
+        {
+            Some(row) => Ok(Some(
+                materialized_from_row(row)
+                    .map_err(|error| EngineError::State(error.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    fn materialized_by_hash(
+        &self,
+        version_hash: &str,
+    ) -> Result<Vec<MaterializedRecord>, EngineError> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT {MATERIALIZED_COLUMNS} FROM model_versions WHERE version_hash = ?1"
+            ))
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        let rows = statement
+            .query_map(rusqlite::params![version_hash], materialized_from_row)
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| EngineError::State(error.to_string()))
+    }
+}
+
+const MATERIALIZED_COLUMNS: &str = "model_id, environment, version_hash, sql_hash, config_hash, \
+     contract_hash, dependency_hash, source_state_hash, compiler_version, target_hash, target, \
+     run_id, materialized_at";
+
+fn materialized_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MaterializedRecord> {
+    let environment: String = row.get(1)?;
+    Ok(MaterializedRecord {
+        model_id: row.get(0)?,
+        environment: if environment.is_empty() {
+            None
+        } else {
+            Some(environment)
+        },
+        version: ModelVersion {
+            hash: row.get(2)?,
+            sql_hash: row.get(3)?,
+            config_hash: row.get(4)?,
+            contract_hash: row.get(5)?,
+            dependency_hash: row.get(6)?,
+            source_state_hash: row.get(7)?,
+            compiler_version: row.get(8)?,
+            target_hash: row.get(9)?,
+        },
+        target: row.get(10)?,
+        run_id: row.get(11)?,
+        materialized_at: row.get(12)?,
+    })
 }
 
 #[cfg(test)]

@@ -315,6 +315,7 @@ mod tests {
             limitations: Vec::new(),
             assertions: Vec::new(),
             contract: None,
+            version: Default::default(),
             pinned_id: None,
             dependencies,
             id,

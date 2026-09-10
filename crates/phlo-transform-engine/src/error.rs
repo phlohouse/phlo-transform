@@ -40,4 +40,6 @@ pub enum EngineError {
     Artifact(String),
     #[error("invalid plan: {0}")]
     InvalidPlan(String),
+    #[error("plan is stale: {0}; run `phlo-transform plan` again")]
+    StalePlan(String),
 }

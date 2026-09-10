@@ -32,6 +32,8 @@ pub struct CompiledModel {
     pub assertions: Vec<crate::semantic::Assertion>,
     /// Explicit contract, when declared.
     pub contract: Option<crate::semantic::ModelContract>,
+    /// Content-addressed desired version.
+    pub version: crate::version::ModelVersion,
     /// Pinned identity from `-- @id`, when present and valid.
     pub pinned_id: Option<ModelId>,
     /// Resolved dependencies, sorted and deduplicated.

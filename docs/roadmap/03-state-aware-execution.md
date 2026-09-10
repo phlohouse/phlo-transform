@@ -345,3 +345,22 @@ Phase 3 is complete when:
 - Nessie promotion;
 - data diff;
 - daemon.
+
+## Implementation notes
+
+Phase 3 is implemented. See [`docs/state.md`](../state.md).
+
+- `ModelVersion` component hashes computed in dependency order during
+  compilation (`core::version`); canonical AST hashing means formatting and
+  comments do not rebuild.
+- `SourceStateProvider` interface (empty + static implementations).
+- SQLite `model_versions` table with `record_materialized`,
+  `materialized_version` and `materialized_by_hash`.
+- `Planner` is state-aware: `build` / `skip` / `cached` with structured
+  `ChangeReason`s.
+- Runner records materialisations and rejects stale plans.
+- `inspect` exposes desired/current versions and status.
+
+Deferred, as listed above: cross-environment reuse, optimiser semantics,
+incremental strategies, Nessie, data diff, daemon.
+

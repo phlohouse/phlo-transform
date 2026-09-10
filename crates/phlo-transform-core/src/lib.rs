@@ -28,6 +28,7 @@ pub mod rewrite;
 pub mod schema;
 pub mod select;
 pub mod semantic;
+pub mod version;
 
 use std::path::Path;
 
@@ -55,6 +56,10 @@ pub use select::{select_models, SelectionOptions};
 pub use semantic::{
     Assertion, ColumnContract, ColumnRef, DataType, ModelContract, ModelSchema, Nullability,
     OutputColumn, RelationRef,
+};
+pub use version::{
+    model_version, EmptySourceStateProvider, ModelVersion, SourceStateProvider,
+    StaticSourceStateProvider, VersionInputs, COMPILER_SEMANTICS_VERSION,
 };
 
 /// Load a native workspace and compile it in one step.

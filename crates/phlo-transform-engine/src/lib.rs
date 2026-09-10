@@ -27,5 +27,6 @@ pub use events::{EngineEvent, ExecutionStatus};
 pub use plan::{dependency_closure, Plan, PlanAction, PlannedModel, PlannedTest, Planner};
 pub use run::{ModelResult, RunOptions, RunResult, Runner, TestResult};
 pub use state::{
-    ModelRunRecord, RunRecord, RunSummary, SqliteStateStore, StateStore, TestRunRecord,
+    MaterializedRecord, ModelRunRecord, RunRecord, RunSummary, SqliteStateStore, StateStore,
+    TestRunRecord,
 };
