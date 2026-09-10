@@ -11,7 +11,10 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use phlo_transform_core::graph::Dependency;
-use phlo_transform_core::{Compilation, Diagnostic, Materialization, ModelId, ModelVersion};
+use phlo_transform_core::{
+    classify_schema_change, Compilation, DataType, Diagnostic, IncrementalStrategy,
+    Materialization, ModelId, ModelVersion, Nullability, SchemaChangeSafety, SchemaColumn,
+};
 
 use crate::adapter::Adapter;
 use crate::error::EngineError;
@@ -44,6 +47,7 @@ pub enum ChangeReason {
     TargetChange,
     CompilerSemanticsChange,
     IncrementalChange,
+    SchemaChange,
     MissingRelation,
     UnknownState,
 }
@@ -59,6 +63,7 @@ impl ChangeReason {
             ChangeReason::TargetChange => "physical target changed",
             ChangeReason::CompilerSemanticsChange => "compiler semantics changed",
             ChangeReason::IncrementalChange => "incremental strategy or key changed",
+            ChangeReason::SchemaChange => "output schema changed incompatibly",
             ChangeReason::MissingRelation => "target relation does not exist",
             ChangeReason::UnknownState => "no recorded materialised version",
         }
@@ -78,6 +83,8 @@ pub struct PlannedModel {
     pub incremental: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
     pub full_rebuild: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watermark: Option<String>,
     pub desired_version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_version: Option<String>,
@@ -231,6 +238,51 @@ impl Planner {
                     None => full_rebuild = true,
                 }
             }
+
+            // Schema-change classification can force a full rebuild.
+            if action == PlanAction::Build && exists && model.schema.known {
+                if let Ok(columns) = self.adapter.relation_columns(&model.target).await {
+                    let current_schema: Vec<SchemaColumn> = columns
+                        .iter()
+                        .map(|column| SchemaColumn {
+                            name: column.name.clone(),
+                            data_type: DataType::parse_trino(&column.data_type),
+                            nullability: Nullability::Unknown,
+                        })
+                        .collect();
+                    let desired_schema: Vec<SchemaColumn> = model
+                        .schema
+                        .columns
+                        .iter()
+                        .map(|column| SchemaColumn {
+                            name: column.name.clone(),
+                            data_type: column.data_type.clone(),
+                            nullability: column.nullability,
+                        })
+                        .collect();
+                    let safety = classify_schema_change(&desired_schema, &current_schema);
+                    if safety != SchemaChangeSafety::Safe {
+                        if !reasons.contains(&ChangeReason::SchemaChange) {
+                            reasons.push(ChangeReason::SchemaChange);
+                        }
+                        if matches!(
+                            safety,
+                            SchemaChangeSafety::FullRebuildRequired | SchemaChangeSafety::Error
+                        ) {
+                            full_rebuild = true;
+                        }
+                    }
+                }
+            }
+
+            // Time-window models resume from the last successful watermark.
+            let watermark = match (&model.config.incremental, &self.state) {
+                (Some(IncrementalStrategy::TimeWindow { .. }), Some(state)) => {
+                    state.watermark(&id.logical_name(), environment.as_deref())?
+                }
+                _ => None,
+            };
+
             let current_version = current_record
                 .as_ref()
                 .map(|record| record.version.hash.clone());
@@ -248,6 +300,7 @@ impl Planner {
                     .as_ref()
                     .map(|strategy| strategy.as_str().to_string()),
                 full_rebuild,
+                watermark,
                 desired_version: desired.hash.clone(),
                 current_version,
                 dependencies: model

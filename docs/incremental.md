@@ -50,21 +50,34 @@ bootstrap.
 - **Bootstrap / full rebuild**: `CREATE TABLE ... AS` (or replace).
 - **append**: `INSERT INTO <target> <select>`.
 - **key**: `MERGE INTO <target> USING (<select>) ON key...` with `UPDATE` and
-  `INSERT` actions derived from the target's columns.
-- **partition** and **time-window**: the intent is represented and planned, but
-  execution currently uses a safe full rebuild rather than claiming precision
-  the engine does not yet have.
+  `INSERT` actions derived from the target's columns. Verified end-to-end
+  against Trino/Iceberg, including idempotent re-application.
+- **partition**: `DELETE FROM <target> WHERE (partition columns) IN (SELECT ...
+  FROM source)` followed by `INSERT`, so only partitions present in the source
+  are replaced and other partitions are untouched.
+- **time-window**: appends rows where the window column is greater than the
+  last committed watermark (`CAST('<watermark>' AS <type>`), then advances the
+  watermark to `max(column)`. Watermarks are committed only on success.
 
-The chosen operation is computed by the engine; adapters implement `append`
-and `merge` (plus `create_or_replace_table` for bootstrap).
+The chosen operation is computed by the engine; adapters implement
+`append`, `merge`, `replace_partitions` and `create_or_replace_table`.
+
+## Schema evolution in planning
+
+For an existing target, the planner compares the desired output schema with the
+target's actual schema using `classify_schema_change`. Added nullable columns
+are safe, numeric widening is review, removed columns force a full rebuild, and
+incompatible changes are errors; `schema_change` and `full_rebuild` appear in
+the plan.
 
 ## State
 
 After a successful incremental build the engine records the strategy and key
 alongside the materialised version. Failed builds do not record a
 materialisation, so subsequent planning still sees the previous state
-(`failed runs do not advance successful incremental state`). A dedicated
-time-window watermark table is not yet implemented.
+(`failed runs do not advance successful incremental state`). Time-window
+models additionally persist a committed watermark (`incremental_state` table)
+and only advance it after a successful build.
 
 ## Schema evolution
 
@@ -80,11 +93,12 @@ time-window watermark table is not yet implemented.
 
 - directive and config parsing (append/key/partition/window, composite keys);
 - strategy inference and key identity;
-- planner full-rebuild on key change;
-- fake-adapter bootstrap-then-merge flow;
-- schema-change classification unit tests.
+- planner full-rebuild on key change and on schema removal;
+- fake-adapter bootstrap-then-merge, partition replacement and time-window
+  watermark flows;
+- live Trino/Iceberg `MERGE` bootstrap/merge/idempotence.
 
 ## Deferred
 
-Partition/time-window precise execution and watermarks; arbitrary
-user-defined incremental algorithms; Nessie/WAP; data diff; streaming.
+Partition-metadata pruning; applying the configured time-window overlap;
+arbitrary user-defined incremental algorithms; streaming.

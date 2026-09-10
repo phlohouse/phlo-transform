@@ -266,6 +266,29 @@ impl Adapter for TrinoAdapter {
         self.run(&merge).await
     }
 
+    async fn replace_partitions(
+        &self,
+        relation: &Relation,
+        partition_columns: &[String],
+        sql: &str,
+    ) -> Result<QueryResult, AdapterError> {
+        let columns: Vec<String> = partition_columns
+            .iter()
+            .map(|column| quote(column))
+            .collect();
+        let columns = columns.join(", ");
+        self.run(&format!(
+            "DELETE FROM {} WHERE ({columns}) IN (SELECT {columns} FROM ({sql}) AS __phlo_src)",
+            relation.sql()
+        ))
+        .await?;
+        self.run(&format!(
+            "INSERT INTO {} SELECT * FROM ({sql}) AS __phlo_src",
+            relation.sql()
+        ))
+        .await
+    }
+
     async fn cancel(&self, query_id: &str) -> Result<(), AdapterError> {
         let url = format!("{}/v1/query/{}", self.config.endpoint, query_id);
         let response = self

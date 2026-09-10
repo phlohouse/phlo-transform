@@ -278,27 +278,25 @@ Phase 4 is complete when:
 
 ## Implementation notes
 
-Phase 4 is **partially implemented and partly deviated** (audited against code
-and tests). See [`docs/incremental.md`](../incremental.md).
+Phase 4 is **partially implemented** (audited against code and tests). See
+[`docs/incremental.md`](../incremental.md).
 
 - `@incremental` directives and `[model.<name>.incremental]` config parse into
   `IncrementalStrategy` (`append`/`key`/`partition`/`time-window`); key
   declarations imply identity.
 - Strategy participates in the model-version `config_hash`; key/strategy
   changes produce an `incremental_change` reason and a full rebuild.
-- Adapter gains `append` and `merge`; the engine chooses bootstrap CTAS,
-  append, merge, or a safe full rebuild.
-- `classify_schema_change` classifies evolving schemas.
+- Adapter gains `append`, `merge` and `replace_partitions`; the engine chooses
+  bootstrap CTAS, append, key `MERGE`, partition replacement, a typed
+  time-window append, or a safe full rebuild.
+- Time-window watermarks are persisted (`incremental_state`) and advanced only
+  on success.
+- `classify_schema_change` is wired into planning: removed/incompatible columns
+  force a full rebuild with a `schema_change` reason.
+- Trino `MERGE` and idempotent re-application are verified live on Iceberg.
 
-Audited gaps and deviations:
-
-- `partition` and `time-window` are represented and planned but execute as a
-  full rebuild; no partition replacement or watermark query exists.
-- `merge` SQL generation is not exercised by any test; the live Trino e2e uses
-  the memory connector, which does not support `MERGE`.
-- `classify_schema_change` is not called by the planner or diff; it exists and
-  is unit-tested only.
-- No dedicated watermark state table; failed runs simply do not record a
-  materialisation.
-- Idempotence under retry is not tested.
+Remaining gaps: partition replacement uses a column-list `DELETE ... IN`
+rather than partition-metadata pruning; the configured time-window overlap is
+stored but not yet applied to the predicate; schema classification is not part
+of data diff.
 

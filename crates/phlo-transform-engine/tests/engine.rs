@@ -11,9 +11,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use phlo_transform_core::{
-    compile, compile_with_options, select_models, Compilation, EmptySchemaProvider,
-    IncrementalStrategy, Materialization, ModelId, ModelOrigin, Relation, SelectionOptions,
-    SemanticModel, SemanticProject, SemanticTest, SourceId, SourceStateProvider,
+    compile, compile_with_options, select_models, Compilation, DataType, EmptySchemaProvider,
+    EmptySourceStateProvider, IncrementalStrategy, Materialization, ModelId, ModelOrigin,
+    Nullability, Relation, RelationSchema, SchemaColumn, SelectionOptions, SemanticModel,
+    SemanticProject, SemanticTest, SourceId, SourceStateProvider, StaticSchemaProvider,
     StaticSourceStateProvider, TestId,
 };
 use phlo_transform_engine::{
@@ -28,8 +29,12 @@ struct FakeAdapter {
     fail_targets: Mutex<BTreeSet<String>>,
     created: Mutex<Vec<String>>,
     appends: Mutex<Vec<String>>,
+    append_sqls: Mutex<Vec<String>>,
     merges: Mutex<Vec<String>>,
+    replaced_partitions: Mutex<Vec<String>>,
+    columns: Mutex<Vec<ColumnInfo>>,
     source_states: Mutex<BTreeMap<String, String>>,
+    max_value: Mutex<Option<String>>,
     test_rows: Mutex<u64>,
     delay_ms: u64,
     current: AtomicUsize,
@@ -63,6 +68,14 @@ impl FakeAdapter {
             .lock()
             .unwrap()
             .insert(relation.to_string(), state.to_string());
+    }
+
+    fn set_columns(&self, columns: Vec<ColumnInfo>) {
+        *self.columns.lock().unwrap() = columns;
+    }
+
+    fn set_max_value(&self, value: &str) {
+        *self.max_value.lock().unwrap() = Some(value.to_string());
     }
 
     async fn create(
@@ -103,7 +116,17 @@ impl Adapter for FakeAdapter {
         Ok(self.existing.lock().unwrap().contains(&relation.display()))
     }
 
-    async fn execute(&self, _sql: &str) -> Result<QueryResult, AdapterError> {
+    async fn execute(&self, sql: &str) -> Result<QueryResult, AdapterError> {
+        if sql.to_ascii_lowercase().contains("max(") {
+            if let Some(value) = self.max_value.lock().unwrap().clone() {
+                return Ok(QueryResult {
+                    query_id: Some("max-query".to_string()),
+                    columns: vec!["max".to_string()],
+                    rows: vec![vec![value]],
+                    row_count: 1,
+                });
+            }
+        }
         let rows = *self.test_rows.lock().unwrap();
         Ok(QueryResult {
             query_id: Some("test-query".to_string()),
@@ -128,9 +151,10 @@ impl Adapter for FakeAdapter {
         self.create(relation, "table-query").await
     }
 
-    async fn append(&self, relation: &Relation, _sql: &str) -> Result<QueryResult, AdapterError> {
+    async fn append(&self, relation: &Relation, sql: &str) -> Result<QueryResult, AdapterError> {
         let display = relation.display();
         self.appends.lock().unwrap().push(display.clone());
+        self.append_sqls.lock().unwrap().push(sql.to_string());
         self.existing.lock().unwrap().insert(display);
         Ok(QueryResult {
             query_id: Some("append-query".to_string()),
@@ -153,6 +177,24 @@ impl Adapter for FakeAdapter {
         })
     }
 
+    async fn replace_partitions(
+        &self,
+        relation: &Relation,
+        _partition_columns: &[String],
+        _sql: &str,
+    ) -> Result<QueryResult, AdapterError> {
+        let display = relation.display();
+        self.replaced_partitions
+            .lock()
+            .unwrap()
+            .push(display.clone());
+        self.existing.lock().unwrap().insert(display);
+        Ok(QueryResult {
+            query_id: Some("replace-partitions-query".to_string()),
+            ..Default::default()
+        })
+    }
+
     async fn cancel(&self, _query_id: &str) -> Result<(), AdapterError> {
         Ok(())
     }
@@ -161,7 +203,7 @@ impl Adapter for FakeAdapter {
         &self,
         _relation: &Relation,
     ) -> Result<Vec<ColumnInfo>, AdapterError> {
-        Ok(Vec::new())
+        Ok(self.columns.lock().unwrap().clone())
     }
 
     async fn ensure_catalog(&self, _request: &CatalogRequest) -> Result<(), AdapterError> {
@@ -713,4 +755,164 @@ async fn collects_source_states_from_adapter() {
     .await
     .expect("collect");
     assert_eq!(provider.source_state(&source).as_deref(), Some("snap-9"));
+}
+
+fn incremental_with(sql: &str, strategy: IncrementalStrategy) -> SemanticModel {
+    let mut model = model("assay.events", sql);
+    model.config.materialization = Materialization::Incremental;
+    model.config.incremental = Some(strategy);
+    model
+}
+
+fn events_provider() -> StaticSchemaProvider {
+    let mut provider = StaticSchemaProvider::new();
+    provider.insert(
+        "external.events",
+        RelationSchema::new(vec![
+            SchemaColumn {
+                name: "id".to_string(),
+                data_type: DataType::BigInt,
+                nullability: Nullability::NotNull,
+            },
+            SchemaColumn {
+                name: "updated_at".to_string(),
+                data_type: DataType::Timestamp,
+                nullability: Nullability::Nullable,
+            },
+        ]),
+    );
+    provider
+}
+
+async fn run_once(
+    adapter: Arc<FakeAdapter>,
+    state: Arc<SqliteStateStore>,
+    compilation: &Compilation,
+    environment: &str,
+) -> phlo_transform_engine::RunResult {
+    let selected = select_models(compilation, &SelectionOptions::default());
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(compilation, &selected, Some(environment.to_string()))
+        .await
+        .unwrap();
+    Runner::new(adapter, Some(state))
+        .apply(
+            compilation,
+            &plan,
+            &RunOptions {
+                environment: Some(environment.to_string()),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn incremental_partition_replaces_after_bootstrap() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+
+    let first = compile_models(vec![incremental_with(
+        "select 1 as id, DATE '2026-09-10' as d",
+        IncrementalStrategy::Partition {
+            columns: vec!["d".to_string()],
+        },
+    )]);
+    run_once(adapter.clone(), state.clone(), &first, "dev").await;
+    assert_eq!(adapter.created.lock().unwrap().len(), 1);
+    assert!(adapter.replaced_partitions.lock().unwrap().is_empty());
+
+    let second = compile_models(vec![incremental_with(
+        "select 1 as id, DATE '2026-09-10' as d \
+         union all select 2, DATE '2026-09-11'",
+        IncrementalStrategy::Partition {
+            columns: vec!["d".to_string()],
+        },
+    )]);
+    let selected = select_models(&second, &SelectionOptions::default());
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&second, &selected, Some("dev".to_string()))
+        .await
+        .unwrap();
+    assert!(!plan.models[0].full_rebuild, "{:?}", plan.models[0]);
+    run_once(adapter.clone(), state.clone(), &second, "dev").await;
+    assert_eq!(adapter.replaced_partitions.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn incremental_time_window_uses_watermark() {
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_max_value("2026-09-10 00:00:00.000");
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let provider = events_provider();
+
+    let build = |sql: &str| {
+        let project = SemanticProject::in_memory(vec![incremental_with(
+            sql,
+            IncrementalStrategy::TimeWindow {
+                column: "updated_at".to_string(),
+                overlap_seconds: None,
+            },
+        )]);
+        let compilation = compile_with_options(&project, &provider, &EmptySourceStateProvider);
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+        compilation
+    };
+
+    let first = build("select id, updated_at from external.events");
+    run_once(adapter.clone(), state.clone(), &first, "dev").await;
+    assert_eq!(
+        state.watermark("assay.events", Some("dev")).unwrap(),
+        Some("2026-09-10 00:00:00.000".to_string())
+    );
+
+    let second = build("select id, updated_at from external.events where id > 0");
+    run_once(adapter.clone(), state.clone(), &second, "dev").await;
+    let appends = adapter.append_sqls.lock().unwrap().clone();
+    assert_eq!(appends.len(), 1, "{appends:?}");
+    assert!(appends[0].contains("CAST("), "{}", appends[0]);
+    assert!(appends[0].contains("updated_at"), "{}", appends[0]);
+}
+
+#[tokio::test]
+async fn schema_removal_forces_full_rebuild() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let provider = events_provider();
+
+    let build = |sql: &str| {
+        let project =
+            SemanticProject::in_memory(vec![incremental_with(sql, IncrementalStrategy::Append)]);
+        let compilation = compile_with_options(&project, &provider, &EmptySourceStateProvider);
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+        compilation
+    };
+
+    let first = build("select id, updated_at from external.events");
+    run_once(adapter.clone(), state.clone(), &first, "dev").await;
+
+    // The target now has an extra legacy column that the desired schema drops.
+    adapter.set_columns(vec![
+        ColumnInfo {
+            name: "id".to_string(),
+            data_type: "bigint".to_string(),
+            nullable: false,
+        },
+        ColumnInfo {
+            name: "legacy".to_string(),
+            data_type: "varchar".to_string(),
+            nullable: true,
+        },
+    ]);
+
+    let second = build("select id, updated_at from external.events where id > 0");
+    let selected = select_models(&second, &SelectionOptions::default());
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&second, &selected, Some("dev".to_string()))
+        .await
+        .unwrap();
+    assert!(plan.models[0].full_rebuild, "{:?}", plan.models[0]);
+    assert!(plan.models[0].reasons.contains(&ChangeReason::SchemaChange));
 }

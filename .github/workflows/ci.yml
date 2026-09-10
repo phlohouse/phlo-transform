@@ -40,3 +40,6 @@ jobs:
 
       - name: Nessie WAP integration tests
         run: cargo test -p phlo-transform-trino --test nessie_wap_e2e -- --ignored
+
+      - name: Incremental MERGE integration tests
+        run: cargo test -p phlo-transform-trino --test trino_incremental_e2e -- --ignored

@@ -111,6 +111,22 @@ pub trait StateStore: Send + Sync {
         &self,
         version_hash: &str,
     ) -> Result<Vec<MaterializedRecord>, EngineError>;
+
+    /// Record a successful time-window watermark. Only called on success.
+    fn set_watermark(
+        &self,
+        model_id: &str,
+        environment: Option<&str>,
+        value: &str,
+        run_id: &str,
+    ) -> Result<(), EngineError>;
+
+    /// The last successful time-window watermark for a model/environment.
+    fn watermark(
+        &self,
+        model_id: &str,
+        environment: Option<&str>,
+    ) -> Result<Option<String>, EngineError>;
 }
 
 /// SQLite-backed local state store.
@@ -191,6 +207,14 @@ impl SqliteStateStore {
                     materialized_at TEXT NOT NULL,
                     incremental_strategy TEXT,
                     incremental_key TEXT,
+                    PRIMARY KEY (model_id, environment)
+                );
+                CREATE TABLE IF NOT EXISTS incremental_state (
+                    model_id TEXT NOT NULL,
+                    environment TEXT NOT NULL,
+                    last_value TEXT,
+                    run_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
                     PRIMARY KEY (model_id, environment)
                 );
                 ",
@@ -448,6 +472,56 @@ impl StateStore for SqliteStateStore {
             .map_err(|error| EngineError::State(error.to_string()))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| EngineError::State(error.to_string()))
+    }
+
+    fn set_watermark(
+        &self,
+        model_id: &str,
+        environment: Option<&str>,
+        value: &str,
+        run_id: &str,
+    ) -> Result<(), EngineError> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO incremental_state
+                 (model_id, environment, last_value, run_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    model_id,
+                    environment.unwrap_or(""),
+                    value,
+                    run_id,
+                    crate::util::now_rfc3339(),
+                ],
+            )
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        Ok(())
+    }
+
+    fn watermark(
+        &self,
+        model_id: &str,
+        environment: Option<&str>,
+    ) -> Result<Option<String>, EngineError> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT last_value FROM incremental_state WHERE model_id = ?1 AND environment = ?2",
+            )
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        let mut rows = statement
+            .query(rusqlite::params![model_id, environment.unwrap_or("")])
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        match rows
+            .next()
+            .map_err(|error| EngineError::State(error.to_string()))?
+        {
+            Some(row) => Ok(row
+                .get::<_, Option<String>>(0)
+                .map_err(|error| EngineError::State(error.to_string()))?),
+            None => Ok(None),
+        }
     }
 }
 

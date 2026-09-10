@@ -42,12 +42,13 @@ implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
   enrichment; cached classification is tested. See [`docs/state.md`](docs/state.md).
   Gaps: non-Iceberg sources have no observable state; `cached` is a
   classification without cross-environment reuse execution.
-- **Phase 4 — incremental models: partial/deviated.** `@incremental`
+- **Phase 4 — incremental models: partial.** `@incremental`
   append/key/partition/time-window intent, version hashing, full-rebuild
-  detection, adapter `append`/`merge` and bootstrap. See
-  [`docs/incremental.md`](docs/incremental.md). Gaps: partition/time-window
-  execute as full rebuilds, `merge` is not e2e-tested, schema classification is
-  not wired to the planner, and there is no watermark state.
+  detection, adapter `append`/`merge`/`replace_partitions`, typed time-window
+  watermarks and planner schema-change classification. Trino `MERGE` is
+  verified live on Iceberg. See [`docs/incremental.md`](docs/incremental.md).
+  Gaps: partition replacement is column-list based (no metadata pruning);
+  configured window overlap is not applied.
 - **Phase 5 — Nessie and WAP: partial.** `NessieClient` (REST + in-memory),
   environment provisioning (`apply --ref <candidate> --from <base>` creates the
   branch and a branch-scoped Trino catalog), candidate writes isolated from

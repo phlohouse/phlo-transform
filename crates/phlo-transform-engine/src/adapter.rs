@@ -73,6 +73,15 @@ pub trait Adapter: Send + Sync {
         sql: &str,
     ) -> Result<QueryResult, AdapterError>;
 
+    /// Replace the partitions (identified by `partition_columns`) that appear
+    /// in `sql`, leaving other partitions untouched.
+    async fn replace_partitions(
+        &self,
+        relation: &Relation,
+        partition_columns: &[String],
+        sql: &str,
+    ) -> Result<QueryResult, AdapterError>;
+
     async fn cancel(&self, query_id: &str) -> Result<(), AdapterError>;
 
     /// Read column metadata for an existing relation.

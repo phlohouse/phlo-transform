@@ -94,6 +94,8 @@ enum ExecOp {
     Table,
     Append,
     Merge(Vec<String>),
+    ReplacePartitions(Vec<String>),
+    TimeWindow { predicate: String },
 }
 
 fn exec_op(model: &phlo_transform_core::CompiledModel, info: Option<&PlannedModel>) -> ExecOp {
@@ -110,12 +112,62 @@ fn exec_op(model: &phlo_transform_core::CompiledModel, info: Option<&PlannedMode
             match model.config.incremental.as_ref() {
                 Some(IncrementalStrategy::Append) => ExecOp::Append,
                 Some(IncrementalStrategy::Key { columns }) => ExecOp::Merge(columns.clone()),
-                // Partition and time-window currently fall back to a safe
-                // full rebuild; the intent is still recorded and planned.
-                _ => ExecOp::Table,
+                Some(IncrementalStrategy::Partition { columns }) => {
+                    ExecOp::ReplacePartitions(columns.clone())
+                }
+                Some(IncrementalStrategy::TimeWindow { column, .. }) => {
+                    match info
+                        .and_then(|model| model.watermark.as_deref())
+                        .and_then(|watermark| time_window_predicate(model, column, watermark))
+                    {
+                        Some(predicate) => ExecOp::TimeWindow { predicate },
+                        // Without a usable watermark/type, rebuild safely.
+                        None => ExecOp::Table,
+                    }
+                }
+                None => ExecOp::Table,
             }
         }
     }
+}
+
+/// Build a typed predicate `"col" > CAST('<watermark>' AS <type>)`.
+fn time_window_predicate(
+    model: &phlo_transform_core::CompiledModel,
+    column: &str,
+    watermark: &str,
+) -> Option<String> {
+    let data_type = model.schema.column(column)?.data_type.clone();
+    let sql_type = sql_type(&data_type)?;
+    let escaped = watermark.replace('\'', "''");
+    Some(format!(
+        "{} > CAST('{escaped}' AS {sql_type})",
+        quote_ident(column)
+    ))
+}
+
+fn sql_type(data_type: &phlo_transform_core::DataType) -> Option<&'static str> {
+    use phlo_transform_core::DataType;
+    Some(match data_type {
+        DataType::Boolean => "boolean",
+        DataType::TinyInt => "tinyint",
+        DataType::SmallInt => "smallint",
+        DataType::Integer => "integer",
+        DataType::BigInt => "bigint",
+        DataType::Real => "real",
+        DataType::Double => "double",
+        DataType::Decimal => "decimal",
+        DataType::Varchar => "varchar",
+        DataType::Date => "date",
+        DataType::Time => "time",
+        DataType::Timestamp => "timestamp",
+        DataType::TimestampTz => "timestamp with time zone",
+        _ => return None,
+    })
+}
+
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 /// Executes plans against an adapter.
@@ -293,6 +345,17 @@ impl Runner {
                         }
                         ExecOp::Append => adapter.append(&target, &compiled_sql).await,
                         ExecOp::Merge(keys) => adapter.merge(&target, &keys, &compiled_sql).await,
+                        ExecOp::ReplacePartitions(columns) => {
+                            adapter
+                                .replace_partitions(&target, &columns, &compiled_sql)
+                                .await
+                        }
+                        ExecOp::TimeWindow { predicate } => {
+                            let filtered = format!(
+                                "SELECT * FROM ({compiled_sql}) AS __phlo_src WHERE {predicate}"
+                            );
+                            adapter.append(&target, &filtered).await
+                        }
                     };
                     Completion {
                         id: task_id,
@@ -352,6 +415,20 @@ impl Runner {
                                 && status.get(child) == Some(&ExecutionStatus::Pending)
                         });
                     ready.extend(new_ready);
+
+                    if matches!(
+                        model.config.incremental,
+                        Some(IncrementalStrategy::TimeWindow { .. })
+                    ) {
+                        advance_watermark(
+                            self.adapter.as_ref(),
+                            model,
+                            options.environment.as_deref(),
+                            &run_id,
+                            &self.state,
+                        )
+                        .await?;
+                    }
                 }
                 Err(error) => {
                     status.insert(id.clone(), ExecutionStatus::Failed);
@@ -729,4 +806,37 @@ fn block_dependents(
             events,
         );
     }
+}
+
+/// After a successful time-window append, advance the committed watermark to
+/// the maximum observed value. Failed runs never reach this path.
+async fn advance_watermark(
+    adapter: &dyn Adapter,
+    model: &phlo_transform_core::CompiledModel,
+    environment: Option<&str>,
+    run_id: &str,
+    state: &Option<Arc<dyn StateStore>>,
+) -> Result<(), EngineError> {
+    let Some(IncrementalStrategy::TimeWindow { column, .. }) = model.config.incremental.as_ref()
+    else {
+        return Ok(());
+    };
+    let query = format!(
+        "SELECT max({}) FROM {}",
+        quote_ident(column),
+        model.target.sql()
+    );
+    if let Ok(result) = adapter.execute(&query).await {
+        if let Some(value) = result
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .filter(|value| value.as_str() != "NULL")
+        {
+            if let Some(state) = state {
+                state.set_watermark(&model.id.logical_name(), environment, value, run_id)?;
+            }
+        }
+    }
+    Ok(())
 }
