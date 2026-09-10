@@ -334,11 +334,10 @@ Implemented:
 - integration test comparing inferred and real Trino schemas.
 
 Remaining (explicit): full Trino type-system parity and broader SQL coverage;
-richer assertion types. Additional audited gaps: the `lineage
---upstream/--downstream` flags are accepted but ignored (the report always
-contains both directions); `impact` human output omits registered consumers;
-offline `lineage`/`impact` return empty column results unless catalogue
-enrichment is available; nested types are coarse (`array`/`map`/`row` element
-types are unknown).
+richer assertion types. Nested `array`/`map`/`row` types are now parsed
+recursively (precision is still collapsed). `lineage --upstream/--downstream`
+filter the direction, `impact` accepts a model or `model.column` (the model
+form works offline), and column impact renders registered consumers. Offline
+column lineage/impact still depend on known schemas.
 
 

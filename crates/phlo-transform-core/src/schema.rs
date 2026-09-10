@@ -139,6 +139,32 @@ mod tests {
         assert_eq!(DataType::parse_trino("nonsense"), DataType::Unknown);
     }
 
+    #[test]
+    fn parses_nested_trino_types() {
+        use DataType::*;
+        assert_eq!(
+            DataType::parse_trino("array(bigint)"),
+            Array(Box::new(BigInt))
+        );
+        assert_eq!(
+            DataType::parse_trino("map(varchar, bigint)"),
+            Map(Box::new(Varchar), Box::new(BigInt))
+        );
+        assert_eq!(
+            DataType::parse_trino("row(id bigint, name varchar)"),
+            Row(vec![BigInt, Varchar])
+        );
+        assert_eq!(
+            DataType::parse_trino("array(row(a bigint, b array(varchar)))"),
+            Array(Box::new(Row(vec![BigInt, Array(Box::new(Varchar))])))
+        );
+        assert_eq!(
+            DataType::parse_trino("timestamp(6) with time zone"),
+            TimestampTz
+        );
+        assert_eq!(DataType::parse_trino("decimal(10,2)"), Decimal);
+    }
+
     fn column(name: &str, data_type: DataType, nullability: Nullability) -> SchemaColumn {
         SchemaColumn {
             name: name.to_string(),

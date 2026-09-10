@@ -816,7 +816,8 @@ fn run_lineage(cli: &Cli, compilation: &Compilation, target: &str) -> Result<Exi
     // column and the prefix is the model.
     if let Ok(id) = ModelId::parse(target) {
         if compilation.model(&id).is_some() {
-            let report = compilation.model_lineage_report(&id).expect("model exists");
+            let mut report = compilation.model_lineage_report(&id).expect("model exists");
+            apply_direction(&mut report, cli);
             if cli.json {
                 print_json(&report)?;
             } else {
@@ -858,6 +859,33 @@ fn run_lineage(cli: &Cli, compilation: &Compilation, target: &str) -> Result<Exi
 }
 
 fn run_impact(cli: &Cli, compilation: &Compilation, column: &str) -> Result<ExitCode, String> {
+    // A model-only argument reports downstream models/tests (works offline).
+    if let Some(model) = compilation.model_by_name(column) {
+        let lineage = compilation
+            .model_lineage_report(&model.id)
+            .expect("model exists");
+        let mut tests: Vec<String> = Vec::new();
+        for dependent in &lineage.downstream {
+            if let Ok(id) = ModelId::parse(dependent) {
+                for test in compilation.tests_for(&id) {
+                    tests.push(test.id.to_string());
+                }
+            }
+        }
+        if cli.json {
+            print_json(&serde_json::json!({
+                "model": model.id.logical_name(),
+                "downstream_models": lineage.downstream,
+                "tests": tests,
+            }))?;
+        } else {
+            println!("Model:             {}", model.id.logical_name());
+            println!("Downstream models: {}", join_or_none(&lineage.downstream));
+            println!("Tests:             {}", join_or_none(&tests));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let Some((model, name)) = column.rsplit_once('.') else {
         return Err(format!("invalid column `{column}`; expected model.column"));
     };
@@ -880,8 +908,19 @@ fn run_impact(cli: &Cli, compilation: &Compilation, column: &str) -> Result<Exit
             join_or_none(&report.downstream_models)
         );
         println!("Tests:              {}", join_or_none(&report.tests));
+        if !report.consumers.is_empty() {
+            println!("Consumers:          {}", join_or_none(&report.consumers));
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn apply_direction(report: &mut phlo_transform_core::ModelLineageReport, cli: &Cli) {
+    if cli.upstream && !cli.downstream {
+        report.downstream.clear();
+    } else if cli.downstream && !cli.upstream {
+        report.upstream.clear();
+    }
 }
 
 fn join_or_none(values: &[String]) -> String {

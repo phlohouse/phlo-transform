@@ -32,9 +32,10 @@ implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
   provider boundary and catalogue enrichment, column resolution and type
   inference, inferred output schemas, `lineage`/`impact`, config-file schema
   contracts, `@key`/`@not-null` assertions with generated SQL tests, and a
-  `lineage.json` artifact. See [`docs/semantic.md`](docs/semantic.md). Gaps:
-  `lineage --upstream/--downstream` flags are ignored, offline lineage/impact
-  are empty without catalogue schemas, and nested types are coarse.
+  `lineage.json` artifact. Nested `array`/`map`/`row` types parse recursively;
+  `lineage` direction flags and model-level `impact` work. See
+  [`docs/semantic.md`](docs/semantic.md). Gaps: offline column lineage/impact
+  need schemas; unsupported SQL is `Unknown`.
 - **Phase 3 — state-aware execution: partial.** Content-addressed model
   versions, materialised-version state, state-aware plan
   (`build`/`skip`/`cached` with reasons) and stale-plan rejection. Source

@@ -112,11 +112,22 @@ configured Trino target (or use `--catalogue` on any command). The fetch builds
 a `StaticSchemaProvider`, so the analyzer and its tests remain
 warehouse-independent.
 
+## Lineage and impact CLI
+
+`lineage <model> --upstream` and `--downstream` filter the direction (either
+may be shown; both by default). `impact` accepts either a `model.column` or a
+model name; the model form reports downstream models/tests without requiring
+catalogue schemas (useful offline), and column impact renders registered
+consumers.
+
 ## Remaining limitations
 
-- Full Trino type-system parity is out of scope; nested types are coarse.
+- Full Trino type-system parity is out of scope; `array`, `map` and `row`
+  nesting is parsed recursively, but arbitrary type parameters are collapsed
+  (for example `decimal(10,2)` does not retain precision).
 - The analyzer covers common transformation SQL; unsupported constructs are
   `Unknown` plus recorded limitations rather than errors.
 - Runtime execution of contract-derived assertions happens through the
   generated SQL tests; richer assertion types can be added later.
+- Offline column lineage/impact is only as precise as known schemas.
 

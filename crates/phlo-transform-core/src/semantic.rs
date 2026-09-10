@@ -31,10 +31,45 @@ pub enum DataType {
 }
 
 impl DataType {
-    /// Parse a Trino type name. Nested types are recognised but kept coarse.
+    /// Parse a Trino type name, including nested `array`, `map` and `row`.
     pub fn parse_trino(value: &str) -> DataType {
-        let normalized = value.trim().to_ascii_lowercase();
-        let base = normalized.split('(').next().unwrap_or("").trim();
+        let value = value.trim();
+        let lower = value.to_ascii_lowercase();
+
+        if lower.starts_with("array") {
+            return match type_arguments(value, "array").and_then(|args| args.first().cloned()) {
+                Some(inner) => DataType::Array(Box::new(DataType::parse_trino(&inner))),
+                None => DataType::Array(Box::new(DataType::Unknown)),
+            };
+        }
+        if lower.starts_with("map") {
+            return match type_arguments(value, "map") {
+                Some(args) if args.len() == 2 => DataType::Map(
+                    Box::new(DataType::parse_trino(&args[0])),
+                    Box::new(DataType::parse_trino(&args[1])),
+                ),
+                _ => DataType::Map(Box::new(DataType::Unknown), Box::new(DataType::Unknown)),
+            };
+        }
+        if lower.starts_with("row") {
+            let fields = type_arguments(value, "row")
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .map(|field| {
+                            let field_type = field
+                                .split_once(' ')
+                                .map(|(_, field_type)| field_type)
+                                .unwrap_or(field.as_str());
+                            DataType::parse_trino(field_type)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            return DataType::Row(fields);
+        }
+
+        let base = lower.split(['(', '<']).next().unwrap_or("").trim();
         match base {
             "boolean" => DataType::Boolean,
             "tinyint" => DataType::TinyInt,
@@ -47,12 +82,14 @@ impl DataType {
             "varchar" | "char" => DataType::Varchar,
             "varbinary" => DataType::Varbinary,
             "date" => DataType::Date,
-            "time" | "time with time zone" => DataType::Time,
-            "timestamp" => DataType::Timestamp,
-            "timestamp with time zone" => DataType::TimestampTz,
-            "array" => DataType::Array(Box::new(DataType::Unknown)),
-            "map" => DataType::Map(Box::new(DataType::Unknown), Box::new(DataType::Unknown)),
-            "row" => DataType::Row(Vec::new()),
+            "time" => DataType::Time,
+            "timestamp" => {
+                if lower.contains("with time zone") {
+                    DataType::TimestampTz
+                } else {
+                    DataType::Timestamp
+                }
+            }
             _ => DataType::Unknown,
         }
     }
@@ -291,4 +328,47 @@ pub struct DiffPolicySpec {
     pub require_full_diff: bool,
     pub require_keyed_diff: bool,
     pub tolerances: std::collections::BTreeMap<String, ColumnTolerance>,
+}
+
+/// Extract the argument list of a parameterised type such as `array(bigint)`
+/// or `row(a bigint, b varchar)`.
+fn type_arguments(value: &str, keyword: &str) -> Option<Vec<String>> {
+    let rest = value.to_ascii_lowercase();
+    let rest = rest.strip_prefix(keyword)?.trim_start();
+    let (open, close) = match rest.chars().next()? {
+        '(' => ('(', ')'),
+        '<' => ('<', '>'),
+        _ => return None,
+    };
+    let inner = rest.strip_prefix(open)?.strip_suffix(close)?;
+    Some(split_top_level(inner))
+}
+
+/// Split a comma-separated type argument list, ignoring commas nested inside
+/// parentheses, angle brackets or brackets.
+fn split_top_level(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut current = String::new();
+    for character in value.chars() {
+        match character {
+            '(' | '<' | '[' => {
+                depth += 1;
+                current.push(character);
+            }
+            ')' | '>' | ']' => {
+                depth = depth.saturating_sub(1);
+                current.push(character);
+            }
+            ',' if depth == 0 => {
+                parts.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(character),
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+    parts
 }

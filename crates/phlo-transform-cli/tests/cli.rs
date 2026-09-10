@@ -128,3 +128,28 @@ fn impact_json_output() {
     assert!(output.status.success());
     assert_snapshot!(stdout(&output));
 }
+
+#[test]
+fn lineage_upstream_flag_filters_direction() {
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "--upstream",
+        "lineage",
+        "reporting.monthly",
+    ]);
+    assert!(output.status.success());
+    let body = stdout(&output);
+    assert!(body.contains("Upstream:"), "{body}");
+    assert!(body.contains("assay.results"), "{body}");
+    assert!(body.contains("Downstream: (none)"), "{body}");
+}
+
+#[test]
+fn impact_accepts_a_model_argument() {
+    let output = run(&["--root", "fixtures/basic-multi-root", "impact", "assay.raw"]);
+    assert!(output.status.success());
+    let body = stdout(&output);
+    assert!(body.contains("assay.results"), "{body}");
+    assert!(body.contains("reporting.monthly"), "{body}");
+}
