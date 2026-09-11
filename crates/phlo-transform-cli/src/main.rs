@@ -832,7 +832,12 @@ async fn run_plan(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, Stri
         print_json(&plan)?;
     } else {
         print_plan_human(&plan);
-        render_diagnostics(&plan.diagnostics);
+        // `print_plan_human` already surfaces diagnostics up front when
+        // the plan is blocked; only trailing (non-blocking) diagnostics
+        // are printed here.
+        if !plan.blocked {
+            render_diagnostics(&plan.diagnostics);
+        }
     }
 
     Ok(if plan.blocked {
@@ -859,7 +864,6 @@ async fn run_apply(
             print_json(&plan)?;
         } else {
             print_plan_human(&plan);
-            render_diagnostics(&plan.diagnostics);
         }
         return Ok(ExitCode::FAILURE);
     }
@@ -1374,10 +1378,35 @@ fn print_plan_human(plan: &Plan) {
     println!();
 
     if plan.blocked {
-        println!("plan blocked by compilation errors");
+        // The errors are the actionable output — show them before the
+        // model table so they are not buried under a long listing.
+        println!("plan blocked by compilation errors:");
+        println!();
+        render_diagnostics(&plan.diagnostics);
+        println!();
     }
 
-    println!("Models ({})", plan.models.len());
+    let mut counts = [0usize; 4]; // build, skip, cached, unknown
+    for model in &plan.models {
+        counts[match model.action {
+            PlanAction::Build => 0,
+            PlanAction::Skip => 1,
+            PlanAction::Cached => 2,
+            PlanAction::Unknown => 3,
+        }] += 1;
+    }
+    println!(
+        "Models ({}) — {} build, {} skip, {} cached{}",
+        plan.models.len(),
+        counts[0],
+        counts[1],
+        counts[2],
+        if counts[3] > 0 {
+            format!(", {} unknown", counts[3])
+        } else {
+            String::new()
+        }
+    );
     for model in &plan.models {
         let action = match model.action {
             PlanAction::Build => "BUILD",
