@@ -59,10 +59,10 @@ existing files unless `--overwrite` is passed. The manifest lands at
 | `{{ dbt.type_string/timestamp/datetime/int/bigint/numeric/boolean() }}` | `varchar` / `timestamp` / `integer` / `bigint` / `numeric` / `boolean` |
 | `{{ dbt.cast('e','t') }}` / `{{ dbt.string_literal('s') }}` / `{{ dbt.escape_single_quotes('s') }}` | `cast(e as t)` / `'s'` / `s` with `'` doubled |
 | `{{ dbt.dateadd('p', n, from) }}` | `(from + interval 'n' p)` (portable across all targets) |
-| `{{ dbt.datediff / last_day / split_part / hash / concat / type_float }}` | lowered only when `profiles.yml` declares `type: duckdb`; unknown profiles stay REVIEW |
+| `{{ dbt.datediff / last_day / split_part / hash / concat / type_float }}` | lowered only when `profiles.yml` declares `type: duckdb` and only with the `dbt.` qualifier (bare `hash()` is not the builtin); unknown profiles stay REVIEW |
 | `{{ dbt_utils.group_by(n) }}` | `1, 2, …, n` |
 | `{{ dbt_utils.equality }}` / `equal_rowcount` / `unique_combination_of_columns` / `not_empty_string` tests | generated `tests/**/*.sql` (`summarize`, `precision`, `exclude_columns` variants stay REVIEW) |
-| `{{ dbt_utils.generate_surrogate_key(['a','b']) }}` | `md5(concat_ws('-', coalesce(cast("a" as varchar), '_dbt_utils_surrogate_key_null_'), …))` — `''` instead when the `surrogate_key_treat_nulls_as_empty_strings` var is set |
+| `{{ dbt_utils.generate_surrogate_key(['a','b']) }}` | `md5(concat_ws('-', coalesce(cast("a" as varchar), '_dbt_utils_surrogate_key_null_'), …))` — `''` instead when the `surrogate_key_treat_nulls_as_empty_strings` var is set. The deprecated `dbt_utils.surrogate_key(...)` varargs form is intentionally REVIEW (upstream raises a compiler error; its null handling differed) |
 | `{{ dbt_utils.star(from=…, except=[…]) }}` | `* exclude (…)` (DuckDB-first; only `from`+`except`/`exclude` are provably equivalent — `relation_alias`, `prefix`, `suffix`, `quote_identifiers`, `unquote_aliases`, `rename`, or any other argument stays REVIEW) |
 | `{{ dbt_utils.safe_cast('c','t') }}` | `try_cast("c" as t)` |
 | `{{ dbt_date.get_base_dates(n_dateparts=N\|start_date,end_date, datepart='p') }}` | a `generate_series` spine select (`day`/`week`/`month`/`quarter`/`year`) — lowered only when `profiles.yml` declares `type: duckdb`; unknown/non-DuckDB profiles stay REVIEW |

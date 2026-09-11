@@ -482,16 +482,41 @@ fn static_eval_lowering() {
     let relocated = file("transforms/custom/custom_schema.sql");
     assert!(relocated.contains("-- @id"), "{relocated}");
 
-    // The generated workspace must compile.
+    // Upstream-equivalence: `dbt.hash` casts to the string type before
+    // hashing, and `dbt.split_part` keeps dbt's argument order
+    // (string, delimiter, part_number).
+    let equiv = file("transforms/upstream_equivalence.sql");
+    assert!(equiv.contains("md5(cast(id as varchar))"), "{equiv}");
+    assert!(equiv.contains("split_part(code, '-', 2)"), "{equiv}");
+    // `{% do return(...) %}` exits the macro: nothing after it (in the
+    // branch or the tail) is emitted. The returned string value is
+    // emitted bare, matching upstream `{{ return(...) }}` rendering.
+    assert!(equiv.contains("flag_on"), "{equiv}");
+    assert!(!equiv.contains("unreached"), "{equiv}");
+
+    // `dbt_utils.surrogate_key` is deprecated upstream (raises a compiler
+    // error; historical null semantics differ) and bare `type_numeric()`
+    // is not the `dbt.` builtin — both stay REVIEW.
+    let not_provable = outcome("not_provable");
+    assert_eq!(not_provable.classification, Classification::Review);
+    let np = file("transforms/not_provable.sql");
+    assert!(np.contains("surrogate_key"), "{np}");
+    assert!(np.contains("type_numeric"), "{np}");
+
+    // The generated workspace compiles except for the REVIEW model, whose
+    // residual Jinja must fail loudly — not silently change meaning.
     let out = tempfile::tempdir().expect("tempdir");
     phlo_transform_dbt::write_translation(out.path(), &translation).expect("write");
     let project = phlo_transform_core::load_project(out.path()).expect("generated project loads");
     let report = phlo_transform_core::compile(&project).check_report();
-    assert!(
-        report.ok,
-        "generated workspace failed check: {:?}",
-        report.diagnostics
-    );
+    assert!(!report.ok, "expected not_provable.sql to fail check");
+    for diagnostic in &report.diagnostics {
+        assert_eq!(
+            diagnostic.path.as_deref(),
+            Some("transforms/not_provable.sql"),
+            "unexpected diagnostic outside not_provable.sql: {diagnostic:?}"
+        );
+    }
 }
 
 #[test]

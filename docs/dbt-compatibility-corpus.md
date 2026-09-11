@@ -51,11 +51,11 @@ project analysed with `phlo-transform translate --from dbt --check`.
 | jaffle-shop-classic | dbt-labs/jaffle-shop-classic | fd7bfaca | 5 | 5 | 0 | 0 | 100% (+0pt) | — |
 | jaffle-shop | dbt-labs/jaffle-shop | 7d0d8de2 | 13 | 12 | 1 | 0 | 92% (+0pt) | — |
 | jaffle_shop_duckdb | dbt-labs/jaffle_shop_duckdb | 36bde6cb | 5 | 5 | 0 | 0 | 100% (+0pt) | — |
-| mrr-playbook | dbt-labs/mrr-playbook | f7921cf7 | 4 | 3 | 1 | 0 | 75% (+25pt) | — |
+| mrr-playbook | dbt-labs/mrr-playbook | f7921cf7 | 4 | 2 | 2 | 0 | 50% (+0pt) | — |
 | spark-utils | dbt-labs/spark-utils | f1771e79 | 0 | 0 | 0 | 0 | 0% | — |
 | the_tuva_project | tuva-health/the_tuva_project | 9cf2d1f7 | 337 | 0 | 44 | 293 | 0% (+0pt) | — |
 
-**Aggregate model coverage: 97/1483 CLEAN (7%)**
+**Aggregate model coverage: 96/1483 CLEAN (6%)**
 
 ## Most common review/unsupported reasons
 
@@ -78,6 +78,7 @@ project analysed with `phlo-transform translate --from dbt --check`.
 | 40 | 24 | DBT004: package macro `fivetran_utils.fill_pass_through_columns` (from `fivetran_utils`) has no native equivalent |
 | 35 | 5 | DBT014: table-level source tests are not translated |
 | 34 | 9 | DBT010: dbt metrics belong to a semantic layer, which Phlo does not implement |
+| 34 | 24 | DBT004: unknown macro `type_numeric` has no native equivalent |
 | 33 | 5 | DBT014: generic test `dbt_utils.equality` has no native conversion |
 | 33 | 8 | DBT006: unrecognised is_incremental() body dropped; model degrades to full-refresh semantics |
 | 31 | 24 | DBT004: qualified macro `the_tuva_project.encounter_id_hash` (package not declared) has no native equivalent |
@@ -101,7 +102,6 @@ project analysed with `phlo-transform translate --from dbt --check`.
 | 13 | 24 | DBT004: qualified macro `dbt.concat` (package not declared) has no native equivalent |
 | 13 | 21 | DBT005: conditional `{% if engagements_enabled %}` cannot be evaluated statically |
 | 13 | 24 | DBT004: qualified macro `the_tuva_project.stable_id_hash` (package not declared) has no native equivalent |
-| 12 | 21 | DBT005: conditional `{% if package in enabled_packages %}` cannot be evaluated statically |
 
 ## Declared package dependencies by classification
 

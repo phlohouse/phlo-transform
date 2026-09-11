@@ -1317,6 +1317,10 @@ struct Lowered {
     /// An `is_incremental()` body was dropped or reduced, meaning the result
     /// is a full-refresh rather than a filtered incremental scan.
     incremental_reduced: bool,
+    /// A `return(...)` was hit: dbt returns from the macro without emitting
+    /// output, so remaining body segments are dead. Checked by the enclosing
+    /// `render_macro_body`/`lower_segments` loop; never merged outward.
+    returned: bool,
 }
 
 impl Lowered {
@@ -1356,6 +1360,11 @@ fn lower_segments(
 ) {
     let mut index = 0usize;
     while index < segments.len() {
+        if lowered.returned {
+            // A `return(...)` ended this rendering scope — dbt evaluates the
+            // value without emitting it and returns, so the rest is dead.
+            break;
+        }
         match &segments[index] {
             Segment::Text(text) => out.push_str(text),
             Segment::Comment(_) => {
@@ -1591,6 +1600,7 @@ fn translate_stmt(
                 return match eval_text_expr(expr, ctx, scope, lowered, 0) {
                     Some(value) => {
                         out.push_str(&value);
+                        lowered.returned = true;
                         index
                     }
                     None => {
@@ -2335,43 +2345,20 @@ fn lower_builtin(
         Some((package, helper)) => (package, helper),
         // Unqualified helper names only resolve when the owning package is
         // a declared dependency — dbt would not resolve them otherwise.
+        // `dbt.*` builtins are never matched bare: dbt requires the `dbt.`
+        // qualifier, so an unqualified call is not provably the builtin.
         None => match name {
-            "generate_surrogate_key"
-            | "surrogate_key"
-            | "star"
-            | "safe_cast"
-            | "date_spine"
-            | "group_by" => ("dbt_utils", name),
+            "generate_surrogate_key" | "star" | "safe_cast" | "date_spine" | "group_by" => {
+                ("dbt_utils", name)
+            }
             "get_base_dates" => ("dbt_date", name),
-            // Bare `type_*()` etc. are not dbt-resolvable (builtins live in
-            // the `dbt.` namespace), but a project macro takes precedence in
-            // `translate_call` — reaching here means none exists, and the
-            // call almost certainly meant the builtin.
-            "type_string"
-            | "type_timestamp"
-            | "type_datetime"
-            | "type_int"
-            | "type_bigint"
-            | "type_numeric"
-            | "type_boolean"
-            | "type_float"
-            | "current_timestamp"
-            | "cast"
-            | "string_literal"
-            | "escape_single_quotes"
-            | "datediff"
-            | "dateadd"
-            | "last_day"
-            | "split_part"
-            | "hash"
-            | "concat" => ("dbt", name),
             _ => return None,
         },
     };
     if provider != "dbt" && provider != "dbt_utils" && provider != "dbt_date" {
         return None;
     }
-    if !name.contains('.') && provider != "dbt" && !ctx.has_package(provider) {
+    if !name.contains('.') && !ctx.has_package(provider) {
         return None;
     }
     let rendered = lower_helper(provider, helper, args, ctx, scope);
@@ -2458,24 +2445,10 @@ fn lower_helper(
             };
             format!("try_cast(\"{field}\" as {data_type})")
         }
-        // `dbt_utils.surrogate_key('a', 'b')` — the deprecated varargs form of
-        // `generate_surrogate_key(['a', 'b'])`; identical lowering.
-        ("dbt_utils", "surrogate_key") => {
-            let mut fields = Vec::new();
-            for i in 0.. {
-                match args.get(i, "") {
-                    Some(lit) => match resolve(lit) {
-                        Lit::Str(field) | Lit::Ident(field) => fields.push(field),
-                        _ => return None,
-                    },
-                    None => break,
-                }
-            }
-            if fields.is_empty() {
-                return None;
-            }
-            surrogate_key_sql(&fields, ctx)
-        }
+        // `dbt_utils.surrogate_key` is NOT lowered: upstream deprecated it in
+        // favour of `generate_surrogate_key` (the current implementation raises
+        // a compiler error telling users to migrate) and its null/empty-string
+        // handling differed historically. Call sites stay REVIEW.
         // `dbt_utils.group_by(n)` → `1, 2, ..., n` — positional grouping.
         ("dbt_utils", "group_by") => {
             let n = args
@@ -2552,19 +2525,21 @@ fn lower_helper(
             let field = sql_arg(args, 0, "date", &resolve)?;
             format!("last_day({field})")
         }
-        // `dbt.split_part('delim', 'str', n)` → `split_part(str, 'delim', n)`
-        // (argument order differs from dbt's call convention).
+        // `dbt.split_part(str, 'delim', n)` — the upstream signature matches
+        // DuckDB's `split_part(string, delimiter, index)` argument order.
         ("dbt", "split_part") if is_duckdb(ctx) => {
-            let part_text = sql_arg(args, 0, "part_text", &resolve)?;
-            let string_text = sql_arg(args, 1, "string_text", &resolve)?;
+            let string_text = sql_arg(args, 0, "string_text", &resolve)?;
+            let part_text = sql_arg(args, 1, "delimiter_text", &resolve)?;
             let n = args
                 .get_raw(2, "part_number")
                 .and_then(|text| macros::eval_int_expr(&text))?;
             format!("split_part({string_text}, '{part_text}', {n})")
         }
+        // Upstream `dbt.hash(field)` is `md5(cast(field as type_string))` —
+        // the cast matters for non-string columns.
         ("dbt", "hash") if is_duckdb(ctx) => {
             let field = sql_arg(args, 0, "field", &resolve)?;
-            format!("md5({field})")
+            format!("md5(cast({field} as varchar))")
         }
         // `dbt.concat(['a', 'b'])` → `concat(a, b)`; DuckDB `concat` ignores
         // NULL arguments, matching dbt's semantics.
@@ -2797,21 +2772,29 @@ fn render_macro_body(
                 if !trial.issues.is_empty() {
                     return None;
                 }
+                // `returned` ends the macro body — intentionally not copied
+                // into `lowered`, which belongs to the caller's scope.
+                let returned = trial.returned;
                 lowered.transformations.extend(trial.transformations);
                 lowered.config.extend(trial.config);
                 if let Some(window) = trial.window_column {
                     lowered.window_column = Some(window);
                 }
                 index = consumed;
+                if returned {
+                    return Some(out);
+                }
             }
             Segment::Expr { inner, .. } => {
                 let inner = inner.trim();
-                // Unwrap `{{ return(<expr>) }}`.
-                let expr = inner
-                    .strip_prefix("return(")
-                    .and_then(|rest| rest.strip_suffix(')'))
-                    .unwrap_or(inner)
-                    .trim();
+                // `{{ return(<expr>) }}` evaluates the expression and exits
+                // the macro — anything after it is dead code.
+                let is_return = inner.starts_with("return(") && inner.ends_with(')');
+                let expr = if is_return {
+                    inner["return(".len()..inner.len() - 1].trim()
+                } else {
+                    inner
+                };
                 if let Some((dispatched, arg_texts)) = split_dispatch(expr, &ctx.project.name) {
                     // `adapter.dispatch('m')(...)` resolves to the adapter's
                     // variant or `default__m` — static selection.
@@ -2859,6 +2842,9 @@ fn render_macro_body(
                     }
                 } else {
                     return None;
+                }
+                if is_return {
+                    return Some(out);
                 }
             }
         }

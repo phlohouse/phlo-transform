@@ -19,3 +19,12 @@ convert_timezone('UTC', '{{ tz }}', {{ column }})
     {% do log("converting cents", info=true) %}
     {% do return('(' ~ amount ~ ' / 100)::numeric(16, 2)') %}
 {% endmacro %}
+
+{% macro flag_or_default(flag) %}
+    {% if flag %}
+        {% do return('flag_on') %}
+        {{ 'unreached_branch_text' }}
+    {% endif %}
+    {% do return('flag_off') %}
+    {{ 'unreached_tail_text' }}
+{% endmacro %}
