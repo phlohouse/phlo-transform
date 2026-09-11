@@ -78,6 +78,7 @@ existing files unless `--overwrite` is passed. The manifest lands at
 | `contract: enforced: true` | `[model.*.contract]` + column types in `phlo.toml` |
 | `models: <proj>: <dir>: +materialized/+schema/+tags` | `transform.toml` folder config |
 | `models: <proj>: +materialized` | `default_materialization` in `phlo.toml` |
+| `{% macro generate_schema_name(custom_schema_name, node) %}` overrides | evaluated statically: its `{% set %}`/`{% if/elif/else %}` chain is run for every `(resource_type, schema)` case the project exercises (`node.resource_type`, `custom_schema_name [is] none`, `target.name`, `target.schema`, `| trim/lower/upper`); when the macro references `target.name` and `profiles.yml` declares multiple outputs, every output is evaluated and all must agree — a Phlo workspace is not dbt-target-specific. CLEAN only when every case resolves to the schema Phlo already emits; a diverging or unprovable case is REVIEW and names the target |
 | singular tests | `tests/**/*.sql` (same layout) |
 | sources | resolved to physical relations; metadata in the manifest |
 
@@ -97,6 +98,13 @@ Every resource is classified — nothing is silently treated as equivalent.
 - `UNSUPPORTED` — not emitted: `snapshot`/`custom` materialisations, snapshot
   and analysis files, disabled models, exposures/metrics/semantic models,
   dbt `unit_tests`/`groups`, and macros that perform runtime operations.
+
+Package dependencies are CLEAN when every observed call site — model
+expressions and package-qualified generic tests — lowered to a native
+equivalent, and REVIEW when any call site could not be lowered (a package
+resource is only dependency accounting: unexercised package contents are
+never vendored). Packages that are declared but unused, or whose helpers we
+do not cover, stay REVIEW.
 
 The report (`--check`) shows per-kind counts by classification, model
 conversion coverage, and deduplicated review reasons. `--json` returns the

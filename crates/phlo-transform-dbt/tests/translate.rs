@@ -94,6 +94,13 @@ fn jaffle_classification() {
         class_of("label_status", ResourceKind::Macro),
         Classification::Clean
     );
+    // `generate_schema_name`: every exercised case — model+staging, model
+    // with no schema, seed+raw — evaluates statically to the schema the
+    // translation already emits (target `dev`, so the prod branch is dead).
+    assert_eq!(
+        class_of("generate_schema_name", ResourceKind::Macro),
+        Classification::Clean
+    );
     // `dbt_utils.star(from=ref('stg_customers'), except=['region'])`
     // lowers statically to `* exclude ("region")`.
     assert_eq!(
@@ -340,6 +347,67 @@ fn seed_refs_arguments_syntax_and_dbt_builtins() {
         .find(|r| r.kind == ResourceKind::Model && r.name.ends_with("time_spine"))
         .expect("time_spine outcome");
     assert_eq!(spine.classification, Classification::Review);
+}
+
+/// Regression: `generate_schema_name` must not be marked CLEAN for only
+/// the selected target. With `target: dev` + a `prod` output, the `prod`
+/// arm places a custom-schematised model in `prod_custom` while the
+/// emitted layout uses `custom` — divergent across targets → REVIEW.
+#[test]
+fn multi_target_schema_macro_stays_review() {
+    let translation = translate_project(&fixture("dbt-schema-targets")).expect("dbt project loads");
+    let macro_outcome = translation
+        .report
+        .resources
+        .iter()
+        .find(|r| r.kind == ResourceKind::Macro && r.name == "generate_schema_name")
+        .expect("generate_schema_name outcome");
+    assert_eq!(macro_outcome.classification, Classification::Review);
+    assert!(
+        macro_outcome
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("`prod`")),
+        "the issue names the diverging target: {:?}",
+        macro_outcome.issues
+    );
+
+    // The models themselves are unaffected — the override only determines
+    // where dbt would have placed them.
+    assert!(
+        translation
+            .report
+            .resources
+            .iter()
+            .filter(|r| r.kind == ResourceKind::Model)
+            .all(|m| m.classification == Classification::Clean),
+        "models stay clean"
+    );
+}
+
+/// Regression: every case must be checked against every target, not just
+/// the first. Both outputs share `schema: main`, so the no-schema case —
+/// which sorts first — is equivalent under `dev` and `prod`; only the
+/// later custom-schema case diverges (`main_custom` under `prod`).
+#[test]
+fn later_diverging_case_is_still_caught_across_targets() {
+    let translation =
+        translate_project(&fixture("dbt-schema-targets-late")).expect("dbt project loads");
+    let macro_outcome = translation
+        .report
+        .resources
+        .iter()
+        .find(|r| r.kind == ResourceKind::Macro && r.name == "generate_schema_name")
+        .expect("generate_schema_name outcome");
+    assert_eq!(macro_outcome.classification, Classification::Review);
+    assert!(
+        macro_outcome
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("`prod`") && issue.message.contains("main_custom")),
+        "the issue names the diverging target and schema: {:?}",
+        macro_outcome.issues
+    );
 }
 
 #[test]

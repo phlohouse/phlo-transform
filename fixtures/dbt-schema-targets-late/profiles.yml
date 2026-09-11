@@ -1,0 +1,11 @@
+schema_targets_late:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: dev.duckdb
+      schema: main
+    prod:
+      type: duckdb
+      path: prod.duckdb
+      schema: main

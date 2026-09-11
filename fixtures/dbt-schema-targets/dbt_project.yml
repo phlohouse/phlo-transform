@@ -1,0 +1,11 @@
+name: schema_targets
+profile: schema_targets
+version: "1.0"
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+models:
+  schema_targets:
+    marts:
+      +schema: custom
