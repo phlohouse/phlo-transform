@@ -94,6 +94,13 @@ fn jaffle_classification() {
         class_of("label_status", ResourceKind::Macro),
         Classification::Clean
     );
+    // `generate_schema_name`: every exercised case — model+staging, model
+    // with no schema, seed+raw — evaluates statically to the schema the
+    // translation already emits (target `dev`, so the prod branch is dead).
+    assert_eq!(
+        class_of("generate_schema_name", ResourceKind::Macro),
+        Classification::Clean
+    );
     // `dbt_utils.star(from=ref('stg_customers'), except=['region'])`
     // lowers statically to `* exclude ("region")`.
     assert_eq!(

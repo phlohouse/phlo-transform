@@ -226,6 +226,13 @@ pub fn translate(project: &DbtProject) -> Translation {
     // Seeds become workspace-native CSV inputs: copied under `seeds/` and
     // loaded into their target relation before models build.
     for seed in &project.seeds {
+        let schema_config = dir_config(&project.seeds_tree, &project.name, &seed.dir);
+        let custom_schema = config_str(&schema_config, "schema");
+        if custom_schema.is_none() && schema_config.contains_key("schema") {
+            ctx.schema_case_dynamic = true;
+        }
+        ctx.schema_cases.insert(("seed".to_string(), custom_schema));
+
         let rel = display(&seed.rel_path);
         let mut emitted = String::from("seeds");
         for segment in &seed.dir {
@@ -344,18 +351,51 @@ pub fn translate(project: &DbtProject) -> Translation {
     }
 
     for package in &project.packages {
+        // Packages whose helpers we statically lower (call sites recorded via
+        // `note_package_call`) are Clean when every observed call lowered;
+        // the package resource only means "dependency accounted for" —
+        // unexercised package contents are never vendored anyway.
+        let short = package
+            .rsplit('/')
+            .next()
+            .unwrap_or(package.as_str())
+            .replace('-', "_");
+        let all_lowered = ctx.package_calls.borrow().get(&short).copied();
+        let (classification, notes, issues) = match all_lowered {
+            Some(true) => (
+                Classification::Clean,
+                vec![
+                    "every observed call site lowered to native SQL; unexercised package contents are not carried over"
+                        .to_string(),
+                ],
+                Vec::new(),
+            ),
+            Some(false) => (
+                Classification::Review,
+                vec!["package macros used by models are classified per call site".to_string()],
+                vec![MigrationIssue::new(
+                    codes::UNKNOWN_MACRO,
+                    "package dependency is not carried over; some call sites stay REVIEW",
+                )],
+            ),
+            None => (
+                Classification::Review,
+                vec!["package macros used by models are classified per call site".to_string()],
+                vec![MigrationIssue::new(
+                    codes::UNKNOWN_MACRO,
+                    "package dependency is not carried over; usages are classified per call site",
+                )],
+            ),
+        };
         outcomes.push(ResourceOutcome {
             kind: ResourceKind::Package,
             name: package.clone(),
             source_path: None,
-            classification: Classification::Review,
+            classification,
             emitted_path: None,
             transformations: Vec::new(),
-            notes: vec!["package macros used by models are classified per call site".to_string()],
-            issues: vec![MigrationIssue::new(
-                codes::UNKNOWN_MACRO,
-                "package dependency is not carried over; usages are classified per call site",
-            )],
+            notes,
+            issues,
             source_hash: None,
         });
     }
@@ -454,6 +494,18 @@ fn macro_outcome(name: &str, ctx: &Context) -> (Classification, Vec<MigrationIss
             )],
             Vec::new(),
         )
+    } else if name == "generate_schema_name" {
+        match eval_schema_name_macro(def, ctx) {
+            Some(transformations) => (Classification::Clean, Vec::new(), transformations),
+            None => (
+                Classification::Review,
+                vec![MigrationIssue::new(
+                    codes::JINJA_STATEMENT,
+                    "`generate_schema_name` cannot be proven equivalent to the emitted schemas",
+                )],
+                Vec::new(),
+            ),
+        }
     } else if has_statement {
         (
             Classification::Review,
@@ -470,6 +522,322 @@ fn macro_outcome(name: &str, ctx: &Context) -> (Classification, Vec<MigrationIss
             vec!["call sites are inlined into model SQL".to_string()],
         )
     }
+}
+
+/// A value resolved while statically evaluating `generate_schema_name`:
+/// either a literal string or the symbolic target default schema
+/// (`target.schema`/`default_schema` — whatever `profiles.yml` says, which
+/// is exactly what we emit when no schema override is configured).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SchemaValue {
+    Literal(String),
+    Default,
+}
+
+/// Statically evaluate a `generate_schema_name(custom_schema_name, node)`
+/// override. dbt calls it once per node with that node's `schema` config;
+/// we evaluate its `{% set %}` + `{% if/elif/else %}` chain for every
+/// `(resource_type, schema)` combination the project exercises and require
+/// each result to equal what the translation already emits for that case —
+/// `Literal(custom)` for a configured schema, `Default` otherwise.
+/// Returns per-case notes when provably equivalent, `None` → REVIEW.
+fn eval_schema_name_macro(def: &MacroDef, ctx: &Context) -> Option<Vec<String>> {
+    if ctx.schema_case_dynamic {
+        return None;
+    }
+
+    // Split the body into leading `{% set %}` bindings and a single
+    // top-level if/elif/else chain; anything else is not provable.
+    let mut bindings: BTreeMap<String, SchemaValue> = BTreeMap::new();
+    let mut arms: Vec<(Option<String>, Vec<&Segment>)> = Vec::new();
+    let mut current: Option<(Option<String>, Vec<&Segment>)> = None;
+    let mut chain_closed = false;
+    for segment in &def.body {
+        match segment {
+            Segment::Comment(_) => {}
+            Segment::Stmt { inner, .. } => {
+                let inner = inner.trim();
+                if chain_closed {
+                    return None;
+                }
+                if let Some(rest) = inner.strip_prefix("set ") {
+                    if current.is_some() {
+                        // `{% set %}` inside a chain arm.
+                        return None;
+                    }
+                    let (name, expr) = rest.split_once('=')?;
+                    bindings.insert(
+                        name.trim().to_string(),
+                        eval_schema_expr(expr.trim(), "", &None, &bindings, ctx)?,
+                    );
+                    continue;
+                }
+                let keyword = inner.split_whitespace().next().unwrap_or("");
+                match keyword {
+                    "if" => {
+                        if current.is_some() {
+                            // Nested `{% if %}` inside an arm.
+                            return None;
+                        }
+                        current = Some((Some(inner[2..].trim().to_string()), Vec::new()));
+                    }
+                    "elif" => {
+                        let (cond, body) = current.take()?;
+                        arms.push((cond, body));
+                        current = Some((Some(inner[4..].trim().to_string()), Vec::new()));
+                    }
+                    "else" => {
+                        let (cond, body) = current.take()?;
+                        arms.push((cond, body));
+                        current = Some((None, Vec::new()));
+                    }
+                    "endif" => {
+                        let (cond, body) = current.take()?;
+                        arms.push((cond, body));
+                        chain_closed = true;
+                    }
+                    _ => return None,
+                }
+            }
+            Segment::Text(text) => {
+                if let Some((_, body)) = current.as_mut() {
+                    body.push(segment);
+                } else if !text.trim().is_empty() {
+                    return None;
+                }
+            }
+            Segment::Expr { .. } => {
+                if let Some((_, body)) = current.as_mut() {
+                    body.push(segment);
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+    if !chain_closed || arms.is_empty() {
+        return None;
+    }
+
+    // Evaluate the chain for each exercised case.
+    let mut notes = Vec::new();
+    for (resource_type, custom) in &ctx.schema_cases {
+        let resolved = resolve_schema_chain(&arms, resource_type, custom, &bindings, ctx)?;
+        let expected = match custom {
+            Some(schema) => SchemaValue::Literal(schema.clone()),
+            None => SchemaValue::Default,
+        };
+        if resolved != expected {
+            return None;
+        }
+        let case = match custom {
+            Some(schema) => format!("{resource_type}+{schema}"),
+            None => format!("{resource_type}+default"),
+        };
+        let outcome = match &resolved {
+            SchemaValue::Literal(schema) => format!("schema `{schema}`"),
+            SchemaValue::Default => "default schema".to_string(),
+        };
+        notes.push(format!("{case} → {outcome}"));
+    }
+    notes.insert(
+        0,
+        "`generate_schema_name` evaluated statically for every exercised case".to_string(),
+    );
+    Some(notes)
+}
+
+/// Evaluate the `generate_schema_name` if/elif/else chain for one
+/// `(resource_type, custom_schema_name)` case.
+fn resolve_schema_chain(
+    arms: &[(Option<String>, Vec<&Segment>)],
+    resource_type: &str,
+    custom: &Option<String>,
+    bindings: &BTreeMap<String, SchemaValue>,
+    ctx: &Context,
+) -> Option<SchemaValue> {
+    for (cond, body) in arms {
+        let fires = match cond {
+            Some(cond) => eval_schema_condition(cond, resource_type, custom, bindings, ctx)?,
+            None => true,
+        };
+        if !fires {
+            continue;
+        }
+        // Render the arm: literal text plus `{{ expr }}` parts.
+        let mut parts: Vec<SchemaValue> = Vec::new();
+        for segment in body {
+            match segment {
+                Segment::Text(text) => {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        parts.push(SchemaValue::Literal(trimmed.to_string()));
+                    }
+                }
+                Segment::Expr { inner, .. } => {
+                    parts.push(eval_schema_expr(
+                        inner.trim(),
+                        resource_type,
+                        custom,
+                        bindings,
+                        ctx,
+                    )?);
+                }
+                Segment::Stmt { .. } | Segment::Comment(_) => {}
+            }
+        }
+        return match parts.as_slice() {
+            [] => None,
+            [single] => Some(single.clone()),
+            _ => {
+                // Concatenation is provable only when every part is a
+                // literal; a `default_{{ custom }}` shape does not equal
+                // what we emit for either side.
+                let mut text = String::new();
+                for part in &parts {
+                    match part {
+                        SchemaValue::Literal(lit) => text.push_str(lit),
+                        SchemaValue::Default => return None,
+                    }
+                }
+                Some(SchemaValue::Literal(text))
+            }
+        };
+    }
+    None
+}
+
+/// Resolve an operand in the `generate_schema_name` scope: quoted literals,
+/// `none`, `target.*`, `node.resource_type`, `custom_schema_name`, or a
+/// `{% set %}` binding. `Default`-bound names resolve to the literal
+/// profile schema when one is known — inside a condition we need the
+/// concrete value, and an unknown value makes the condition unprovable.
+fn eval_schema_operand(
+    text: &str,
+    resource_type: &str,
+    custom: &Option<String>,
+    bindings: &BTreeMap<String, SchemaValue>,
+    ctx: &Context,
+) -> Option<Lit> {
+    match text {
+        "custom_schema_name" => Some(match custom {
+            Some(custom) => Lit::Str(custom.clone()),
+            None => Lit::None,
+        }),
+        "node.resource_type" => Some(Lit::Str(resource_type.to_string())),
+        "target.name" => ctx
+            .project
+            .profile
+            .as_ref()
+            .and_then(|p| p.name.clone())
+            .map(Lit::Str),
+        "target.schema" => Some(
+            ctx.project
+                .profile
+                .as_ref()
+                .and_then(|p| p.schema.clone())
+                .map(Lit::Str)?,
+        ),
+        other => match bindings.get(other) {
+            Some(SchemaValue::Literal(lit)) => Some(Lit::Str(lit.clone())),
+            Some(SchemaValue::Default) => Some(
+                ctx.project
+                    .profile
+                    .as_ref()
+                    .and_then(|p| p.schema.clone())
+                    .map(Lit::Str)?,
+            ),
+            None => pylit::parse_value(other).ok(),
+        },
+    }
+}
+
+/// Evaluate one `{% if %}`/`{% elif %}` condition against a case.
+/// Supports `is none`/`is not none`, `==`/`!=`, `not`, and truthiness.
+fn eval_schema_condition(
+    cond: &str,
+    resource_type: &str,
+    custom: &Option<String>,
+    bindings: &BTreeMap<String, SchemaValue>,
+    ctx: &Context,
+) -> Option<bool> {
+    let operand = |text: &str| eval_schema_operand(text, resource_type, custom, bindings, ctx);
+    let truthy = |lit: Lit| match lit {
+        Lit::Bool(b) => Some(b),
+        Lit::Int(n) => Some(n != 0),
+        Lit::Str(s) | Lit::Ident(s) => Some(!s.is_empty()),
+        Lit::List(items) => Some(!items.is_empty()),
+        Lit::Dict(items) => Some(!items.is_empty()),
+        Lit::None => Some(false),
+        Lit::Jinja(_) | Lit::Float(_) => None,
+    };
+    let cond = cond.trim();
+    if let Some(inner) = cond.strip_suffix(" is none") {
+        return Some(matches!(operand(inner.trim())?, Lit::None));
+    }
+    if let Some(inner) = cond.strip_suffix(" is not none") {
+        return Some(!matches!(operand(inner.trim())?, Lit::None));
+    }
+    if let Some((left, right)) = cond.split_once("==") {
+        return Some(operand(left.trim())? == operand(right.trim())?);
+    }
+    if let Some((left, right)) = cond.split_once("!=") {
+        return Some(operand(left.trim())? != operand(right.trim())?);
+    }
+    if let Some(inner) = cond.strip_prefix("not ") {
+        return operand(inner.trim()).and_then(|lit| truthy(lit).map(|v| !v));
+    }
+    operand(cond).and_then(truthy)
+}
+
+/// Resolve a `{% set %}` right-hand side or an arm's `{{ expr }}` output to
+/// a `SchemaValue`: `target.schema`/`default_schema` → the symbolic
+/// default, other idents → case inputs or bindings, literals → Literal.
+/// Trailing `| trim`/`| lower`/`| upper` filters apply to literals.
+fn eval_schema_expr(
+    expr: &str,
+    resource_type: &str,
+    custom: &Option<String>,
+    bindings: &BTreeMap<String, SchemaValue>,
+    ctx: &Context,
+) -> Option<SchemaValue> {
+    let (expr, filters) = match expr.split_once('|') {
+        Some((value, filters)) => (value.trim(), Some(filters)),
+        None => (expr.trim(), None),
+    };
+    let mut value = match expr {
+        "target.schema" | "default_schema"
+            if matches!(
+                bindings.get("default_schema"),
+                Some(SchemaValue::Default) | None
+            ) =>
+        {
+            SchemaValue::Default
+        }
+        "custom_schema_name" => SchemaValue::Literal(custom.clone()?),
+        "node.resource_type" => SchemaValue::Literal(resource_type.to_string()),
+        "target.name" => {
+            SchemaValue::Literal(ctx.project.profile.as_ref().and_then(|p| p.name.clone())?)
+        }
+        other => bindings.get(other).cloned().or_else(|| {
+            pylit::parse_value(other).ok().and_then(|lit| match lit {
+                Lit::Str(text) | Lit::Ident(text) => Some(SchemaValue::Literal(text)),
+                Lit::Int(i) => Some(SchemaValue::Literal(i.to_string())),
+                _ => None,
+            })
+        })?,
+    };
+    if let (Some(filters), SchemaValue::Literal(lit)) = (filters, &mut value) {
+        for filter in filters.split('|').map(str::trim) {
+            match filter.split('(').next().unwrap_or("").trim() {
+                "trim" => *lit = lit.trim().to_string(),
+                "lower" | "lowercase" => *lit = lit.to_lowercase(),
+                "upper" | "uppercase" => *lit = lit.to_uppercase(),
+                _ => return None,
+            }
+        }
+    }
+    Some(value)
 }
 
 /// Per-model outcome plus the file it produced, if any.
@@ -506,6 +874,14 @@ struct Context<'a> {
     contract_sections: Vec<String>,
     /// Model stems that collided on emitted identity.
     collided_names: Vec<String>,
+    /// `(resource_type, custom_schema_name)` cases exercised by the project,
+    /// used to prove `generate_schema_name` equivalent to what we emit.
+    schema_cases: BTreeSet<(String, Option<String>)>,
+    /// A model/seed had a non-string `schema` config — schema macro
+    /// evaluation cannot cover it.
+    schema_case_dynamic: bool,
+    /// Declared package → whether every observed call site lowered statically.
+    package_calls: std::cell::RefCell<BTreeMap<String, bool>>,
 }
 
 #[derive(Clone)]
@@ -560,11 +936,26 @@ impl<'a> Context<'a> {
             macro_defs,
             contract_sections: Vec::new(),
             collided_names: Vec::new(),
+            schema_cases: BTreeSet::new(),
+            schema_case_dynamic: false,
+            package_calls: std::cell::RefCell::new(BTreeMap::new()),
         }
     }
 
     fn is_project_macro(&self, name: &str) -> bool {
         self.macro_files_classified.contains_key(name)
+    }
+
+    /// Record a package call site's lowering outcome (only for declared
+    /// packages — `dbt.*` builtins are not dependencies).
+    fn note_package_call(&self, provider: &str, lowered_ok: bool) {
+        if self.has_package(provider) {
+            self.package_calls
+                .borrow_mut()
+                .entry(provider.to_string())
+                .and_modify(|ok| *ok &= lowered_ok)
+                .or_insert(lowered_ok);
+        }
     }
 
     /// Whether the project declares the package `short` (e.g. `dbt_utils`)
@@ -1371,6 +1762,27 @@ fn lower_builtin(
     if !name.contains('.') && !ctx.has_package(provider) {
         return None;
     }
+    let rendered = lower_helper(provider, helper, args, ctx, scope);
+    ctx.note_package_call(provider, rendered.is_some());
+    if let Some(rendered) = rendered {
+        lowered
+            .transformations
+            .push(format!("{name}(...) → {rendered}"));
+        Some(rendered)
+    } else {
+        None
+    }
+}
+
+/// The recognised-helper bodies for `lower_builtin`; `None` means the call
+/// shape is not provable and the call site stays REVIEW.
+fn lower_helper(
+    provider: &str,
+    helper: &str,
+    args: &ArgsRef,
+    ctx: &Context,
+    scope: &Scope,
+) -> Option<String> {
     let resolve = |lit: Lit| -> Lit {
         match lit {
             Lit::Ident(ident) => scope.get(&ident).cloned().unwrap_or(Lit::Ident(ident)),
@@ -1506,9 +1918,6 @@ fn lower_builtin(
         }
         _ => return None,
     };
-    lowered
-        .transformations
-        .push(format!("{name}(...) → {rendered}"));
     Some(rendered)
 }
 
@@ -2191,6 +2600,20 @@ fn translate_model(
         ctx.project,
     );
 
+    // Record the `generate_schema_name` inputs this model exercises.
+    match merged.get("schema") {
+        Some(lit) => match lit.as_str() {
+            Some(schema) => {
+                ctx.schema_cases
+                    .insert(("model".to_string(), Some(schema.to_string())));
+            }
+            None => ctx.schema_case_dynamic = true,
+        },
+        None => {
+            ctx.schema_cases.insert(("model".to_string(), None));
+        }
+    }
+
     // `-- @id` pins logical identity so files can move after migration.
     let mut directives: Vec<String> = Vec::new();
     let mut header_notes: Vec<String> = Vec::new();
@@ -2671,10 +3094,13 @@ fn translate_generic_test(
 
     // Package-qualified test names (`dbt_utils.expression_is_true`) resolve
     // to the bare name when the package is declared.
-    let name = match name.rsplit_once('.') {
-        Some((package, bare)) if ctx.has_package(package) => bare.to_string(),
-        _ => name,
+    let (name, package) = match name.rsplit_once('.') {
+        Some((package, bare)) if ctx.has_package(package) => {
+            (bare.to_string(), Some(package.to_string()))
+        }
+        _ => (name, None),
     };
+    let issues_before = outcome.issues.len();
 
     let where_clause = args
         .get(Value::String("where".into()))
@@ -2705,148 +3131,151 @@ fn translate_generic_test(
         ));
     };
 
-    match name.as_str() {
-        "unique" => {
-            let Some(column) = column else {
-                outcome.issues.push(MigrationIssue::new(
-                    codes::UNSUPPORTED_TEST,
-                    "model-level `unique` test is ambiguous",
-                ));
-                return;
-            };
-            if key_columns.iter().any(|key| key == column) {
-                outcome
-                    .transformations
-                    .push(format!("unique test on `{column}` folded into @key"));
-                return;
-            }
-            test_file(ctx, outcome,
+    'dispatch: {
+        match name.as_str() {
+            "unique" => {
+                let Some(column) = column else {
+                    outcome.issues.push(MigrationIssue::new(
+                        codes::UNSUPPORTED_TEST,
+                        "model-level `unique` test is ambiguous",
+                    ));
+                    break 'dispatch;
+                };
+                if key_columns.iter().any(|key| key == column) {
+                    outcome
+                        .transformations
+                        .push(format!("unique test on `{column}` folded into @key"));
+                    break 'dispatch;
+                }
+                test_file(ctx, outcome,
                 "unique",
                 format!(
                     "select \"{column}\", count(*) as n from {model_logical} group by \"{column}\" having count(*) > 1"
                 ),
             );
-        }
-        "not_null" => {
-            let Some(column) = column else {
-                outcome.issues.push(MigrationIssue::new(
-                    codes::UNSUPPORTED_TEST,
-                    "model-level `not_null` test is ambiguous",
-                ));
-                return;
-            };
-            if key_columns.iter().any(|key| key == column) {
+            }
+            "not_null" => {
+                let Some(column) = column else {
+                    outcome.issues.push(MigrationIssue::new(
+                        codes::UNSUPPORTED_TEST,
+                        "model-level `not_null` test is ambiguous",
+                    ));
+                    break 'dispatch;
+                };
+                if key_columns.iter().any(|key| key == column) {
+                    outcome
+                        .transformations
+                        .push(format!("not_null test on `{column}` folded into @key"));
+                    break 'dispatch;
+                }
+                directives.push(format!("-- @not-null {column}"));
                 outcome
                     .transformations
-                    .push(format!("not_null test on `{column}` folded into @key"));
-                return;
+                    .push(format!("not_null test on `{column}` became @not-null"));
             }
-            directives.push(format!("-- @not-null {column}"));
-            outcome
-                .transformations
-                .push(format!("not_null test on `{column}` became @not-null"));
-        }
-        "accepted_values" => {
-            let values = args
-                .get(Value::String("values".into()))
-                .and_then(Value::as_sequence)
-                .map(|items| {
-                    items
-                        .iter()
-                        .map(|item| match yaml_to_lit(item).to_sql_literal() {
-                            Some(literal) => literal,
-                            None => "NULL".to_string(),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                });
-            match (column, values) {
-                (Some(column), Some(values)) => test_file(
-                    ctx,
-                    outcome,
-                    "accepted_values",
-                    format!("select * from {model_logical} where \"{column}\" not in ({values})"),
-                ),
-                _ => outcome.issues.push(MigrationIssue::new(
-                    codes::UNSUPPORTED_TEST,
-                    "`accepted_values` test lacks a column or values",
-                )),
+            "accepted_values" => {
+                let values = args
+                    .get(Value::String("values".into()))
+                    .and_then(Value::as_sequence)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|item| match yaml_to_lit(item).to_sql_literal() {
+                                Some(literal) => literal,
+                                None => "NULL".to_string(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    });
+                match (column, values) {
+                    (Some(column), Some(values)) => test_file(
+                        ctx,
+                        outcome,
+                        "accepted_values",
+                        format!(
+                            "select * from {model_logical} where \"{column}\" not in ({values})"
+                        ),
+                    ),
+                    _ => outcome.issues.push(MigrationIssue::new(
+                        codes::UNSUPPORTED_TEST,
+                        "`accepted_values` test lacks a column or values",
+                    )),
+                }
             }
-        }
-        "relationships" => {
-            let to = args.get(Value::String("to".into())).and_then(Value::as_str);
-            let field = args
-                .get(Value::String("field".into()))
-                .and_then(Value::as_str)
-                .unwrap_or("id");
-            let Some(column) = column else {
-                outcome.issues.push(MigrationIssue::new(
-                    codes::UNSUPPORTED_TEST,
-                    "model-level `relationships` test is ambiguous",
-                ));
-                return;
-            };
-            let Some(target) = to.and_then(|to| resolve_test_target(to, ctx)) else {
-                outcome.issues.push(MigrationIssue::new(
-                    codes::UNSUPPORTED_TEST,
-                    "`relationships` test target could not be resolved",
-                ));
-                return;
-            };
-            test_file(ctx, outcome,
+            "relationships" => {
+                let to = args.get(Value::String("to".into())).and_then(Value::as_str);
+                let field = args
+                    .get(Value::String("field".into()))
+                    .and_then(Value::as_str)
+                    .unwrap_or("id");
+                let Some(column) = column else {
+                    outcome.issues.push(MigrationIssue::new(
+                        codes::UNSUPPORTED_TEST,
+                        "model-level `relationships` test is ambiguous",
+                    ));
+                    break 'dispatch;
+                };
+                let Some(target) = to.and_then(|to| resolve_test_target(to, ctx)) else {
+                    outcome.issues.push(MigrationIssue::new(
+                        codes::UNSUPPORTED_TEST,
+                        "`relationships` test target could not be resolved",
+                    ));
+                    break 'dispatch;
+                };
+                test_file(ctx, outcome,
                 "relationships",
                 format!(
                     "select child.* from {model_logical} child left join {target} parent on child.\"{column}\" = parent.\"{field}\" where child.\"{column}\" is not null and parent.\"{field}\" is null"
                 ),
             );
-        }
-        // dbt_utils.expression_is_true(model, expression) — rows where the
-        // predicate does not hold are failures.
-        "expression_is_true" => {
-            let expression = args
-                .get(Value::String("expression".into()))
-                .and_then(Value::as_str);
-            match expression {
-                Some(expression) => test_file(
-                    ctx,
-                    outcome,
-                    "expression_is_true",
-                    format!("select * from {model_logical} where not ({expression})"),
-                ),
-                None => outcome.issues.push(MigrationIssue::new(
-                    codes::UNSUPPORTED_TEST,
-                    "`expression_is_true` test lacks `expression`",
-                )),
             }
-        }
-        // dbt_utils.accepted_range — values outside the range fail. Either
-        // bound is optional; `inclusive` (default true) selects `>=`/`<=`
-        // over `>`/`<`.
-        "accepted_range" => {
-            let lit = |key: &str| {
-                args.get(Value::String(key.to_string()))
-                    .and_then(|value| yaml_to_lit(value).to_sql_literal())
-            };
-            let inclusive = args
-                .get(Value::String("inclusive".to_string()))
-                .map(|value| !matches!(yaml_to_lit(value), Lit::Bool(false)))
-                .unwrap_or(true);
-            let (lower, upper) = if inclusive { ("<", ">") } else { ("<=", ">=") };
-            let mut bounds = Vec::new();
-            if let Some(min) = lit("min_value") {
-                bounds.push((lower, min));
+            // dbt_utils.expression_is_true(model, expression) — rows where the
+            // predicate does not hold are failures.
+            "expression_is_true" => {
+                let expression = args
+                    .get(Value::String("expression".into()))
+                    .and_then(Value::as_str);
+                match expression {
+                    Some(expression) => test_file(
+                        ctx,
+                        outcome,
+                        "expression_is_true",
+                        format!("select * from {model_logical} where not ({expression})"),
+                    ),
+                    None => outcome.issues.push(MigrationIssue::new(
+                        codes::UNSUPPORTED_TEST,
+                        "`expression_is_true` test lacks `expression`",
+                    )),
+                }
             }
-            if let Some(max) = lit("max_value") {
-                bounds.push((upper, max));
-            }
-            match (column, bounds.is_empty()) {
-                (Some(column), false) => {
-                    let violations = bounds
-                        .iter()
-                        .map(|(op, bound)| format!("\"{column}\" {op} {bound}"))
-                        .collect::<Vec<_>>()
-                        .join(" or ");
-                    test_file(
+            // dbt_utils.accepted_range — values outside the range fail. Either
+            // bound is optional; `inclusive` (default true) selects `>=`/`<=`
+            // over `>`/`<`.
+            "accepted_range" => {
+                let lit = |key: &str| {
+                    args.get(Value::String(key.to_string()))
+                        .and_then(|value| yaml_to_lit(value).to_sql_literal())
+                };
+                let inclusive = args
+                    .get(Value::String("inclusive".to_string()))
+                    .map(|value| !matches!(yaml_to_lit(value), Lit::Bool(false)))
+                    .unwrap_or(true);
+                let (lower, upper) = if inclusive { ("<", ">") } else { ("<=", ">=") };
+                let mut bounds = Vec::new();
+                if let Some(min) = lit("min_value") {
+                    bounds.push((lower, min));
+                }
+                if let Some(max) = lit("max_value") {
+                    bounds.push((upper, max));
+                }
+                match (column, bounds.is_empty()) {
+                    (Some(column), false) => {
+                        let violations = bounds
+                            .iter()
+                            .map(|(op, bound)| format!("\"{column}\" {op} {bound}"))
+                            .collect::<Vec<_>>()
+                            .join(" or ");
+                        test_file(
                         ctx,
                         outcome,
                         "accepted_range",
@@ -2854,27 +3283,27 @@ fn translate_generic_test(
                             "select * from {model_logical} where \"{column}\" is not null and ({violations})"
                         ),
                     );
+                    }
+                    _ => outcome.issues.push(MigrationIssue::new(
+                        codes::UNSUPPORTED_TEST,
+                        "`accepted_range` test lacks a column or bounds",
+                    )),
                 }
-                _ => outcome.issues.push(MigrationIssue::new(
-                    codes::UNSUPPORTED_TEST,
-                    "`accepted_range` test lacks a column or bounds",
-                )),
             }
-        }
-        // dbt_utils.not_constant — the test fails when the column takes only
-        // one distinct value (a Phlo test fails on returned rows).
-        "not_constant" => match column {
-            Some(column) => {
-                let group_by = args
-                    .get(Value::String("group_by_columns".to_string()))
-                    .and_then(Value::as_sequence)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .map(|item| item.as_str().map(|name| format!("\"{name}\"")))
-                            .collect::<Option<Vec<_>>>()
-                    });
-                match group_by {
+            // dbt_utils.not_constant — the test fails when the column takes only
+            // one distinct value (a Phlo test fails on returned rows).
+            "not_constant" => match column {
+                Some(column) => {
+                    let group_by = args
+                        .get(Value::String("group_by_columns".to_string()))
+                        .and_then(Value::as_sequence)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .map(|item| item.as_str().map(|name| format!("\"{name}\"")))
+                                .collect::<Option<Vec<_>>>()
+                        });
+                    match group_by {
                     Some(Some(groups)) if !groups.is_empty() => test_file(
                         ctx,
                         outcome,
@@ -2897,49 +3326,49 @@ fn translate_generic_test(
                         ),
                     ),
                 }
-            }
-            None => outcome.issues.push(MigrationIssue::new(
-                codes::UNSUPPORTED_TEST,
-                "`not_constant` test lacks a column",
-            )),
-        },
-        // dbt_utils.not_empty_string — `trim_whitespace` (default true)
-        // makes whitespace-only strings fail too.
-        "not_empty_string" => match column {
-            Some(column) => {
-                let trim = args
-                    .get(Value::String("trim_whitespace".to_string()))
-                    .map(|value| !matches!(yaml_to_lit(value), Lit::Bool(false)))
-                    .unwrap_or(true);
-                let predicate = if trim {
-                    format!("trim(\"{column}\") = ''")
-                } else {
-                    format!("\"{column}\" = ''")
-                };
-                test_file(
-                    ctx,
-                    outcome,
-                    "not_empty_string",
-                    format!("select * from {model_logical} where {predicate}"),
-                );
-            }
-            None => outcome.issues.push(MigrationIssue::new(
-                codes::UNSUPPORTED_TEST,
-                "`not_empty_string` test lacks a column",
-            )),
-        },
-        "unique_combination_of_columns" => {
-            let columns = args
-                .get(Value::String("combination_of_columns".into()))
-                .and_then(Value::as_sequence)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(|c| format!("\"{c}\""))
-                        .collect::<Vec<_>>()
-                });
-            match columns {
+                }
+                None => outcome.issues.push(MigrationIssue::new(
+                    codes::UNSUPPORTED_TEST,
+                    "`not_constant` test lacks a column",
+                )),
+            },
+            // dbt_utils.not_empty_string — `trim_whitespace` (default true)
+            // makes whitespace-only strings fail too.
+            "not_empty_string" => match column {
+                Some(column) => {
+                    let trim = args
+                        .get(Value::String("trim_whitespace".to_string()))
+                        .map(|value| !matches!(yaml_to_lit(value), Lit::Bool(false)))
+                        .unwrap_or(true);
+                    let predicate = if trim {
+                        format!("trim(\"{column}\") = ''")
+                    } else {
+                        format!("\"{column}\" = ''")
+                    };
+                    test_file(
+                        ctx,
+                        outcome,
+                        "not_empty_string",
+                        format!("select * from {model_logical} where {predicate}"),
+                    );
+                }
+                None => outcome.issues.push(MigrationIssue::new(
+                    codes::UNSUPPORTED_TEST,
+                    "`not_empty_string` test lacks a column",
+                )),
+            },
+            "unique_combination_of_columns" => {
+                let columns = args
+                    .get(Value::String("combination_of_columns".into()))
+                    .and_then(Value::as_sequence)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(|c| format!("\"{c}\""))
+                            .collect::<Vec<_>>()
+                    });
+                match columns {
                 Some(columns) if !columns.is_empty() => test_file(ctx, outcome,
                     "unique_combination",
                     format!(
@@ -2953,13 +3382,18 @@ fn translate_generic_test(
                     "`unique_combination_of_columns` lacks `combination_of_columns`",
                 )),
             }
+            }
+            other => {
+                outcome.issues.push(MigrationIssue::new(
+                    codes::UNSUPPORTED_TEST,
+                    format!("generic test `{other}` has no native conversion"),
+                ));
+            }
         }
-        other => {
-            outcome.issues.push(MigrationIssue::new(
-                codes::UNSUPPORTED_TEST,
-                format!("generic test `{other}` has no native conversion"),
-            ));
-        }
+    }
+
+    if let Some(package) = package {
+        ctx.note_package_call(&package, outcome.issues.len() == issues_before);
     }
 }
 

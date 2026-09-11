@@ -19,3 +19,7 @@ models:
     marts:
       +materialized: table
       +tags: ['mart']
+
+seeds:
+  jaffle:
+    +schema: raw

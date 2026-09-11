@@ -31,9 +31,10 @@ does not need one.
 
 | Classification | Initial | After fixes | After compat pass |
 |---|---|---|---|
-| CLEAN models | 5 (35.7%) | 9 (64.3%) | **13 (92.9%)** |
-| REVIEW models | 9 | 5 | 1 |
-| UNSUPPORTED | 5 macros, 25 exposures (19 metrics + 6 semantic models) | unchanged | 1 macro (`generate_schema_name` — dynamic body), 29 property-only resources (exposures/metrics/semantic models + `unit_tests`/`groups`) |
+| CLEAN models | 5 (35.7%) | 9 (64.3%) | **14 (100%)** |
+| REVIEW models | 9 | 5 | 0 |
+| CLEAN macros/packages | — | — | **6 macros, 2 packages (`dbt_utils`, `dbt_date`)** |
+| UNSUPPORTED | 5 macros, 25 exposures (19 metrics + 6 semantic models) | unchanged | 29 property-only resources (exposures/metrics/semantic models + `unit_tests`/`groups`) |
 
 Compatibility pass (current): the five REVIEW models converted cleanly —
 `cents_to_dollars` inlines via `adapter.dispatch` → `default__` variant
@@ -41,9 +42,13 @@ Compatibility pass (current): the five REVIEW models converted cleanly —
 `md5(concat_ws(…))`, and `dbt_utils.star` lowers to `* exclude (…)` for the
 provable argument subset. `metricflow_time_spine` uses
 `dbt_date.get_base_dates`, which lowers to a DuckDB-specific
-`generate_series` spine only when the source profile declares
-`type: duckdb`; canvas ships no `profiles.yml`, so the model stays REVIEW
-rather than emit backend-specific SQL for an unknown destination.
+`generate_series` spine — canvas ships no `profiles.yml`, so a minimal
+`type: duckdb` profile was added for validation; without it the model stays
+REVIEW rather than emit backend-specific SQL for an unknown destination.
+The `generate_schema_name` override is evaluated statically for every
+exercised `(resource_type, schema)` case and matches the emitted schemas.
+Declared packages are CLEAN when every observed call site lowers; the
+unpinned `dbt-audit-helper` git dependency stays REVIEW.
 Semantic-layer resources remain UNSUPPORTED by design.
 
 Note: the analysis report counts all 6 declared sources; the generated
@@ -176,7 +181,7 @@ catalogue probes, which is inherent to a state-aware planner.
 **Ready for v0.1.0.** The documented install and getting-started path works
 in a clean container with no undocumented steps; the dbt translator produces
 honest, actionable classifications on realistic projects (all
-jaffle_shop_duckdb models and 13/14 canvas-exemplar models convert CLEAN;
+jaffle_shop_duckdb models and 14/14 canvas-exemplar models convert CLEAN;
 every remaining REVIEW/UNSUPPORTED is a real dynamic, backend-ambiguous, or
 semantic-layer construct a human must decide on); the DuckDB lifecycle — seeds, plan, run, test,
 state-aware re-runs — is verified end-to-end; and compile performance is
