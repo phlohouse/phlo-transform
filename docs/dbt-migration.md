@@ -52,8 +52,8 @@ existing files unless `--overwrite` is passed. The manifest lands at
 | `seeds/**/*.csv` | copied verbatim to `seeds/`; `[seeds]`/`[seed."name"]` schema config in `phlo.toml`; content-hash state (`csv:` prefix) so CSV edits re-trigger downstream builds |
 | `{{ dbt.date_trunc('p', 'col') }}` | `date_trunc('p', col)` |
 | `{{ dbt.current_timestamp() }}` | `current_timestamp` |
-| `{{ dbt_utils.generate_surrogate_key(['a','b']) }}` | `md5(concat_ws('-', coalesce(cast("a" as varchar), ''), …))` |
-| `{{ dbt_utils.star(from=…, except=[…]) }}` | `* exclude (…)` (DuckDB-first; `prefix`/`suffix` args stay REVIEW) |
+| `{{ dbt_utils.generate_surrogate_key(['a','b']) }}` | `md5(concat_ws('-', coalesce(cast("a" as varchar), '_dbt_utils_surrogate_key_null_'), …))` — `''` instead when the `surrogate_key_treat_nulls_as_empty_strings` var is set |
+| `{{ dbt_utils.star(from=…, except=[…]) }}` | `* exclude (…)` (DuckDB-first; only `from`+`except` are provably equivalent — `relation_alias`/`prefix`/`suffix`/`quote_identifiers` stay REVIEW) |
 | `{{ dbt_utils.safe_cast('c','t') }}` | `try_cast("c" as t)` |
 | `{{ dbt_date.get_base_dates(n_dateparts=N\|start_date,end_date, datepart='p') }}` | a `generate_series` spine select (`day`/`week`/`month`/`quarter`/`year`) |
 | simple project macros (`{{ my_macro('x') }}` whose body is literal SQL + `{{ param }}` substitutions, `{{ return(…) }}`, `adapter.dispatch` → `default__`/`adapter__` variants) | inlined into the model's SQL; dynamic bodies (statements, runtime lookups) stay REVIEW |
@@ -71,7 +71,7 @@ existing files unless `--overwrite` is passed. The manifest lands at
 | `unique`/`not_null` on a key column | folded into `@key`/`@incremental key=` |
 | `not_null` on other columns | `-- @not-null col` |
 | other column tests (`unique`, `accepted_values`, `relationships`, `unique_combination_of_columns`) | generated `tests/**/*.sql` |
-| `dbt_utils.expression_is_true` / `accepted_range` / `not_constant` / `not_empty_string` (package-qualified names resolve when the package is declared) | generated `tests/**/*.sql` |
+| `dbt_utils.expression_is_true` / `accepted_range` (either bound optional, `inclusive: false` supported) / `not_constant` / `not_empty_string` (honours `trim_whitespace`) (package-qualified names resolve when the package is declared) | generated `tests/**/*.sql` |
 | `meta.owner` | `-- @owner` |
 | `tags` | `-- @tags` |
 | `description` | a leading `-- ` comment |

@@ -15,7 +15,7 @@ use crate::cancel::CancelHandle;
 use crate::error::{AdapterError, EngineError};
 use crate::events::{EngineEvent, ExecutionStatus};
 use crate::plan::{Plan, PlanAction, PlannedModel};
-use crate::source_state::{adapter_default_schema, seed_relation};
+use crate::source_state::{adapter_default_schema, relation_for_source, seed_relation};
 use crate::state::{
     MaterializedRecord, ModelRunRecord, RunRecord, SeedRecord, StateStore, TestRunRecord,
 };
@@ -332,6 +332,14 @@ impl Runner {
             }
         }
 
+        // A seed that failed to load must block every model that reads it —
+        // otherwise they would run against a stale (or missing) seed table.
+        let failed_seed_targets: BTreeSet<String> = seed_results
+            .iter()
+            .filter(|result| result.status == ExecutionStatus::Failed)
+            .map(|result| result.target.clone())
+            .collect();
+
         // Dependency bookkeeping restricted to the planned set.
         let mut remaining: BTreeMap<ModelId, usize> = BTreeMap::new();
         let mut dependents: BTreeMap<ModelId, Vec<ModelId>> = BTreeMap::new();
@@ -390,6 +398,58 @@ impl Runner {
                 );
             }
             release_dependents(id, &dependents, &mut remaining);
+        }
+
+        if !failed_seed_targets.is_empty() {
+            let default_catalog = compilation.defaults.catalog.as_deref();
+            let default_schema = compilation
+                .defaults
+                .schema
+                .as_deref()
+                .or_else(|| adapter_default_schema(self.adapter.name()));
+            for id in &planned {
+                if status.get(id) != Some(&ExecutionStatus::Pending) {
+                    continue;
+                }
+                let Some(model) = compilation.model(id) else {
+                    continue;
+                };
+                let reads_failed_seed = model.source_dependencies().any(|source| {
+                    failed_seed_targets.contains(
+                        &relation_for_source(source, default_catalog, default_schema).display(),
+                    )
+                });
+                if !reads_failed_seed {
+                    continue;
+                }
+                status.insert(id.clone(), ExecutionStatus::Blocked);
+                events.push(EngineEvent::ModelFinished {
+                    model: id.logical_name(),
+                    status: ExecutionStatus::Blocked,
+                    query_id: None,
+                    duration_ms: 0,
+                });
+                results.insert(
+                    id.clone(),
+                    model_result(
+                        model,
+                        ExecutionStatus::Blocked,
+                        None,
+                        Some("blocked by a failed seed load".to_string()),
+                        0,
+                        plan_info.get(id),
+                    ),
+                );
+                block_dependents(
+                    id,
+                    &dependents,
+                    &mut status,
+                    &mut results,
+                    compilation,
+                    &plan_info,
+                    &mut events,
+                );
+            }
         }
 
         let mut ready: VecDeque<ModelId> = planned

@@ -1378,8 +1378,10 @@ fn lower_builtin(
         }
     };
     let rendered = match (provider, helper) {
-        // `md5(concat_ws('-', coalesce(cast("col" as varchar), ''), ...))`
-        // reproduces the dbt_utils default implementation.
+        // `md5(concat_ws('-', coalesce(cast("col" as varchar), SENTINEL), ...))`
+        // reproduces the dbt_utils default implementation. The null sentinel
+        // is `'_dbt_utils_surrogate_key_null_'` unless the project sets the
+        // `surrogate_key_treat_nulls_as_empty_strings` var.
         ("dbt_utils", "generate_surrogate_key") => {
             let fields = args
                 .get(0, "field_list")
@@ -1388,17 +1390,40 @@ fn lower_builtin(
             if fields.is_empty() {
                 return None;
             }
+            let empty_nulls = ctx
+                .project
+                .vars
+                .get(Value::String(
+                    "surrogate_key_treat_nulls_as_empty_strings".to_string(),
+                ))
+                .map(|value| matches!(yaml_to_lit(value), Lit::Bool(true)))
+                .unwrap_or(false);
+            let null_sentinel = if empty_nulls {
+                "''"
+            } else {
+                "'_dbt_utils_surrogate_key_null_'"
+            };
             let parts: Vec<String> = fields
                 .iter()
-                .map(|field| format!("coalesce(cast(\"{field}\" as varchar), '')"))
+                .map(|field| format!("coalesce(cast(\"{field}\" as varchar), {null_sentinel})"))
                 .collect();
             format!("md5(concat_ws('-', {}))", parts.join(", "))
         }
         // `dbt_utils.star(from=..., except=[...])` → `* exclude (...)`.
-        // `prefix`/`suffix` need the source's column list — not static.
+        // Only this narrow shape is provably equivalent: `relation_alias`
+        // qualifies/renames output columns, `quote_identifiers` quotes each
+        // name, and `prefix`/`suffix` rename — all need the source's column
+        // list, which is not static. Those uses stay REVIEW.
         ("dbt_utils", "star") => {
-            if args.get_raw(3, "prefix").is_some() || args.get_raw(4, "suffix").is_some() {
-                return None;
+            for (position, key) in [
+                (1, "relation_alias"),
+                (3, "prefix"),
+                (4, "suffix"),
+                (5, "quote_identifiers"),
+            ] {
+                if args.get_raw(position, key).is_some() {
+                    return None;
+                }
             }
             let except = args
                 .get(2, "except")
@@ -2781,35 +2806,57 @@ fn translate_generic_test(
                 )),
             }
         }
-        // dbt_utils.accepted_range — values outside [min, max] fail.
+        // dbt_utils.accepted_range — values outside the range fail. Either
+        // bound is optional; `inclusive` (default true) selects `>=`/`<=`
+        // over `>`/`<`.
         "accepted_range" => {
             let lit = |key: &str| {
                 args.get(Value::String(key.to_string()))
                     .and_then(|value| yaml_to_lit(value).to_sql_literal())
             };
-            match (column, lit("min_value"), lit("max_value")) {
-                (Some(column), Some(min), Some(max)) => test_file(
-                    ctx,
-                    outcome,
-                    "accepted_range",
-                    format!(
-                        "select * from {model_logical} where \"{column}\" is not null and not (\"{column}\" >= {min} and \"{column}\" <= {max})"
-                    ),
-                ),
+            let inclusive = args
+                .get(Value::String("inclusive".to_string()))
+                .map(|value| !matches!(yaml_to_lit(value), Lit::Bool(false)))
+                .unwrap_or(true);
+            let (lower, upper) = if inclusive { ("<", ">") } else { ("<=", ">=") };
+            let mut bounds = Vec::new();
+            if let Some(min) = lit("min_value") {
+                bounds.push((lower, min));
+            }
+            if let Some(max) = lit("max_value") {
+                bounds.push((upper, max));
+            }
+            match (column, bounds.is_empty()) {
+                (Some(column), false) => {
+                    let violations = bounds
+                        .iter()
+                        .map(|(op, bound)| format!("\"{column}\" {op} {bound}"))
+                        .collect::<Vec<_>>()
+                        .join(" or ");
+                    test_file(
+                        ctx,
+                        outcome,
+                        "accepted_range",
+                        format!(
+                            "select * from {model_logical} where \"{column}\" is not null and ({violations})"
+                        ),
+                    );
+                }
                 _ => outcome.issues.push(MigrationIssue::new(
                     codes::UNSUPPORTED_TEST,
                     "`accepted_range` test lacks a column or bounds",
                 )),
             }
         }
-        // dbt_utils.not_constant — a column that takes >1 distinct value.
+        // dbt_utils.not_constant — the test fails when the column takes only
+        // one distinct value (a Phlo test fails on returned rows).
         "not_constant" => match column {
             Some(column) => test_file(
                 ctx,
                 outcome,
                 "not_constant",
                 format!(
-                    "select count(distinct \"{column}\") as n from {model_logical} having count(distinct \"{column}\") > 1"
+                    "select count(distinct \"{column}\") as n from {model_logical} having count(distinct \"{column}\") = 1"
                 ),
             ),
             None => outcome.issues.push(MigrationIssue::new(
@@ -2817,14 +2864,26 @@ fn translate_generic_test(
                 "`not_constant` test lacks a column",
             )),
         },
-        // dbt_utils.not_empty_string.
+        // dbt_utils.not_empty_string — `trim_whitespace` (default true)
+        // makes whitespace-only strings fail too.
         "not_empty_string" => match column {
-            Some(column) => test_file(
-                ctx,
-                outcome,
-                "not_empty_string",
-                format!("select * from {model_logical} where \"{column}\" = ''"),
-            ),
+            Some(column) => {
+                let trim = args
+                    .get(Value::String("trim_whitespace".to_string()))
+                    .map(|value| !matches!(yaml_to_lit(value), Lit::Bool(false)))
+                    .unwrap_or(true);
+                let predicate = if trim {
+                    format!("trim(\"{column}\") = ''")
+                } else {
+                    format!("\"{column}\" = ''")
+                };
+                test_file(
+                    ctx,
+                    outcome,
+                    "not_empty_string",
+                    format!("select * from {model_logical} where {predicate}"),
+                );
+            }
             None => outcome.issues.push(MigrationIssue::new(
                 codes::UNSUPPORTED_TEST,
                 "`not_empty_string` test lacks a column",

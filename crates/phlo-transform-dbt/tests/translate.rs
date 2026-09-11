@@ -100,6 +100,11 @@ fn jaffle_classification() {
         class_of("package_users", ResourceKind::Model),
         Classification::Clean
     );
+    // `star` with `relation_alias` is outside the provable subset — REVIEW.
+    assert_eq!(
+        class_of("package_users_aliased", ResourceKind::Model),
+        Classification::Review
+    );
     // Seeds copy as runnable CSV inputs.
     assert_eq!(
         class_of("countries", ResourceKind::Seed),
@@ -193,11 +198,12 @@ fn jaffle_emitted_sql() {
     assert!(!pivot.contains("{{"), "{pivot}");
     assert_eq!(pivot.matches("_amount").count(), 3, "{pivot}");
 
-    // dbt_utils.generate_surrogate_key lowers to md5(concat_ws(...));
-    // the dispatching project macro inlines its default variant.
+    // dbt_utils.generate_surrogate_key lowers to md5(concat_ws(...)) using
+    // the upstream null sentinel; the dispatching project macro inlines its
+    // default variant.
     let enriched = file("transforms/marts/orders_enriched.sql");
     assert!(
-        enriched.contains("md5(concat_ws('-', coalesce(cast(\"order_id\" as varchar), ''), coalesce(cast(\"status\" as varchar), '')))"),
+        enriched.contains("md5(concat_ws('-', coalesce(cast(\"order_id\" as varchar), '_dbt_utils_surrogate_key_null_'), coalesce(cast(\"status\" as varchar), '_dbt_utils_surrogate_key_null_')))"),
         "{enriched}"
     );
     assert!(
@@ -231,6 +237,23 @@ fn jaffle_emitted_sql() {
         expression.contains("where not (customer_id >= 0)"),
         "{expression}"
     );
+
+    // dbt_utils.not_constant fails when the column is constant.
+    let constant = file("tests/generated/marts__customers__customer_id__not_constant.sql");
+    assert!(
+        constant.contains("having count(distinct \"customer_id\") = 1"),
+        "{constant}"
+    );
+
+    // dbt_utils.accepted_range with only a lower bound and inclusive=false.
+    let range = file("tests/generated/marts__customers__customer_id__accepted_range.sql");
+    assert!(range.contains("\"customer_id\" <= 0"), "{range}");
+
+    // dbt_utils.not_empty_string honours trim_whitespace.
+    let empty = file("tests/generated/marts__customers__customer_id__not_empty_string.sql");
+    assert!(empty.contains("\"customer_id\" = ''"), "{empty}");
+    let trimmed = file("tests/generated/marts__customers__email__not_empty_string.sql");
+    assert!(trimmed.contains("trim(\"email\") = ''"), "{trimmed}");
 }
 
 #[test]

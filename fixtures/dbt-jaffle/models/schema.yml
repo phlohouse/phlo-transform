@@ -27,7 +27,18 @@ models:
           expression: "customer_id >= 0"
     columns:
       - name: customer_id
-        tests: [unique, not_null]
+        tests:
+          - unique
+          - not_null
+          - dbt_utils.not_constant
+          - dbt_utils.accepted_range:
+              min_value: 0
+              inclusive: false
+          - dbt_utils.not_empty_string:
+              trim_whitespace: false
+      - name: email
+        tests:
+          - dbt_utils.not_empty_string
   - name: orders_incremental
     columns:
       - name: order_id

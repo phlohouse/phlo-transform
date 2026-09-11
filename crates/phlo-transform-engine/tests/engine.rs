@@ -35,6 +35,7 @@ struct FakeAdapter {
     replaced_partitions: Mutex<Vec<String>>,
     columns: Mutex<Vec<ColumnInfo>>,
     loaded_csvs: Mutex<Vec<String>>,
+    fail_loads: Mutex<BTreeSet<String>>,
     source_states: Mutex<BTreeMap<String, String>>,
     max_value: Mutex<Option<String>>,
     test_rows: Mutex<u64>,
@@ -170,6 +171,12 @@ impl Adapter for FakeAdapter {
         path: &Path,
     ) -> Result<QueryResult, AdapterError> {
         let display = relation.display();
+        if self.fail_loads.lock().unwrap().contains(&display) {
+            return Err(AdapterError::new(
+                "FAKE001",
+                format!("simulated seed failure for {display}"),
+            ));
+        }
         self.loaded_csvs
             .lock()
             .unwrap()
@@ -1062,4 +1069,75 @@ async fn seed_content_change_replans_the_load() {
         .await
         .unwrap();
     assert_eq!(plan.seeds[0].action, PlanAction::Build);
+}
+
+/// A failed seed load blocks the models reading it (and their dependents)
+/// instead of running them against a stale seed table.
+#[tokio::test]
+async fn failed_seed_load_blocks_dependent_models() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("seeds")).unwrap();
+    std::fs::write(
+        dir.path().join("seeds/raw_events.csv"),
+        "id,status\n1,placed\n",
+    )
+    .unwrap();
+
+    let mut project = SemanticProject::in_memory(vec![
+        model("main.stg_events", "select * from raw.raw_events"),
+        model("main.daily", "select * from main.stg_events"),
+        model("main.independent", "select * from external.other"),
+    ]);
+    project.workspace_root = Some(dir.path().to_path_buf());
+    project.seeds = vec![SemanticSeed {
+        name: "raw_events".to_string(),
+        path: PathBuf::from("seeds/raw_events.csv"),
+        schema: Some("raw".to_string()),
+        content_hash: "hash-v1".to_string(),
+        columns: vec!["id".to_string(), "status".to_string()],
+    }];
+    let compilation = compile(&project);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter
+        .fail_loads
+        .lock()
+        .unwrap()
+        .insert("raw.raw_events".to_string());
+    // A stale seed table still exists — the models must not read it.
+    adapter
+        .existing
+        .lock()
+        .unwrap()
+        .insert("raw.raw_events".to_string());
+
+    let result = run_once(
+        adapter.clone(),
+        Arc::new(SqliteStateStore::in_memory().unwrap()),
+        &compilation,
+        "dev",
+    )
+    .await;
+
+    assert_eq!(result.seeds[0].status, ExecutionStatus::Failed);
+    assert_eq!(result.status, ExecutionStatus::Failed);
+    let status = |name: &str| {
+        result
+            .models
+            .iter()
+            .find(|model| model.model == name)
+            .map(|model| model.status)
+            .unwrap()
+    };
+    assert_eq!(status("main.stg_events"), ExecutionStatus::Blocked);
+    assert_eq!(status("main.daily"), ExecutionStatus::Blocked);
+    assert_eq!(status("main.independent"), ExecutionStatus::Passed);
+    let created = adapter.created.lock().unwrap().clone();
+    assert!(
+        !created
+            .iter()
+            .any(|target| target == "main.stg_events" || target == "main.daily"),
+        "{created:?}"
+    );
 }
