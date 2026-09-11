@@ -385,6 +385,31 @@ fn multi_target_schema_macro_stays_review() {
     );
 }
 
+/// Regression: every case must be checked against every target, not just
+/// the first. Both outputs share `schema: main`, so the no-schema case —
+/// which sorts first — is equivalent under `dev` and `prod`; only the
+/// later custom-schema case diverges (`main_custom` under `prod`).
+#[test]
+fn later_diverging_case_is_still_caught_across_targets() {
+    let translation =
+        translate_project(&fixture("dbt-schema-targets-late")).expect("dbt project loads");
+    let macro_outcome = translation
+        .report
+        .resources
+        .iter()
+        .find(|r| r.kind == ResourceKind::Macro && r.name == "generate_schema_name")
+        .expect("generate_schema_name outcome");
+    assert_eq!(macro_outcome.classification, Classification::Review);
+    assert!(
+        macro_outcome
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("`prod`") && issue.message.contains("main_custom")),
+        "the issue names the diverging target and schema: {:?}",
+        macro_outcome.issues
+    );
+}
+
 #[test]
 fn clean_fixture_verifies_with_the_native_compiler() {
     let translation = translate_project(&fixture("dbt-clean")).expect("load");

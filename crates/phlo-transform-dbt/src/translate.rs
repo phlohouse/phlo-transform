@@ -726,14 +726,14 @@ fn eval_schema_name_macro(def: &MacroDef, ctx: &Context) -> Result<Vec<String>, 
                     render(&expected)
                 ));
             }
-            if multi_target {
-                break;
-            }
             let outcome = match &resolved {
                 SchemaValue::Literal(schema) => format!("schema `{schema}`"),
                 SchemaValue::Default => "default schema".to_string(),
             };
-            notes.push(format!("{case} → {outcome}"));
+            let note = format!("{case} → {outcome}");
+            if !notes.contains(&note) {
+                notes.push(note);
+            }
         }
     }
     if multi_target {
