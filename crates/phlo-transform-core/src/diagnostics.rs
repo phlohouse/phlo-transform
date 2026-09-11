@@ -16,6 +16,7 @@ pub mod codes {
     pub const PROJECT_FILE_READ: &str = "PROJECT006";
     pub const PROJECT_TARGET_COLLISION: &str = "PROJECT007";
     pub const PROJECT_SEED_NAME_COLLISION: &str = "PROJECT008";
+    pub const PROJECT_NO_ROOTS: &str = "PROJECT009";
 
     pub const CONFIG_INVALID: &str = "CONFIG001";
     pub const CONFIG_INVALID_ROOT: &str = "CONFIG002";
@@ -68,6 +69,10 @@ pub struct Diagnostic {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<usize>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,6 +98,8 @@ impl Diagnostic {
             severity,
             message: message.into(),
             path: None,
+            line: None,
+            column: None,
             labels: Vec::new(),
             help: None,
         }
@@ -100,6 +107,13 @@ impl Diagnostic {
 
     pub fn with_path(mut self, path: impl Into<String>) -> Self {
         self.path = Some(path.into());
+        self
+    }
+
+    /// Attach a 1-based source position for `path`.
+    pub fn with_location(mut self, line: usize, column: usize) -> Self {
+        self.line = Some(line);
+        self.column = Some(column);
         self
     }
 

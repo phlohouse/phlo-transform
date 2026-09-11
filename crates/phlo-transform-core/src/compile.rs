@@ -677,14 +677,47 @@ fn parse_diagnostic(
     path: Option<&str>,
     context: &str,
 ) -> Diagnostic {
-    let mut diagnostic = Diagnostic::error(
-        codes::PARSE_INVALID_SQL,
-        format!("{context}: {}", error.message()),
-    );
+    let (message, location) = split_parser_location(error.message());
+    let mut diagnostic =
+        Diagnostic::error(codes::PARSE_INVALID_SQL, format!("{context}: {message}"));
     if let Some(path) = path {
         diagnostic = diagnostic.with_path(path.to_string());
     }
+    if let Some((line, column)) = location {
+        diagnostic = diagnostic.with_location(line, column);
+    }
     diagnostic
+}
+
+/// sqlparser formats positions as a trailing ` at Line: N, Column: M`. Split
+/// that tail into a structured location so CLI output can render
+/// `path:line:column` for editor navigation.
+fn split_parser_location(message: &str) -> (String, Option<(usize, usize)>) {
+    let Some(line_marker) = message.rfind("Line: ") else {
+        return (message.to_string(), None);
+    };
+    let tail = &message[line_marker + "Line: ".len()..];
+    let Some(comma) = tail.find(',') else {
+        return (message.to_string(), None);
+    };
+    let Ok(line) = tail[..comma].trim().parse::<usize>() else {
+        return (message.to_string(), None);
+    };
+    let Some(column) = tail[comma + 1..].strip_prefix(" Column: ") else {
+        return (message.to_string(), None);
+    };
+    let digits: String = column
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect();
+    let Ok(column) = digits.parse::<usize>() else {
+        return (message.to_string(), None);
+    };
+    // Only strip when the location is the message tail (optionally preceded
+    // by ` at` / `at`), not a position mentioned mid-message.
+    let prefix = message[..line_marker].trim_end();
+    let stripped = prefix.strip_suffix(" at").unwrap_or(prefix);
+    (stripped.trim_end().to_string(), Some((line, column)))
 }
 
 fn emit_directive_diagnostics(

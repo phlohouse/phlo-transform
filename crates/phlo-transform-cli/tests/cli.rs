@@ -361,6 +361,66 @@ fn translated_dbt_project_runs_on_duckdb() {
     assert!(stdout(&output).contains("status:   unchanged"));
 }
 
+#[test]
+fn lineage_without_target_prints_the_whole_graph() {
+    let output = run(&["--root", "fixtures/basic-multi-root", "lineage"]);
+    assert!(output.status.success());
+    let body = stdout(&output);
+    assert!(body.contains("assay.raw"), "{body}");
+    assert!(body.contains("-> assay.results"), "{body}");
+    assert!(body.contains("<- assay.results"), "{body}");
+}
+
+#[test]
+fn empty_directory_warns_instead_of_passing_silently() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_str().expect("utf-8 path");
+    let output = run(&["--root", root, "check"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("PROJECT009"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn parse_diagnostics_carry_path_line_and_column() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms")).expect("mkdir");
+    std::fs::write(
+        root.join("transforms/bad.sql"),
+        "select a\nfrom t\nselect oops\n",
+    )
+    .expect("write model");
+
+    let output = run(&["--root", root.to_str().expect("utf-8"), "check"]);
+    assert!(!output.status.success());
+    let body = stdout(&output);
+    assert!(body.contains("--> transforms/bad.sql:3:1"), "{body}");
+    assert!(
+        !body.contains("Line: 3"),
+        "location tail not stripped: {body}"
+    );
+}
+
+#[test]
+fn inspect_surfaces_model_diagnostics() {
+    let output = run(&["--root", "fixtures/invalid-sql", "inspect", "assay.broken"]);
+    assert!(output.status.success());
+    let body = stdout(&output);
+    assert!(body.contains("PARSE001"), "{body}");
+}
+
+#[test]
+fn doctor_compile_failure_names_the_first_error() {
+    let output = run(&["--root", "fixtures/invalid-sql", "--json", "doctor"]);
+    assert!(!output.status.success());
+    let body = stdout(&output);
+    assert!(body.contains("PARSE001"), "{body}");
+}
+
 /// Regression: an unqualified source (`from raw_events`) resolves through
 /// DuckDB's search path to `main.raw_events`. Source-state enrichment must
 /// use the same resolution or appended source rows stay invisible and plans
