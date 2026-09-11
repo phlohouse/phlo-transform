@@ -39,6 +39,12 @@ models:
       - name: email
         tests:
           - dbt_utils.not_empty_string
+  - name: labelled
+    columns:
+      - name: status_label
+        tests:
+          - dbt_utils.not_constant:
+              group_by_columns: [order_id]
   - name: orders_incremental
     columns:
       - name: order_id

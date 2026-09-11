@@ -31,18 +31,20 @@ does not need one.
 
 | Classification | Initial | After fixes | After compat pass |
 |---|---|---|---|
-| CLEAN models | 5 (35.7%) | 9 (64.3%) | **14 (100%)** |
-| REVIEW models | 9 | 5 | 0 |
+| CLEAN models | 5 (35.7%) | 9 (64.3%) | **13 (92.9%)** |
+| REVIEW models | 9 | 5 | 1 |
 | UNSUPPORTED | 5 macros, 25 exposures (19 metrics + 6 semantic models) | unchanged | 1 macro (`generate_schema_name` — dynamic body), 29 property-only resources (exposures/metrics/semantic models + `unit_tests`/`groups`) |
 
 Compatibility pass (current): the five REVIEW models converted cleanly —
 `cents_to_dollars` inlines via `adapter.dispatch` → `default__` variant
 (statically selected), `dbt_utils.generate_surrogate_key` lowers to
-`md5(concat_ws(…))`, `dbt_utils.star` lowers to `* exclude (…)`, and
-`dbt_date.get_base_dates(n_dateparts=365*10, datepart="day")` lowers to a
-`generate_series` spine (the integer arithmetic in `n_dateparts` is
-evaluated at translation time). `translate --verify` now **passes** on this
-project. Semantic-layer resources remain UNSUPPORTED by design.
+`md5(concat_ws(…))`, and `dbt_utils.star` lowers to `* exclude (…)` for the
+provable argument subset. `metricflow_time_spine` uses
+`dbt_date.get_base_dates`, which lowers to a DuckDB-specific
+`generate_series` spine only when the source profile declares
+`type: duckdb`; canvas ships no `profiles.yml`, so the model stays REVIEW
+rather than emit backend-specific SQL for an unknown destination.
+Semantic-layer resources remain UNSUPPORTED by design.
 
 Note: the analysis report counts all 6 declared sources; the generated
 workspace reports 3 — only sources actually referenced by models are
@@ -126,19 +128,24 @@ catalogue probes, which is inherent to a state-aware planner.
 ## Regression coverage added
 
 - `fixtures/dbt-seeds` — seed `ref()`, `arguments:` test syntax,
-  `dbt.date_trunc`.
+  `dbt.date_trunc`, and a `get_base_dates` call with no `profiles.yml`
+  staying REVIEW.
 - `fixtures/dbt-jaffle` — extended with `{% set %}`/`{% for %}` expansion
   (`payments_pivot`), `dbt_utils.generate_surrogate_key` +
   dispatching `cents_to_dollars` (`orders_enriched`),
   `dbt_date.get_base_dates` (`time_spine`), `dbt_utils.star`
-  (`package_users`), and a `dbt_utils.expression_is_true` test.
+  (`package_users`, `package_users_aliased`/`package_users_renamed` →
+  REVIEW), grouped `not_constant`, and a `dbt_utils.expression_is_true`
+  test.
 - `fixtures/dbt-dynamic` — a dynamic `{% for %}` over `run_query` stays
   REVIEW and keeps `--verify` failing.
 - `fixtures/native-seeds` — native `seeds/**/*.csv` discovery,
   `[seeds] schema`, content-hash versioning.
 - `phlo-transform-dbt::seed_refs_arguments_syntax_and_dbt_builtins`.
-- `phlo-transform-engine::seed_loads_before_models_and_skips_when_unchanged`
-  and `seed_content_change_replans_the_load` — plan/apply/state over a
+- `phlo-transform-engine::seed_loads_before_models_and_skips_when_unchanged`,
+  `seed_content_change_replans_the_load`,
+  `failed_seed_load_blocks_dependent_models`, and
+  `seed_tests_pull_the_seed_into_the_plan` — plan/apply/state over a
   fake adapter.
 - `phlo-transform-core::csv_seeds_are_discovered_and_compiled`.
 - `phlo-transform-cli::unqualified_source_appends_trigger_rebuilds_on_duckdb`
@@ -168,10 +175,10 @@ catalogue probes, which is inherent to a state-aware planner.
 
 **Ready for v0.1.0.** The documented install and getting-started path works
 in a clean container with no undocumented steps; the dbt translator produces
-honest, actionable classifications on realistic projects (100% of
-canvas-exemplar's and jaffle_shop_duckdb's models now convert CLEAN; every
-remaining REVIEW/UNSUPPORTED is a real dynamic or semantic-layer construct
-a human must decide on); the DuckDB lifecycle — seeds, plan, run, test,
+honest, actionable classifications on realistic projects (all
+jaffle_shop_duckdb models and 13/14 canvas-exemplar models convert CLEAN;
+every remaining REVIEW/UNSUPPORTED is a real dynamic, backend-ambiguous, or
+semantic-layer construct a human must decide on); the DuckDB lifecycle — seeds, plan, run, test,
 state-aware re-runs — is verified end-to-end; and compile performance is
 comfortable to at least 5,000 models. The version number already says
 what it is: an early release with documented gaps, and the docs match the

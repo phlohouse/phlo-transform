@@ -15,6 +15,7 @@ use phlo_transform_core::graph::Dependency;
 use phlo_transform_core::{
     classify_schema_change, Compilation, DataType, Diagnostic, IncrementalStrategy,
     Materialization, ModelId, ModelVersion, Nullability, SchemaChangeSafety, SchemaColumn,
+    SourceId,
 };
 
 use crate::adapter::Adapter;
@@ -213,21 +214,34 @@ impl Planner {
             .or_else(|| adapter_default_schema(self.adapter.name()));
         let mut needed_seeds: BTreeMap<String, &phlo_transform_core::CompiledSeed> =
             BTreeMap::new();
+        let mut seed_sources: Vec<&SourceId> = Vec::new();
         for id in &order {
             let Some(model) = compilation.model(id) else {
                 continue;
             };
-            for source in model.source_dependencies() {
-                let relation = relation_for_source(source, default_catalog, default_schema);
-                if let Some(seed) = seed_for_relation(
-                    &compilation.seeds,
-                    &relation,
-                    default_catalog,
-                    default_schema,
-                    self.adapter.name(),
-                ) {
-                    needed_seeds.insert(seed.name.clone(), seed);
-                }
+            seed_sources.extend(model.source_dependencies());
+        }
+        // Seed-owned generated tests also need the seed loaded: a test that
+        // reads a seed relation must not run against a stale or missing table.
+        for test in &compilation.tests {
+            if test
+                .targets
+                .iter()
+                .all(|target| planned_ids.contains(target))
+            {
+                seed_sources.extend(test.sources.iter());
+            }
+        }
+        for source in seed_sources {
+            let relation = relation_for_source(source, default_catalog, default_schema);
+            if let Some(seed) = seed_for_relation(
+                &compilation.seeds,
+                &relation,
+                default_catalog,
+                default_schema,
+                self.adapter.name(),
+            ) {
+                needed_seeds.insert(seed.name.clone(), seed);
             }
         }
         let mut seeds = Vec::with_capacity(needed_seeds.len());

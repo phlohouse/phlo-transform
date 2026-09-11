@@ -674,8 +674,14 @@ impl Runner {
         }
 
         let tests = if options.run_tests && !cancelled {
-            self.run_tests(compilation, plan, &status, &mut events)
-                .await
+            self.run_tests(
+                compilation,
+                plan,
+                &status,
+                &failed_seed_targets,
+                &mut events,
+            )
+            .await
         } else {
             Vec::new()
         };
@@ -821,10 +827,17 @@ impl Runner {
         compilation: &Compilation,
         plan: &Plan,
         model_status: &BTreeMap<ModelId, ExecutionStatus>,
+        failed_seed_targets: &BTreeSet<String>,
         events: &mut Vec<EngineEvent>,
     ) -> Vec<TestResult> {
         let planned_tests: BTreeSet<&str> =
             plan.tests.iter().map(|test| test.id.as_str()).collect();
+        let default_catalog = compilation.defaults.catalog.as_deref();
+        let default_schema = compilation
+            .defaults
+            .schema
+            .as_deref()
+            .or_else(|| adapter_default_schema(self.adapter.name()));
         let mut results = Vec::new();
 
         for test in &compilation.tests {
@@ -837,7 +850,12 @@ impl Runner {
                     Some(ExecutionStatus::Passed) | Some(ExecutionStatus::Skipped)
                 )
             });
-            if !targets_ready {
+            let sources_ready = test.sources.iter().all(|source| {
+                !failed_seed_targets.contains(
+                    &relation_for_source(source, default_catalog, default_schema).display(),
+                )
+            });
+            if !targets_ready || !sources_ready {
                 continue;
             }
 

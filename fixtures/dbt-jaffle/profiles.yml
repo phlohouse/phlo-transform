@@ -1,0 +1,9 @@
+jaffle:
+
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: 'jaffle.duckdb'
+      schema: main
+      threads: 4

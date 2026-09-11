@@ -1415,15 +1415,18 @@ fn lower_builtin(
         // name, and `prefix`/`suffix` rename — all need the source's column
         // list, which is not static. Those uses stay REVIEW.
         ("dbt_utils", "star") => {
-            for (position, key) in [
-                (1, "relation_alias"),
-                (3, "prefix"),
-                (4, "suffix"),
-                (5, "quote_identifiers"),
-            ] {
-                if args.get_raw(position, key).is_some() {
-                    return None;
-                }
+            // Only `from`/`except`/`exclude` are provable. Anything else —
+            // `relation_alias`, `prefix`, `suffix`, `quote_identifiers`,
+            // `unquote_aliases`, `rename`, or a second positional argument —
+            // changes output columns and stays REVIEW.
+            let allowed = ["from", "except", "exclude"];
+            if args
+                .kwarg_names()
+                .iter()
+                .any(|name| !allowed.contains(name))
+                || args.get_raw(1, "").is_some()
+            {
+                return None;
             }
             let except = args
                 .get(2, "except")
@@ -1451,8 +1454,18 @@ fn lower_builtin(
         // `dbt.current_timestamp()` → `current_timestamp`.
         ("dbt", "current_timestamp") => "current_timestamp".to_string(),
         // `dbt_date.get_base_dates(...)`: the package emits a `date_spine`
-        // select; the lowering targets `generate_series` (DuckDB first).
+        // select; the lowering targets `generate_series`, which is
+        // DuckDB-specific — only lower when the source profile is DuckDB.
         ("dbt_date", "get_base_dates") => {
+            if ctx
+                .project
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.adapter_type.as_deref())
+                != Some("duckdb")
+            {
+                return None;
+            }
             let datepart = args
                 .get(3, "datepart")
                 .map(resolve)
@@ -2851,14 +2864,40 @@ fn translate_generic_test(
         // dbt_utils.not_constant — the test fails when the column takes only
         // one distinct value (a Phlo test fails on returned rows).
         "not_constant" => match column {
-            Some(column) => test_file(
-                ctx,
-                outcome,
-                "not_constant",
-                format!(
-                    "select count(distinct \"{column}\") as n from {model_logical} having count(distinct \"{column}\") = 1"
-                ),
-            ),
+            Some(column) => {
+                let group_by = args
+                    .get(Value::String("group_by_columns".to_string()))
+                    .and_then(Value::as_sequence)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|item| item.as_str().map(|name| format!("\"{name}\"")))
+                            .collect::<Option<Vec<_>>>()
+                    });
+                match group_by {
+                    Some(Some(groups)) if !groups.is_empty() => test_file(
+                        ctx,
+                        outcome,
+                        "not_constant",
+                        format!(
+                            "select {groups}, count(distinct \"{column}\") as n from {model_logical} group by {groups} having count(distinct \"{column}\") = 1",
+                            groups = groups.join(", ")
+                        ),
+                    ),
+                    Some(None) => outcome.issues.push(MigrationIssue::new(
+                        codes::UNSUPPORTED_TEST,
+                        "`not_constant` group_by_columns must be a static string list",
+                    )),
+                    _ => test_file(
+                        ctx,
+                        outcome,
+                        "not_constant",
+                        format!(
+                            "select count(distinct \"{column}\") as n from {model_logical} having count(distinct \"{column}\") = 1"
+                        ),
+                    ),
+                }
+            }
             None => outcome.issues.push(MigrationIssue::new(
                 codes::UNSUPPORTED_TEST,
                 "`not_constant` test lacks a column",

@@ -1141,3 +1141,78 @@ async fn failed_seed_load_blocks_dependent_models() {
         "{created:?}"
     );
 }
+
+/// A seed that only feeds a test (no downstream model) is still planned and
+/// loaded first; when the load fails the test is skipped instead of reading
+/// a stale table.
+#[tokio::test]
+async fn seed_tests_pull_the_seed_into_the_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("seeds")).unwrap();
+    std::fs::write(
+        dir.path().join("seeds/raw_events.csv"),
+        "id,status\n1,placed\n",
+    )
+    .unwrap();
+
+    let build = || {
+        let mut project = SemanticProject::in_memory(vec![model(
+            "main.independent",
+            "select * from external.other",
+        )]);
+        project.workspace_root = Some(dir.path().to_path_buf());
+        project.seeds = vec![SemanticSeed {
+            name: "raw_events".to_string(),
+            path: PathBuf::from("seeds/raw_events.csv"),
+            schema: Some("raw".to_string()),
+            content_hash: "hash-v1".to_string(),
+            columns: vec!["id".to_string(), "status".to_string()],
+        }];
+        project.tests = vec![SemanticTest {
+            id: TestId::new("seed_has_no_nulls"),
+            sql: "select * from raw.raw_events where id is null".to_string(),
+            origin: ModelOrigin::in_memory(),
+        }];
+        let compilation = compile(&project);
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+        compilation
+    };
+
+    // The seed is planned even though no model reads it.
+    let compilation = build();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    assert_eq!(plan.seeds.len(), 1);
+    assert_eq!(plan.seeds[0].name, "raw_events");
+    assert_eq!(plan.seeds[0].action, PlanAction::Build);
+    assert_eq!(plan.tests.len(), 1);
+
+    let runner = Runner::new(adapter.clone(), None);
+    let result = runner
+        .apply(&compilation, &plan, &RunOptions::default())
+        .await
+        .expect("run succeeds");
+    let loaded = adapter.loaded_csvs.lock().unwrap().clone();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(result.tests.len(), 1);
+    assert_eq!(result.tests[0].status, ExecutionStatus::Passed);
+
+    // A failed load skips the test entirely.
+    let compilation = build();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    adapter
+        .fail_loads
+        .lock()
+        .unwrap()
+        .insert("raw.raw_events".to_string());
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let runner = Runner::new(adapter.clone(), None);
+    let result = runner
+        .apply(&compilation, &plan, &RunOptions::default())
+        .await
+        .expect("run succeeds");
+    assert_eq!(result.status, ExecutionStatus::Failed);
+    assert!(result.tests.is_empty(), "{:?}", result.tests);
+}

@@ -105,6 +105,11 @@ fn jaffle_classification() {
         class_of("package_users_aliased", ResourceKind::Model),
         Classification::Review
     );
+    // `star` with `rename` is outside the provable subset — REVIEW.
+    assert_eq!(
+        class_of("package_users_renamed", ResourceKind::Model),
+        Classification::Review
+    );
     // Seeds copy as runnable CSV inputs.
     assert_eq!(
         class_of("countries", ResourceKind::Seed),
@@ -244,6 +249,12 @@ fn jaffle_emitted_sql() {
         constant.contains("having count(distinct \"customer_id\") = 1"),
         "{constant}"
     );
+    // `group_by_columns` scopes the constant check per group.
+    let grouped = file("tests/generated/marts__labelled__status_label__not_constant.sql");
+    assert!(
+        grouped.contains("group by \"order_id\" having count(distinct \"status_label\") = 1"),
+        "{grouped}"
+    );
 
     // dbt_utils.accepted_range with only a lower bound and inclusive=false.
     let range = file("tests/generated/marts__customers__customer_id__accepted_range.sql");
@@ -320,6 +331,15 @@ fn seed_refs_arguments_syntax_and_dbt_builtins() {
     assert!(accepted.contains("'placed'"), "{accepted}");
     let relationships = file("tests/generated/staging__stg_events__event_id__relationships.sql");
     assert!(relationships.contains("raw_events"), "{relationships}");
+
+    // `get_base_dates` lowers only for a known DuckDB profile; this project
+    // has no profiles.yml, so the model stays REVIEW.
+    let spine = report
+        .resources
+        .iter()
+        .find(|r| r.kind == ResourceKind::Model && r.name.ends_with("time_spine"))
+        .expect("time_spine outcome");
+    assert_eq!(spine.classification, Classification::Review);
 }
 
 #[test]

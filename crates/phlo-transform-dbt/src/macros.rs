@@ -117,6 +117,18 @@ impl<'a> ArgsRef<'a> {
         }
     }
 
+    /// Names of every keyword argument supplied to the call.
+    pub fn kwarg_names(&self) -> Vec<&str> {
+        match self {
+            ArgsRef::Strict(call) => call.keyword.iter().map(|(name, _)| name.as_str()).collect(),
+            ArgsRef::Loose(call) => call
+                .args
+                .iter()
+                .filter_map(|(key, _)| key.as_deref())
+                .collect(),
+        }
+    }
+
     /// Keyword or positional argument's raw text (loose calls keep it
     /// verbatim; strict calls render the literal back).
     pub fn get_raw(&self, position: usize, name: &str) -> Option<String> {
