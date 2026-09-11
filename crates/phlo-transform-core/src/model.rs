@@ -277,6 +277,28 @@ pub struct SemanticTest {
     pub origin: ModelOrigin,
 }
 
+/// A discovered CSV seed: workspace-owned static data loaded into a
+/// relation by the engine before models build.
+///
+/// Seed identity is the file stem (`seeds/raw/orders.csv` → `orders`), and
+/// the content hash doubles as the seed's source state so editing the CSV
+/// invalidates downstream model versions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemanticSeed {
+    /// Seed name — the CSV file stem; also the relation's table name.
+    pub name: String,
+    /// Workspace-relative CSV path.
+    pub path: PathBuf,
+    /// Configured target schema, if any (`[seeds] schema` or
+    /// `[seed."<name>"] schema`); otherwise the workspace default and then
+    /// the adapter's default schema apply.
+    pub schema: Option<String>,
+    /// SHA-256 of the file contents.
+    pub content_hash: String,
+    /// Header columns, when the file could be read.
+    pub columns: Vec<String>,
+}
+
 /// The complete semantic input to the compiler.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SemanticProject {
@@ -285,6 +307,8 @@ pub struct SemanticProject {
     pub roots: Vec<TransformRoot>,
     pub models: Vec<SemanticModel>,
     pub tests: Vec<SemanticTest>,
+    /// CSV seeds discovered under `seeds/**`.
+    pub seeds: Vec<SemanticSeed>,
     pub defaults: WorkspaceDefaults,
     /// Policy for cross-workflow model dependencies.
     pub cross_workflow: crate::config::CrossWorkflowPolicy,
@@ -301,6 +325,7 @@ impl SemanticProject {
             roots: Vec::new(),
             models,
             tests: Vec::new(),
+            seeds: Vec::new(),
             defaults: WorkspaceDefaults::default(),
             cross_workflow: crate::config::CrossWorkflowPolicy::default(),
             diagnostics: Vec::new(),

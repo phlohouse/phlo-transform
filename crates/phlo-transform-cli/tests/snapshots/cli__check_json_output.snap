@@ -1,5 +1,6 @@
 ---
 source: crates/phlo-transform-cli/tests/cli.rs
+assertion_line: 77
 expression: stdout(&output)
 ---
 {
@@ -21,6 +22,7 @@ expression: stdout(&output)
   ],
   "model_count": 3,
   "source_count": 1,
+  "seed_count": 0,
   "test_count": 0,
   "diagnostics": []
 }

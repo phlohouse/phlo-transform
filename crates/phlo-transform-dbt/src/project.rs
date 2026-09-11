@@ -21,6 +21,19 @@ pub struct DbtSqlFile {
     pub sql: String,
 }
 
+/// A discovered CSV seed file.
+#[derive(Clone, Debug)]
+pub struct DbtSeed {
+    /// Absolute path to the CSV.
+    pub path: PathBuf,
+    /// Path relative to the project root.
+    pub rel_path: PathBuf,
+    /// Directory segments below the seed root (for `seeds:` tree config).
+    pub dir: Vec<String>,
+    /// File stem — the dbt seed name.
+    pub name: String,
+}
+
 /// A parsed `*.yml`/`*.yaml` properties file.
 #[derive(Clone, Debug)]
 pub struct DbtPropertyFile {
@@ -52,13 +65,15 @@ pub struct DbtProject {
     pub vars: Mapping,
     /// The `models:` hierarchy from `dbt_project.yml` (empty when absent).
     pub models_tree: Value,
+    /// The `seeds:` hierarchy from `dbt_project.yml` (for `+schema` etc.).
+    pub seeds_tree: Value,
     pub models: Vec<DbtSqlFile>,
     pub property_files: Vec<DbtPropertyFile>,
     pub singular_tests: Vec<DbtSqlFile>,
     /// Macro names → the file that defined them.
     pub macros: BTreeMap<String, PathBuf>,
     pub macro_files: Vec<DbtSqlFile>,
-    pub seeds: Vec<PathBuf>,
+    pub seeds: Vec<DbtSeed>,
     pub snapshots: Vec<DbtSqlFile>,
     pub analyses: Vec<DbtSqlFile>,
     pub packages: Vec<String>,
@@ -116,6 +131,7 @@ pub fn load(root: &Path) -> Result<DbtProject, ProjectError> {
         analysis_paths: analysis_paths.clone(),
         vars,
         models_tree,
+        seeds_tree: project_yaml.get("seeds").cloned().unwrap_or(Value::Null),
         models: Vec::new(),
         property_files: Vec::new(),
         singular_tests: Vec::new(),
@@ -171,7 +187,16 @@ pub fn load(root: &Path) -> Result<DbtProject, ProjectError> {
     for dir in &seed_paths {
         for file in walk(root, dir, &mut warnings) {
             if extension(&file) == Some("csv") {
-                project.seeds.push(file.clone());
+                project.seeds.push(DbtSeed {
+                    rel_path: file.strip_prefix(root).unwrap_or(&file).to_path_buf(),
+                    dir: dir_segments(root, dir, &file),
+                    name: file
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    path: file.clone(),
+                });
             }
         }
     }
@@ -273,17 +298,7 @@ fn read_yaml(root: &Path, path: &Path, warnings: &mut Vec<String>) -> Option<Dbt
 
 fn sql_file(root: &Path, dir: &Path, path: &Path, sql: String) -> DbtSqlFile {
     let rel_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
-    let within = path.strip_prefix(root.join(dir)).unwrap_or(path);
-    let mut dir_segments: Vec<String> = within
-        .parent()
-        .map(|parent| {
-            parent
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    dir_segments.retain(|segment| !segment.is_empty());
+    let dir_segments = dir_segments(root, dir, path);
     let stem = path
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -295,6 +310,22 @@ fn sql_file(root: &Path, dir: &Path, path: &Path, sql: String) -> DbtSqlFile {
         stem,
         sql,
     }
+}
+
+/// Directory segments of `path` below `root/dir`.
+fn dir_segments(root: &Path, dir: &Path, path: &Path) -> Vec<String> {
+    let within = path.strip_prefix(root.join(dir)).unwrap_or(path);
+    let mut segments: Vec<String> = within
+        .parent()
+        .map(|parent| {
+            parent
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    segments.retain(|segment| !segment.is_empty());
+    segments
 }
 
 /// Extract `{% macro name(` and `{% materialization name %}` definitions.

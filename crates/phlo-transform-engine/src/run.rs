@@ -15,7 +15,10 @@ use crate::cancel::CancelHandle;
 use crate::error::{AdapterError, EngineError};
 use crate::events::{EngineEvent, ExecutionStatus};
 use crate::plan::{Plan, PlanAction, PlannedModel};
-use crate::state::{MaterializedRecord, ModelRunRecord, RunRecord, StateStore, TestRunRecord};
+use crate::source_state::{adapter_default_schema, relation_for_source, seed_relation};
+use crate::state::{
+    MaterializedRecord, ModelRunRecord, RunRecord, SeedRecord, StateStore, TestRunRecord,
+};
 use crate::util::{now_rfc3339, sha256_hex};
 
 /// Options controlling a run.
@@ -58,6 +61,15 @@ pub struct ModelResult {
     pub sql_hash: String,
 }
 
+/// The outcome of a single seed load.
+#[derive(Clone, Debug, Serialize)]
+pub struct SeedResult {
+    pub seed: String,
+    pub target: String,
+    pub status: ExecutionStatus,
+    pub error: Option<String>,
+}
+
 /// The outcome of a single test.
 #[derive(Clone, Debug, Serialize)]
 pub struct TestResult {
@@ -78,6 +90,8 @@ pub struct RunResult {
     pub finished_at: String,
     pub models: Vec<ModelResult>,
     pub tests: Vec<TestResult>,
+    /// Seed loads performed before model builds.
+    pub seeds: Vec<SeedResult>,
     pub events: Vec<EngineEvent>,
 }
 
@@ -245,6 +259,87 @@ impl Runner {
                 .map_err(EngineError::Adapter)?;
         }
 
+        // Load planned seeds before any model build: seed relations are the
+        // physical inputs the models select from.
+        let mut seed_results: Vec<SeedResult> = Vec::new();
+        for planned_seed in &plan.seeds {
+            let Some(seed) = compilation
+                .seeds
+                .iter()
+                .find(|seed| seed.name == planned_seed.name)
+            else {
+                continue;
+            };
+            if planned_seed.action != PlanAction::Build {
+                events.push(EngineEvent::SeedFinished {
+                    seed: planned_seed.name.clone(),
+                    status: ExecutionStatus::Skipped,
+                });
+                seed_results.push(SeedResult {
+                    seed: planned_seed.name.clone(),
+                    target: planned_seed.target.clone(),
+                    status: ExecutionStatus::Skipped,
+                    error: None,
+                });
+                continue;
+            }
+            let relation = seed_relation(
+                seed,
+                compilation.defaults.catalog.as_deref(),
+                compilation
+                    .defaults
+                    .schema
+                    .as_deref()
+                    .or_else(|| adapter_default_schema(self.adapter.name())),
+                self.adapter.name(),
+            );
+            self.adapter
+                .ensure_schema(&relation)
+                .await
+                .map_err(EngineError::Adapter)?;
+            let path = match &compilation.workspace_root {
+                Some(root) => root.join(&seed.path),
+                None => seed.path.clone(),
+            };
+            events.push(EngineEvent::SeedStarted {
+                seed: planned_seed.name.clone(),
+            });
+            match self.adapter.load_csv(&relation, &path).await {
+                Ok(_) => {
+                    events.push(EngineEvent::SeedFinished {
+                        seed: planned_seed.name.clone(),
+                        status: ExecutionStatus::Passed,
+                    });
+                    seed_results.push(SeedResult {
+                        seed: planned_seed.name.clone(),
+                        target: relation.display(),
+                        status: ExecutionStatus::Passed,
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    events.push(EngineEvent::SeedFinished {
+                        seed: planned_seed.name.clone(),
+                        status: ExecutionStatus::Failed,
+                    });
+                    seed_results.push(SeedResult {
+                        seed: planned_seed.name.clone(),
+                        target: relation.display(),
+                        status: ExecutionStatus::Failed,
+                        error: Some(error.to_string()),
+                    });
+                }
+            }
+        }
+
+        // A seed that failed to load must block every model that reads it —
+        // otherwise they would run against a stale (or missing) seed table.
+        let failed_seed_targets: BTreeSet<String> = seed_results
+            .iter()
+            .filter(|result| result.status == ExecutionStatus::Failed)
+            .map(|result| result.target.clone())
+            .collect();
+
         // Dependency bookkeeping restricted to the planned set.
         let mut remaining: BTreeMap<ModelId, usize> = BTreeMap::new();
         let mut dependents: BTreeMap<ModelId, Vec<ModelId>> = BTreeMap::new();
@@ -303,6 +398,58 @@ impl Runner {
                 );
             }
             release_dependents(id, &dependents, &mut remaining);
+        }
+
+        if !failed_seed_targets.is_empty() {
+            let default_catalog = compilation.defaults.catalog.as_deref();
+            let default_schema = compilation
+                .defaults
+                .schema
+                .as_deref()
+                .or_else(|| adapter_default_schema(self.adapter.name()));
+            for id in &planned {
+                if status.get(id) != Some(&ExecutionStatus::Pending) {
+                    continue;
+                }
+                let Some(model) = compilation.model(id) else {
+                    continue;
+                };
+                let reads_failed_seed = model.source_dependencies().any(|source| {
+                    failed_seed_targets.contains(
+                        &relation_for_source(source, default_catalog, default_schema).display(),
+                    )
+                });
+                if !reads_failed_seed {
+                    continue;
+                }
+                status.insert(id.clone(), ExecutionStatus::Blocked);
+                events.push(EngineEvent::ModelFinished {
+                    model: id.logical_name(),
+                    status: ExecutionStatus::Blocked,
+                    query_id: None,
+                    duration_ms: 0,
+                });
+                results.insert(
+                    id.clone(),
+                    model_result(
+                        model,
+                        ExecutionStatus::Blocked,
+                        None,
+                        Some("blocked by a failed seed load".to_string()),
+                        0,
+                        plan_info.get(id),
+                    ),
+                );
+                block_dependents(
+                    id,
+                    &dependents,
+                    &mut status,
+                    &mut results,
+                    compilation,
+                    &plan_info,
+                    &mut events,
+                );
+            }
         }
 
         let mut ready: VecDeque<ModelId> = planned
@@ -527,8 +674,14 @@ impl Runner {
         }
 
         let tests = if options.run_tests && !cancelled {
-            self.run_tests(compilation, plan, &status, &mut events)
-                .await
+            self.run_tests(
+                compilation,
+                plan,
+                &status,
+                &failed_seed_targets,
+                &mut events,
+            )
+            .await
         } else {
             Vec::new()
         };
@@ -537,6 +690,9 @@ impl Runner {
             .values()
             .any(|result| result.status == ExecutionStatus::Failed)
             || tests
+                .iter()
+                .any(|result| result.status == ExecutionStatus::Failed)
+            || seed_results
                 .iter()
                 .any(|result| result.status == ExecutionStatus::Failed);
         let run_status = if cancelled {
@@ -604,6 +760,25 @@ impl Runner {
                     }
                 }
             }
+            for result in &seed_results {
+                if result.status != ExecutionStatus::Passed {
+                    continue;
+                }
+                if let Some(seed) = compilation
+                    .seeds
+                    .iter()
+                    .find(|seed| seed.name == result.seed)
+                {
+                    state.record_seed(&SeedRecord {
+                        name: seed.name.clone(),
+                        environment: options.environment.clone(),
+                        content_hash: seed.content_hash.clone(),
+                        target: result.target.clone(),
+                        run_id: run_id.clone(),
+                        loaded_at: finished_at.clone(),
+                    })?;
+                }
+            }
             for result in &tests {
                 state.record_test(&TestRunRecord {
                     run_id: run_id.clone(),
@@ -642,6 +817,7 @@ impl Runner {
             finished_at,
             models,
             tests,
+            seeds: seed_results,
             events,
         })
     }
@@ -651,10 +827,17 @@ impl Runner {
         compilation: &Compilation,
         plan: &Plan,
         model_status: &BTreeMap<ModelId, ExecutionStatus>,
+        failed_seed_targets: &BTreeSet<String>,
         events: &mut Vec<EngineEvent>,
     ) -> Vec<TestResult> {
         let planned_tests: BTreeSet<&str> =
             plan.tests.iter().map(|test| test.id.as_str()).collect();
+        let default_catalog = compilation.defaults.catalog.as_deref();
+        let default_schema = compilation
+            .defaults
+            .schema
+            .as_deref()
+            .or_else(|| adapter_default_schema(self.adapter.name()));
         let mut results = Vec::new();
 
         for test in &compilation.tests {
@@ -667,7 +850,12 @@ impl Runner {
                     Some(ExecutionStatus::Passed) | Some(ExecutionStatus::Skipped)
                 )
             });
-            if !targets_ready {
+            let sources_ready = test.sources.iter().all(|source| {
+                !failed_seed_targets.contains(
+                    &relation_for_source(source, default_catalog, default_schema).display(),
+                )
+            });
+            if !targets_ready || !sources_ready {
                 continue;
             }
 

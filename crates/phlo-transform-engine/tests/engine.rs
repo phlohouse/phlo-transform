@@ -5,6 +5,7 @@
 //! warehouse.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,8 +15,8 @@ use phlo_transform_core::{
     compile, compile_with_options, select_models, Compilation, DataType, EmptySchemaProvider,
     EmptySourceStateProvider, IncrementalStrategy, Materialization, ModelId, ModelOrigin,
     Nullability, Relation, RelationSchema, SchemaColumn, SelectionOptions, SemanticModel,
-    SemanticProject, SemanticTest, SourceId, SourceStateProvider, StaticSchemaProvider,
-    StaticSourceStateProvider, TestId,
+    SemanticProject, SemanticSeed, SemanticTest, SourceId, SourceStateProvider,
+    StaticSchemaProvider, StaticSourceStateProvider, TestId,
 };
 use phlo_transform_engine::{
     collect_source_states, Adapter, AdapterError, ArtifactWriter, CancelHandle, CatalogRequest,
@@ -33,6 +34,8 @@ struct FakeAdapter {
     merges: Mutex<Vec<String>>,
     replaced_partitions: Mutex<Vec<String>>,
     columns: Mutex<Vec<ColumnInfo>>,
+    loaded_csvs: Mutex<Vec<String>>,
+    fail_loads: Mutex<BTreeSet<String>>,
     source_states: Mutex<BTreeMap<String, String>>,
     max_value: Mutex<Option<String>>,
     test_rows: Mutex<u64>,
@@ -158,6 +161,29 @@ impl Adapter for FakeAdapter {
         self.existing.lock().unwrap().insert(display);
         Ok(QueryResult {
             query_id: Some("append-query".to_string()),
+            ..Default::default()
+        })
+    }
+
+    async fn load_csv(
+        &self,
+        relation: &Relation,
+        path: &Path,
+    ) -> Result<QueryResult, AdapterError> {
+        let display = relation.display();
+        if self.fail_loads.lock().unwrap().contains(&display) {
+            return Err(AdapterError::new(
+                "FAKE001",
+                format!("simulated seed failure for {display}"),
+            ));
+        }
+        self.loaded_csvs
+            .lock()
+            .unwrap()
+            .push(format!("{display} <- {}", path.display()));
+        self.existing.lock().unwrap().insert(display);
+        Ok(QueryResult {
+            query_id: Some("load-csv".to_string()),
             ..Default::default()
         })
     }
@@ -757,6 +783,7 @@ async fn collects_source_states_from_adapter() {
     let provider = collect_source_states(
         &adapter,
         std::slice::from_ref(&source),
+        &[],
         None,
         Some("default"),
     )
@@ -955,4 +982,237 @@ async fn time_window_overlap_widens_the_predicate() {
         "{}",
         appends[0]
     );
+}
+
+/// A model reading a seed relation plans the CSV load first, then skips it
+/// once the recorded content hash matches.
+#[tokio::test]
+async fn seed_loads_before_models_and_skips_when_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("seeds")).unwrap();
+    std::fs::write(
+        dir.path().join("seeds/raw_events.csv"),
+        "id,status\n1,placed\n",
+    )
+    .unwrap();
+
+    let mut project = SemanticProject::in_memory(vec![model(
+        "main.stg_events",
+        "select * from raw.raw_events",
+    )]);
+    project.workspace_root = Some(dir.path().to_path_buf());
+    project.seeds = vec![SemanticSeed {
+        name: "raw_events".to_string(),
+        path: PathBuf::from("seeds/raw_events.csv"),
+        schema: Some("raw".to_string()),
+        content_hash: "hash-v1".to_string(),
+        columns: vec!["id".to_string(), "status".to_string()],
+    }];
+    let compilation = compile(&project);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let result = run_once(adapter.clone(), state.clone(), &compilation, "dev").await;
+
+    assert_eq!(result.status, ExecutionStatus::Passed);
+    assert_eq!(result.seeds.len(), 1);
+    assert_eq!(result.seeds[0].status, ExecutionStatus::Passed);
+    let loaded = adapter.loaded_csvs.lock().unwrap().clone();
+    assert_eq!(loaded.len(), 1);
+    assert!(loaded[0].starts_with("raw.raw_events <- "), "{loaded:?}");
+    assert!(loaded[0].ends_with("seeds/raw_events.csv"), "{loaded:?}");
+
+    // Second plan: relation exists and the recorded hash matches → Skip.
+    let selected = select_models(&compilation, &SelectionOptions::default());
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&compilation, &selected, Some("dev".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(plan.seeds.len(), 1);
+    assert_eq!(plan.seeds[0].action, PlanAction::Skip);
+}
+
+/// A changed CSV content hash re-plans the seed as a Build.
+#[tokio::test]
+async fn seed_content_change_replans_the_load() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("seeds")).unwrap();
+    std::fs::write(dir.path().join("seeds/raw_events.csv"), "id,status\n").unwrap();
+
+    let build = |hash: &str| {
+        let mut project = SemanticProject::in_memory(vec![model(
+            "main.stg_events",
+            "select * from raw.raw_events",
+        )]);
+        project.workspace_root = Some(dir.path().to_path_buf());
+        project.seeds = vec![SemanticSeed {
+            name: "raw_events".to_string(),
+            path: PathBuf::from("seeds/raw_events.csv"),
+            schema: Some("raw".to_string()),
+            content_hash: hash.to_string(),
+            columns: vec!["id".to_string(), "status".to_string()],
+        }];
+        let compilation = compile(&project);
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+        compilation
+    };
+
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    run_once(adapter.clone(), state.clone(), &build("hash-v1"), "dev").await;
+
+    let selected = select_models(&build("hash-v2"), &SelectionOptions::default());
+    let compilation = build("hash-v2");
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&compilation, &selected, Some("dev".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(plan.seeds[0].action, PlanAction::Build);
+}
+
+/// A failed seed load blocks the models reading it (and their dependents)
+/// instead of running them against a stale seed table.
+#[tokio::test]
+async fn failed_seed_load_blocks_dependent_models() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("seeds")).unwrap();
+    std::fs::write(
+        dir.path().join("seeds/raw_events.csv"),
+        "id,status\n1,placed\n",
+    )
+    .unwrap();
+
+    let mut project = SemanticProject::in_memory(vec![
+        model("main.stg_events", "select * from raw.raw_events"),
+        model("main.daily", "select * from main.stg_events"),
+        model("main.independent", "select * from external.other"),
+    ]);
+    project.workspace_root = Some(dir.path().to_path_buf());
+    project.seeds = vec![SemanticSeed {
+        name: "raw_events".to_string(),
+        path: PathBuf::from("seeds/raw_events.csv"),
+        schema: Some("raw".to_string()),
+        content_hash: "hash-v1".to_string(),
+        columns: vec!["id".to_string(), "status".to_string()],
+    }];
+    let compilation = compile(&project);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter
+        .fail_loads
+        .lock()
+        .unwrap()
+        .insert("raw.raw_events".to_string());
+    // A stale seed table still exists — the models must not read it.
+    adapter
+        .existing
+        .lock()
+        .unwrap()
+        .insert("raw.raw_events".to_string());
+
+    let result = run_once(
+        adapter.clone(),
+        Arc::new(SqliteStateStore::in_memory().unwrap()),
+        &compilation,
+        "dev",
+    )
+    .await;
+
+    assert_eq!(result.seeds[0].status, ExecutionStatus::Failed);
+    assert_eq!(result.status, ExecutionStatus::Failed);
+    let status = |name: &str| {
+        result
+            .models
+            .iter()
+            .find(|model| model.model == name)
+            .map(|model| model.status)
+            .unwrap()
+    };
+    assert_eq!(status("main.stg_events"), ExecutionStatus::Blocked);
+    assert_eq!(status("main.daily"), ExecutionStatus::Blocked);
+    assert_eq!(status("main.independent"), ExecutionStatus::Passed);
+    let created = adapter.created.lock().unwrap().clone();
+    assert!(
+        !created
+            .iter()
+            .any(|target| target == "main.stg_events" || target == "main.daily"),
+        "{created:?}"
+    );
+}
+
+/// A seed that only feeds a test (no downstream model) is still planned and
+/// loaded first; when the load fails the test is skipped instead of reading
+/// a stale table.
+#[tokio::test]
+async fn seed_tests_pull_the_seed_into_the_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("seeds")).unwrap();
+    std::fs::write(
+        dir.path().join("seeds/raw_events.csv"),
+        "id,status\n1,placed\n",
+    )
+    .unwrap();
+
+    let build = || {
+        let mut project = SemanticProject::in_memory(vec![model(
+            "main.independent",
+            "select * from external.other",
+        )]);
+        project.workspace_root = Some(dir.path().to_path_buf());
+        project.seeds = vec![SemanticSeed {
+            name: "raw_events".to_string(),
+            path: PathBuf::from("seeds/raw_events.csv"),
+            schema: Some("raw".to_string()),
+            content_hash: "hash-v1".to_string(),
+            columns: vec!["id".to_string(), "status".to_string()],
+        }];
+        project.tests = vec![SemanticTest {
+            id: TestId::new("seed_has_no_nulls"),
+            sql: "select * from raw.raw_events where id is null".to_string(),
+            origin: ModelOrigin::in_memory(),
+        }];
+        let compilation = compile(&project);
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+        compilation
+    };
+
+    // The seed is planned even though no model reads it.
+    let compilation = build();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    assert_eq!(plan.seeds.len(), 1);
+    assert_eq!(plan.seeds[0].name, "raw_events");
+    assert_eq!(plan.seeds[0].action, PlanAction::Build);
+    assert_eq!(plan.tests.len(), 1);
+
+    let runner = Runner::new(adapter.clone(), None);
+    let result = runner
+        .apply(&compilation, &plan, &RunOptions::default())
+        .await
+        .expect("run succeeds");
+    let loaded = adapter.loaded_csvs.lock().unwrap().clone();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(result.tests.len(), 1);
+    assert_eq!(result.tests[0].status, ExecutionStatus::Passed);
+
+    // A failed load skips the test entirely.
+    let compilation = build();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    adapter
+        .fail_loads
+        .lock()
+        .unwrap()
+        .insert("raw.raw_events".to_string());
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let runner = Runner::new(adapter.clone(), None);
+    let result = runner
+        .apply(&compilation, &plan, &RunOptions::default())
+        .await
+        .expect("run succeeds");
+    assert_eq!(result.status, ExecutionStatus::Failed);
+    assert!(result.tests.is_empty(), "{:?}", result.tests);
 }

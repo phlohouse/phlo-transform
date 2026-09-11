@@ -20,6 +20,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # libduckdb-sys compiles a multi-GB static library; the default
+      # runner disk is too small without reclaiming preinstalled tooling.
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell \
+            /usr/local/julia* \
+            /usr/local/lib/node_modules
+          sudo docker image prune --all --force
+          df -h /
+
       # Install the toolchain pinned in .mise.toml (Rust 1.93 + rustfmt/clippy).
       - uses: jdx/mise-action@v2
 

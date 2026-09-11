@@ -4,7 +4,7 @@
 //! Phlo representation, and produces emitted files plus a report/manifest.
 //! Translation is deterministic: identical input produces identical output.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -12,8 +12,9 @@ use serde_yaml::{Mapping, Value};
 use sha2::{Digest, Sha256};
 
 use crate::jinja::{self, Call, Segment};
-use crate::project::DbtProject;
-use crate::pylit::Lit;
+use crate::macros::{self, ArgsRef, MacroDef, Scope};
+use crate::project::{DbtProject, DbtSeed};
+use crate::pylit::{self, Lit};
 use crate::report::{
     codes, Classification, EmittedFile, MigrationIssue, MigrationManifest, MigrationReport,
     ResourceKind, ResourceOutcome,
@@ -45,6 +46,7 @@ const ENVIRONMENT_EXPRS: &[&str] = &[
     "load_result",
     "store_result",
     "store_raw_result",
+    "run_query",
     "print",
     "log",
     "modules.datetime",
@@ -114,20 +116,18 @@ pub fn translate(project: &DbtProject) -> Translation {
     }
 
     ctx.model_targets = model_targets.clone();
-    // `ref('seed_name')` targets the relation dbt would materialise the CSV
-    // as: the file stem in the target schema (unqualified when no schema is
-    // known, matching how a bare name resolves in the warehouse).
-    let seed_schema = project.profile.as_ref().and_then(|p| p.schema.as_deref());
+    // `ref('seed_name')` targets the relation the seed CSV loads into: the
+    // `seeds:` tree's `+schema`, then the profile schema, then the bare
+    // stem (resolved to the workspace default schema / adapter default).
     ctx.seed_targets = project
         .seeds
         .iter()
-        .filter_map(|seed| seed.file_stem().and_then(|stem| stem.to_str()))
-        .map(|stem| {
-            let relation = match seed_schema {
-                Some(schema) => format!("{schema}.{stem}"),
-                None => stem.to_string(),
+        .map(|seed| {
+            let relation = match seed_schema(project, seed) {
+                Some(schema) => format!("{schema}.{}", seed.name),
+                None => seed.name.clone(),
             };
-            (stem.to_string(), relation)
+            (seed.name.clone(), relation)
         })
         .collect();
     ctx.collided_names = collisions;
@@ -185,7 +185,7 @@ pub fn translate(project: &DbtProject) -> Translation {
     }
 
     // Property-only resources: sources, seeds, snapshots, exposures, ...
-    collect_property_resources(project, &mut outcomes);
+    collect_property_resources(project, &mut ctx, &mut outcomes);
 
     // Declared sources resolve to physical relations — CLEAN, with metadata
     // carried in the manifest only (Phlo infers sources from SQL).
@@ -223,29 +223,75 @@ pub fn translate(project: &DbtProject) -> Translation {
         outcomes.push(outcome.0);
     }
 
-    // Seeds are copied so teams can decide how to host them.
+    // Seeds become workspace-native CSV inputs: copied under `seeds/` and
+    // loaded into their target relation before models build.
     for seed in &project.seeds {
-        let rel = display(seed);
-        outcomes.push(ResourceOutcome {
-            kind: ResourceKind::Seed,
-            name: seed
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or_default()
-                .to_string(),
-            source_path: Some(rel.clone()),
-            classification: Classification::Review,
-            emitted_path: None,
-            transformations: Vec::new(),
-            notes: vec![
-                "Phlo has no native seed concept yet; load the CSV as a source or keep it under version control".to_string(),
-            ],
-            issues: vec![MigrationIssue::new(
-                codes::SEED,
-                "dbt seed has no native Phlo representation",
-            )],
-            source_hash: file_hash(&project.root.join(seed)),
-        });
+        let rel = display(&seed.rel_path);
+        let mut emitted = String::from("seeds");
+        for segment in &seed.dir {
+            emitted.push('/');
+            emitted.push_str(&sanitize_segment(segment));
+        }
+        emitted.push('/');
+        emitted.push_str(&sanitize_segment(&seed.name));
+        emitted.push_str(".csv");
+        let target = ctx
+            .seed_targets
+            .get(&seed.name)
+            .cloned()
+            .unwrap_or_else(|| seed.name.clone());
+        match std::fs::read(&seed.path) {
+            Ok(bytes) => {
+                files.push(EmittedFile {
+                    rel_path: emitted.clone(),
+                    contents: String::from_utf8_lossy(&bytes).into_owned(),
+                });
+                outcomes.push(ResourceOutcome {
+                    kind: ResourceKind::Seed,
+                    name: seed.name.clone(),
+                    source_path: Some(rel),
+                    classification: Classification::Clean,
+                    emitted_path: Some(emitted.clone()),
+                    transformations: vec![format!("copied to {emitted}; loads as {target}")],
+                    notes: Vec::new(),
+                    issues: Vec::new(),
+                    source_hash: Some(hash_text_bytes(&bytes)),
+                });
+            }
+            Err(error) => {
+                outcomes.push(ResourceOutcome {
+                    kind: ResourceKind::Seed,
+                    name: seed.name.clone(),
+                    source_path: Some(rel),
+                    classification: Classification::Review,
+                    emitted_path: None,
+                    transformations: Vec::new(),
+                    notes: Vec::new(),
+                    issues: vec![MigrationIssue::new(
+                        codes::SEED,
+                        format!("could not read seed CSV: {error}"),
+                    )],
+                    source_hash: None,
+                });
+            }
+        }
+    }
+
+    // Seed target schema overrides: `seeds: <project>: +schema:` becomes a
+    // `[seed.*]`/`[seeds]` section in the emitted phlo.toml.
+    let mut seed_schemas: Vec<(String, String)> = Vec::new();
+    for seed in &project.seeds {
+        if let Some(schema) = config_str(
+            &dir_config(&project.seeds_tree, &project.name, &seed.dir),
+            "schema",
+        ) {
+            seed_schemas.push((seed.name.clone(), schema));
+        }
+    }
+    if !seed_schemas.is_empty() && seed_schemas.iter().all(|(_, s)| s == &seed_schemas[0].1) {
+        phlo_toml.seeds_schema = Some(seed_schemas[0].1.clone());
+    } else {
+        phlo_toml.seed_schemas = seed_schemas;
     }
 
     for snapshot in &project.snapshots {
@@ -283,22 +329,16 @@ pub fn translate(project: &DbtProject) -> Translation {
     }
 
     for (name, file) in &ctx.macro_files_classified {
+        let (classification, issues, transformations) = macro_outcome(name, &ctx);
         outcomes.push(ResourceOutcome {
             kind: ResourceKind::Macro,
             name: name.clone(),
             source_path: Some(display(file)),
-            classification: if ctx.macro_unsupported.contains(name) {
-                Classification::Unsupported
-            } else {
-                Classification::Review
-            },
+            classification,
             emitted_path: None,
-            transformations: Vec::new(),
+            transformations,
             notes: Vec::new(),
-            issues: vec![MigrationIssue::new(
-                codes::UNKNOWN_MACRO,
-                "macros are not translated; model usages are classified individually",
-            )],
+            issues,
             source_hash: None,
         });
     }
@@ -366,6 +406,72 @@ pub fn translate(project: &DbtProject) -> Translation {
     }
 }
 
+/// Classify a macro or materialization definition: Clean when its body
+/// renders statically (expression segments only — `return`, bound params,
+/// `adapter.dispatch` delegation), Unsupported when it performs runtime
+/// operations, Review otherwise.
+fn macro_outcome(name: &str, ctx: &Context) -> (Classification, Vec<MigrationIssue>, Vec<String>) {
+    if ctx.materializations.contains(name) {
+        return (
+            Classification::Unsupported,
+            vec![MigrationIssue::new(
+                codes::UNKNOWN_MACRO,
+                "custom materializations are not translated",
+            )],
+            Vec::new(),
+        );
+    }
+    let Some(def) = ctx.macro_defs.get(name) else {
+        return (
+            Classification::Review,
+            vec![MigrationIssue::new(
+                codes::UNKNOWN_MACRO,
+                "macros are not translated; model usages are classified individually",
+            )],
+            Vec::new(),
+        );
+    };
+    let has_statement = def
+        .body
+        .iter()
+        .any(|segment| matches!(segment, Segment::Stmt { .. }));
+    let runtime = def.body.iter().any(|segment| match segment {
+        Segment::Expr { inner, .. } => {
+            let inner = inner.trim();
+            ["run_query", "load_result", "store_result", "statement("]
+                .iter()
+                .any(|token| inner.contains(token))
+                || (inner.contains("adapter.") && !inner.contains("adapter.dispatch"))
+        }
+        _ => false,
+    });
+    if runtime {
+        (
+            Classification::Unsupported,
+            vec![MigrationIssue::new(
+                codes::UNKNOWN_MACRO,
+                "macro performs runtime operations and is not translated",
+            )],
+            Vec::new(),
+        )
+    } else if has_statement {
+        (
+            Classification::Review,
+            vec![MigrationIssue::new(
+                codes::JINJA_STATEMENT,
+                "macro body uses `{% %}` statements and is not inlined",
+            )],
+            Vec::new(),
+        )
+    } else {
+        (
+            Classification::Clean,
+            Vec::new(),
+            vec!["call sites are inlined into model SQL".to_string()],
+        )
+    }
+}
+
 /// Per-model outcome plus the file it produced, if any.
 type ModelOutcome = (ResourceOutcome, Option<(String, String)>);
 
@@ -390,9 +496,12 @@ struct Context<'a> {
     generated_tests: Vec<EmittedFile>,
     /// Workspace default materialization (view unless configured).
     default_materialization: String,
-    /// Macro name → defining file; macro name → whether it is unsupported.
+    /// Macro name → defining file.
     macro_files_classified: BTreeMap<String, PathBuf>,
-    macro_unsupported: Vec<String>,
+    /// `{% materialization %}` names — never translated.
+    materializations: BTreeSet<String>,
+    /// Parseable `{% macro %}` definitions for the static inlining subset.
+    macro_defs: BTreeMap<String, MacroDef>,
     /// Contract sections appended to the emitted `phlo.toml`.
     contract_sections: Vec<String>,
     /// Model stems that collided on emitted identity.
@@ -410,15 +519,11 @@ struct SourceInfo {
 impl<'a> Context<'a> {
     fn new(project: &'a DbtProject) -> Self {
         let mut macro_files_classified = BTreeMap::new();
-        let mut macro_unsupported = Vec::new();
+        let mut materializations = BTreeSet::new();
         for file in &project.macro_files {
-            let unsupported = file.sql.contains("adapter.dispatch")
-                || file.sql.contains("run_query")
-                || file.sql.contains("{% materialization")
-                || file.sql.contains("load_result")
-                || file.sql.contains("store_result");
             for segment in jinja::scan(&file.sql) {
                 if let Segment::Stmt { inner, .. } = &segment {
+                    let materialization = inner.starts_with("materialization ");
                     let rest = inner
                         .strip_prefix("macro ")
                         .or_else(|| inner.strip_prefix("materialization "));
@@ -429,13 +534,17 @@ impl<'a> Context<'a> {
                             .collect();
                         if !name.is_empty() {
                             macro_files_classified.insert(name.clone(), file.rel_path.clone());
-                            if unsupported {
-                                macro_unsupported.push(name);
+                            if materialization {
+                                materializations.insert(name);
                             }
                         }
                     }
                 }
             }
+        }
+        let mut macro_defs = BTreeMap::new();
+        for file in &project.macro_files {
+            macro_defs.extend(macros::parse_macro_defs(file));
         }
         Self {
             project,
@@ -447,7 +556,8 @@ impl<'a> Context<'a> {
             generated_tests: Vec::new(),
             default_materialization: "view".to_string(),
             macro_files_classified,
-            macro_unsupported,
+            materializations,
+            macro_defs,
             contract_sections: Vec::new(),
             collided_names: Vec::new(),
         }
@@ -455,6 +565,19 @@ impl<'a> Context<'a> {
 
     fn is_project_macro(&self, name: &str) -> bool {
         self.macro_files_classified.contains_key(name)
+    }
+
+    /// Whether the project declares the package `short` (e.g. `dbt_utils`)
+    /// in `packages.yml`/`dependencies.yml`.
+    fn has_package(&self, short: &str) -> bool {
+        self.project.packages.iter().any(|dependency| {
+            dependency
+                .rsplit('/')
+                .next()
+                .unwrap_or(dependency.as_str())
+                .replace('-', "_")
+                == short
+        })
     }
 
     fn package_of<'n>(&self, name: &'n str) -> Option<&'n str> {
@@ -481,6 +604,10 @@ struct PhloToml {
     default_materialization: Option<String>,
     default_catalog: Option<String>,
     default_schema: Option<String>,
+    /// Shared `[seeds]` schema when every seed targets the same schema.
+    seeds_schema: Option<String>,
+    /// Per-seed `[seed."name"] schema` overrides.
+    seed_schemas: Vec<(String, String)>,
     /// `model.<logical>.contract/columns` sections, appended verbatim.
     model_sections: Vec<String>,
 }
@@ -507,6 +634,18 @@ impl PhloToml {
                 out.push_str(&line);
                 out.push('\n');
             }
+        }
+        if let Some(schema) = &self.seeds_schema {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!("[seeds]\nschema = \"{schema}\"\n"));
+        }
+        for (name, schema) in &self.seed_schemas {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!("[seed.\"{name}\"]\nschema = \"{schema}\"\n"));
         }
         for section in &self.model_sections {
             if !out.is_empty() {
@@ -634,12 +773,6 @@ fn hash_text(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
-fn file_hash(path: &Path) -> Option<String> {
-    std::fs::read(path)
-        .ok()
-        .map(|bytes| hash_text_bytes(&bytes))
-}
-
 fn hash_text_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -681,15 +814,23 @@ impl Lowered {
 fn lower_sql(sql: &str, ctx: &Context) -> Lowered {
     let mut lowered = Lowered::default();
     let segments = jinja::scan(sql);
+    let mut scope = Scope::new();
     let mut out = String::new();
-    lower_segments(&segments, ctx, &mut lowered, &mut out);
+    lower_segments(&segments, ctx, &mut scope, &mut lowered, &mut out);
     lowered.sql = out;
     lowered
 }
 
 /// Lower a segment slice into `out`. Used for the top-level scan and
-/// recursively for the else-branch of an `is_incremental()` conditional.
-fn lower_segments(segments: &[Segment], ctx: &Context, lowered: &mut Lowered, out: &mut String) {
+/// recursively for `{% for %}` bodies, static `{% if %}` branches and the
+/// else-branch of an `is_incremental()` conditional.
+fn lower_segments(
+    segments: &[Segment],
+    ctx: &Context,
+    scope: &mut Scope,
+    lowered: &mut Lowered,
+    out: &mut String,
+) {
     let mut index = 0usize;
     while index < segments.len() {
         match &segments[index] {
@@ -720,16 +861,25 @@ fn lower_segments(segments: &[Segment], ctx: &Context, lowered: &mut Lowered, ou
                             .transformations
                             .push("removed {{ config(...) }} block".to_string());
                     } else {
-                        out.push_str(&translate_call(&call, raw, ctx, lowered, quoted));
+                        out.push_str(&translate_call(&call, raw, ctx, scope, lowered, quoted));
+                    }
+                } else if let Some(loose) = jinja::parse_call_loose(inner) {
+                    // Arguments that are not simple literals (e.g.
+                    // `365 * 10`) still lower when the helper is
+                    // recognised and every arg is statically evaluable.
+                    let args = ArgsRef::Loose(&loose);
+                    match lower_builtin(&loose.name, &args, ctx, scope, lowered) {
+                        Some(sql) => out.push_str(&sql),
+                        None => out.push_str(&translate_bare_expr(inner, raw, scope, lowered)),
                     }
                 } else {
-                    out.push_str(&translate_bare_expr(inner, raw, lowered));
+                    out.push_str(&translate_bare_expr(inner, raw, scope, lowered));
                 }
             }
-            Segment::Stmt { raw, inner } => {
+            Segment::Stmt { .. } => {
                 // `translate_stmt` returns the last consumed index; the loop
                 // still advances past it.
-                index = translate_stmt(segments, index, inner, raw, ctx, lowered, out);
+                index = translate_stmt(segments, index, ctx, scope, lowered, out);
             }
         }
         index += 1;
@@ -741,18 +891,49 @@ fn lower_segments(segments: &[Segment], ctx: &Context, lowered: &mut Lowered, ou
 fn translate_stmt(
     segments: &[Segment],
     index: usize,
-    inner: &str,
-    raw: &str,
     ctx: &Context,
+    scope: &mut Scope,
     lowered: &mut Lowered,
     out: &mut String,
 ) -> usize {
+    let Segment::Stmt { raw, inner } = &segments[index] else {
+        return index;
+    };
+    let (raw, inner) = (raw.as_str(), inner.as_str());
     let keyword = jinja::stmt_keyword(inner);
     match keyword {
+        // `{% if execute %}` is a runtime gate: drop the wrapper and keep
+        // translating the body (always-on at translation time).
+        "if" if inner.trim().strip_prefix("if").map(str::trim) == Some("execute") => {
+            match find_if_block(segments, index) {
+                Some(block) => {
+                    let endif_index = block.endif_index;
+                    lower_segments(
+                        &segments[block.body_start..block.else_index.unwrap_or(endif_index)],
+                        ctx,
+                        scope,
+                        lowered,
+                        out,
+                    );
+                    lowered
+                        .transformations
+                        .push("`{% if execute %}` gate removed; body always emitted".to_string());
+                    endif_index
+                }
+                None => {
+                    lowered.review(MigrationIssue::new(
+                        codes::JINJA_STATEMENT,
+                        "unterminated `{% if execute %}` block",
+                    ));
+                    out.push_str(raw);
+                    index
+                }
+            }
+        }
         "if" if jinja::is_incremental_condition(inner) => match find_if_block(segments, index) {
             Some(block) => {
                 let endif_index = block.endif_index;
-                handle_incremental_block(segments, &block, ctx, lowered, out);
+                handle_incremental_block(segments, &block, ctx, scope, lowered, out);
                 endif_index
             }
             None => {
@@ -764,7 +945,33 @@ fn translate_stmt(
                 index
             }
         },
-        "if" | "elif" | "else" => {
+        "if" => match handle_static_if(segments, index, inner, ctx, scope, lowered, out) {
+            Some(endif_index) => endif_index,
+            None => {
+                lowered.review(MigrationIssue::new(
+                    codes::JINJA_STATEMENT,
+                    format!("conditional `{{% {inner} %}}` cannot be evaluated statically"),
+                ));
+                out.push_str(raw);
+                index
+            }
+        },
+        "set" => {
+            handle_set(inner, ctx, scope, lowered);
+            index
+        }
+        "for" => match handle_for(segments, index, inner, ctx, scope, lowered, out) {
+            Some(endfor_index) => endfor_index,
+            None => {
+                lowered.review(MigrationIssue::new(
+                    codes::JINJA_STATEMENT,
+                    format!("`{{% {inner} %}}` is not a static loop over a literal list"),
+                ));
+                out.push_str(raw);
+                index
+            }
+        },
+        "elif" | "else" => {
             lowered.review(MigrationIssue::new(
                 codes::JINJA_STATEMENT,
                 format!("conditional `{{% {inner} %}}` cannot be evaluated statically"),
@@ -772,8 +979,8 @@ fn translate_stmt(
             out.push_str(raw);
             index
         }
-        "set" | "for" | "do" | "call" | "filter" | "block" | "with" | "include" | "import"
-        | "from" | "extends" | "raw" | "endraw" => {
+        "do" | "call" | "filter" | "block" | "with" | "include" | "import" | "from" | "extends"
+        | "raw" | "endraw" => {
             lowered.review(MigrationIssue::new(
                 codes::JINJA_STATEMENT,
                 format!("Jinja statement `{keyword}` has no native equivalent"),
@@ -840,6 +1047,7 @@ fn handle_incremental_block(
     segments: &[Segment],
     block: &IfBlock,
     ctx: &Context,
+    scope: &mut Scope,
     lowered: &mut Lowered,
     out: &mut String,
 ) {
@@ -856,6 +1064,7 @@ fn handle_incremental_block(
             lower_segments(
                 &segments[else_index + 1..block.endif_index],
                 ctx,
+                scope,
                 lowered,
                 out,
             );
@@ -876,6 +1085,162 @@ fn handle_incremental_block(
             }
         },
     }
+}
+
+/// `{% set name = <static value> %}`: bind the name in the compile-time
+/// scope and emit nothing. Non-literal right-hand sides stay REVIEW.
+fn handle_set(inner: &str, ctx: &Context, scope: &mut Scope, lowered: &mut Lowered) {
+    let Some(rest) = inner.trim().strip_prefix("set") else {
+        return;
+    };
+    let rest = rest.trim();
+    let reject = |lowered: &mut Lowered| {
+        lowered.review(MigrationIssue::new(
+            codes::JINJA_STATEMENT,
+            format!("`{{% {inner} %}}` is not a literal assignment"),
+        ));
+    };
+    // `{% set x %}...{% endset %}` capture form is dynamic.
+    let Some(eq) = rest.find('=') else {
+        reject(lowered);
+        return;
+    };
+    let name = rest[..eq].trim();
+    let expr = rest[eq + 1..].trim();
+    if name.is_empty()
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || rest[..eq].ends_with('=')
+    {
+        reject(lowered);
+        return;
+    }
+    match macros::eval_static(expr, scope, &ctx.project.vars) {
+        Some(lit) => {
+            scope.insert(name.to_string(), lit);
+            lowered
+                .transformations
+                .push(format!("`{{% set {name} = ... %}}` bound statically"));
+        }
+        None => {
+            lowered.review(MigrationIssue::new(
+                codes::JINJA_STATEMENT,
+                format!("`{{% {inner} %}}` value cannot be evaluated statically"),
+            ));
+        }
+    }
+}
+
+/// `{% for item in <literal list or set variable> %}...{% endfor %}`:
+/// expand statically, binding `item` and `loop.*` per iteration. Returns
+/// the index of the consumed `endfor`.
+fn handle_for(
+    segments: &[Segment],
+    index: usize,
+    inner: &str,
+    ctx: &Context,
+    scope: &mut Scope,
+    lowered: &mut Lowered,
+    out: &mut String,
+) -> Option<usize> {
+    let rest = inner.trim().strip_prefix("for")?.trim();
+    let (variable, expr) = rest.split_once(" in ")?;
+    let variable = variable.trim();
+    if variable.is_empty()
+        || !variable
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let endfor = find_end(segments, index, "for", "endfor")?;
+    let items = match macros::eval_static(expr, scope, &ctx.project.vars) {
+        Some(Lit::List(items)) => items,
+        _ => return None,
+    };
+    let body = &segments[index + 1..endfor];
+    let length = items.len() as i64;
+    lowered.transformations.push(format!(
+        "`{{% for {variable} in ... %}}` expanded statically"
+    ));
+    for (i, item) in items.into_iter().enumerate() {
+        scope.insert(variable.to_string(), item);
+        scope.insert("loop.index".to_string(), Lit::Int(i as i64 + 1));
+        scope.insert("loop.index0".to_string(), Lit::Int(i as i64));
+        scope.insert("loop.length".to_string(), Lit::Int(length));
+        scope.insert("loop.first".to_string(), Lit::Bool(i == 0));
+        scope.insert("loop.last".to_string(), Lit::Bool(i as i64 + 1 == length));
+        lower_segments(body, ctx, scope, lowered, out);
+    }
+    scope.remove(variable);
+    scope.retain(|key, _| !key.starts_with("loop."));
+    Some(endfor)
+}
+
+/// Find the `{% end<open> %}` matching the statement at `index`, tracking
+/// nesting of the same block kind.
+fn find_end(segments: &[Segment], index: usize, open: &str, close: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, segment) in segments.iter().enumerate().skip(index + 1) {
+        if let Segment::Stmt { inner, .. } = segment {
+            match jinja::stmt_keyword(inner) {
+                k if k == open => depth += 1,
+                k if k == close => {
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Statically evaluate `{% if cond %}`: when the condition's truth is known
+/// at translation time, lower only the taken branch. `elif` chains recurse
+/// through the same handler. Returns `None` for dynamic conditions.
+fn handle_static_if(
+    segments: &[Segment],
+    index: usize,
+    inner: &str,
+    ctx: &Context,
+    scope: &mut Scope,
+    lowered: &mut Lowered,
+    out: &mut String,
+) -> Option<usize> {
+    let keyword = jinja::stmt_keyword(inner);
+    let condition = inner.trim().strip_prefix(keyword)?.trim();
+    let block = find_if_block(segments, index)?;
+    let taken = macros::eval_condition(condition, scope, &ctx.project.vars)?;
+    lowered
+        .transformations
+        .push("static `{% if %}` branch resolved at translation time".to_string());
+    let body_end = block.else_index.unwrap_or(block.endif_index);
+    if taken {
+        lower_segments(
+            &segments[block.body_start..body_end],
+            ctx,
+            scope,
+            lowered,
+            out,
+        );
+    } else if let Some(else_index) = block.else_index {
+        match &segments[else_index] {
+            // `elif` re-enters the same logic with its own condition.
+            Segment::Stmt { inner, .. } if jinja::stmt_keyword(inner) == "elif" => {
+                handle_static_if(segments, else_index, inner, ctx, scope, lowered, out)?;
+            }
+            _ => lower_segments(
+                &segments[else_index + 1..block.endif_index],
+                ctx,
+                scope,
+                lowered,
+                out,
+            ),
+        }
+    }
+    Some(block.endif_index)
 }
 
 /// Detect the common `col > (select max(col) from {{ this }})` watermark
@@ -910,6 +1275,7 @@ fn translate_call(
     call: &Call,
     raw: &str,
     ctx: &Context,
+    scope: &Scope,
     lowered: &mut Lowered,
     quoted: bool,
 ) -> String {
@@ -944,6 +1310,19 @@ fn translate_call(
             raw.to_string()
         }
         name => {
+            let args = ArgsRef::Strict(call);
+            // Recognised package helpers (qualified), then safe
+            // project-macro inlining; for unqualified names the project
+            // definition wins — matching dbt's resolution order.
+            if name.contains('.') {
+                if let Some(sql) = lower_builtin(name, &args, ctx, scope, lowered) {
+                    return sql;
+                }
+            } else if let Some(sql) = inline_project_macro(name, call, ctx, lowered, 0) {
+                return sql;
+            } else if let Some(sql) = lower_builtin(name, &args, ctx, scope, lowered) {
+                return sql;
+            }
             let detail = if let Some(package) = ctx.package_of(name) {
                 format!("package macro `{name}` (from `{package}`)")
             } else if ctx.is_project_macro(name) {
@@ -963,6 +1342,355 @@ fn translate_call(
             raw.to_string()
         }
     }
+}
+
+/// Static lowerings of well-known package helpers — deterministic SQL
+/// rewrites; the package's Jinja is never executed. Returns `None` when
+/// the call is not a recognised helper or its arguments are not fully
+/// static.
+fn lower_builtin(
+    name: &str,
+    args: &ArgsRef,
+    ctx: &Context,
+    scope: &Scope,
+    lowered: &mut Lowered,
+) -> Option<String> {
+    let (provider, helper) = match name.rsplit_once('.') {
+        Some((package, helper)) => (package, helper),
+        // Unqualified helper names only resolve when the owning package is
+        // a declared dependency — dbt would not resolve them otherwise.
+        None => match name {
+            "generate_surrogate_key" | "star" | "safe_cast" => ("dbt_utils", name),
+            "get_base_dates" | "date_spine" => ("dbt_date", name),
+            _ => return None,
+        },
+    };
+    if provider != "dbt" && provider != "dbt_utils" && provider != "dbt_date" {
+        return None;
+    }
+    if !name.contains('.') && !ctx.has_package(provider) {
+        return None;
+    }
+    let resolve = |lit: Lit| -> Lit {
+        match lit {
+            Lit::Ident(ident) => scope.get(&ident).cloned().unwrap_or(Lit::Ident(ident)),
+            other => other,
+        }
+    };
+    let rendered = match (provider, helper) {
+        // `md5(concat_ws('-', coalesce(cast("col" as varchar), SENTINEL), ...))`
+        // reproduces the dbt_utils default implementation. The null sentinel
+        // is `'_dbt_utils_surrogate_key_null_'` unless the project sets the
+        // `surrogate_key_treat_nulls_as_empty_strings` var.
+        ("dbt_utils", "generate_surrogate_key") => {
+            let fields = args
+                .get(0, "field_list")
+                .map(resolve)
+                .and_then(|lit| lit.as_str_list())?;
+            if fields.is_empty() {
+                return None;
+            }
+            let empty_nulls = ctx
+                .project
+                .vars
+                .get(Value::String(
+                    "surrogate_key_treat_nulls_as_empty_strings".to_string(),
+                ))
+                .map(|value| matches!(yaml_to_lit(value), Lit::Bool(true)))
+                .unwrap_or(false);
+            let null_sentinel = if empty_nulls {
+                "''"
+            } else {
+                "'_dbt_utils_surrogate_key_null_'"
+            };
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|field| format!("coalesce(cast(\"{field}\" as varchar), {null_sentinel})"))
+                .collect();
+            format!("md5(concat_ws('-', {}))", parts.join(", "))
+        }
+        // `dbt_utils.star(from=..., except=[...])` → `* exclude (...)`.
+        // Only this narrow shape is provably equivalent: `relation_alias`
+        // qualifies/renames output columns, `quote_identifiers` quotes each
+        // name, and `prefix`/`suffix` rename — all need the source's column
+        // list, which is not static. Those uses stay REVIEW.
+        ("dbt_utils", "star") => {
+            // Only `from`/`except`/`exclude` are provable. Anything else —
+            // `relation_alias`, `prefix`, `suffix`, `quote_identifiers`,
+            // `unquote_aliases`, `rename`, or a second positional argument —
+            // changes output columns and stays REVIEW.
+            let allowed = ["from", "except", "exclude"];
+            if args
+                .kwarg_names()
+                .iter()
+                .any(|name| !allowed.contains(name))
+                || args.get_raw(1, "").is_some()
+            {
+                return None;
+            }
+            let except = args
+                .get(2, "except")
+                .or_else(|| args.get(2, "exclude"))
+                .map(resolve)
+                .and_then(|lit| lit.as_str_list());
+            match except {
+                Some(columns) if !columns.is_empty() => {
+                    let quoted: Vec<String> = columns.iter().map(|c| format!("\"{c}\"")).collect();
+                    format!("* exclude ({})", quoted.join(", "))
+                }
+                _ => "*".to_string(),
+            }
+        }
+        // `dbt_utils.safe_cast('col', 'type')` → `try_cast("col" as type)`.
+        ("dbt_utils", "safe_cast") => {
+            let field = args.get(0, "field").map(resolve)?;
+            let data_type = args.get(1, "type").map(resolve)?;
+            let (Lit::Str(field) | Lit::Ident(field), Lit::Str(data_type)) = (field, data_type)
+            else {
+                return None;
+            };
+            format!("try_cast(\"{field}\" as {data_type})")
+        }
+        // `dbt.current_timestamp()` → `current_timestamp`.
+        ("dbt", "current_timestamp") => "current_timestamp".to_string(),
+        // `dbt_date.get_base_dates(...)`: the package emits a `date_spine`
+        // select; the lowering targets `generate_series`, which is
+        // DuckDB-specific — only lower when the source profile is DuckDB.
+        ("dbt_date", "get_base_dates") => {
+            if ctx
+                .project
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.adapter_type.as_deref())
+                != Some("duckdb")
+            {
+                return None;
+            }
+            let datepart = args
+                .get(3, "datepart")
+                .map(resolve)
+                .and_then(|lit| lit.as_str().map(str::to_string))
+                .unwrap_or_else(|| "day".to_string());
+            if !matches!(
+                datepart.as_str(),
+                "day" | "week" | "month" | "quarter" | "year"
+            ) {
+                return None;
+            }
+            let col = format!("date_{datepart}");
+            let series = |start: String, end: String| {
+                format!(
+                    "select cast(date_trunc('{datepart}', s.{col}) as timestamp) as {col} \
+                     from generate_series({start}, {end}, interval '1' {datepart}) as s({col})"
+                )
+            };
+            let start = args.get(0, "start_date").map(resolve);
+            let end = args.get(1, "end_date").map(resolve);
+            match (start, end) {
+                // `n_dateparts = N` → today − N parts … tomorrow.
+                (None | Some(Lit::None), None | Some(Lit::None)) => {
+                    let n = args
+                        .get_raw(2, "n_dateparts")
+                        .and_then(|text| macros::eval_int_expr(&text))?;
+                    series(
+                        format!("current_date - interval '{n}' {datepart}"),
+                        format!("current_date + interval '1' {datepart}"),
+                    )
+                }
+                (Some(Lit::Str(start)), Some(Lit::Str(end))) => series(
+                    format!("cast('{start}' as timestamp)"),
+                    format!("cast('{end}' as timestamp)"),
+                ),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    lowered
+        .transformations
+        .push(format!("{name}(...) → {rendered}"));
+    Some(rendered)
+}
+
+/// Inline a project macro whose body is statically renderable: literal SQL
+/// text plus `{{ param }}` substitutions, `{{ return(...) }}` and
+/// `adapter.dispatch` delegation to `default__`/`adapter__` variants.
+/// Anything else (statements, runtime lookups, nested dynamic calls)
+/// returns `None` so the call site stays REVIEW.
+fn inline_project_macro(
+    name: &str,
+    call: &Call,
+    ctx: &Context,
+    lowered: &mut Lowered,
+    depth: usize,
+) -> Option<String> {
+    let def = ctx.macro_defs.get(name)?;
+    inline_def(
+        def,
+        call.positional.clone(),
+        call.keyword.clone(),
+        ctx,
+        lowered,
+        depth,
+        name,
+    )
+}
+
+fn inline_def(
+    def: &MacroDef,
+    positional: Vec<Lit>,
+    keyword: Vec<(String, Lit)>,
+    ctx: &Context,
+    lowered: &mut Lowered,
+    depth: usize,
+    label: &str,
+) -> Option<String> {
+    if depth > 4 {
+        return None;
+    }
+    let mut bindings: Scope = Scope::new();
+    for (position, param) in def.params.iter().enumerate() {
+        let value = positional
+            .get(position)
+            .cloned()
+            .or_else(|| {
+                keyword
+                    .iter()
+                    .find(|(key, _)| key == param)
+                    .map(|(_, value)| value.clone())
+            })
+            .or_else(|| {
+                def.defaults
+                    .iter()
+                    .find(|(key, _)| key == param)
+                    .map(|(_, value)| value.clone())
+            })?;
+        bindings.insert(param.clone(), value);
+    }
+    let rendered = render_macro_body(&def.body, &bindings, ctx, lowered, depth)?;
+    lowered
+        .transformations
+        .push(format!("{label}(...) inlined to native SQL"));
+    Some(rendered)
+}
+
+/// Render a macro body: text is verbatim; expressions must be bound
+/// parameters, literals, `return(...)`, `adapter.dispatch(...)` delegation
+/// or `ref`/`source`/`var` calls. Statements make the body dynamic.
+fn render_macro_body(
+    body: &[Segment],
+    bindings: &Scope,
+    ctx: &Context,
+    lowered: &mut Lowered,
+    depth: usize,
+) -> Option<String> {
+    let mut out = String::new();
+    for segment in body {
+        match segment {
+            Segment::Text(text) => out.push_str(text),
+            Segment::Comment(_) => {}
+            Segment::Stmt { .. } => return None,
+            Segment::Expr { inner, .. } => {
+                let inner = inner.trim();
+                // Unwrap `{{ return(<expr>) }}`.
+                let expr = inner
+                    .strip_prefix("return(")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                    .unwrap_or(inner)
+                    .trim();
+                if let Some((dispatched, arg_texts)) = split_dispatch(expr) {
+                    // `adapter.dispatch('m')(...)` resolves to the adapter's
+                    // variant or `default__m` — static selection.
+                    let adapter = ctx
+                        .project
+                        .profile
+                        .as_ref()
+                        .and_then(|p| p.adapter_type.as_deref());
+                    let variant = adapter
+                        .map(|a| format!("{a}__{dispatched}"))
+                        .filter(|v| ctx.macro_defs.contains_key(v))
+                        .unwrap_or_else(|| format!("default__{dispatched}"));
+                    let def = ctx.macro_defs.get(&variant)?;
+                    let mut args = Vec::new();
+                    for text in arg_texts {
+                        let lit = pylit::parse_value(&text).ok().and_then(|lit| match lit {
+                            Lit::Ident(name) => bindings.get(&name).cloned(),
+                            other => Some(other),
+                        })?;
+                        args.push(lit);
+                    }
+                    out.push_str(&inline_def(
+                        def,
+                        args,
+                        Vec::new(),
+                        ctx,
+                        lowered,
+                        depth + 1,
+                        &variant,
+                    )?);
+                } else if let Some(call) = jinja::parse_call(expr) {
+                    match call.name.as_str() {
+                        "ref" | "source" | "var" => out.push_str(&translate_call(
+                            &call,
+                            segment.raw(),
+                            ctx,
+                            bindings,
+                            lowered,
+                            false,
+                        )),
+                        // Nested project macros inline recursively.
+                        _ => out.push_str(&inline_project_macro(
+                            &call.name,
+                            &call,
+                            ctx,
+                            lowered,
+                            depth + 1,
+                        )?),
+                    }
+                } else if let Some(lit) = bindings.get(expr) {
+                    out.push_str(&macros::render_lit(lit)?);
+                } else if let Ok(lit) = crate::pylit::parse_value(expr) {
+                    match lit {
+                        Lit::Ident(_) | Lit::Jinja(_) => return None,
+                        other => out.push_str(&macros::render_lit(&other)?),
+                    }
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Split `adapter.dispatch('name'[, 'namespace'])(args)` into the macro
+/// name and its raw argument texts. A namespace argument makes dispatch
+/// resolve outside the project — rejected.
+fn split_dispatch(expr: &str) -> Option<(String, Vec<String>)> {
+    let rest = expr.trim().strip_prefix("adapter.dispatch")?.trim_start();
+    let (name_args, after) = rest.strip_prefix('(')?.split_once(")(")?;
+    let after = after.strip_suffix(')')?;
+    let dispatch_args = jinja::parse_call_loose(&format!("f({name_args})"))?;
+    let name = dispatch_args
+        .args
+        .first()?
+        .1
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_string();
+    if name.is_empty() || dispatch_args.args.len() > 1 {
+        return None;
+    }
+    let call_args = jinja::parse_call_loose(&format!("f({after})"))?;
+    Some((
+        name,
+        call_args
+            .args
+            .iter()
+            .map(|(_, text)| text.clone())
+            .collect(),
+    ))
 }
 
 fn translate_ref(call: &Call, raw: &str, ctx: &Context, lowered: &mut Lowered) -> String {
@@ -1034,12 +1762,6 @@ fn resolve_model(name: &str, raw: &str, ctx: &Context, lowered: &mut Lowered) ->
                 lowered
                     .transformations
                     .push(format!("ref('{name}') → {relation} (seed)"));
-                // The seed itself is already reported REVIEW; the model SQL
-                // is correct, so this is a note rather than a downgrade —
-                // same contract as a source the warehouse must contain.
-                lowered.notes.push(format!(
-                    "references seed `{name}`; load the CSV into relation `{relation}` before running"
-                ));
                 relation.clone()
             }
             None => {
@@ -1155,8 +1877,26 @@ fn translate_var(
 }
 
 /// Non-call `{{ expr }}` — variables, `this`, attribute access, filters.
-fn translate_bare_expr(inner: &str, raw: &str, lowered: &mut Lowered) -> String {
+/// Names bound by `{% set %}`/`{% for %}` substitute statically.
+fn translate_bare_expr(inner: &str, raw: &str, scope: &Scope, lowered: &mut Lowered) -> String {
     let name = inner.trim();
+    if let Some(lit) = scope.get(name) {
+        match macros::render_lit(lit) {
+            Some(text) => {
+                lowered
+                    .transformations
+                    .push(format!("`{{{{ {name} }}}}` bound statically → {text}"));
+                return text;
+            }
+            None => {
+                lowered.review(MigrationIssue::new(
+                    codes::UNKNOWN_MACRO,
+                    format!("`{{{{ {name} }}}}` binds a non-scalar value"),
+                ));
+                return raw.to_string();
+            }
+        }
+    }
     match name {
         "this" => {
             lowered.review(MigrationIssue::new(
@@ -1188,7 +1928,7 @@ fn translate_bare_expr(inner: &str, raw: &str, lowered: &mut Lowered) -> String 
 }
 
 /// Convert a `serde_yaml` scalar/compound into a literal where possible.
-fn yaml_to_lit(value: &Value) -> Lit {
+pub(crate) fn yaml_to_lit(value: &Value) -> Lit {
     match value {
         Value::Null => Lit::None,
         Value::Bool(b) => Lit::Bool(*b),
@@ -1297,6 +2037,16 @@ fn collect_config_keys(node: &Value, into: &mut BTreeMap<String, Value>) {
 
 fn config_str(config: &BTreeMap<String, Value>, key: &str) -> Option<String> {
     config.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// A seed's configured schema: `seeds:` tree `+schema`, then the profile's
+/// target schema, matching how dbt lands the CSV.
+fn seed_schema(project: &DbtProject, seed: &DbtSeed) -> Option<String> {
+    config_str(
+        &dir_config(&project.seeds_tree, &project.name, &seed.dir),
+        "schema",
+    )
+    .or_else(|| project.profile.as_ref().and_then(|p| p.schema.clone()))
 }
 
 /// Models disabled via `enabled: false` in any config layer.
@@ -1919,6 +2669,13 @@ fn translate_generic_test(
     };
     let args = merged_test_args(&args);
 
+    // Package-qualified test names (`dbt_utils.expression_is_true`) resolve
+    // to the bare name when the package is declared.
+    let name = match name.rsplit_once('.') {
+        Some((package, bare)) if ctx.has_package(package) => bare.to_string(),
+        _ => name,
+    };
+
     let where_clause = args
         .get(Value::String("where".into()))
         .or_else(|| {
@@ -2043,7 +2800,135 @@ fn translate_generic_test(
                 ),
             );
         }
-        "unique_combination_of_columns" | "dbt_utils.unique_combination_of_columns" => {
+        // dbt_utils.expression_is_true(model, expression) — rows where the
+        // predicate does not hold are failures.
+        "expression_is_true" => {
+            let expression = args
+                .get(Value::String("expression".into()))
+                .and_then(Value::as_str);
+            match expression {
+                Some(expression) => test_file(
+                    ctx,
+                    outcome,
+                    "expression_is_true",
+                    format!("select * from {model_logical} where not ({expression})"),
+                ),
+                None => outcome.issues.push(MigrationIssue::new(
+                    codes::UNSUPPORTED_TEST,
+                    "`expression_is_true` test lacks `expression`",
+                )),
+            }
+        }
+        // dbt_utils.accepted_range — values outside the range fail. Either
+        // bound is optional; `inclusive` (default true) selects `>=`/`<=`
+        // over `>`/`<`.
+        "accepted_range" => {
+            let lit = |key: &str| {
+                args.get(Value::String(key.to_string()))
+                    .and_then(|value| yaml_to_lit(value).to_sql_literal())
+            };
+            let inclusive = args
+                .get(Value::String("inclusive".to_string()))
+                .map(|value| !matches!(yaml_to_lit(value), Lit::Bool(false)))
+                .unwrap_or(true);
+            let (lower, upper) = if inclusive { ("<", ">") } else { ("<=", ">=") };
+            let mut bounds = Vec::new();
+            if let Some(min) = lit("min_value") {
+                bounds.push((lower, min));
+            }
+            if let Some(max) = lit("max_value") {
+                bounds.push((upper, max));
+            }
+            match (column, bounds.is_empty()) {
+                (Some(column), false) => {
+                    let violations = bounds
+                        .iter()
+                        .map(|(op, bound)| format!("\"{column}\" {op} {bound}"))
+                        .collect::<Vec<_>>()
+                        .join(" or ");
+                    test_file(
+                        ctx,
+                        outcome,
+                        "accepted_range",
+                        format!(
+                            "select * from {model_logical} where \"{column}\" is not null and ({violations})"
+                        ),
+                    );
+                }
+                _ => outcome.issues.push(MigrationIssue::new(
+                    codes::UNSUPPORTED_TEST,
+                    "`accepted_range` test lacks a column or bounds",
+                )),
+            }
+        }
+        // dbt_utils.not_constant — the test fails when the column takes only
+        // one distinct value (a Phlo test fails on returned rows).
+        "not_constant" => match column {
+            Some(column) => {
+                let group_by = args
+                    .get(Value::String("group_by_columns".to_string()))
+                    .and_then(Value::as_sequence)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|item| item.as_str().map(|name| format!("\"{name}\"")))
+                            .collect::<Option<Vec<_>>>()
+                    });
+                match group_by {
+                    Some(Some(groups)) if !groups.is_empty() => test_file(
+                        ctx,
+                        outcome,
+                        "not_constant",
+                        format!(
+                            "select {groups}, count(distinct \"{column}\") as n from {model_logical} group by {groups} having count(distinct \"{column}\") = 1",
+                            groups = groups.join(", ")
+                        ),
+                    ),
+                    Some(None) => outcome.issues.push(MigrationIssue::new(
+                        codes::UNSUPPORTED_TEST,
+                        "`not_constant` group_by_columns must be a static string list",
+                    )),
+                    _ => test_file(
+                        ctx,
+                        outcome,
+                        "not_constant",
+                        format!(
+                            "select count(distinct \"{column}\") as n from {model_logical} having count(distinct \"{column}\") = 1"
+                        ),
+                    ),
+                }
+            }
+            None => outcome.issues.push(MigrationIssue::new(
+                codes::UNSUPPORTED_TEST,
+                "`not_constant` test lacks a column",
+            )),
+        },
+        // dbt_utils.not_empty_string — `trim_whitespace` (default true)
+        // makes whitespace-only strings fail too.
+        "not_empty_string" => match column {
+            Some(column) => {
+                let trim = args
+                    .get(Value::String("trim_whitespace".to_string()))
+                    .map(|value| !matches!(yaml_to_lit(value), Lit::Bool(false)))
+                    .unwrap_or(true);
+                let predicate = if trim {
+                    format!("trim(\"{column}\") = ''")
+                } else {
+                    format!("\"{column}\" = ''")
+                };
+                test_file(
+                    ctx,
+                    outcome,
+                    "not_empty_string",
+                    format!("select * from {model_logical} where {predicate}"),
+                );
+            }
+            None => outcome.issues.push(MigrationIssue::new(
+                codes::UNSUPPORTED_TEST,
+                "`not_empty_string` test lacks a column",
+            )),
+        },
+        "unique_combination_of_columns" => {
             let columns = args
                 .get(Value::String("combination_of_columns".into()))
                 .and_then(Value::as_sequence)
@@ -2271,7 +3156,11 @@ fn translate_singular_test(test: &crate::project::DbtSqlFile, ctx: &Context) -> 
 
 /// Outcomes for resources that exist only in property files (sources,
 /// exposures, metrics, semantic models, yaml-declared snapshots/seeds).
-fn collect_property_resources(project: &DbtProject, outcomes: &mut Vec<ResourceOutcome>) {
+fn collect_property_resources(
+    project: &DbtProject,
+    ctx: &mut Context,
+    outcomes: &mut Vec<ResourceOutcome>,
+) {
     for file in &project.property_files {
         let path = display(&file.rel_path);
         for (key, kind, class, message) in [
@@ -2294,16 +3183,22 @@ fn collect_property_resources(project: &DbtProject, outcomes: &mut Vec<ResourceO
                 "dbt semantic models belong to a semantic layer, which Phlo does not implement",
             ),
             (
+                "unit_tests",
+                ResourceKind::Exposure,
+                Classification::Unsupported,
+                "dbt unit tests have no Phlo equivalent",
+            ),
+            (
+                "groups",
+                ResourceKind::Exposure,
+                Classification::Unsupported,
+                "dbt groups have no Phlo equivalent",
+            ),
+            (
                 "snapshots",
                 ResourceKind::Snapshot,
                 Classification::Unsupported,
                 "dbt snapshots have no Phlo equivalent",
-            ),
-            (
-                "seeds",
-                ResourceKind::Seed,
-                Classification::Review,
-                "dbt seed declarations have no native static-data representation",
             ),
         ] {
             if let Some(items) = file.root.get(key).and_then(Value::as_sequence) {
@@ -2325,6 +3220,66 @@ fn collect_property_resources(project: &DbtProject, outcomes: &mut Vec<ResourceO
                         source_hash: None,
                     });
                 }
+            }
+        }
+
+        // Yaml seed entries attach tests/config to the discovered CSVs.
+        if let Some(items) = file.root.get("seeds").and_then(Value::as_sequence) {
+            for item in items {
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("(unnamed)")
+                    .to_string();
+                let Some(relation) = ctx.seed_targets.get(&name).cloned() else {
+                    outcomes.push(ResourceOutcome {
+                        kind: ResourceKind::Seed,
+                        name,
+                        source_path: Some(path.clone()),
+                        classification: Classification::Review,
+                        emitted_path: None,
+                        transformations: Vec::new(),
+                        notes: Vec::new(),
+                        issues: vec![MigrationIssue::new(
+                            codes::SEED,
+                            "declared seed has no matching CSV under the seed paths",
+                        )],
+                        source_hash: None,
+                    });
+                    continue;
+                };
+                let mut outcome = ResourceOutcome {
+                    kind: ResourceKind::Seed,
+                    name: name.clone(),
+                    source_path: Some(path.clone()),
+                    classification: Classification::Clean,
+                    emitted_path: None,
+                    transformations: Vec::new(),
+                    notes: Vec::new(),
+                    issues: Vec::new(),
+                    source_hash: None,
+                };
+                // Seeds have no model file, so `-- @not-null` directives the
+                // shared path would emit become generated null-scan tests.
+                let seed_directives = emit_property_tests(item, &relation, &[], ctx, &mut outcome);
+                for directive in seed_directives {
+                    if let Some(column) = directive.strip_prefix("-- @not-null ") {
+                        ctx.generated_tests.push(EmittedFile {
+                            rel_path: format!(
+                                "tests/generated/{}__{}__not_null.sql",
+                                relation.replace('.', "__"),
+                                column
+                            ),
+                            contents: format!(
+                                "select * from {relation} where \"{column}\" is null\n"
+                            ),
+                        });
+                    }
+                }
+                if !outcome.issues.is_empty() {
+                    outcome.classification = Classification::Review;
+                }
+                outcomes.push(outcome);
             }
         }
     }

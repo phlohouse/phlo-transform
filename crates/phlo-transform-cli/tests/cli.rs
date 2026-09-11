@@ -208,7 +208,7 @@ fn translate_dbt_check_reports_classification() {
     };
     assert_eq!(class_of("customers"), "CLEAN");
     assert_eq!(class_of("orders_incremental"), "CLEAN");
-    assert_eq!(class_of("labelled"), "REVIEW");
+    assert_eq!(class_of("labelled"), "CLEAN");
     assert_eq!(class_of("orders_snapshot"), "UNSUPPORTED");
 }
 
@@ -245,13 +245,13 @@ fn translate_dbt_writes_and_verifies() {
 
 #[test]
 fn translate_verify_failure_exits_nonzero() {
-    // dbt-jaffle contains REVIEW models whose residual Jinja cannot compile, so
-    // --verify must surface that as a failing exit code.
+    // dbt-dynamic contains a dynamic `{% for %}` loop whose residual Jinja
+    // cannot compile, so --verify must surface that as a failing exit code.
     let out_dir = tempfile::tempdir().expect("tempdir");
     let out = out_dir.path().join("generated");
     let output = run(&[
         "--root",
-        "fixtures/dbt-jaffle",
+        "fixtures/dbt-dynamic",
         "translate",
         "--from",
         "dbt",
@@ -260,7 +260,7 @@ fn translate_verify_failure_exits_nonzero() {
         "--verify",
     ]);
     assert!(!output.status.success());
-    assert!(out.join("transforms/marts/customers.sql").exists());
+    assert!(out.join("transforms/probe.sql").exists());
 }
 
 /// Full migration lifecycle: translate a dbt project, seed the sources in a

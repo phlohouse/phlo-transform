@@ -1,0 +1,5 @@
+[transform]
+default_namespace = "main"
+
+[seeds]
+schema = "raw"

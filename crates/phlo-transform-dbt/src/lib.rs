@@ -12,6 +12,7 @@
 //! YAML) live in this crate; the core compiler never sees them.
 
 pub mod jinja;
+mod macros;
 pub mod project;
 pub mod pylit;
 pub mod report;

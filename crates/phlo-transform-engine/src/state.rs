@@ -83,6 +83,19 @@ pub struct MaterializedRecord {
     pub materialized_at: String,
 }
 
+/// A seed load recorded against an environment.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SeedRecord {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    /// The seed CSV's content hash at load time.
+    pub content_hash: String,
+    pub target: String,
+    pub run_id: String,
+    pub loaded_at: String,
+}
+
 /// Persists run history.
 pub trait StateStore: Send + Sync {
     fn start_run(&self, run: &RunRecord) -> Result<(), EngineError>;
@@ -127,6 +140,16 @@ pub trait StateStore: Send + Sync {
         model_id: &str,
         environment: Option<&str>,
     ) -> Result<Option<String>, EngineError>;
+
+    /// Record a successful seed load.
+    fn record_seed(&self, record: &SeedRecord) -> Result<(), EngineError>;
+
+    /// The latest seed load for an environment.
+    fn seed_state(
+        &self,
+        name: &str,
+        environment: Option<&str>,
+    ) -> Result<Option<SeedRecord>, EngineError>;
 }
 
 /// SQLite-backed local state store.
@@ -216,6 +239,15 @@ impl SqliteStateStore {
                     run_id TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (model_id, environment)
+                );
+                CREATE TABLE IF NOT EXISTS seed_loads (
+                    name TEXT NOT NULL,
+                    environment TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    loaded_at TEXT NOT NULL,
+                    PRIMARY KEY (name, environment)
                 );
                 ",
             )
@@ -520,6 +552,72 @@ impl StateStore for SqliteStateStore {
             Some(row) => Ok(row
                 .get::<_, Option<String>>(0)
                 .map_err(|error| EngineError::State(error.to_string()))?),
+            None => Ok(None),
+        }
+    }
+
+    fn record_seed(&self, record: &SeedRecord) -> Result<(), EngineError> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO seed_loads
+                 (name, environment, content_hash, target, run_id, loaded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    record.name,
+                    record.environment.clone().unwrap_or_default(),
+                    record.content_hash,
+                    record.target,
+                    record.run_id,
+                    record.loaded_at,
+                ],
+            )
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        Ok(())
+    }
+
+    fn seed_state(
+        &self,
+        name: &str,
+        environment: Option<&str>,
+    ) -> Result<Option<SeedRecord>, EngineError> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT name, environment, content_hash, target, run_id, loaded_at
+                 FROM seed_loads WHERE name = ?1 AND environment = ?2",
+            )
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        let mut rows = statement
+            .query(rusqlite::params![name, environment.unwrap_or("")])
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        match rows
+            .next()
+            .map_err(|error| EngineError::State(error.to_string()))?
+        {
+            Some(row) => {
+                let env: String = row
+                    .get(1)
+                    .map_err(|error| EngineError::State(error.to_string()))?;
+                Ok(Some(SeedRecord {
+                    name: row
+                        .get(0)
+                        .map_err(|error| EngineError::State(error.to_string()))?,
+                    environment: if env.is_empty() { None } else { Some(env) },
+                    content_hash: row
+                        .get(2)
+                        .map_err(|error| EngineError::State(error.to_string()))?,
+                    target: row
+                        .get(3)
+                        .map_err(|error| EngineError::State(error.to_string()))?,
+                    run_id: row
+                        .get(4)
+                        .map_err(|error| EngineError::State(error.to_string()))?,
+                    loaded_at: row
+                        .get(5)
+                        .map_err(|error| EngineError::State(error.to_string()))?,
+                }))
+            }
             None => Ok(None),
         }
     }

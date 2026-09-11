@@ -395,7 +395,25 @@ impl<'a> Analyzer<'a> {
                     state
                         .limitations
                         .insert("table functions are not analysed".to_string());
-                    return None;
+                    // `FROM generate_series(...) AS t(c)` declares its output
+                    // column names in the alias — resolve against those even
+                    // though the function's types stay unknown.
+                    return alias
+                        .as_ref()
+                        .filter(|alias| !alias.columns.is_empty())
+                        .map(|alias| ScopedRelation {
+                            qualifier: Some(alias.name.value.clone()),
+                            columns: alias
+                                .columns
+                                .iter()
+                                .map(|column| Column {
+                                    name: column.name.value.clone(),
+                                    data_type: DataType::Unknown,
+                                    nullability: Nullability::Unknown,
+                                    inputs: Vec::new(),
+                                })
+                                .collect(),
+                        });
                 }
                 let parts: Vec<String> = name
                     .0

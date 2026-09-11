@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::diagnostics::{Diagnostic, Severity};
 use crate::graph::{Dependency, TransformGraph};
 use crate::identity::{ModelId, Namespace, SourceId};
-use crate::model::{ModelConfig, ModelOrigin, Relation, TestId, TransformRoot};
+use crate::model::{ModelConfig, ModelOrigin, Relation, TestId, TransformRoot, WorkspaceDefaults};
 
 /// A fully resolved model.
 #[derive(Clone, Debug, PartialEq)]
@@ -70,6 +70,34 @@ impl CompiledModel {
     }
 }
 
+/// A discovered CSV seed carried through compilation. The `schema` holds the
+/// configured schema when known (`[seed.*]`/`[seeds]`/workspace default);
+/// otherwise the adapter default applies at load time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompiledSeed {
+    pub name: String,
+    /// Workspace-relative CSV path.
+    pub path: PathBuf,
+    pub schema: Option<String>,
+    pub content_hash: String,
+    pub columns: Vec<String>,
+}
+
+impl CompiledSeed {
+    /// The physical relation the seed loads into under the resolved schema
+    /// (callers supply the adapter's default schema as the fallback).
+    pub fn relation(&self, catalog: Option<&str>, fallback_schema: &str) -> Relation {
+        Relation {
+            catalog: catalog.map(str::to_string),
+            schema: self
+                .schema
+                .clone()
+                .unwrap_or_else(|| fallback_schema.to_string()),
+            table: self.name.clone(),
+        }
+    }
+}
+
 /// A fully resolved custom test.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompiledTest {
@@ -107,6 +135,10 @@ pub struct Compilation {
     pub roots: Vec<TransformRoot>,
     pub models: Vec<CompiledModel>,
     pub tests: Vec<CompiledTest>,
+    /// Discovered CSV seeds, resolved through the workspace schema defaults.
+    pub seeds: Vec<CompiledSeed>,
+    /// The workspace defaults that physical targeting used.
+    pub defaults: WorkspaceDefaults,
     pub graph: TransformGraph,
     pub diagnostics: Vec<Diagnostic>,
     index: BTreeMap<ModelId, usize>,
@@ -114,11 +146,14 @@ pub struct Compilation {
 }
 
 impl Compilation {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         workspace_root: Option<PathBuf>,
         roots: Vec<TransformRoot>,
         models: Vec<CompiledModel>,
         tests: Vec<CompiledTest>,
+        seeds: Vec<CompiledSeed>,
+        defaults: WorkspaceDefaults,
         diagnostics: Vec<Diagnostic>,
     ) -> Self {
         let index = models
@@ -137,6 +172,8 @@ impl Compilation {
             roots,
             models,
             tests,
+            seeds,
+            defaults,
             graph,
             diagnostics,
             index,

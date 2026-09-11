@@ -3,6 +3,8 @@
 //! Deliberately compact: only what Phase 1 needs. Dialect-specific DDL lives
 //! in the adapter, not the engine.
 
+use std::path::Path;
+
 use async_trait::async_trait;
 
 use phlo_transform_core::Relation;
@@ -105,4 +107,18 @@ pub trait Adapter: Send + Sync {
         relation: &Relation,
         partition_columns: &[String],
     ) -> Result<Option<Vec<(String, i64)>>, AdapterError>;
+
+    /// Load a CSV seed file into a relation, replacing it. Adapters that
+    /// cannot ingest CSVs report `UNSUPPORTED` (the default).
+    async fn load_csv(
+        &self,
+        relation: &Relation,
+        path: &Path,
+    ) -> Result<QueryResult, AdapterError> {
+        let _ = (relation, path);
+        Err(AdapterError::new(
+            "UNSUPPORTED",
+            format!("{} does not support CSV seeds", self.name()),
+        ))
+    }
 }

@@ -5,7 +5,8 @@
 //! environment, and the plan explains why a model will be built, skipped or
 //! reused from cache.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -14,10 +15,14 @@ use phlo_transform_core::graph::Dependency;
 use phlo_transform_core::{
     classify_schema_change, Compilation, DataType, Diagnostic, IncrementalStrategy,
     Materialization, ModelId, ModelVersion, Nullability, SchemaChangeSafety, SchemaColumn,
+    SourceId,
 };
 
 use crate::adapter::Adapter;
 use crate::error::EngineError;
+use crate::source_state::{
+    adapter_default_schema, relation_for_source, seed_for_relation, seed_relation,
+};
 use crate::state::StateStore;
 use crate::util::{now_rfc3339, sha256_hex};
 
@@ -94,6 +99,18 @@ pub struct PlannedModel {
     pub compiled_sql: String,
 }
 
+/// A seed in a plan — the CSV gets loaded into `target` before models build.
+#[derive(Clone, Debug, Serialize)]
+pub struct PlannedSeed {
+    pub name: String,
+    pub target: String,
+    /// Workspace-relative CSV path.
+    pub path: PathBuf,
+    pub action: PlanAction,
+    /// The CSV's content hash — the seed's version.
+    pub desired_version: String,
+}
+
 /// A test in a plan.
 #[derive(Clone, Debug, Serialize)]
 pub struct PlannedTest {
@@ -114,6 +131,8 @@ pub struct Plan {
     pub compiler_semantics_version: String,
     /// True when compilation errors block execution.
     pub blocked: bool,
+    /// Seeds the planned models read through `source(...)`, in load order.
+    pub seeds: Vec<PlannedSeed>,
     pub models: Vec<PlannedModel>,
     pub tests: Vec<PlannedTest>,
     pub diagnostics: Vec<Diagnostic>,
@@ -185,6 +204,78 @@ impl Planner {
             .into_iter()
             .filter(|id| planned_ids.contains(id))
             .collect();
+
+        // Seeds are planned for the source relations the selected models read.
+        let default_catalog = compilation.defaults.catalog.as_deref();
+        let default_schema = compilation
+            .defaults
+            .schema
+            .as_deref()
+            .or_else(|| adapter_default_schema(self.adapter.name()));
+        let mut needed_seeds: BTreeMap<String, &phlo_transform_core::CompiledSeed> =
+            BTreeMap::new();
+        let mut seed_sources: Vec<&SourceId> = Vec::new();
+        for id in &order {
+            let Some(model) = compilation.model(id) else {
+                continue;
+            };
+            seed_sources.extend(model.source_dependencies());
+        }
+        // Seed-owned generated tests also need the seed loaded: a test that
+        // reads a seed relation must not run against a stale or missing table.
+        for test in &compilation.tests {
+            if test
+                .targets
+                .iter()
+                .all(|target| planned_ids.contains(target))
+            {
+                seed_sources.extend(test.sources.iter());
+            }
+        }
+        for source in seed_sources {
+            let relation = relation_for_source(source, default_catalog, default_schema);
+            if let Some(seed) = seed_for_relation(
+                &compilation.seeds,
+                &relation,
+                default_catalog,
+                default_schema,
+                self.adapter.name(),
+            ) {
+                needed_seeds.insert(seed.name.clone(), seed);
+            }
+        }
+        let mut seeds = Vec::with_capacity(needed_seeds.len());
+        for seed in needed_seeds.into_values() {
+            let relation =
+                seed_relation(seed, default_catalog, default_schema, self.adapter.name());
+            let action = if blocked {
+                PlanAction::Unknown
+            } else {
+                let exists = self.adapter.relation_exists(&relation).await?;
+                let current = match &self.state {
+                    Some(state) => state.seed_state(&seed.name, environment.as_deref())?,
+                    None => None,
+                };
+                let current_ok = current
+                    .map(|record| {
+                        record.content_hash == seed.content_hash
+                            && record.target == relation.display()
+                    })
+                    .unwrap_or(false);
+                if exists && current_ok {
+                    PlanAction::Skip
+                } else {
+                    PlanAction::Build
+                }
+            };
+            seeds.push(PlannedSeed {
+                name: seed.name.clone(),
+                target: relation.display(),
+                path: seed.path.clone(),
+                action,
+                desired_version: seed.content_hash.clone(),
+            });
+        }
 
         let mut models = Vec::with_capacity(order.len());
         for id in &order {
@@ -347,6 +438,7 @@ impl Planner {
             adapter: self.adapter.name().to_string(),
             compiler_semantics_version: phlo_transform_core::COMPILER_SEMANTICS_VERSION.to_string(),
             blocked,
+            seeds,
             models,
             tests,
             diagnostics: compilation.diagnostics.clone(),

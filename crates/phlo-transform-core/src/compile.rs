@@ -11,7 +11,7 @@ use phlo_transform_sql::{
 use sqlparser::ast::Statement;
 
 use crate::analyze::Analyzer;
-use crate::compiled::{Compilation, CompiledModel, CompiledTest};
+use crate::compiled::{Compilation, CompiledModel, CompiledSeed, CompiledTest};
 use crate::config::CrossWorkflowPolicy;
 use crate::diagnostics::{codes, Diagnostic, Severity};
 use crate::graph::Dependency;
@@ -215,11 +215,28 @@ pub fn compile_with_options(
 
     let compiled_tests = compile_tests(project, &resolver, &targets, &mut diagnostics);
 
+    let compiled_seeds: Vec<CompiledSeed> = project
+        .seeds
+        .iter()
+        .map(|seed| CompiledSeed {
+            name: seed.name.clone(),
+            path: seed.path.clone(),
+            schema: seed
+                .schema
+                .clone()
+                .or_else(|| project.defaults.schema.clone()),
+            content_hash: seed.content_hash.clone(),
+            columns: seed.columns.clone(),
+        })
+        .collect();
+
     let mut compilation = Compilation::new(
         project.workspace_root.clone(),
         project.roots.clone(),
         compiled_models,
         compiled_tests,
+        compiled_seeds,
+        project.defaults.clone(),
         diagnostics,
     );
 

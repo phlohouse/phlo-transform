@@ -504,3 +504,32 @@ fn cross_workflow_policy_can_error() {
         .iter()
         .any(|diagnostic| diagnostic.severity == Severity::Error));
 }
+
+/// CSV files under `seeds/` become runnable inputs: their content hash is
+/// the seed version and `[seeds] schema` picks the target schema.
+#[test]
+fn csv_seeds_are_discovered_and_compiled() {
+    let project = load_project(&fixture("native-seeds")).expect("workspace should load");
+    assert_eq!(project.seeds.len(), 1);
+    let seed = &project.seeds[0];
+    assert_eq!(seed.name, "raw_events");
+    assert_eq!(seed.path, PathBuf::from("seeds/raw_events.csv"));
+    assert_eq!(seed.schema.as_deref(), Some("raw"));
+    assert_eq!(seed.columns, vec!["id".to_string(), "status".to_string()]);
+    assert!(!seed.content_hash.is_empty());
+
+    let compilation = compile(&project);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+    assert_eq!(compilation.check_report().seed_count, 1);
+    let compiled_seed = &compilation.seeds[0];
+    assert_eq!(
+        compiled_seed.relation(None, "default").display(),
+        "raw.raw_events"
+    );
+
+    // The model reads the seed's relation as a source.
+    assert_eq!(
+        dependency_names(&compilation, "main.stg_events"),
+        vec!["raw.raw_events"]
+    );
+}

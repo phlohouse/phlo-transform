@@ -30,6 +30,7 @@ pub struct CheckReport {
     pub roots: Vec<RootReport>,
     pub model_count: usize,
     pub source_count: usize,
+    pub seed_count: usize,
     pub test_count: usize,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -79,11 +80,22 @@ pub struct SourceSummary {
     pub name: String,
 }
 
+/// A CSV seed in `list`.
+#[derive(Clone, Debug, Serialize)]
+pub struct SeedSummary {
+    pub name: String,
+    pub path: String,
+    /// Target schema when resolved by configuration; the adapter default
+    /// applies otherwise.
+    pub schema: Option<String>,
+}
+
 /// The result of `list`.
 #[derive(Clone, Debug, Serialize)]
 pub struct ListReport {
     pub models: Vec<ModelSummary>,
     pub sources: Vec<SourceSummary>,
+    pub seeds: Vec<SeedSummary>,
     pub tests: Vec<TestSummary>,
 }
 
@@ -216,6 +228,7 @@ impl Compilation {
             roots,
             model_count: self.models.len(),
             source_count: self.sources().len(),
+            seed_count: self.seeds.len(),
             test_count: self.tests.len(),
             diagnostics: self.diagnostics.clone(),
         }
@@ -231,10 +244,20 @@ impl Compilation {
                 name: source.logical_name(),
             })
             .collect();
+        let seeds = self
+            .seeds
+            .iter()
+            .map(|seed| SeedSummary {
+                name: seed.name.clone(),
+                path: seed.path.to_string_lossy().replace('\\', "/"),
+                schema: seed.schema.clone(),
+            })
+            .collect();
         let tests = self.tests.iter().map(test_summary).collect();
         ListReport {
             models,
             sources,
+            seeds,
             tests,
         }
     }

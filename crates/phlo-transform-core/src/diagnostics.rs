@@ -15,6 +15,7 @@ pub mod codes {
     pub const PROJECT_UNRESOLVABLE_PATH: &str = "PROJECT005";
     pub const PROJECT_FILE_READ: &str = "PROJECT006";
     pub const PROJECT_TARGET_COLLISION: &str = "PROJECT007";
+    pub const PROJECT_SEED_NAME_COLLISION: &str = "PROJECT008";
 
     pub const CONFIG_INVALID: &str = "CONFIG001";
     pub const CONFIG_INVALID_ROOT: &str = "CONFIG002";

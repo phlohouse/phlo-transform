@@ -55,17 +55,25 @@ fn jaffle_classification() {
         Classification::Clean
     );
 
-    // Review: macros, ephemeral, else-branch incremental, packages, seeds.
+    // Static Jinja: `{% set %}` + `{% for %}` over a literal list expand
+    // at translation time; `{% if not loop.last %}` resolves statically.
+    assert_eq!(
+        class_of("payments_pivot", ResourceKind::Model),
+        Classification::Clean
+    );
+    // Recognised package helpers and an adapter-dispatching project macro.
+    assert_eq!(
+        class_of("orders_enriched", ResourceKind::Model),
+        Classification::Clean
+    );
+    assert_eq!(
+        class_of("time_spine", ResourceKind::Model),
+        Classification::Clean
+    );
+
+    // Review: ephemeral and else-branch incremental models, packages.
     assert_eq!(
         class_of("helpers", ResourceKind::Model),
-        Classification::Review
-    );
-    assert_eq!(
-        class_of("labelled", ResourceKind::Model),
-        Classification::Review
-    );
-    assert_eq!(
-        class_of("package_users", ResourceKind::Model),
         Classification::Review
     );
     assert_eq!(
@@ -73,16 +81,39 @@ fn jaffle_classification() {
         Classification::Review
     );
     assert_eq!(
-        class_of("label_status", ResourceKind::Macro),
-        Classification::Review
-    );
-    assert_eq!(
         class_of("dbt-labs/dbt_utils", ResourceKind::Package),
         Classification::Review
     );
+
+    // Project-macro inlining: `label_status('status')` renders its body.
+    assert_eq!(
+        class_of("labelled", ResourceKind::Model),
+        Classification::Clean
+    );
+    assert_eq!(
+        class_of("label_status", ResourceKind::Macro),
+        Classification::Clean
+    );
+    // `dbt_utils.star(from=ref('stg_customers'), except=['region'])`
+    // lowers statically to `* exclude ("region")`.
+    assert_eq!(
+        class_of("package_users", ResourceKind::Model),
+        Classification::Clean
+    );
+    // `star` with `relation_alias` is outside the provable subset — REVIEW.
+    assert_eq!(
+        class_of("package_users_aliased", ResourceKind::Model),
+        Classification::Review
+    );
+    // `star` with `rename` is outside the provable subset — REVIEW.
+    assert_eq!(
+        class_of("package_users_renamed", ResourceKind::Model),
+        Classification::Review
+    );
+    // Seeds copy as runnable CSV inputs.
     assert_eq!(
         class_of("countries", ResourceKind::Seed),
-        Classification::Review
+        Classification::Clean
     );
 
     // Unsupported: snapshots.
@@ -157,12 +188,83 @@ fn jaffle_emitted_sql() {
     );
     assert!(marts_toml.contains("tags = [\"mart\"]"), "{marts_toml}");
 
+    // Static Jinja expansion: `{% set %}` + `{% for %}` + `{% if loop.last %}`
+    // fully unroll into plain SQL.
+    let pivot = file("transforms/marts/payments_pivot.sql");
+    assert!(
+        pivot.contains("'credit_card' then amount else 0 end) as credit_card_amount"),
+        "{pivot}"
+    );
+    assert!(
+        pivot.contains("'bank_transfer' then amount else 0 end) as bank_transfer_amount"),
+        "{pivot}"
+    );
+    assert!(!pivot.contains("{%"), "{pivot}");
+    assert!(!pivot.contains("{{"), "{pivot}");
+    assert_eq!(pivot.matches("_amount").count(), 3, "{pivot}");
+
+    // dbt_utils.generate_surrogate_key lowers to md5(concat_ws(...)) using
+    // the upstream null sentinel; the dispatching project macro inlines its
+    // default variant.
+    let enriched = file("transforms/marts/orders_enriched.sql");
+    assert!(
+        enriched.contains("md5(concat_ws('-', coalesce(cast(\"order_id\" as varchar), '_dbt_utils_surrogate_key_null_'), coalesce(cast(\"status\" as varchar), '_dbt_utils_surrogate_key_null_')))"),
+        "{enriched}"
+    );
+    assert!(
+        enriched.contains("(amount / 100)::numeric(16, 2)"),
+        "{enriched}"
+    );
+    assert!(!enriched.contains("{{"), "{enriched}");
+
+    // dbt_date.get_base_dates(n_dateparts=365*2, datepart="day") lowers to a
+    // generate_series spine; the arithmetic arg evaluates at compile time.
+    let spine = file("transforms/marts/time_spine.sql");
+    assert!(spine.contains("generate_series("), "{spine}");
+    assert!(spine.contains("interval '730' day"), "{spine}");
+    assert!(spine.contains("as date_day"), "{spine}");
+    assert!(!spine.contains("{{"), "{spine}");
+
+    // The CSV seed is copied verbatim as a native seed input.
+    let seed = file("seeds/countries.csv");
+    assert!(seed.contains("code,"), "{seed}");
+
     // Generated tests from schema.yml column tests.
     let unique = file("tests/generated/marts__customers__customer_id__unique.sql");
     assert!(unique.contains("marts.customers"), "{unique}");
     file("tests/generated/raw__orders__id__unique.sql");
     file("tests/generated/raw__orders__status__accepted_values.sql");
     file("tests/assert_positive_amounts.sql");
+
+    // dbt_utils.expression_is_true lowers to a failing-rows select.
+    let expression = file("tests/generated/marts__customers__model__expression_is_true.sql");
+    assert!(
+        expression.contains("where not (customer_id >= 0)"),
+        "{expression}"
+    );
+
+    // dbt_utils.not_constant fails when the column is constant.
+    let constant = file("tests/generated/marts__customers__customer_id__not_constant.sql");
+    assert!(
+        constant.contains("having count(distinct \"customer_id\") = 1"),
+        "{constant}"
+    );
+    // `group_by_columns` scopes the constant check per group.
+    let grouped = file("tests/generated/marts__labelled__status_label__not_constant.sql");
+    assert!(
+        grouped.contains("group by \"order_id\" having count(distinct \"status_label\") = 1"),
+        "{grouped}"
+    );
+
+    // dbt_utils.accepted_range with only a lower bound and inclusive=false.
+    let range = file("tests/generated/marts__customers__customer_id__accepted_range.sql");
+    assert!(range.contains("\"customer_id\" <= 0"), "{range}");
+
+    // dbt_utils.not_empty_string honours trim_whitespace.
+    let empty = file("tests/generated/marts__customers__customer_id__not_empty_string.sql");
+    assert!(empty.contains("\"customer_id\" = ''"), "{empty}");
+    let trimmed = file("tests/generated/marts__customers__email__not_empty_string.sql");
+    assert!(trimmed.contains("trim(\"email\") = ''"), "{trimmed}");
 }
 
 #[test]
@@ -182,9 +284,9 @@ fn translation_is_deterministic() {
     );
 }
 
-/// Regression: `ref()` to a seed must resolve to the relation dbt would
-/// materialise it as (not "no known target"), modern `arguments:` test
-/// syntax must convert, and `dbt.date_trunc` lowers to the native function.
+/// Regression: `ref()` to a seed resolves to the relation the CSV loads
+/// into, the CSV is copied as a native seed, modern `arguments:` test
+/// syntax converts, and `dbt.date_trunc` lowers to the native function.
 #[test]
 fn seed_refs_arguments_syntax_and_dbt_builtins() {
     let translation = translate_project(&fixture("dbt-seeds")).expect("dbt project loads");
@@ -195,19 +297,19 @@ fn seed_refs_arguments_syntax_and_dbt_builtins() {
         .iter()
         .find(|r| r.kind == ResourceKind::Model && r.name.ends_with("stg_events"))
         .expect("stg_events outcome");
-    // The model itself is CLEAN — the emitted SQL is correct; the seed
-    // resource carries the REVIEW. A note records the hosting requirement.
     assert_eq!(model.classification, Classification::Clean);
     assert!(
-        model.issues.iter().all(|issue| issue.code != "DBT001"),
-        "seed ref must resolve: {:?}",
+        model.issues.is_empty(),
+        "seed ref resolves and lowers clean: {:?}",
         model.issues
     );
-    assert!(
-        model.notes.iter().any(|note| note.contains("raw_events")),
-        "expected a seed-hosting note: {:?}",
-        model.notes
-    );
+
+    let seed = report
+        .resources
+        .iter()
+        .find(|r| r.kind == ResourceKind::Seed && r.name == "raw_events")
+        .expect("raw_events seed outcome");
+    assert_eq!(seed.classification, Classification::Clean);
 
     let file = |path: &str| {
         translation
@@ -229,6 +331,15 @@ fn seed_refs_arguments_syntax_and_dbt_builtins() {
     assert!(accepted.contains("'placed'"), "{accepted}");
     let relationships = file("tests/generated/staging__stg_events__event_id__relationships.sql");
     assert!(relationships.contains("raw_events"), "{relationships}");
+
+    // `get_base_dates` lowers only for a known DuckDB profile; this project
+    // has no profiles.yml, so the model stays REVIEW.
+    let spine = report
+        .resources
+        .iter()
+        .find(|r| r.kind == ResourceKind::Model && r.name.ends_with("time_spine"))
+        .expect("time_spine outcome");
+    assert_eq!(spine.classification, Classification::Review);
 }
 
 #[test]

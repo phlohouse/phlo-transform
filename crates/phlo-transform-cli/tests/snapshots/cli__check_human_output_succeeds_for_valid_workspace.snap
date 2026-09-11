@@ -1,11 +1,13 @@
 ---
 source: crates/phlo-transform-cli/tests/cli.rs
+assertion_line: 44
 expression: stdout(&output)
 ---
 Workspace: fixtures/basic-multi-root
 Roots:     2
 Models:    3
 Sources:   1
+Seeds:     0
 Tests:     0
 
 check passed
