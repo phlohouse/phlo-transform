@@ -8,6 +8,10 @@ smallest equivalent native Phlo workspace. It is a one-way translator, not a
 dbt compatibility runtime: all dbt semantics live in the
 `phlo-transform-dbt` crate and never reach the compiler.
 
+Measured coverage against ~30 public dbt projects lives in
+[`dbt-compatibility-corpus.md`](dbt-compatibility-corpus.md) (reproducible via
+`scripts/dbt_compat_corpus.py`).
+
 ## Usage
 
 ```bash
@@ -52,12 +56,27 @@ existing files unless `--overwrite` is passed. The manifest lands at
 | `seeds/**/*.csv` | copied verbatim to `seeds/`; `[seeds]`/`[seed."name"]` schema config in `phlo.toml`; content-hash state (`csv:` prefix) so CSV edits re-trigger downstream builds |
 | `{{ dbt.date_trunc('p', 'col') }}` | `date_trunc('p', col)` |
 | `{{ dbt.current_timestamp() }}` | `current_timestamp` |
+| `{{ dbt.type_string/timestamp/datetime/int/bigint/numeric/boolean() }}` | `varchar` / `timestamp` / `integer` / `bigint` / `numeric` / `boolean` |
+| `{{ dbt.cast('e','t') }}` / `{{ dbt.string_literal('s') }}` / `{{ dbt.escape_single_quotes('s') }}` | `cast(e as t)` / `'s'` / `s` with `'` doubled |
+| `{{ dbt.dateadd('p', n, from) }}` | `(from + interval 'n' p)` (portable across all targets) |
+| `{{ dbt.datediff / last_day / split_part / hash / concat / type_float }}` | lowered only when `profiles.yml` declares `type: duckdb`; unknown profiles stay REVIEW |
+| `{{ dbt_utils.group_by(n) }}` | `1, 2, …, n` |
+| `{{ dbt_utils.equality }}` / `equal_rowcount` / `unique_combination_of_columns` / `not_empty_string` tests | generated `tests/**/*.sql` (`summarize`, `precision`, `exclude_columns` variants stay REVIEW) |
 | `{{ dbt_utils.generate_surrogate_key(['a','b']) }}` | `md5(concat_ws('-', coalesce(cast("a" as varchar), '_dbt_utils_surrogate_key_null_'), …))` — `''` instead when the `surrogate_key_treat_nulls_as_empty_strings` var is set |
 | `{{ dbt_utils.star(from=…, except=[…]) }}` | `* exclude (…)` (DuckDB-first; only `from`+`except`/`exclude` are provably equivalent — `relation_alias`, `prefix`, `suffix`, `quote_identifiers`, `unquote_aliases`, `rename`, or any other argument stays REVIEW) |
 | `{{ dbt_utils.safe_cast('c','t') }}` | `try_cast("c" as t)` |
 | `{{ dbt_date.get_base_dates(n_dateparts=N\|start_date,end_date, datepart='p') }}` | a `generate_series` spine select (`day`/`week`/`month`/`quarter`/`year`) — lowered only when `profiles.yml` declares `type: duckdb`; unknown/non-DuckDB profiles stay REVIEW |
-| simple project macros (`{{ my_macro('x') }}` whose body is literal SQL + `{{ param }}` substitutions, `{{ return(…) }}`, `adapter.dispatch` → `default__`/`adapter__` variants) | inlined into the model's SQL; dynamic bodies (statements, runtime lookups) stay REVIEW |
-| `{% set name = <literal or var()> %}` | bound at translation time; `{{ name }}` substitutes statically |
+| simple project macros (`{{ my_macro('x') }}` whose body is literal SQL + `{{ param }}` substitutions, `{{ return(…) }}`, static `{% set %}`/`{% if %}`/`{% for %}`/`{% do return(…) %}`, `adapter.dispatch` → `default__`/`adapter__` variants) | inlined into the model's SQL; dynamic bodies (runtime lookups, unprovable statements) stay REVIEW |
+| `{% set name = <literal, var(), or static call> %}` | bound at translation time; `{{ name }}` substitutes statically |
+| `{% set name %}…{% endset %}` | captured statically; `{{ name }}` substitutes the rendered body |
+| `{% raw %}…{% endraw %}` | contents emitted verbatim (Jinja-looking text inside is data) |
+| `{% do log(…) %}` / `print(…)` / `exceptions.warn(…)` / `return(…)` | dropped / statically returned |
+| `{{ target.type }}`, `{{ target.schema }}` and other scalar profile fields | the literal value from `profiles.yml`; unknown profiles stay REVIEW |
+| `{{ this.name }}` | the current model's name |
+| `{{ config(...) }}` with non-literal values (`target.type == 'x'`, `var()`, boolean project-macro wrappers) | evaluated statically; `enabled = false` marks the model UNSUPPORTED (Phlo has no disabled state) |
+| `config(schema = 'literal')` differing from the derived namespace | model relocated under a `custom/` folder with `-- @id` preserving its logical name; dynamic schemas stay REVIEW |
+| `{{ pkg.macro(...) }}` where `pkg` is the project's own name | inlined like an unqualified project macro; `adapter.dispatch('m', '<project>')` resolves to `default__m`/adapter variants |
+| Jinja ternaries `x if cond else y`, `~` concatenation, `not/and/or`, `in`, `is [not] sameas/none`, `> >= < <=` comparisons | evaluated statically |
 | `{% for x in <literal list> %}…{% endfor %}` (incl. `loop.index/first/last`) | unrolled statically |
 | `{% if <statically-known condition> %}` / `{% if execute %}` | resolved at translation time / gate removed |
 | `test: {arguments: {...}}` (modern) and `test: {...}` (legacy) | both argument spellings are read |

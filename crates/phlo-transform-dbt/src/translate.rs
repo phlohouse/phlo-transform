@@ -974,6 +974,11 @@ struct Context<'a> {
     schema_case_dynamic: bool,
     /// Declared package → whether every observed call site lowered statically.
     package_calls: std::cell::RefCell<BTreeMap<String, bool>>,
+    /// Stem of the model currently being lowered (`{{ this.name }}`).
+    current_stem: Option<String>,
+    /// Nested project-macro inlining depth — bounds recursion across all
+    /// call paths (`{{ m() }}`, `{% set x = m() %}`, macro-body statements).
+    inline_depth: std::cell::Cell<usize>,
 }
 
 #[derive(Clone)]
@@ -1030,8 +1035,35 @@ impl<'a> Context<'a> {
             collided_names: Vec::new(),
             schema_cases: BTreeSet::new(),
             schema_case_dynamic: false,
+            inline_depth: std::cell::Cell::new(0),
             package_calls: std::cell::RefCell::new(BTreeMap::new()),
+            current_stem: None,
         }
+    }
+
+    /// `target.<field>` values that are identical under every declared
+    /// `profiles.yml` output — the only `target.*` expressions that are
+    /// statically provable, since a Phlo workspace is not dbt-target-specific.
+    fn target_fields(&self) -> Vec<(String, String)> {
+        let Some(profile) = &self.project.profile else {
+            return Vec::new();
+        };
+        let mut fields: BTreeMap<String, String> = BTreeMap::new();
+        let mut first = true;
+        for (name, output) in &profile.output_fields {
+            let mut values: BTreeMap<String, String> = output.clone();
+            values.insert("name".to_string(), name.clone());
+            if let Some(database) = values.get("database").cloned() {
+                values.insert("dbname".to_string(), database);
+            }
+            if first {
+                fields = values;
+                first = false;
+            } else {
+                fields.retain(|key, value| values.get(key) == Some(value));
+            }
+        }
+        fields.into_iter().collect()
     }
 
     fn is_project_macro(&self, name: &str) -> bool {
@@ -1298,6 +1330,14 @@ fn lower_sql(sql: &str, ctx: &Context) -> Lowered {
     let mut lowered = Lowered::default();
     let segments = jinja::scan(sql);
     let mut scope = Scope::new();
+    // `target.*` is statically provable when every profiles.yml output agrees
+    // on the field; `{{ this.name }}` is the resource's own name.
+    for (field, value) in ctx.target_fields() {
+        scope.insert(format!("target.{field}"), Lit::Str(value));
+    }
+    if let Some(stem) = &ctx.current_stem {
+        scope.insert("this.name".to_string(), Lit::Str(stem.clone()));
+    }
     let mut out = String::new();
     lower_segments(&segments, ctx, &mut scope, &mut lowered, &mut out);
     lowered.sql = out;
@@ -1328,7 +1368,14 @@ fn lower_segments(
                 // inside an already-quoted string, so emit the value unquoted.
                 let quoted = out.trim_end().ends_with('\'')
                     && matches!(segments.get(index + 1), Some(Segment::Text(t)) if t.starts_with('\''));
-                if let Some(call) = jinja::parse_call(inner) {
+                // pylit renders call-shaped values as `Ident("f(...)")`,
+                // losing the arguments — a `config(enabled = (macro(...)))`
+                // value is opaque and needs the loose path instead.
+                let strict = jinja::parse_call(inner).filter(|call| {
+                    !call.keyword.iter().any(|(_, v)| lit_is_opaque(v))
+                        && !call.positional.iter().any(lit_is_opaque)
+                });
+                if let Some(call) = strict {
                     if call.name == "config" {
                         for (key, value) in &call.keyword {
                             lowered.config.push((key.clone(), value.clone()));
@@ -1347,16 +1394,40 @@ fn lower_segments(
                         out.push_str(&translate_call(&call, raw, ctx, scope, lowered, quoted));
                     }
                 } else if let Some(loose) = jinja::parse_call_loose(inner) {
+                    // `{{ config(...) }}` whose values are not simple
+                    // literals (e.g. `enabled = target.type == 'x'`) still
+                    // lower when every value evaluates statically.
+                    if loose.name == "config" && handle_loose_config(&loose, ctx, scope, lowered) {
+                        index += 1;
+                        continue;
+                    }
                     // Arguments that are not simple literals (e.g.
                     // `365 * 10`) still lower when the helper is
                     // recognised and every arg is statically evaluable.
                     let args = ArgsRef::Loose(&loose);
-                    match lower_builtin(&loose.name, &args, ctx, scope, lowered) {
+                    let own_macro = loose
+                        .name
+                        .split_once('.')
+                        .filter(|(package, _)| *package == ctx.project.name.as_str())
+                        .map(|(_, local)| local);
+                    let project_macro = own_macro
+                        .or(if loose.name.contains('.') {
+                            None
+                        } else {
+                            Some(loose.name.as_str())
+                        })
+                        .filter(|name| ctx.macro_defs.contains_key(*name));
+                    let inlined = project_macro.and_then(|name| {
+                        let call = eval_loose_call(&loose, name, ctx, scope, lowered)?;
+                        inline_project_macro(name, &call, ctx, lowered, 0)
+                    });
+                    match inlined.or_else(|| lower_builtin(&loose.name, &args, ctx, scope, lowered))
+                    {
                         Some(sql) => out.push_str(&sql),
-                        None => out.push_str(&translate_bare_expr(inner, raw, scope, lowered)),
+                        None => out.push_str(&translate_bare_expr(inner, raw, ctx, scope, lowered)),
                     }
                 } else {
-                    out.push_str(&translate_bare_expr(inner, raw, scope, lowered));
+                    out.push_str(&translate_bare_expr(inner, raw, ctx, scope, lowered));
                 }
             }
             Segment::Stmt { .. } => {
@@ -1431,42 +1502,137 @@ fn translate_stmt(
         "if" => match handle_static_if(segments, index, inner, ctx, scope, lowered, out) {
             Some(endif_index) => endif_index,
             None => {
-                lowered.review(MigrationIssue::new(
-                    codes::JINJA_STATEMENT,
-                    format!("conditional `{{% {inner} %}}` cannot be evaluated statically"),
-                ));
-                out.push_str(raw);
-                index
+                // Keep the whole block verbatim so the emitted file fails
+                // loudly, but report one finding rather than one per
+                // interior statement.
+                match find_if_block(segments, index) {
+                    Some(block) => {
+                        lowered.review(MigrationIssue::new(
+                            codes::JINJA_STATEMENT,
+                            format!("conditional `{{% {inner} %}}` cannot be evaluated statically"),
+                        ));
+                        push_raw_span(segments, index, block.endif_index, out);
+                        block.endif_index
+                    }
+                    None => {
+                        lowered.review(MigrationIssue::new(
+                            codes::JINJA_STATEMENT,
+                            format!("conditional `{{% {inner} %}}` cannot be evaluated statically"),
+                        ));
+                        out.push_str(raw);
+                        index
+                    }
+                }
             }
         },
-        "set" => {
-            handle_set(inner, ctx, scope, lowered);
-            index
-        }
+        "set" => handle_set(segments, index, inner, ctx, scope, lowered, out),
         "for" => match handle_for(segments, index, inner, ctx, scope, lowered, out) {
             Some(endfor_index) => endfor_index,
+            None => match find_end(segments, index, "for", "endfor") {
+                Some(endfor_index) => {
+                    lowered.review(MigrationIssue::new(
+                        codes::JINJA_STATEMENT,
+                        format!("`{{% {inner} %}}` is not a static loop over a literal list"),
+                    ));
+                    push_raw_span(segments, index, endfor_index, out);
+                    endfor_index
+                }
+                None => {
+                    lowered.review(MigrationIssue::new(
+                        codes::JINJA_STATEMENT,
+                        format!("`{{% {inner} %}}` is not a static loop over a literal list"),
+                    ));
+                    out.push_str(raw);
+                    index
+                }
+            },
+        },
+        "raw" => match find_end(segments, index, "raw", "endraw") {
+            // `{% raw %}...{% endraw %}` emits its contents literally —
+            // Jinja-looking text inside is data, not code.
+            Some(endraw_index) => {
+                for segment in &segments[index + 1..endraw_index] {
+                    out.push_str(segment.raw());
+                }
+                lowered
+                    .transformations
+                    .push("`{% raw %}` block emitted verbatim".to_string());
+                endraw_index
+            }
             None => {
                 lowered.review(MigrationIssue::new(
                     codes::JINJA_STATEMENT,
-                    format!("`{{% {inner} %}}` is not a static loop over a literal list"),
+                    "unterminated `{% raw %}` block",
                 ));
                 out.push_str(raw);
                 index
             }
         },
-        "elif" | "else" => {
+        "endraw" | "endfor" | "endif" | "endset" | "endmacro" | "endcall" | "endfilter"
+        | "endblock" => {
             lowered.review(MigrationIssue::new(
                 codes::JINJA_STATEMENT,
-                format!("conditional `{{% {inner} %}}` cannot be evaluated statically"),
+                format!("unmatched Jinja statement `{keyword}`"),
             ));
             out.push_str(raw);
             index
         }
-        "do" | "call" | "filter" | "block" | "with" | "include" | "import" | "from" | "extends"
-        | "raw" | "endraw" => {
+        // `{% do expr %}` evaluates a call for its side effect. Calls that
+        // only log/print at run time can be dropped; everything else is a
+        // real side effect and stays REVIEW.
+        "do" => {
+            let body = inner.trim().strip_prefix("do").map(str::trim).unwrap_or("");
+            // `{% do return(expr) %}` — dbt's expression-statement form of
+            // `return()`; the value is emitted like `{{ return(expr) }}`.
+            if let Some(expr) = body
+                .strip_prefix("return(")
+                .and_then(|rest| rest.strip_suffix(')'))
+            {
+                return match eval_text_expr(expr, ctx, scope, lowered, 0) {
+                    Some(value) => {
+                        out.push_str(&value);
+                        index
+                    }
+                    None => {
+                        lowered.review(MigrationIssue::new(
+                            codes::JINJA_STATEMENT,
+                            format!("`{{% {inner} %}}` return value is not static"),
+                        ));
+                        index
+                    }
+                };
+            }
+            match jinja::parse_call_loose(body).map(|call| call.name) {
+                Some(name)
+                    if matches!(name.as_str(), "log" | "print") || name == "exceptions.warn" =>
+                {
+                    lowered
+                        .transformations
+                        .push(format!("dropped `{{% {inner} %}}` (runtime logging)"));
+                    index
+                }
+                _ => {
+                    lowered.review(MigrationIssue::new(
+                        codes::JINJA_STATEMENT,
+                        format!("`{{% {inner} %}}` performs a runtime side effect"),
+                    ));
+                    out.push_str(raw);
+                    index
+                }
+            }
+        }
+        "call" | "filter" | "block" | "with" | "include" | "import" | "from" | "extends" => {
             lowered.review(MigrationIssue::new(
                 codes::JINJA_STATEMENT,
                 format!("Jinja statement `{keyword}` has no native equivalent"),
+            ));
+            out.push_str(raw);
+            index
+        }
+        "elif" | "else" => {
+            lowered.review(MigrationIssue::new(
+                codes::JINJA_STATEMENT,
+                format!("conditional `{{% {inner} %}}` cannot be evaluated statically"),
             ));
             out.push_str(raw);
             index
@@ -1570,23 +1736,69 @@ fn handle_incremental_block(
     }
 }
 
+/// Emit the raw source text of `segments[start..=end]` so the generated
+/// file still fails loudly at `check` time.
+fn push_raw_span(segments: &[Segment], start: usize, end: usize, out: &mut String) {
+    for segment in &segments[start..=end] {
+        out.push_str(segment.raw());
+    }
+}
+
 /// `{% set name = <static value> %}`: bind the name in the compile-time
-/// scope and emit nothing. Non-literal right-hand sides stay REVIEW.
-fn handle_set(inner: &str, ctx: &Context, scope: &mut Scope, lowered: &mut Lowered) {
+/// scope and emit nothing. The capture form `{% set name %}...{% endset %}`
+/// binds the rendered body when it renders statically. Anything else stays
+/// REVIEW. Returns the index of the last consumed segment.
+fn handle_set(
+    segments: &[Segment],
+    index: usize,
+    inner: &str,
+    ctx: &Context,
+    scope: &mut Scope,
+    lowered: &mut Lowered,
+    out: &mut String,
+) -> usize {
     let Some(rest) = inner.trim().strip_prefix("set") else {
-        return;
+        return index;
     };
     let rest = rest.trim();
-    let reject = |lowered: &mut Lowered| {
-        lowered.review(MigrationIssue::new(
-            codes::JINJA_STATEMENT,
-            format!("`{{% {inner} %}}` is not a literal assignment"),
-        ));
-    };
-    // `{% set x %}...{% endset %}` capture form is dynamic.
     let Some(eq) = rest.find('=') else {
-        reject(lowered);
-        return;
+        // `{% set name %}body{% endset %}` capture form.
+        let name = rest;
+        let valid = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        return match (valid, find_end(segments, index, "set", "endset")) {
+            (true, Some(endset)) => {
+                match render_capture(&segments[index + 1..endset], ctx, scope, lowered) {
+                    Some(rendered) => {
+                        scope.insert(name.to_string(), Lit::Str(rendered));
+                        lowered
+                            .transformations
+                            .push(format!("`{{% set {name} %}}` captured statically"));
+                    }
+                    None => {
+                        lowered.review(MigrationIssue::new(
+                            codes::JINJA_STATEMENT,
+                            format!("`{{% {inner} %}}` capture body cannot be rendered statically"),
+                        ));
+                    }
+                }
+                endset
+            }
+            (true, None) => {
+                lowered.review(MigrationIssue::new(
+                    codes::JINJA_STATEMENT,
+                    format!("unterminated `{{% set {name} %}}` capture block"),
+                ));
+                out.push_str(segments[index].raw());
+                index
+            }
+            (false, _) => {
+                lowered.review(MigrationIssue::new(
+                    codes::JINJA_STATEMENT,
+                    format!("`{{% {inner} %}}` is not a literal assignment"),
+                ));
+                index
+            }
+        };
     };
     let name = rest[..eq].trim();
     let expr = rest[eq + 1..].trim();
@@ -1594,10 +1806,16 @@ fn handle_set(inner: &str, ctx: &Context, scope: &mut Scope, lowered: &mut Lower
         || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         || rest[..eq].ends_with('=')
     {
-        reject(lowered);
-        return;
+        lowered.review(MigrationIssue::new(
+            codes::JINJA_STATEMENT,
+            format!("`{{% {inner} %}}` is not a literal assignment"),
+        ));
+        return index;
     }
-    match macros::eval_static(expr, scope, &ctx.project.vars) {
+    let value = macros::eval_static(expr, scope, &ctx.project.vars)
+        .or_else(|| eval_condition_lit(expr, scope, ctx, lowered))
+        .or_else(|| eval_text_expr(expr, ctx, scope, lowered, 0).map(Lit::Str));
+    match value {
         Some(lit) => {
             scope.insert(name.to_string(), lit);
             lowered
@@ -1611,6 +1829,270 @@ fn handle_set(inner: &str, ctx: &Context, scope: &mut Scope, lowered: &mut Lower
             ));
         }
     }
+    index
+}
+
+/// Evaluate a boolean-ish `{% set x = cond %}` right-hand side. Leaf values
+/// may also come from statically-renderable project macros (a common
+/// `boolean_var('flag')` wrapper around `var`).
+fn eval_condition_lit(
+    text: &str,
+    scope: &Scope,
+    ctx: &Context,
+    lowered: &mut Lowered,
+) -> Option<Lit> {
+    macros::eval_condition_with(text, scope, &ctx.project.vars, &mut |t, s, v| {
+        macros::eval_static(t, s, v).or_else(|| {
+            eval_text_expr(t, ctx, s, lowered, 0).and_then(|rendered| match rendered.trim() {
+                "true" | "True" => Some(Lit::Bool(true)),
+                "false" | "False" => Some(Lit::Bool(false)),
+                "none" | "None" | "null" => Some(Lit::None),
+                _ => None,
+            })
+        })
+    })
+    .map(Lit::Bool)
+}
+
+/// `{{ config(...) }}` whose argument list is not strictly parseable (values
+/// like `target.type == 'x'` or `modules.datetime...`). Every value must
+/// evaluate statically or the call is left for the normal REVIEW path.
+fn handle_loose_config(
+    loose: &jinja::LooseCall,
+    ctx: &Context,
+    scope: &Scope,
+    lowered: &mut Lowered,
+) -> bool {
+    let mut entries: Vec<(String, Lit)> = Vec::new();
+    for (key, text) in &loose.args {
+        match key {
+            Some(key) => {
+                let Some(lit) = macros::eval_static(text, scope, &ctx.project.vars)
+                    .or_else(|| eval_condition_lit(text, scope, ctx, lowered))
+                else {
+                    return false;
+                };
+                entries.push((key.clone(), lit));
+            }
+            None => match macros::eval_static(text, scope, &ctx.project.vars) {
+                Some(Lit::Dict(items)) => entries.extend(items),
+                _ => return false,
+            },
+        }
+    }
+    if entries.is_empty() {
+        return false;
+    }
+    for (key, value) in entries {
+        lowered.config.push((key, value));
+    }
+    lowered
+        .transformations
+        .push("removed {{ config(...) }} block (values evaluated statically)".to_string());
+    true
+}
+
+/// Whether a parsed literal lost information: pylit renders call-shaped
+/// values (`f(x)`) as `Ident("f(...)")` — opaque until re-parsed loosely.
+fn lit_is_opaque(lit: &Lit) -> bool {
+    match lit {
+        Lit::Ident(text) => text.ends_with("(...)"),
+        Lit::List(items) => items.iter().any(lit_is_opaque),
+        Lit::Dict(items) => items.iter().any(|(_, v)| lit_is_opaque(v)),
+        _ => false,
+    }
+}
+
+/// Render an inline Jinja template found in a YAML string (e.g. a property
+/// `schema:` value) when every construct is statically evaluable. Returns
+/// `None` when anything remains dynamic — no diagnostics are recorded.
+fn eval_jinja_text(text: &str, ctx: &Context) -> Option<String> {
+    let segments = jinja::scan(text);
+    let mut trial = Lowered::default();
+    let mut scope = Scope::new();
+    for (field, value) in ctx.target_fields() {
+        scope.insert(format!("target.{field}"), Lit::Str(value));
+    }
+    if let Some(stem) = &ctx.current_stem {
+        scope.insert("this.name".to_string(), Lit::Str(stem.clone()));
+    }
+    let mut out = String::new();
+    lower_segments(&segments, ctx, &mut scope, &mut trial, &mut out);
+    if !trial.issues.is_empty() || out.contains("{{") || out.contains("{%") {
+        return None;
+    }
+    Some(out)
+}
+
+/// Evaluate a loosely-parsed call's raw argument texts into a strict `Call`
+/// so project-macro inlining can bind them. Every argument must reduce to a
+/// static literal — `None` otherwise.
+fn eval_loose_call(
+    loose: &jinja::LooseCall,
+    name: &str,
+    ctx: &Context,
+    scope: &Scope,
+    lowered: &mut Lowered,
+) -> Option<jinja::Call> {
+    let mut positional = Vec::new();
+    let mut keyword = Vec::new();
+    for (key, text) in &loose.args {
+        let lit = macros::eval_static(text, scope, &ctx.project.vars)
+            .or_else(|| eval_condition_lit(text, scope, ctx, lowered))
+            .or_else(|| eval_text_expr(text, ctx, scope, lowered, 0).map(Lit::Str))?;
+        match key {
+            Some(key) => keyword.push((key.clone(), lit)),
+            None => positional.push(lit),
+        }
+    }
+    Some(jinja::Call {
+        name: name.to_string(),
+        positional,
+        keyword,
+    })
+}
+
+/// Render a `{% set x %}...{% endset %}` capture body: literal text plus
+/// expressions that evaluate to scalars. Returns `None` when any segment is
+/// dynamic — the call site then stays REVIEW.
+fn render_capture(
+    body: &[Segment],
+    ctx: &Context,
+    scope: &Scope,
+    lowered: &mut Lowered,
+) -> Option<String> {
+    let mut out = String::new();
+    for segment in body {
+        match segment {
+            Segment::Text(text) => out.push_str(text),
+            Segment::Comment(_) => {}
+            Segment::Expr { inner, .. } => {
+                out.push_str(&eval_text_expr(inner.trim(), ctx, scope, lowered, 0)?);
+            }
+            Segment::Stmt { .. } => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Evaluate a string-valued expression appearing in `{% set %}` values and
+/// capture bodies: literals and scope-bound names, `a ~ b` concatenation,
+/// `var()` lookups and recognised helper/macro calls. Returns `None` when
+/// any part is dynamic — nothing is emitted and no issue is recorded here;
+/// the caller decides the classification.
+fn eval_text_expr(
+    text: &str,
+    ctx: &Context,
+    scope: &Scope,
+    lowered: &mut Lowered,
+    depth: usize,
+) -> Option<String> {
+    let text = text.trim();
+    if let Some(lit) = macros::eval_static(text, scope, &ctx.project.vars) {
+        return macros::render_lit(&lit);
+    }
+    // `consequent if cond else alternate` — Jinja ternary.
+    if let Some(position) = macros::find_top_level_word(text, " if ") {
+        let rest = &text[position + 4..];
+        if let Some(else_pos) = macros::find_top_level_word(rest, " else ") {
+            let taken = macros::eval_condition(&rest[..else_pos], scope, &ctx.project.vars)?;
+            let branch = if taken {
+                &text[..position]
+            } else {
+                &rest[else_pos + 6..]
+            };
+            return eval_text_expr(branch, ctx, scope, lowered, depth);
+        }
+    }
+    let parts = split_tilde(text);
+    if parts.len() > 1 {
+        let mut out = String::new();
+        for part in parts {
+            out.push_str(&eval_text_expr(&part, ctx, scope, lowered, depth)?);
+        }
+        return Some(out);
+    }
+    let call = jinja::parse_call(text)?;
+    resolve_expr_call(&call, ctx, scope, lowered, depth)
+}
+
+/// Lower a call inside a `{% set %}` value or capture body. Unlike
+/// `translate_call`, failure returns `None` without recording an issue.
+fn resolve_expr_call(
+    call: &Call,
+    ctx: &Context,
+    scope: &Scope,
+    lowered: &mut Lowered,
+    depth: usize,
+) -> Option<String> {
+    match call.name.as_str() {
+        "var" => {
+            let name = call.arg(0)?;
+            let lit = ctx
+                .project
+                .vars
+                .get(Value::String(name.to_string()))
+                .map(yaml_to_lit)
+                .or_else(|| call.positional.get(1).cloned())?;
+            macros::render_lit(&lit)
+        }
+        "ref" if call.positional.len() == 1 => {
+            let name = call.arg(0)?;
+            ctx.model_targets
+                .get(name)
+                .or_else(|| ctx.seed_targets.get(name))
+                .cloned()
+        }
+        "source" if call.positional.len() == 2 => {
+            let (source, table) = (call.arg(0)?, call.arg(1)?);
+            ctx.sources
+                .get(&(source.to_string(), table.to_string()))
+                .map(|info| info.relation.clone())
+        }
+        name => {
+            let args = ArgsRef::Strict(call);
+            let own_macro = name
+                .split_once('.')
+                .filter(|(package, _)| *package == ctx.project.name.as_str())
+                .map(|(_, local)| local);
+            if name.contains('.') && own_macro.is_none() {
+                lower_builtin(name, &args, ctx, scope, lowered)
+            } else {
+                inline_project_macro(own_macro.unwrap_or(name), call, ctx, lowered, depth)
+                    .or_else(|| lower_builtin(name, &args, ctx, scope, lowered))
+            }
+        }
+    }
+}
+
+/// Split `a ~ b` on top-level `~` (quotes and brackets are not split points).
+fn split_tilde(input: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => match quote {
+                Some(q) if q == bytes[i] => quote = None,
+                None => quote = Some(bytes[i]),
+                _ => {}
+            },
+            b'\\' if quote.is_some() => i += 1,
+            b'(' | b'[' | b'{' if quote.is_none() => depth += 1,
+            b')' | b']' | b'}' if quote.is_none() => depth = depth.saturating_sub(1),
+            b'~' if quote.is_none() && depth == 0 => {
+                parts.push(input[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(input[start..].to_string());
+    parts
 }
 
 /// `{% for item in <literal list or set variable> %}...{% endfor %}`:
@@ -1695,7 +2177,10 @@ fn handle_static_if(
     let keyword = jinja::stmt_keyword(inner);
     let condition = inner.trim().strip_prefix(keyword)?.trim();
     let block = find_if_block(segments, index)?;
-    let taken = macros::eval_condition(condition, scope, &ctx.project.vars)?;
+    let taken = match eval_condition_lit(condition, scope, ctx, lowered) {
+        Some(Lit::Bool(taken)) => taken,
+        _ => return None,
+    };
     lowered
         .transformations
         .push("static `{% if %}` branch resolved at translation time".to_string());
@@ -1796,12 +2281,20 @@ fn translate_call(
             let args = ArgsRef::Strict(call);
             // Recognised package helpers (qualified), then safe
             // project-macro inlining; for unqualified names the project
-            // definition wins — matching dbt's resolution order.
-            if name.contains('.') {
+            // definition wins — matching dbt's resolution order. A call
+            // qualified by the project's own name (`shopify.macro()` in the
+            // `shopify` package) is still a project macro.
+            let own_macro = name
+                .split_once('.')
+                .filter(|(package, _)| *package == ctx.project.name.as_str())
+                .map(|(_, local)| local);
+            if name.contains('.') && own_macro.is_none() {
                 if let Some(sql) = lower_builtin(name, &args, ctx, scope, lowered) {
                     return sql;
                 }
-            } else if let Some(sql) = inline_project_macro(name, call, ctx, lowered, 0) {
+            } else if let Some(sql) =
+                inline_project_macro(own_macro.unwrap_or(name), call, ctx, lowered, 0)
+            {
                 return sql;
             } else if let Some(sql) = lower_builtin(name, &args, ctx, scope, lowered) {
                 return sql;
@@ -1843,15 +2336,42 @@ fn lower_builtin(
         // Unqualified helper names only resolve when the owning package is
         // a declared dependency — dbt would not resolve them otherwise.
         None => match name {
-            "generate_surrogate_key" | "star" | "safe_cast" => ("dbt_utils", name),
-            "get_base_dates" | "date_spine" => ("dbt_date", name),
+            "generate_surrogate_key"
+            | "surrogate_key"
+            | "star"
+            | "safe_cast"
+            | "date_spine"
+            | "group_by" => ("dbt_utils", name),
+            "get_base_dates" => ("dbt_date", name),
+            // Bare `type_*()` etc. are not dbt-resolvable (builtins live in
+            // the `dbt.` namespace), but a project macro takes precedence in
+            // `translate_call` — reaching here means none exists, and the
+            // call almost certainly meant the builtin.
+            "type_string"
+            | "type_timestamp"
+            | "type_datetime"
+            | "type_int"
+            | "type_bigint"
+            | "type_numeric"
+            | "type_boolean"
+            | "type_float"
+            | "current_timestamp"
+            | "cast"
+            | "string_literal"
+            | "escape_single_quotes"
+            | "datediff"
+            | "dateadd"
+            | "last_day"
+            | "split_part"
+            | "hash"
+            | "concat" => ("dbt", name),
             _ => return None,
         },
     };
     if provider != "dbt" && provider != "dbt_utils" && provider != "dbt_date" {
         return None;
     }
-    if !name.contains('.') && !ctx.has_package(provider) {
+    if !name.contains('.') && provider != "dbt" && !ctx.has_package(provider) {
         return None;
     }
     let rendered = lower_helper(provider, helper, args, ctx, scope);
@@ -1894,24 +2414,7 @@ fn lower_helper(
             if fields.is_empty() {
                 return None;
             }
-            let empty_nulls = ctx
-                .project
-                .vars
-                .get(Value::String(
-                    "surrogate_key_treat_nulls_as_empty_strings".to_string(),
-                ))
-                .map(|value| matches!(yaml_to_lit(value), Lit::Bool(true)))
-                .unwrap_or(false);
-            let null_sentinel = if empty_nulls {
-                "''"
-            } else {
-                "'_dbt_utils_surrogate_key_null_'"
-            };
-            let parts: Vec<String> = fields
-                .iter()
-                .map(|field| format!("coalesce(cast(\"{field}\" as varchar), {null_sentinel})"))
-                .collect();
-            format!("md5(concat_ws('-', {}))", parts.join(", "))
+            surrogate_key_sql(&fields, ctx)
         }
         // `dbt_utils.star(from=..., except=[...])` → `* exclude (...)`.
         // Only this narrow shape is provably equivalent: `relation_alias`
@@ -1955,8 +2458,142 @@ fn lower_helper(
             };
             format!("try_cast(\"{field}\" as {data_type})")
         }
+        // `dbt_utils.surrogate_key('a', 'b')` — the deprecated varargs form of
+        // `generate_surrogate_key(['a', 'b'])`; identical lowering.
+        ("dbt_utils", "surrogate_key") => {
+            let mut fields = Vec::new();
+            for i in 0.. {
+                match args.get(i, "") {
+                    Some(lit) => match resolve(lit) {
+                        Lit::Str(field) | Lit::Ident(field) => fields.push(field),
+                        _ => return None,
+                    },
+                    None => break,
+                }
+            }
+            if fields.is_empty() {
+                return None;
+            }
+            surrogate_key_sql(&fields, ctx)
+        }
+        // `dbt_utils.group_by(n)` → `1, 2, ..., n` — positional grouping.
+        ("dbt_utils", "group_by") => {
+            let n = args
+                .get_raw(0, "n")
+                .and_then(|text| macros::eval_int_expr(&text))?;
+            if n < 1 {
+                return None;
+            }
+            (1..=n)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
         // `dbt.current_timestamp()` → `current_timestamp`.
         ("dbt", "current_timestamp") => "current_timestamp".to_string(),
+        // `dbt.type_*()` — dbt's cross-database type names. This subset is a
+        // valid type name on every Phlo target (Trino, DuckDB, PostgreSQL),
+        // so no profile is required. `type_float` differs (`float` vs
+        // `double`/`real`) and stays profile-gated below.
+        ("dbt", "type_string") => "varchar".to_string(),
+        ("dbt", "type_timestamp" | "type_datetime") => "timestamp".to_string(),
+        ("dbt", "type_int") => "integer".to_string(),
+        ("dbt", "type_bigint") => "bigint".to_string(),
+        ("dbt", "type_numeric") => "numeric".to_string(),
+        ("dbt", "type_boolean") => "boolean".to_string(),
+        // `dbt.cast('expr', 'type')` → `cast(expr as type)`.
+        ("dbt", "cast") => {
+            let field = sql_arg(args, 0, "field", &resolve)?;
+            let data_type = sql_arg(args, 1, "type", &resolve)?;
+            format!("cast({field} as {data_type})")
+        }
+        // `dbt.string_literal('x')` → a quoted, escaped SQL string literal.
+        ("dbt", "string_literal") => {
+            let value = args
+                .get(0, "s")
+                .map(resolve)
+                .and_then(|lit| lit.as_str().map(str::to_string))?;
+            format!("'{}'", value.replace('\'', "''"))
+        }
+        // `dbt.escape_single_quotes('x')` → the string with `'` doubled
+        // (unquoted, matching dbt — callers place it inside quotes).
+        ("dbt", "escape_single_quotes") => {
+            let value = args
+                .get(0, "s")
+                .map(resolve)
+                .and_then(|lit| lit.as_str().map(str::to_string))?;
+            value.replace('\'', "''")
+        }
+        // DuckDB-gated helpers: correct only when the source profile declares
+        // `type: duckdb` (matching `dbt_date.get_base_dates`).
+        ("dbt", "type_float") if is_duckdb(ctx) => "float".to_string(),
+        // `dbt.datediff(first, second, 'part')` → `date_diff('part', first, second)`.
+        ("dbt", "datediff") if is_duckdb(ctx) => {
+            let first = sql_arg(args, 0, "first_date", &resolve)?;
+            let second = sql_arg(args, 1, "second_date", &resolve)?;
+            let part = sql_arg(args, 2, "datepart", &resolve)?;
+            format!("date_diff('{part}', {first}, {second})")
+        }
+        // `dbt.dateadd('part', n, from)` → `from + interval 'n' part` —
+        // portable across Trino, DuckDB and PostgreSQL.
+        ("dbt", "dateadd") => {
+            let part = sql_arg(args, 0, "datepart", &resolve)?;
+            let n = args
+                .get_raw(1, "interval")
+                .and_then(|text| macros::eval_int_expr(&text))?;
+            let from = sql_arg(args, 2, "from_date_or_timestamp", &resolve)?;
+            if n >= 0 {
+                format!("({from} + interval '{n}' {part})")
+            } else {
+                format!("({from} - interval '{}' {part})", -n)
+            }
+        }
+        ("dbt", "last_day") if is_duckdb(ctx) => {
+            let field = sql_arg(args, 0, "date", &resolve)?;
+            format!("last_day({field})")
+        }
+        // `dbt.split_part('delim', 'str', n)` → `split_part(str, 'delim', n)`
+        // (argument order differs from dbt's call convention).
+        ("dbt", "split_part") if is_duckdb(ctx) => {
+            let part_text = sql_arg(args, 0, "part_text", &resolve)?;
+            let string_text = sql_arg(args, 1, "string_text", &resolve)?;
+            let n = args
+                .get_raw(2, "part_number")
+                .and_then(|text| macros::eval_int_expr(&text))?;
+            format!("split_part({string_text}, '{part_text}', {n})")
+        }
+        ("dbt", "hash") if is_duckdb(ctx) => {
+            let field = sql_arg(args, 0, "field", &resolve)?;
+            format!("md5({field})")
+        }
+        // `dbt.concat(['a', 'b'])` → `concat(a, b)`; DuckDB `concat` ignores
+        // NULL arguments, matching dbt's semantics.
+        ("dbt", "concat") if is_duckdb(ctx) => {
+            let fields = args
+                .get(0, "fields")
+                .map(resolve)
+                .and_then(|lit| lit.as_str_list())?;
+            format!("concat({})", fields.join(", "))
+        }
+        // `date_spine('part', start, end)` (dbt builtin / dbt_utils /
+        // dbt_date) → a `generate_series` spine. The start/end arguments are
+        // string literals containing SQL fragments, used verbatim.
+        ("dbt" | "dbt_utils" | "dbt_date", "date_spine") if is_duckdb(ctx) => {
+            let datepart = sql_arg(args, 0, "datepart", &resolve)?;
+            if !matches!(
+                datepart.as_str(),
+                "second" | "minute" | "hour" | "day" | "week" | "month" | "quarter" | "year"
+            ) {
+                return None;
+            }
+            let start = sql_arg(args, 1, "start_date", &resolve)?;
+            let end = sql_arg(args, 2, "end_date", &resolve)?;
+            let col = format!("date_{datepart}");
+            format!(
+                "select cast(date_trunc('{datepart}', s.{col}) as date) as {col} \
+                 from generate_series({start}, {end}, interval '1' {datepart}) as s({col})"
+            )
+        }
         // `dbt_date.get_base_dates(...)`: the package emits a `date_spine`
         // select; the lowering targets `generate_series`, which is
         // DuckDB-specific — only lower when the source profile is DuckDB.
@@ -1977,7 +2614,7 @@ fn lower_helper(
                 .unwrap_or_else(|| "day".to_string());
             if !matches!(
                 datepart.as_str(),
-                "day" | "week" | "month" | "quarter" | "year"
+                "second" | "minute" | "hour" | "day" | "week" | "month" | "quarter" | "year"
             ) {
                 return None;
             }
@@ -2013,6 +2650,56 @@ fn lower_helper(
     Some(rendered)
 }
 
+/// `md5(concat_ws('-', coalesce(cast("col" as varchar), SENTINEL), ...))`
+/// reproduces the dbt_utils default implementation. The null sentinel is
+/// `'_dbt_utils_surrogate_key_null_'` unless the project sets the
+/// `surrogate_key_treat_nulls_as_empty_strings` var.
+fn surrogate_key_sql(fields: &[String], ctx: &Context) -> String {
+    let empty_nulls = ctx
+        .project
+        .vars
+        .get(Value::String(
+            "surrogate_key_treat_nulls_as_empty_strings".to_string(),
+        ))
+        .map(|value| matches!(yaml_to_lit(value), Lit::Bool(true)))
+        .unwrap_or(false);
+    let null_sentinel = if empty_nulls {
+        "''"
+    } else {
+        "'_dbt_utils_surrogate_key_null_'"
+    };
+    let parts: Vec<String> = fields
+        .iter()
+        .map(|field| format!("coalesce(cast(\"{field}\" as varchar), {null_sentinel})"))
+        .collect();
+    format!("md5(concat_ws('-', {}))", parts.join(", "))
+}
+
+/// Whether the source profile declares `type: duckdb` — the gate for
+/// DuckDB-specific lowerings.
+fn is_duckdb(ctx: &Context) -> bool {
+    ctx.project
+        .profile
+        .as_ref()
+        .and_then(|profile| profile.adapter_type.as_deref())
+        == Some("duckdb")
+}
+
+/// A helper argument used as verbatim SQL text: string literals are raw SQL
+/// (column names, expressions), scope-bound names resolve to their value.
+fn sql_arg(
+    args: &ArgsRef,
+    position: usize,
+    name: &str,
+    resolve: &dyn Fn(Lit) -> Lit,
+) -> Option<String> {
+    match resolve(args.get(position, name)?) {
+        Lit::Str(text) | Lit::Ident(text) => Some(text),
+        Lit::Int(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 /// Inline a project macro whose body is statically renderable: literal SQL
 /// text plus `{{ param }}` substitutions, `{{ return(...) }}` and
 /// `adapter.dispatch` delegation to `default__`/`adapter__` variants.
@@ -2025,8 +2712,12 @@ fn inline_project_macro(
     lowered: &mut Lowered,
     depth: usize,
 ) -> Option<String> {
+    if ctx.inline_depth.get() >= 32 {
+        return None;
+    }
     let def = ctx.macro_defs.get(name)?;
-    inline_def(
+    ctx.inline_depth.set(ctx.inline_depth.get() + 1);
+    let rendered = inline_def(
         def,
         call.positional.clone(),
         call.keyword.clone(),
@@ -2034,7 +2725,9 @@ fn inline_project_macro(
         lowered,
         depth,
         name,
-    )
+    );
+    ctx.inline_depth.set(ctx.inline_depth.get() - 1);
+    rendered
 }
 
 fn inline_def(
@@ -2086,11 +2779,31 @@ fn render_macro_body(
     depth: usize,
 ) -> Option<String> {
     let mut out = String::new();
-    for segment in body {
+    // `{% set %}` inside a macro binds locally.
+    let mut local_scope = bindings.clone();
+    let mut index = 0usize;
+    while index < body.len() {
+        let segment = &body[index];
         match segment {
             Segment::Text(text) => out.push_str(text),
             Segment::Comment(_) => {}
-            Segment::Stmt { .. } => return None,
+            Segment::Stmt { .. } => {
+                // Static `{% set %}`/`{% if %}`/`{% for %}`/`{% do %}` are
+                // handled by the same machinery as models — buffered so a
+                // non-static statement leaves no partial diagnostics.
+                let mut trial = Lowered::default();
+                let consumed =
+                    translate_stmt(body, index, ctx, &mut local_scope, &mut trial, &mut out);
+                if !trial.issues.is_empty() {
+                    return None;
+                }
+                lowered.transformations.extend(trial.transformations);
+                lowered.config.extend(trial.config);
+                if let Some(window) = trial.window_column {
+                    lowered.window_column = Some(window);
+                }
+                index = consumed;
+            }
             Segment::Expr { inner, .. } => {
                 let inner = inner.trim();
                 // Unwrap `{{ return(<expr>) }}`.
@@ -2099,7 +2812,7 @@ fn render_macro_body(
                     .and_then(|rest| rest.strip_suffix(')'))
                     .unwrap_or(inner)
                     .trim();
-                if let Some((dispatched, arg_texts)) = split_dispatch(expr) {
+                if let Some((dispatched, arg_texts)) = split_dispatch(expr, &ctx.project.name) {
                     // `adapter.dispatch('m')(...)` resolves to the adapter's
                     // variant or `default__m` — static selection.
                     let adapter = ctx
@@ -2115,7 +2828,7 @@ fn render_macro_body(
                     let mut args = Vec::new();
                     for text in arg_texts {
                         let lit = pylit::parse_value(&text).ok().and_then(|lit| match lit {
-                            Lit::Ident(name) => bindings.get(&name).cloned(),
+                            Lit::Ident(name) => local_scope.get(&name).cloned(),
                             other => Some(other),
                         })?;
                         args.push(lit);
@@ -2130,25 +2843,14 @@ fn render_macro_body(
                         &variant,
                     )?);
                 } else if let Some(call) = jinja::parse_call(expr) {
-                    match call.name.as_str() {
-                        "ref" | "source" | "var" => out.push_str(&translate_call(
-                            &call,
-                            segment.raw(),
-                            ctx,
-                            bindings,
-                            lowered,
-                            false,
-                        )),
-                        // Nested project macros inline recursively.
-                        _ => out.push_str(&inline_project_macro(
-                            &call.name,
-                            &call,
-                            ctx,
-                            lowered,
-                            depth + 1,
-                        )?),
-                    }
-                } else if let Some(lit) = bindings.get(expr) {
+                    out.push_str(&resolve_expr_call(
+                        &call,
+                        ctx,
+                        &local_scope,
+                        lowered,
+                        depth + 1,
+                    )?);
+                } else if let Some(lit) = local_scope.get(expr) {
                     out.push_str(&macros::render_lit(lit)?);
                 } else if let Ok(lit) = crate::pylit::parse_value(expr) {
                     match lit {
@@ -2160,6 +2862,7 @@ fn render_macro_body(
                 }
             }
         }
+        index += 1;
     }
     Some(out)
 }
@@ -2167,10 +2870,43 @@ fn render_macro_body(
 /// Split `adapter.dispatch('name'[, 'namespace'])(args)` into the macro
 /// name and its raw argument texts. A namespace argument makes dispatch
 /// resolve outside the project — rejected.
-fn split_dispatch(expr: &str) -> Option<(String, Vec<String>)> {
+fn split_dispatch(expr: &str, project_name: &str) -> Option<(String, Vec<String>)> {
     let rest = expr.trim().strip_prefix("adapter.dispatch")?.trim_start();
-    let (name_args, after) = rest.strip_prefix('(')?.split_once(")(")?;
-    let after = after.strip_suffix(')')?;
+    let rest = rest.strip_prefix('(')?;
+    // Find the close of the dispatch-argument group, then the call group
+    // (whitespace between them is common: `dispatch('m') (args)`).
+    let mut depth = 0usize;
+    let mut quote = None;
+    let bytes = rest.as_bytes();
+    let mut close = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'\'' | b'"' => match quote {
+                Some(q) if q == b => quote = None,
+                None => quote = Some(b),
+                _ => {}
+            },
+            b'\\' if quote.is_some() => {}
+            b'(' | b'[' | b'{' if quote.is_none() => depth += 1,
+            b')' | b']' | b'}' if quote.is_none() => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    if bytes[close] != b')' {
+        return None;
+    }
+    let name_args = &rest[..close];
+    let after = rest[close + 1..]
+        .trim_start()
+        .strip_prefix('(')?
+        .strip_suffix(')')?;
     let dispatch_args = jinja::parse_call_loose(&format!("f({name_args})"))?;
     let name = dispatch_args
         .args
@@ -2180,7 +2916,22 @@ fn split_dispatch(expr: &str) -> Option<(String, Vec<String>)> {
         .trim_matches('\'')
         .trim_matches('"')
         .to_string();
-    if name.is_empty() || dispatch_args.args.len() > 1 {
+    if name.is_empty() {
+        return None;
+    }
+    // `adapter.dispatch('m', 'namespace')` — only the project's own package
+    // name resolves locally; anything else dispatches outside the project.
+    if dispatch_args.args.len() > 1 {
+        let namespace = dispatch_args.args[1]
+            .1
+            .trim()
+            .trim_matches('\'')
+            .trim_matches('"');
+        if namespace != project_name {
+            return None;
+        }
+    }
+    if dispatch_args.args.len() > 2 {
         return None;
     }
     let call_args = jinja::parse_call_loose(&format!("f({after})"))?;
@@ -2379,7 +3130,13 @@ fn translate_var(
 
 /// Non-call `{{ expr }}` — variables, `this`, attribute access, filters.
 /// Names bound by `{% set %}`/`{% for %}` substitute statically.
-fn translate_bare_expr(inner: &str, raw: &str, scope: &Scope, lowered: &mut Lowered) -> String {
+fn translate_bare_expr(
+    inner: &str,
+    raw: &str,
+    ctx: &Context,
+    scope: &Scope,
+    lowered: &mut Lowered,
+) -> String {
     let name = inner.trim();
     if let Some(lit) = scope.get(name) {
         match macros::render_lit(lit) {
@@ -2419,6 +3176,12 @@ fn translate_bare_expr(inner: &str, raw: &str, scope: &Scope, lowered: &mut Lowe
             ));
         }
         _ => {
+            if let Some(text) = eval_text_expr(name, ctx, scope, lowered, 0) {
+                lowered
+                    .transformations
+                    .push(format!("`{{{{ {name} }}}}` evaluated statically → {text}"));
+                return text;
+            }
             lowered.review(MigrationIssue::new(
                 codes::UNKNOWN_MACRO,
                 format!("expression `{{{{ {name} }}}}` cannot be evaluated statically"),
@@ -2641,7 +3404,7 @@ fn translate_model(
 ) -> ModelOutcome {
     let segments = emitted_segments(&model.dir, &model.stem);
     let logical = logical_name(&segments, &ctx.project.name);
-    let rel_output = emitted_path(&segments);
+    let mut rel_output = emitted_path(&segments);
     let display_path = display(&model.rel_path);
 
     let mut outcome = ResourceOutcome {
@@ -2676,7 +3439,9 @@ fn translate_model(
         ));
     }
 
+    ctx.current_stem = Some(model.stem.clone());
     let lowered = lower_sql(&model.sql, ctx);
+    ctx.current_stem = None;
     outcome
         .transformations
         .extend(lowered.transformations.clone());
@@ -2685,12 +3450,45 @@ fn translate_model(
 
     // Merge config: dir → property file → in-file.
     let properties = ctx.model_properties.get(&model.stem).cloned();
-    let merged = merged_model_config(
+    let mut merged = merged_model_config(
         &model.dir,
         properties.as_ref(),
         &lowered.config,
         ctx.project,
     );
+
+    // `schema:` in property YAML is often an inline Jinja template
+    // (`"{{ var('prefix', 'x') }}_layer"`); render it when fully static.
+    // A non-evaluable template is marked non-literal so the schema case is
+    // recorded as dynamic rather than as the raw template text.
+    if let Some(Lit::Str(raw)) = merged.get("schema").cloned() {
+        if raw.contains("{{") || raw.contains("{%") {
+            match eval_jinja_text(&raw, ctx) {
+                Some(resolved) if !resolved.trim().is_empty() => {
+                    let resolved = resolved.trim().to_string();
+                    outcome.transformations.push(format!(
+                        "config `schema` rendered statically → `{resolved}`"
+                    ));
+                    merged.insert("schema".to_string(), Lit::Str(resolved));
+                }
+                _ => {
+                    merged.insert("schema".to_string(), Lit::Dict(Vec::new()));
+                }
+            }
+        }
+    }
+
+    // In-file `{{ config(enabled = false) }}` (including statically
+    // evaluated `target.*`/`var()` conditions) disables the model.
+    if merged.get("enabled") == Some(&Lit::Bool(false)) {
+        outcome.classification = Classification::Unsupported;
+        outcome.emitted_path = None;
+        outcome.issues.push(MigrationIssue::new(
+            codes::DISABLED,
+            "model is disabled (`enabled = false`); Phlo has no disabled state",
+        ));
+        return (outcome, None);
+    }
 
     // Record the `generate_schema_name` inputs this model exercises.
     match merged.get("schema") {
@@ -2757,6 +3555,40 @@ fn translate_model(
             // including the namespace segment.
             let folder_key = model.dir.join("/");
             toml.set_folder(&folder_key, "schema", &format!("\"{schema}\""));
+        }
+    }
+
+    // Per-model literal `schema`: Phlo derives the target schema from the
+    // logical identity (namespace) unless a folder config overrides it. When
+    // the dbt schema equals the derived schema the config is a no-op; when it
+    // differs, the model is emitted under a schema-named leaf folder carrying
+    // a folder-level override — `-- @id` keeps the logical identity stable.
+    if let Some(Lit::Str(schema)) = merged.get("schema") {
+        let derived_schema = config_str(&dir_only_config, "schema")
+            .or_else(|| segments.first().cloned().filter(|_| !model.dir.is_empty()))
+            .unwrap_or_else(|| ctx.project.name.clone());
+        if schema != &derived_schema {
+            let schema_segment = sanitize_segment(schema);
+            let mut relocated: Vec<String> =
+                model.dir.iter().map(|s| sanitize_segment(s)).collect();
+            relocated.push(schema_segment.clone());
+            relocated.push(sanitize_segment(&model.stem));
+            rel_output = emitted_path(&relocated);
+            outcome.emitted_path = Some(rel_output.clone());
+            let namespace = relocated[0].clone();
+            let folder_key = if model.dir.is_empty() {
+                schema_segment.clone()
+            } else {
+                format!("{}/{schema_segment}", model.dir.join("/"))
+            };
+            root_tomls
+                .entry(PathBuf::from("transforms").join(&namespace))
+                .or_default()
+                .set_folder(&folder_key, "schema", &format!("\"{schema}\""));
+            directives.push(format!("-- @id {logical}"));
+            outcome.transformations.push(format!(
+                "per-model `schema` → folder `{folder_key}` schema `{schema}` (identity pinned with @id)"
+            ));
         }
     }
 
@@ -2931,11 +3763,15 @@ fn translate_model(
             ));
         }
     }
-    if merged.contains_key("schema") && !schema_translated {
-        outcome.issues.push(MigrationIssue::new(
+    match merged.get("schema") {
+        // Literal schemas were either a no-op against the derived namespace
+        // schema or relocated into a folder override above.
+        Some(Lit::Str(_)) | None => {}
+        Some(_) if schema_translated => {}
+        Some(_) => outcome.issues.push(MigrationIssue::new(
             codes::UNTRANSLATED_CONFIG,
-            "per-model `schema` is not representable; Phlo derives the target schema from logical identity",
-        ));
+            "per-model `schema` is dynamic; it cannot be evaluated statically",
+        )),
     }
     if merged.contains_key("alias") {
         outcome
@@ -3474,6 +4310,92 @@ fn translate_generic_test(
                     "`unique_combination_of_columns` lacks `combination_of_columns`",
                 )),
             }
+            }
+            // dbt_utils.equality — both relations must contain the same rows.
+            // Only the plain form and `compare_columns` are provable;
+            // `summarize`/`precision`/`exclude_columns` change semantics and
+            // stay REVIEW.
+            "equality" => {
+                let unsupported = ["summarize", "precision", "exclude_columns"]
+                    .iter()
+                    .any(|key| args.contains_key(Value::String(key.to_string())));
+                let other = args
+                    .get(Value::String("compare_model".into()))
+                    .or_else(|| args.get(Value::String("model".into())))
+                    .and_then(Value::as_str)
+                    .and_then(|spec| resolve_test_target(spec, ctx));
+                let columns = args
+                    .get(Value::String("compare_columns".into()))
+                    .and_then(Value::as_sequence)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|item| item.as_str().map(|c| format!("\"{c}\"")))
+                            .collect::<Option<Vec<_>>>()
+                    });
+                match (unsupported, other, columns) {
+                    (false, Some(other), Some(Some(columns))) => {
+                        let cols = columns.join(", ");
+                        test_file(
+                            ctx,
+                            outcome,
+                            "equality",
+                            format!(
+                                "(select {cols} from {model_logical} except all select {cols} from {other}) \
+                                 union all \
+                                 (select {cols} from {other} except all select {cols} from {model_logical})"
+                            ),
+                        );
+                    }
+                    (false, Some(other), None) => {
+                        test_file(
+                            ctx,
+                            outcome,
+                            "equality",
+                            format!(
+                                "(select * from {model_logical} except all select * from {other}) \
+                                 union all \
+                                 (select * from {other} except all select * from {model_logical})"
+                            ),
+                        );
+                    }
+                    (false, _, Some(None)) => outcome.issues.push(MigrationIssue::new(
+                        codes::UNSUPPORTED_TEST,
+                        "`equality` compare_columns must be a static string list",
+                    )),
+                    (true, _, _) => outcome.issues.push(MigrationIssue::new(
+                        codes::UNSUPPORTED_TEST,
+                        "`equality` with summarize/precision/exclude_columns has no native conversion",
+                    )),
+                    (_, None, _) => outcome.issues.push(MigrationIssue::new(
+                        codes::UNSUPPORTED_TEST,
+                        "`equality` compare_model could not be resolved",
+                    )),
+                }
+            }
+            // dbt_utils.equal_rowcount — the test fails when the two
+            // relations have different row counts.
+            "equal_rowcount" => {
+                let other = args
+                    .get(Value::String("compare_model".into()))
+                    .or_else(|| args.get(Value::String("model".into())))
+                    .and_then(Value::as_str)
+                    .and_then(|spec| resolve_test_target(spec, ctx));
+                match other {
+                    Some(other) => test_file(
+                        ctx,
+                        outcome,
+                        "equal_rowcount",
+                        format!(
+                            "select * from (select (select count(*) from {model_logical}) as here, \
+                             (select count(*) from {other}) as there) t where here <> there"
+                        ),
+                    ),
+                    None => outcome.issues.push(MigrationIssue::new(
+                        codes::UNSUPPORTED_TEST,
+                        "`equal_rowcount` compare_model could not be resolved",
+                    )),
+                }
             }
             other => {
                 outcome.issues.push(MigrationIssue::new(

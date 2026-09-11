@@ -49,6 +49,11 @@ pub struct ProfileTarget {
     /// Every declared output: name → schema. Used to evaluate
     /// `generate_schema_name` across all targets, not just the selected one.
     pub outputs: BTreeMap<String, Option<String>>,
+    /// Every declared output: name → non-secret scalar fields
+    /// (`type`, `schema`, `database`, ...). Used to evaluate `target.*`
+    /// expressions statically; a field is only static when every declared
+    /// output agrees on it.
+    pub output_fields: BTreeMap<String, BTreeMap<String, String>>,
     pub adapter_type: Option<String>,
     pub database: Option<String>,
     pub catalog: Option<String>,
@@ -424,11 +429,44 @@ fn read_profile(root: &Path, profile_name: Option<&str>) -> Option<ProfileTarget
                 })
             })
             .collect(),
+        output_fields: outputs
+            .iter()
+            .filter_map(|(name, output)| {
+                name.as_str()
+                    .map(|name| (name.to_string(), scalar_fields(output)))
+            })
+            .collect(),
         adapter_type: get_str(target, "type").map(str::to_string),
         database: get_str(target, "database").map(str::to_string),
         catalog: get_str(target, "catalog").map(str::to_string),
         schema: get_str(target, "schema").map(str::to_string),
     })
+}
+
+/// Non-secret scalar fields of one `outputs:` entry. Credentials and other
+/// secret-bearing keys are never read.
+fn scalar_fields(output: &Value) -> BTreeMap<String, String> {
+    const SECRET: &[&str] = &["pass", "secret", "token", "key", "cred", "auth"];
+    let mut fields = BTreeMap::new();
+    let Some(map) = output.as_mapping() else {
+        return fields;
+    };
+    for (key, value) in map {
+        let Some(key) = key.as_str() else { continue };
+        if SECRET.iter().any(|needle| key.contains(needle)) {
+            continue;
+        }
+        let rendered = match value {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        };
+        if let Some(rendered) = rendered {
+            fields.insert(key.to_string(), rendered);
+        }
+    }
+    fields
 }
 
 fn get_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {

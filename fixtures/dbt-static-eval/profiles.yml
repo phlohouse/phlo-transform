@@ -1,0 +1,9 @@
+static_eval:
+
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: 'static_eval.duckdb'
+      schema: main
+      threads: 4
