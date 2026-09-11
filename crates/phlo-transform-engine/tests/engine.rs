@@ -5,6 +5,7 @@
 //! warehouse.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,8 +15,8 @@ use phlo_transform_core::{
     compile, compile_with_options, select_models, Compilation, DataType, EmptySchemaProvider,
     EmptySourceStateProvider, IncrementalStrategy, Materialization, ModelId, ModelOrigin,
     Nullability, Relation, RelationSchema, SchemaColumn, SelectionOptions, SemanticModel,
-    SemanticProject, SemanticTest, SourceId, SourceStateProvider, StaticSchemaProvider,
-    StaticSourceStateProvider, TestId,
+    SemanticProject, SemanticSeed, SemanticTest, SourceId, SourceStateProvider,
+    StaticSchemaProvider, StaticSourceStateProvider, TestId,
 };
 use phlo_transform_engine::{
     collect_source_states, Adapter, AdapterError, ArtifactWriter, CancelHandle, CatalogRequest,
@@ -33,6 +34,7 @@ struct FakeAdapter {
     merges: Mutex<Vec<String>>,
     replaced_partitions: Mutex<Vec<String>>,
     columns: Mutex<Vec<ColumnInfo>>,
+    loaded_csvs: Mutex<Vec<String>>,
     source_states: Mutex<BTreeMap<String, String>>,
     max_value: Mutex<Option<String>>,
     test_rows: Mutex<u64>,
@@ -158,6 +160,23 @@ impl Adapter for FakeAdapter {
         self.existing.lock().unwrap().insert(display);
         Ok(QueryResult {
             query_id: Some("append-query".to_string()),
+            ..Default::default()
+        })
+    }
+
+    async fn load_csv(
+        &self,
+        relation: &Relation,
+        path: &Path,
+    ) -> Result<QueryResult, AdapterError> {
+        let display = relation.display();
+        self.loaded_csvs
+            .lock()
+            .unwrap()
+            .push(format!("{display} <- {}", path.display()));
+        self.existing.lock().unwrap().insert(display);
+        Ok(QueryResult {
+            query_id: Some("load-csv".to_string()),
             ..Default::default()
         })
     }
@@ -757,6 +776,7 @@ async fn collects_source_states_from_adapter() {
     let provider = collect_source_states(
         &adapter,
         std::slice::from_ref(&source),
+        &[],
         None,
         Some("default"),
     )
@@ -955,4 +975,91 @@ async fn time_window_overlap_widens_the_predicate() {
         "{}",
         appends[0]
     );
+}
+
+/// A model reading a seed relation plans the CSV load first, then skips it
+/// once the recorded content hash matches.
+#[tokio::test]
+async fn seed_loads_before_models_and_skips_when_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("seeds")).unwrap();
+    std::fs::write(
+        dir.path().join("seeds/raw_events.csv"),
+        "id,status\n1,placed\n",
+    )
+    .unwrap();
+
+    let mut project = SemanticProject::in_memory(vec![model(
+        "main.stg_events",
+        "select * from raw.raw_events",
+    )]);
+    project.workspace_root = Some(dir.path().to_path_buf());
+    project.seeds = vec![SemanticSeed {
+        name: "raw_events".to_string(),
+        path: PathBuf::from("seeds/raw_events.csv"),
+        schema: Some("raw".to_string()),
+        content_hash: "hash-v1".to_string(),
+        columns: vec!["id".to_string(), "status".to_string()],
+    }];
+    let compilation = compile(&project);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let result = run_once(adapter.clone(), state.clone(), &compilation, "dev").await;
+
+    assert_eq!(result.status, ExecutionStatus::Passed);
+    assert_eq!(result.seeds.len(), 1);
+    assert_eq!(result.seeds[0].status, ExecutionStatus::Passed);
+    let loaded = adapter.loaded_csvs.lock().unwrap().clone();
+    assert_eq!(loaded.len(), 1);
+    assert!(loaded[0].starts_with("raw.raw_events <- "), "{loaded:?}");
+    assert!(loaded[0].ends_with("seeds/raw_events.csv"), "{loaded:?}");
+
+    // Second plan: relation exists and the recorded hash matches → Skip.
+    let selected = select_models(&compilation, &SelectionOptions::default());
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&compilation, &selected, Some("dev".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(plan.seeds.len(), 1);
+    assert_eq!(plan.seeds[0].action, PlanAction::Skip);
+}
+
+/// A changed CSV content hash re-plans the seed as a Build.
+#[tokio::test]
+async fn seed_content_change_replans_the_load() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("seeds")).unwrap();
+    std::fs::write(dir.path().join("seeds/raw_events.csv"), "id,status\n").unwrap();
+
+    let build = |hash: &str| {
+        let mut project = SemanticProject::in_memory(vec![model(
+            "main.stg_events",
+            "select * from raw.raw_events",
+        )]);
+        project.workspace_root = Some(dir.path().to_path_buf());
+        project.seeds = vec![SemanticSeed {
+            name: "raw_events".to_string(),
+            path: PathBuf::from("seeds/raw_events.csv"),
+            schema: Some("raw".to_string()),
+            content_hash: hash.to_string(),
+            columns: vec!["id".to_string(), "status".to_string()],
+        }];
+        let compilation = compile(&project);
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+        compilation
+    };
+
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    run_once(adapter.clone(), state.clone(), &build("hash-v1"), "dev").await;
+
+    let selected = select_models(&build("hash-v2"), &SelectionOptions::default());
+    let compilation = build("hash-v2");
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&compilation, &selected, Some("dev".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(plan.seeds[0].action, PlanAction::Build);
 }

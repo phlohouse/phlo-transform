@@ -153,6 +153,97 @@ pub fn parse_call(inner: &str) -> Option<Call> {
     })
 }
 
+/// A `name(args)` call where each argument keeps its raw text — used when a
+/// recognised helper needs an argument that is not a simple literal (for
+/// example `n_dateparts = 365 * 10`). `args` is `(key, text)` with `key`
+/// `None` for positional arguments.
+#[derive(Clone, Debug)]
+pub struct LooseCall {
+    pub name: String,
+    pub args: Vec<(Option<String>, String)>,
+}
+
+/// Parse `name(...)` tolerantly: argument values stay raw text. Returns
+/// `None` when the expression is not call-shaped.
+pub fn parse_call_loose(inner: &str) -> Option<LooseCall> {
+    let inner = inner.trim();
+    let open = inner.find('(')?;
+    let name = inner[..open].trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.'))
+    {
+        return None;
+    }
+    if !inner.ends_with(')') {
+        return None;
+    }
+    let mut args = Vec::new();
+    for piece in split_args(&inner[open + 1..inner.len() - 1]) {
+        let trimmed = piece.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // `key = value` when a bare identifier precedes `=` (not `==`).
+        let key = trimmed
+            .find('=')
+            .filter(|&i| {
+                trimmed[..i]
+                    .trim()
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !trimmed[..i].trim().is_empty()
+                    && trimmed.as_bytes().get(i + 1) != Some(&b'=')
+            })
+            .map(|i| trimmed[..i].trim().to_string());
+        let text = match &key {
+            Some(key) => trimmed[key.len()..]
+                .trim_start()
+                .trim_start_matches('=')
+                .trim()
+                .to_string(),
+            None => trimmed.to_string(),
+        };
+        args.push((key, text));
+    }
+    Some(LooseCall {
+        name: name.to_string(),
+        args,
+    })
+}
+
+/// Split a call's argument list on top-level commas (brackets, braces,
+/// parens and quoted strings are not split points).
+fn split_args(input: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => match quote {
+                Some(q) if q == bytes[i] => quote = None,
+                None => quote = Some(bytes[i]),
+                _ => {}
+            },
+            b'\\' if quote.is_some() => i += 1,
+            b'(' | b'[' | b'{' if quote.is_none() => depth += 1,
+            b')' | b']' | b'}' if quote.is_none() => depth = depth.saturating_sub(1),
+            b',' if quote.is_none() && depth == 0 => {
+                parts.push(input[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(input[start..].to_string());
+    parts
+}
+
 /// The first word of a `{% ... %}` statement, e.g. `if`, `for`, `macro`.
 pub fn stmt_keyword(inner: &str) -> &str {
     let end = inner

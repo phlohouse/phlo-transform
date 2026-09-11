@@ -48,8 +48,18 @@ existing files unless `--overwrite` is passed. The manifest lands at
 | `{{ ref('m') }}` | the model's logical name (`staging.stg_orders`) |
 | `{{ ref('pkg', 'm') }}` (same project) | the model's logical name |
 | `{{ source('s', 't') }}` | the physical `db.schema.identifier` relation |
-| `{{ ref('seed_name') }}` | the relation the CSV lands as (`<schema>.<name>`, or bare `<name>` when no target schema is known); the seed resource is flagged REVIEW, the model itself is CLEAN |
+| `{{ ref('seed_name') }}` | the relation the CSV lands as (`<schema>.<name>`, or bare `<name>` when no target schema is known) — the CSV itself is copied to `seeds/` and loads automatically at `run` time |
+| `seeds/**/*.csv` | copied verbatim to `seeds/`; `[seeds]`/`[seed."name"]` schema config in `phlo.toml`; content-hash state (`csv:` prefix) so CSV edits re-trigger downstream builds |
 | `{{ dbt.date_trunc('p', 'col') }}` | `date_trunc('p', col)` |
+| `{{ dbt.current_timestamp() }}` | `current_timestamp` |
+| `{{ dbt_utils.generate_surrogate_key(['a','b']) }}` | `md5(concat_ws('-', coalesce(cast("a" as varchar), ''), …))` |
+| `{{ dbt_utils.star(from=…, except=[…]) }}` | `* exclude (…)` (DuckDB-first; `prefix`/`suffix` args stay REVIEW) |
+| `{{ dbt_utils.safe_cast('c','t') }}` | `try_cast("c" as t)` |
+| `{{ dbt_date.get_base_dates(n_dateparts=N\|start_date,end_date, datepart='p') }}` | a `generate_series` spine select (`day`/`week`/`month`/`quarter`/`year`) |
+| simple project macros (`{{ my_macro('x') }}` whose body is literal SQL + `{{ param }}` substitutions, `{{ return(…) }}`, `adapter.dispatch` → `default__`/`adapter__` variants) | inlined into the model's SQL; dynamic bodies (statements, runtime lookups) stay REVIEW |
+| `{% set name = <literal or var()> %}` | bound at translation time; `{{ name }}` substitutes statically |
+| `{% for x in <literal list> %}…{% endfor %}` (incl. `loop.index/first/last`) | unrolled statically |
+| `{% if <statically-known condition> %}` / `{% if execute %}` | resolved at translation time / gate removed |
 | `test: {arguments: {...}}` (modern) and `test: {...}` (legacy) | both argument spellings are read |
 | `{{ var('x') }}` / `var('x', default)` | the literal value from `vars:` |
 | `{{ config(...) }}` | removed; its values become directives/config |
@@ -61,6 +71,7 @@ existing files unless `--overwrite` is passed. The manifest lands at
 | `unique`/`not_null` on a key column | folded into `@key`/`@incremental key=` |
 | `not_null` on other columns | `-- @not-null col` |
 | other column tests (`unique`, `accepted_values`, `relationships`, `unique_combination_of_columns`) | generated `tests/**/*.sql` |
+| `dbt_utils.expression_is_true` / `accepted_range` / `not_constant` / `not_empty_string` (package-qualified names resolve when the package is declared) | generated `tests/**/*.sql` |
 | `meta.owner` | `-- @owner` |
 | `tags` | `-- @tags` |
 | `description` | a leading `-- ` comment |
@@ -76,14 +87,16 @@ Every resource is classified — nothing is silently treated as equivalent.
 
 - `CLEAN` — translated to native semantics with no residual Jinja.
 - `REVIEW` — emitted but requires human attention: residual Jinja
-  (macros, `{% set %}`, `{% for %}`, non-watermark `{% if %}`), `ephemeral`
-  materialisation (emitted as a view), environment-dependent expressions
-  (`env_var`, `run_started_at`, `target.*`, `adapter.*`), unresolved
-  `ref`/`source`/`var`, unrecognised incremental patterns (degraded to
-  full-refresh), unconvertible config (`grants`, hooks, `database`), seeds,
-  and package dependencies.
+  (`{% set %}`/`{% for %}`/`{% if %}` whose values are not statically
+  known, dynamic macros, `run_query`), `ephemeral` materialisation
+  (emitted as a view), environment-dependent expressions (`env_var`,
+  `run_started_at`, `target.*`, `adapter.*` calls beyond dispatch),
+  unresolved `ref`/`source`/`var`, unrecognised incremental patterns
+  (degraded to full-refresh), unconvertible config (`grants`, hooks,
+  `database`), and package dependencies.
 - `UNSUPPORTED` — not emitted: `snapshot`/`custom` materialisations, snapshot
-  and analysis files, disabled models, exposures/metrics/semantic models.
+  and analysis files, disabled models, exposures/metrics/semantic models,
+  dbt `unit_tests`/`groups`, and macros that perform runtime operations.
 
 The report (`--check`) shows per-kind counts by classification, model
 conversion coverage, and deduplicated review reasons. `--json` returns the
@@ -93,14 +106,19 @@ idempotence auditing.
 
 ## Deliberate limits
 
-- Jinja is scanned and classified, never executed. Unknown `{{ }}`/`{% %}`
-  constructs are preserved verbatim so the generated file fails loudly at
-  `check` time rather than silently changing meaning.
+- Jinja is scanned and classified, never executed. Only statically
+  provable constructs are expanded (`{% set %}`/`{% for %}` over literals
+  and `var()`s, literal-condition `{% if %}`); anything dynamic —
+  `run_query`, adapter calls, environment-driven loops — is preserved
+  verbatim so the generated file fails loudly at `check` time rather than
+  silently changing meaning.
+- Project macros inline only when the whole body statically renders
+  (text + parameter substitution + `return(...)` + `adapter.dispatch` to
+  `default__`/adapter variants). Anything else stays REVIEW.
 - A non-watermark `is_incremental()` body is dropped (or its `else` branch
   kept) and the model degrades to a correct full-refresh, flagged `REVIEW`.
 - `profiles.yml` credentials are never read; only non-secret target fields are
   used as workspace defaults.
-- Seeds, macros, and packages are reported but not translated. `ref()` calls
-  *to* a seed resolve — to the relation the CSV would materialise as — so
-  dependent models emit valid SQL and classify CLEAN; only the seed resource
-  itself is REVIEW, since nothing loads the CSV for you.
+- Seeds load as `CREATE OR REPLACE TABLE … SELECT * FROM read_csv_auto(…)`
+  (DuckDB); adapters without `load_csv` report seeds UNSUPPORTED at plan
+  time. Package dependencies are reported, not vendored.

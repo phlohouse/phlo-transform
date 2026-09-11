@@ -382,6 +382,19 @@ impl Adapter for DuckDbAdapter {
     ) -> Result<Option<Vec<(String, i64)>>, AdapterError> {
         Ok(None)
     }
+
+    async fn load_csv(
+        &self,
+        relation: &Relation,
+        path: &std::path::Path,
+    ) -> Result<QueryResult, AdapterError> {
+        let escaped = path.display().to_string().replace('\'', "''");
+        self.run_sql(&format!(
+            "CREATE OR REPLACE TABLE {} AS SELECT * FROM read_csv_auto('{escaped}', header = true)",
+            relation.sql()
+        ))
+        .await
+    }
 }
 
 /// Deterministic FNV-1a fingerprint of a sequence of strings.

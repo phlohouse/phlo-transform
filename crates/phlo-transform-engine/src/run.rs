@@ -15,7 +15,10 @@ use crate::cancel::CancelHandle;
 use crate::error::{AdapterError, EngineError};
 use crate::events::{EngineEvent, ExecutionStatus};
 use crate::plan::{Plan, PlanAction, PlannedModel};
-use crate::state::{MaterializedRecord, ModelRunRecord, RunRecord, StateStore, TestRunRecord};
+use crate::source_state::{adapter_default_schema, seed_relation};
+use crate::state::{
+    MaterializedRecord, ModelRunRecord, RunRecord, SeedRecord, StateStore, TestRunRecord,
+};
 use crate::util::{now_rfc3339, sha256_hex};
 
 /// Options controlling a run.
@@ -58,6 +61,15 @@ pub struct ModelResult {
     pub sql_hash: String,
 }
 
+/// The outcome of a single seed load.
+#[derive(Clone, Debug, Serialize)]
+pub struct SeedResult {
+    pub seed: String,
+    pub target: String,
+    pub status: ExecutionStatus,
+    pub error: Option<String>,
+}
+
 /// The outcome of a single test.
 #[derive(Clone, Debug, Serialize)]
 pub struct TestResult {
@@ -78,6 +90,8 @@ pub struct RunResult {
     pub finished_at: String,
     pub models: Vec<ModelResult>,
     pub tests: Vec<TestResult>,
+    /// Seed loads performed before model builds.
+    pub seeds: Vec<SeedResult>,
     pub events: Vec<EngineEvent>,
 }
 
@@ -243,6 +257,79 @@ impl Runner {
                 .ensure_schema(&relation)
                 .await
                 .map_err(EngineError::Adapter)?;
+        }
+
+        // Load planned seeds before any model build: seed relations are the
+        // physical inputs the models select from.
+        let mut seed_results: Vec<SeedResult> = Vec::new();
+        for planned_seed in &plan.seeds {
+            let Some(seed) = compilation
+                .seeds
+                .iter()
+                .find(|seed| seed.name == planned_seed.name)
+            else {
+                continue;
+            };
+            if planned_seed.action != PlanAction::Build {
+                events.push(EngineEvent::SeedFinished {
+                    seed: planned_seed.name.clone(),
+                    status: ExecutionStatus::Skipped,
+                });
+                seed_results.push(SeedResult {
+                    seed: planned_seed.name.clone(),
+                    target: planned_seed.target.clone(),
+                    status: ExecutionStatus::Skipped,
+                    error: None,
+                });
+                continue;
+            }
+            let relation = seed_relation(
+                seed,
+                compilation.defaults.catalog.as_deref(),
+                compilation
+                    .defaults
+                    .schema
+                    .as_deref()
+                    .or_else(|| adapter_default_schema(self.adapter.name())),
+                self.adapter.name(),
+            );
+            self.adapter
+                .ensure_schema(&relation)
+                .await
+                .map_err(EngineError::Adapter)?;
+            let path = match &compilation.workspace_root {
+                Some(root) => root.join(&seed.path),
+                None => seed.path.clone(),
+            };
+            events.push(EngineEvent::SeedStarted {
+                seed: planned_seed.name.clone(),
+            });
+            match self.adapter.load_csv(&relation, &path).await {
+                Ok(_) => {
+                    events.push(EngineEvent::SeedFinished {
+                        seed: planned_seed.name.clone(),
+                        status: ExecutionStatus::Passed,
+                    });
+                    seed_results.push(SeedResult {
+                        seed: planned_seed.name.clone(),
+                        target: relation.display(),
+                        status: ExecutionStatus::Passed,
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    events.push(EngineEvent::SeedFinished {
+                        seed: planned_seed.name.clone(),
+                        status: ExecutionStatus::Failed,
+                    });
+                    seed_results.push(SeedResult {
+                        seed: planned_seed.name.clone(),
+                        target: relation.display(),
+                        status: ExecutionStatus::Failed,
+                        error: Some(error.to_string()),
+                    });
+                }
+            }
         }
 
         // Dependency bookkeeping restricted to the planned set.
@@ -538,6 +625,9 @@ impl Runner {
             .any(|result| result.status == ExecutionStatus::Failed)
             || tests
                 .iter()
+                .any(|result| result.status == ExecutionStatus::Failed)
+            || seed_results
+                .iter()
                 .any(|result| result.status == ExecutionStatus::Failed);
         let run_status = if cancelled {
             ExecutionStatus::Cancelled
@@ -604,6 +694,25 @@ impl Runner {
                     }
                 }
             }
+            for result in &seed_results {
+                if result.status != ExecutionStatus::Passed {
+                    continue;
+                }
+                if let Some(seed) = compilation
+                    .seeds
+                    .iter()
+                    .find(|seed| seed.name == result.seed)
+                {
+                    state.record_seed(&SeedRecord {
+                        name: seed.name.clone(),
+                        environment: options.environment.clone(),
+                        content_hash: seed.content_hash.clone(),
+                        target: result.target.clone(),
+                        run_id: run_id.clone(),
+                        loaded_at: finished_at.clone(),
+                    })?;
+                }
+            }
             for result in &tests {
                 state.record_test(&TestRunRecord {
                     run_id: run_id.clone(),
@@ -642,6 +751,7 @@ impl Runner {
             finished_at,
             models,
             tests,
+            seeds: seed_results,
             events,
         })
     }

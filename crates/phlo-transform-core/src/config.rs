@@ -19,6 +19,27 @@ pub struct PhloConfig {
     /// Per-model contracts, keyed by model name (dots or underscores).
     pub model: BTreeMap<String, ModelContractConfig>,
     pub dependencies: DependenciesConfig,
+    /// `[seeds]` — default schema for discovered CSV seeds.
+    pub seeds: SeedsConfig,
+    /// `[seed."<name>"]` — per-seed overrides.
+    pub seed: BTreeMap<String, SeedConfig>,
+}
+
+/// The `[seeds]` section: defaults for `seeds/**/*.csv` files.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SeedsConfig {
+    /// Schema the seed CSVs are loaded into (workspace default schema
+    /// applies when unset).
+    pub schema: Option<String>,
+}
+
+/// A `[seed."<name>"]` section.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SeedConfig {
+    /// Per-seed target schema override.
+    pub schema: Option<String>,
 }
 
 /// Cross-workflow dependency policy.

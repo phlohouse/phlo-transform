@@ -34,7 +34,7 @@ pub mod version;
 use std::path::Path;
 
 pub use compile::{compile, compile_with_options, compile_with_provider};
-pub use compiled::{Compilation, CompiledModel, CompiledTest};
+pub use compiled::{Compilation, CompiledModel, CompiledSeed, CompiledTest};
 pub use config::CrossWorkflowPolicy;
 pub use consumers::{ConsumerRegistry, EmptyConsumerRegistry, StaticConsumerRegistry};
 pub use diagnostics::{codes, Diagnostic, Severity};
@@ -43,14 +43,14 @@ pub use graph::{Dependency, EdgeKind, GraphNode, TransformGraph};
 pub use identity::{IdentityError, ModelId, Namespace, SourceId};
 pub use model::{
     FrontendKind, ModelConfig, ModelOrigin, Relation, RootKind, RootNamespaceStrategy, RootRef,
-    SemanticModel, SemanticProject, SemanticTest, TestId, TransformRoot, TransformRootId,
-    WorkspaceDefaults,
+    SemanticModel, SemanticProject, SemanticSeed, SemanticTest, TestId, TransformRoot,
+    TransformRootId, WorkspaceDefaults,
 };
 pub use phlo_transform_sql::{IncrementalStrategy, Materialization};
 pub use report::{
     CheckReport, ColumnLineageReport, ColumnReport, GraphArtifact, GraphEdgeArtifact,
     GraphNodeArtifact, ImpactReport, InspectReport, ListReport, ModelDetail, ModelLineageReport,
-    ModelSummary, RootReport, SourceSummary, TestSummary,
+    ModelSummary, RootReport, SeedSummary, SourceSummary, TestSummary,
 };
 pub use schema::{
     classify_schema_change, EmptySchemaProvider, RelationSchema, SchemaChangeSafety, SchemaColumn,

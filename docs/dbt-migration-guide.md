@@ -195,15 +195,17 @@ the model compiles. Common fixes:
 
 | REVIEW reason | What to do |
 |---|---|
-| project/package macro call (`{{ label_status(...) }}`, `{{ dbt_utils.star(...) }}`) | inline the equivalent SQL by hand |
+| project/package macro call with a dynamic body (`{% %}` statements, `run_query`) | inline the equivalent SQL by hand — simple expression-body macros and helpers like `dbt_utils.star`/`generate_surrogate_key`/`safe_cast`, `dbt_date.get_base_dates`, `dbt.date_trunc`/`current_timestamp` already lower statically |
 | `ephemeral` model | emitted as a view — usually fine; inline it into consumers if you want it gone |
 | `is_incremental()` else-branch kept | model is a correct full-refresh; add `@incremental` if you want incremental behaviour |
 | `env_var`/`target.*`/`run_started_at` | replace with a literal or a Phlo-native mechanism |
 | unresolved `ref`/`source`/`var` | fix the name or supply the var |
 
-UNSUPPORTED resources (snapshots, seeds, exposures, metrics) are listed in the
-report and the manifest with reasons — they need a manual decision, not a
-translation.
+Seed CSVs are copied to `seeds/` and load automatically at `run` time —
+no manual `duckdb` step is needed for them. UNSUPPORTED resources
+(snapshots, exposures, metrics, semantic models, dbt `unit_tests`/`groups`)
+are listed in the report and the manifest with reasons — they need a manual
+decision, not a translation.
 
 ## 5. Run the translated project on DuckDB
 

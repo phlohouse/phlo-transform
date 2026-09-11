@@ -1,5 +1,6 @@
 ---
 source: crates/phlo-transform-core/tests/snapshots.rs
+assertion_line: 59
 expression: "compiled(\"custom-roots\").check_report()"
 ---
 {
@@ -15,6 +16,7 @@ expression: "compiled(\"custom-roots\").check_report()"
   ],
   "model_count": 2,
   "source_count": 1,
+  "seed_count": 0,
   "test_count": 0,
   "diagnostics": []
 }

@@ -22,6 +22,9 @@ models:
     description: Customer mart with order counts
     meta:
       owner: analytics
+    tests:
+      - dbt_utils.expression_is_true:
+          expression: "customer_id >= 0"
     columns:
       - name: customer_id
         tests: [unique, not_null]

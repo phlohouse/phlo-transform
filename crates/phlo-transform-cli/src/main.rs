@@ -19,10 +19,10 @@ use phlo_transform_core::{
 use phlo_transform_daemon::{serve, spawn_watcher, WorkspaceService};
 use phlo_transform_duckdb::DuckDbAdapter;
 use phlo_transform_engine::{
-    collect_source_states, diff, ensure_environment, promote, relation_for_source, Adapter,
-    ArtifactWriter, CancelHandle, DiffPolicy, DiffRequest, DiffStrategy, EnvironmentSetup,
-    EnvironmentSpec, ExecutionStatus, Plan, PlanAction, Planner, PromotionRequest, RunOptions,
-    RunResult, Runner, SqliteStateStore, StateStore,
+    adapter_default_schema, collect_source_states, diff, ensure_environment, promote,
+    relation_for_source, Adapter, ArtifactWriter, CancelHandle, DiffPolicy, DiffRequest,
+    DiffStrategy, EnvironmentSetup, EnvironmentSpec, ExecutionStatus, Plan, PlanAction, Planner,
+    PromotionRequest, RunOptions, RunResult, Runner, SqliteStateStore, StateStore,
 };
 use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -1184,10 +1184,7 @@ async fn enrich(
     // Unqualified sources resolve through the engine's search path, so a
     // bare `raw_orders` lands in the adapter's own default schema — `main`
     // on DuckDB. Match that here or state/schema lookups miss entirely.
-    let default_schema = default_schema.or(match adapter.name() {
-        "duckdb" => Some("main"),
-        _ => None,
-    });
+    let default_schema = default_schema.or(adapter_default_schema(adapter.name()));
     let mut provider = StaticSchemaProvider::new();
     for source in &sources {
         let relation = relation_for_source(source, default_catalog, default_schema);
@@ -1215,10 +1212,15 @@ async fn enrich(
     }
     // A source whose state cannot be observed must not discard the schema
     // enrichment already gathered for the others.
-    let source_states =
-        collect_source_states(adapter.as_ref(), &sources, default_catalog, default_schema)
-            .await
-            .unwrap_or_default();
+    let source_states = collect_source_states(
+        adapter.as_ref(),
+        &sources,
+        &base.seeds,
+        default_catalog,
+        default_schema,
+    )
+    .await
+    .unwrap_or_default();
     Some(compile_with_options(project, &provider, &source_states))
 }
 
@@ -1253,6 +1255,7 @@ fn print_check_human(report: &CheckReport) {
     println!("Roots:     {}", report.roots.len());
     println!("Models:    {}", report.model_count);
     println!("Sources:   {}", report.source_count);
+    println!("Seeds:     {}", report.seed_count);
     println!("Tests:     {}", report.test_count);
     println!();
     println!(
@@ -1290,6 +1293,15 @@ fn print_list_human(report: &ListReport) {
     println!("Sources ({})", report.sources.len());
     for source in &report.sources {
         println!("  {}", source.name);
+    }
+
+    if !report.seeds.is_empty() {
+        println!();
+        println!("Seeds ({})", report.seeds.len());
+        for seed in &report.seeds {
+            let schema = seed.schema.as_deref().unwrap_or("<adapter default>");
+            println!("  {:<28} {} -> {}", seed.name, seed.path, schema);
+        }
     }
 
     println!();
@@ -1388,6 +1400,20 @@ fn print_plan_human(plan: &Plan) {
         }
     }
 
+    if !plan.seeds.is_empty() {
+        println!();
+        println!("Seeds ({})", plan.seeds.len());
+        for seed in &plan.seeds {
+            let action = match seed.action {
+                PlanAction::Build => "LOAD",
+                PlanAction::Skip => "SKIP",
+                PlanAction::Cached => "CACHED",
+                PlanAction::Unknown => "UNKNOWN",
+            };
+            println!("  {:<6} {:<28} {}", action, seed.name, seed.target);
+        }
+    }
+
     println!();
     println!("Tests ({})", plan.tests.len());
     for test in &plan.tests {
@@ -1400,6 +1426,20 @@ fn print_run_human(result: &RunResult) {
     println!("Run:    {}", result.run_id);
     println!("Status: {}", result.status.label());
     println!();
+    for seed in &result.seeds {
+        println!(
+            "  {:<8} {:<28} {}",
+            seed.status.label(),
+            seed.seed,
+            seed.target
+        );
+        if let Some(error) = &seed.error {
+            println!("           {error}");
+        }
+    }
+    if !result.seeds.is_empty() {
+        println!();
+    }
     for model in &result.models {
         println!(
             "  {:<8} {:<28} {}ms",
@@ -1722,6 +1762,7 @@ fn run_translate(
                         roots: Vec::new(),
                         model_count: 0,
                         source_count: 0,
+                        seed_count: 0,
                         test_count: 0,
                         diagnostics,
                     });

@@ -34,12 +34,16 @@ pub use environment::{ensure_environment, EnvironmentSetup, EnvironmentSpec};
 pub use error::{AdapterError, EngineError};
 pub use events::{EngineEvent, ExecutionStatus};
 pub use plan::{
-    dependency_closure, ChangeReason, Plan, PlanAction, PlannedModel, PlannedTest, Planner,
+    dependency_closure, ChangeReason, Plan, PlanAction, PlannedModel, PlannedSeed, PlannedTest,
+    Planner,
 };
 pub use promotion::{promote, PromotionRecord, PromotionRequest};
-pub use run::{ModelResult, RunOptions, RunResult, Runner, TestResult};
-pub use source_state::{collect_source_states, relation_for_source};
+pub use run::{ModelResult, RunOptions, RunResult, Runner, SeedResult, TestResult};
+pub use source_state::{
+    adapter_default_schema, collect_source_states, relation_for_source, seed_for_relation,
+    seed_relation,
+};
 pub use state::{
-    MaterializedRecord, ModelRunRecord, RunRecord, RunSummary, SqliteStateStore, StateStore,
-    TestRunRecord,
+    MaterializedRecord, ModelRunRecord, RunRecord, RunSummary, SeedRecord, SqliteStateStore,
+    StateStore, TestRunRecord,
 };

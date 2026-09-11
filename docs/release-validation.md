@@ -29,18 +29,20 @@ does not need one.
 
 ### canvas-exemplar (14 models, 6 sources, 6 macros, 3 packages, 25 exposures)
 
-| Classification | Before fixes | After fixes |
-|---|---|---|
-| CLEAN models | 5 (35.7%) | 9 (64.3%) |
-| REVIEW models | 9 | 5 |
-| UNSUPPORTED | 5 macros, 25 exposures (19 metrics + 6 semantic models) | unchanged |
+| Classification | Initial | After fixes | After compat pass |
+|---|---|---|---|
+| CLEAN models | 5 (35.7%) | 9 (64.3%) | **14 (100%)** |
+| REVIEW models | 9 | 5 | 0 |
+| UNSUPPORTED | 5 macros, 25 exposures (19 metrics + 6 semantic models) | unchanged | 1 macro (`generate_schema_name` — dynamic body), 29 property-only resources (exposures/metrics/semantic models + `unit_tests`/`groups`) |
 
-Remaining REVIEWs are all correct: project macro `cents_to_dollars` (3 call
-sites), package macro `dbt_utils.generate_surrogate_key`, and
-`dbt_date.get_base_dates(...)` in `metricflow_time_spine`. Jinja is
-deliberately never executed; these files are emitted broken on purpose so
-`check` fails loudly. `translate --verify` exits 1 on this project, as
-designed.
+Compatibility pass (current): the five REVIEW models converted cleanly —
+`cents_to_dollars` inlines via `adapter.dispatch` → `default__` variant
+(statically selected), `dbt_utils.generate_surrogate_key` lowers to
+`md5(concat_ws(…))`, `dbt_utils.star` lowers to `* exclude (…)`, and
+`dbt_date.get_base_dates(n_dateparts=365*10, datepart="day")` lowers to a
+`generate_series` spine (the integer arithmetic in `n_dateparts` is
+evaluated at translation time). `translate --verify` now **passes** on this
+project. Semantic-layer resources remain UNSUPPORTED by design.
 
 Note: the analysis report counts all 6 declared sources; the generated
 workspace reports 3 — only sources actually referenced by models are
@@ -49,31 +51,31 @@ counts.
 
 ### jaffle_shop_duckdb (5 models, 3 seeds)
 
-| | Before fixes | After fixes |
-|---|---|---|
-| CLEAN models | 1 (20%) | 4 (80%) |
-| REVIEW models | 4 | 1 (`orders` — a real `{% for %}` pivot a human must unroll) |
+| | Initial | After fixes | After compat pass |
+|---|---|---|---|
+| CLEAN models | 1 | 1 | **5 (100%)** |
+| REVIEW models | 4 | 4 | 0 |
+| CLEAN seeds | 0 | 0 | **3** |
 
-Before the fixes, `ref('raw_customers')`-style seed references failed with
-DBT001 "no known target" and modern `arguments:` test syntax produced false
-DBT014s. Now seed refs resolve to the physical relation; the seed resource
-itself stays REVIEW ("nothing loads the CSV for you") while the dependent
-model is CLEAN — the same contract as a source the warehouse must contain.
+The `orders.sql` pivot (`{% set payment_methods = [...] %}` + `{% for %}` +
+`{% if not loop.last %}`) now expands statically at translation time, and
+seeds became runnable inputs rather than manual prerequisites.
 
 ## End-to-end execution (jaffle_shop_duckdb → DuckDB)
 
-After translating (`--verify` exits 1 only because of the intentional
-`orders.sql` pivot) and loading the three seed CSVs as `raw_*` tables:
+The translated workspace runs verbatim with no manual seed loading: the
+three CSVs are copied to `seeds/` and the runner loads them
+(`CREATE OR REPLACE TABLE main.raw_* AS SELECT * FROM read_csv_auto(…)`)
+before building models.
 
 - `doctor`, `check`, `plan`, `run`, `test`, `inspect`, `explain`, `lineage`,
   `manifest` — all exit 0.
-- 15 tests pass (unique, relationships, accepted_values from `arguments:`
-  syntax, not_null directives).
-- **State:** after inserting a row into `raw_orders`/`raw_payments`, `plan`
-  correctly shows `BUILD staging.stg_orders / stg_payments` ("a source state
-  changed") and `BUILD jaffle_shop.customers / orders` ("an upstream model
-  version changed"), while `stg_customers` stays `SKIP`. The new row
-  propagates. A subsequent no-change run is a full `SKIP`.
+- 3 seeds load; 5 models build; 20 tests pass (unique, relationships,
+  accepted_values from `arguments:` syntax, not_null directives).
+- **State:** seed CSV content hashes are recorded in `seed_loads`; a changed
+  CSV re-plans the seed (and its downstream models, via the `csv:` source
+  state) and an unchanged CSV is `SKIP`. Source-table appends still trigger
+  rebuilds as before.
 
 ## Scaling benchmark (synthetic workspaces, DuckDB `:memory:`)
 
@@ -93,10 +95,10 @@ catalogue probes, which is inherent to a state-aware planner.
 
 1. **`ref()` to seeds failed to resolve (DBT001).** Seed names are known
    resources; a ref now resolves to the relation dbt would materialise the
-   CSV as (file stem in the target schema). The seed resource is REVIEW;
-   the referencing model is CLEAN with a note — the same contract as
-   sources. `relationships` test targets pointing at seeds resolve the same
-   way.
+   CSV as (file stem in the target schema). Seeds are native runnable
+   inputs — the CSV is copied to `seeds/` and loaded automatically — so
+   both the seed and the referencing model classify CLEAN.
+   `relationships` test targets pointing at seeds resolve the same way.
 2. **dbt `arguments:` test syntax unsupported.** The modern form
    `accepted_values: {arguments: {values: [...]}}` (and `relationships:
    {arguments: {to, field}}`) produced false "lacks a column or values" /
@@ -125,20 +127,35 @@ catalogue probes, which is inherent to a state-aware planner.
 
 - `fixtures/dbt-seeds` — seed `ref()`, `arguments:` test syntax,
   `dbt.date_trunc`.
+- `fixtures/dbt-jaffle` — extended with `{% set %}`/`{% for %}` expansion
+  (`payments_pivot`), `dbt_utils.generate_surrogate_key` +
+  dispatching `cents_to_dollars` (`orders_enriched`),
+  `dbt_date.get_base_dates` (`time_spine`), `dbt_utils.star`
+  (`package_users`), and a `dbt_utils.expression_is_true` test.
+- `fixtures/dbt-dynamic` — a dynamic `{% for %}` over `run_query` stays
+  REVIEW and keeps `--verify` failing.
+- `fixtures/native-seeds` — native `seeds/**/*.csv` discovery,
+  `[seeds] schema`, content-hash versioning.
 - `phlo-transform-dbt::seed_refs_arguments_syntax_and_dbt_builtins`.
+- `phlo-transform-engine::seed_loads_before_models_and_skips_when_unchanged`
+  and `seed_content_change_replans_the_load` — plan/apply/state over a
+  fake adapter.
+- `phlo-transform-core::csv_seeds_are_discovered_and_compiled`.
 - `phlo-transform-cli::unqualified_source_appends_trigger_rebuilds_on_duckdb`
   — full lifecycle e2e asserting a source append reclassifies the model
   `BUILD`, not `SKIP`.
 
-## Known limitations (unchanged, documented)
+## Known limitations (documented)
 
 - dbt semantic-layer resources (metrics, semantic models, exposures),
-  snapshots, analyses, and disabled models are UNSUPPORTED by design.
-- Project and package macros (e.g. `cents_to_dollars`,
-  `dbt_utils.generate_surrogate_key`, `dbt_date.*`) are never executed;
+  snapshots, analyses, `unit_tests`/`groups`, and disabled models are
+  UNSUPPORTED by design.
+- Dynamic macros and Jinja constructs (`{% set %}` capture blocks, `{% for %}`
+  over non-literals, `run_query`, `{% call %}`, macro bodies containing
+  `{% %}` statements, e.g. `generate_schema_name`) are never executed;
   call sites are REVIEW and must be rewritten by hand.
-- Seeds have no native representation; `ref()`s to them resolve, but the
-  CSV must be loaded into the target relation manually.
+- Seeds translate to native CSV inputs (DuckDB `load_csv`); adapters
+  without a `load_csv` implementation report them UNSUPPORTED.
 - DuckDB `source_state` fingerprints schema + row count: in-place updates
   that preserve the row count remain invisible (Iceberg snapshot IDs are the
   precise mechanism).
@@ -151,11 +168,11 @@ catalogue probes, which is inherent to a state-aware planner.
 
 **Ready for v0.1.0.** The documented install and getting-started path works
 in a clean container with no undocumented steps; the dbt translator produces
-honest, actionable classifications on a realistic project (64% of
-canvas-exemplar's and 80% of jaffle_shop_duckdb's models convert CLEAN;
-every remaining REVIEW is a real
-Jinja construct a human must decide on); the DuckDB lifecycle — plan, run,
-test, state-aware re-runs — is verified end-to-end; and compile performance
-is comfortable to at least 5,000 models. The version number already says
+honest, actionable classifications on realistic projects (100% of
+canvas-exemplar's and jaffle_shop_duckdb's models now convert CLEAN; every
+remaining REVIEW/UNSUPPORTED is a real dynamic or semantic-layer construct
+a human must decide on); the DuckDB lifecycle — seeds, plan, run, test,
+state-aware re-runs — is verified end-to-end; and compile performance is
+comfortable to at least 5,000 models. The version number already says
 what it is: an early release with documented gaps, and the docs match the
 behaviour observed here.

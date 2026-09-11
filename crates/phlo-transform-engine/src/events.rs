@@ -60,6 +60,13 @@ pub enum EngineEvent {
     ModelQueued {
         model: String,
     },
+    SeedStarted {
+        seed: String,
+    },
+    SeedFinished {
+        seed: String,
+        status: ExecutionStatus,
+    },
     ModelStarted {
         model: String,
     },

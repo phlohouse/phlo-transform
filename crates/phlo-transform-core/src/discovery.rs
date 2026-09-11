@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use phlo_transform_sql::{parse_directives, IncrementalStrategy, Materialization};
+use sha2::{Digest, Sha256};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::config::{
@@ -20,8 +21,8 @@ use crate::diagnostics::{codes, Diagnostic};
 use crate::identity::{IdentityError, ModelId, Namespace};
 use crate::model::{
     FrontendKind, ModelConfig, ModelOrigin, RootKind, RootNamespaceStrategy, RootRef,
-    SemanticModel, SemanticProject, SemanticTest, TestId, TransformRoot, TransformRootId,
-    WorkspaceDefaults,
+    SemanticModel, SemanticProject, SemanticSeed, SemanticTest, TestId, TransformRoot,
+    TransformRootId, WorkspaceDefaults,
 };
 use crate::semantic::{ColumnContract, ColumnTolerance, DataType, DiffPolicySpec, ModelContract};
 
@@ -131,12 +132,14 @@ pub fn load_project(workspace_root: &Path) -> Result<SemanticProject, Vec<Diagno
     }
 
     let tests = load_tests(workspace_root, &mut diagnostics);
+    let seeds = load_seeds(workspace_root, &config, &mut diagnostics);
 
     Ok(SemanticProject {
         workspace_root: Some(workspace_root.to_path_buf()),
         roots,
         models,
         tests,
+        seeds,
         defaults,
         cross_workflow: config.dependencies.cross_workflow,
         diagnostics,
@@ -484,6 +487,102 @@ fn test_name(relative_path: &Path) -> Option<String> {
         return None;
     }
     Some(components.join("."))
+}
+
+/// Discover CSV seeds under the conventional `seeds/` directory.
+///
+/// Seed names come from the file stem; the CSV content hash becomes the
+/// seed's source state so downstream models rebuild when the data changes.
+fn load_seeds(
+    workspace_root: &Path,
+    config: &PhloConfig,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<SemanticSeed> {
+    let mut seeds = Vec::new();
+    let dir = workspace_root.join("seeds");
+    if !dir.is_dir() {
+        return seeds;
+    }
+    let mut files = Vec::new();
+    for entry in WalkDir::new(&dir).follow_links(false) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                diagnostics.push(Diagnostic::warning(
+                    codes::PROJECT_FILE_READ,
+                    format!("could not read a seed entry: {error}"),
+                ));
+                continue;
+            }
+        };
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|e| e.to_str()) == Some("csv")
+        {
+            files.push(entry.path().to_path_buf());
+        }
+    }
+    files.sort();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for path in files {
+        let relative = match path.strip_prefix(workspace_root) {
+            Ok(relative) => relative.to_path_buf(),
+            Err(_) => path.clone(),
+        };
+        let display = display_path(&relative);
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                diagnostics.push(
+                    Diagnostic::error(
+                        codes::PROJECT_FILE_READ,
+                        format!("could not read seed: {error}"),
+                    )
+                    .with_path(display),
+                );
+                continue;
+            }
+        };
+        if !seen.insert(stem.to_string()) {
+            diagnostics.push(
+                Diagnostic::error(
+                    codes::PROJECT_SEED_NAME_COLLISION,
+                    format!("seed name `{stem}` is ambiguous across seeds/**"),
+                )
+                .with_path(display),
+            );
+            continue;
+        }
+        seeds.push(SemanticSeed {
+            name: stem.to_string(),
+            path: relative,
+            schema: config
+                .seed
+                .get(stem)
+                .and_then(|seed| seed.schema.clone())
+                .or_else(|| config.seeds.schema.clone()),
+            content_hash: format!("{:x}", Sha256::digest(&bytes)),
+            columns: seed_columns(&bytes),
+        });
+    }
+    seeds
+}
+
+/// The CSV header row, split on commas with surrounding quotes trimmed.
+/// (Quoted commas inside header names are not split — seed headers are
+/// simple identifiers in practice.)
+fn seed_columns(bytes: &[u8]) -> Vec<String> {
+    let header = match bytes.iter().position(|b| *b == b'\n' || *b == b'\r') {
+        Some(end) => &bytes[..end],
+        None => bytes,
+    };
+    let text = String::from_utf8_lossy(header);
+    text.split(',')
+        .map(|column| column.trim().trim_matches('"').to_string())
+        .filter(|column| !column.is_empty())
+        .collect()
 }
 
 struct RootInfo {
