@@ -163,7 +163,7 @@ pub fn render_lit(value: &Lit) -> Option<String> {
 
 /// Evaluate a `{% set %}` / `{% for %}` right-hand side statically:
 /// Python literals, names bound in `scope`, `var()` lookups, a small set of
-/// Jinja filters (`length`, `replace`, `default`, case/`trim`, `join`,
+/// Jinja filters (`length`, `replace`, case/`trim`, `join`,
 /// `int`/`string`) and small integer arithmetic. Returns `None` for
 /// anything dynamic.
 pub fn eval_static(text: &str, scope: &Scope, vars: &Mapping) -> Option<Lit> {
@@ -282,10 +282,12 @@ fn apply_filter(value: Lit, filter: &str, scope: &Scope, vars: &Mapping) -> Opti
             let (old, new) = (text(&args[0])?, text(&args[1])?);
             Some(Lit::Str(text(&value)?.replace(&old, &new)))
         }
-        "default" | "d" if args.len() == 1 => match value {
-            Lit::None => Some(args.into_iter().next().unwrap()),
-            other => Some(other),
-        },
+        // `default`/`d`, `escape`/`e` and `list` are intentionally not in the
+        // static subset: Jinja `default` substitutes only *undefined* values
+        // (falsey values pass through unless `boolean=true`), `escape`
+        // HTML-escapes `& < > ' "` rather than SQL-escaping quotes, and `list`
+        // turns a string into a character list. Approximations would mark
+        // expressions CLEAN while changing their output.
         "lower" => text(&value).map(|s| Lit::Str(s.to_lowercase())),
         "upper" => text(&value).map(|s| Lit::Str(s.to_uppercase())),
         "trim" | "strip" => text(&value).map(|s| Lit::Str(s.trim().to_string())),
@@ -310,8 +312,6 @@ fn apply_filter(value: Lit, filter: &str, scope: &Scope, vars: &Mapping) -> Opti
             Lit::Bool(b) => Some(Lit::Str(b.to_string())),
             _ => None,
         },
-        "e" | "escape" => text(&value).map(|s| Lit::Str(s.replace('\'', "''"))),
-        "list" => Some(value),
         _ => None,
     }
 }

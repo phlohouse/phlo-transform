@@ -496,12 +496,18 @@ fn static_eval_lowering() {
 
     // `dbt_utils.surrogate_key` is deprecated upstream (raises a compiler
     // error; historical null semantics differ) and bare `type_numeric()`
-    // is not the `dbt.` builtin — both stay REVIEW.
+    // is not the `dbt.` builtin — both stay REVIEW. `default`, `escape`
+    // and `list` filters are excluded from the static subset because
+    // faithful Jinja semantics (undefined-only defaulting, HTML escaping,
+    // string→char-list) differ from naive approximations.
     let not_provable = outcome("not_provable");
     assert_eq!(not_provable.classification, Classification::Review);
     let np = file("transforms/not_provable.sql");
     assert!(np.contains("surrogate_key"), "{np}");
     assert!(np.contains("type_numeric"), "{np}");
+    assert!(np.contains("default"), "{np}");
+    assert!(np.contains("escape"), "{np}");
+    assert!(np.contains("list"), "{np}");
 
     // The generated workspace compiles except for the REVIEW model, whose
     // residual Jinja must fail loudly — not silently change meaning.
