@@ -29,12 +29,17 @@ does not need one.
 
 ### canvas-exemplar (14 models, 6 sources, 6 macros, 3 packages, 25 exposures)
 
-| Classification | Initial | After fixes | After compat pass |
-|---|---|---|---|
-| CLEAN models | 5 (35.7%) | 9 (64.3%) | **14 (100%)** |
-| REVIEW models | 9 | 5 | 0 |
-| CLEAN macros/packages | — | — | **6 macros, 2 packages (`dbt_utils`, `dbt_date`)** |
-| UNSUPPORTED | 5 macros, 25 exposures (19 metrics + 6 semantic models) | unchanged | 29 property-only resources (exposures/metrics/semantic models + `unit_tests`/`groups`) |
+Upstream checkout ships no `profiles.yml`. Two runs are reported: the
+untouched project, and the project plus a minimal `type: duckdb` profile
+(which dbt itself also requires to run).
+
+| Classification | Initial | After fixes | Upstream (no profile) | With DuckDB profile |
+|---|---|---|---|---|
+| CLEAN models | 5 (35.7%) | 9 (64.3%) | **13 (92.9%)** | **14 (100%)** |
+| REVIEW models | 9 | 5 | 1 | 0 |
+| CLEAN macros | — | — | 6 | 6 |
+| CLEAN packages | — | — | 1 (`dbt_utils`) | 2 (+ `dbt_date`) |
+| UNSUPPORTED | 5 macros, 25 exposures | unchanged | 29 property-only resources (exposures/metrics/semantic models + `unit_tests`/`groups`) | same |
 
 Compatibility pass (current): the five REVIEW models converted cleanly —
 `cents_to_dollars` inlines via `adapter.dispatch` → `default__` variant
@@ -42,11 +47,15 @@ Compatibility pass (current): the five REVIEW models converted cleanly —
 `md5(concat_ws(…))`, and `dbt_utils.star` lowers to `* exclude (…)` for the
 provable argument subset. `metricflow_time_spine` uses
 `dbt_date.get_base_dates`, which lowers to a DuckDB-specific
-`generate_series` spine — canvas ships no `profiles.yml`, so a minimal
-`type: duckdb` profile was added for validation; without it the model stays
-REVIEW rather than emit backend-specific SQL for an unknown destination.
+`generate_series` spine only when the source profile declares
+`type: duckdb` — without a profile it stays REVIEW rather than emit
+backend-specific SQL for an unknown destination.
 The `generate_schema_name` override is evaluated statically for every
-exercised `(resource_type, schema)` case and matches the emitted schemas.
+exercised `(resource_type, schema)` case — canvas's cases never reach its
+`target.name` arm, so it proves target-independent and CLEAN. When a macro
+does branch on `target.name` and the profile declares multiple outputs,
+every output is evaluated and the macro stays REVIEW (naming the diverging
+target) unless all agree — a Phlo workspace is not dbt-target-specific.
 Declared packages are CLEAN when every observed call site lowers; the
 unpinned `dbt-audit-helper` git dependency stays REVIEW.
 Semantic-layer resources remain UNSUPPORTED by design.
@@ -181,7 +190,8 @@ catalogue probes, which is inherent to a state-aware planner.
 **Ready for v0.1.0.** The documented install and getting-started path works
 in a clean container with no undocumented steps; the dbt translator produces
 honest, actionable classifications on realistic projects (all
-jaffle_shop_duckdb models and 14/14 canvas-exemplar models convert CLEAN;
+jaffle_shop_duckdb models and all canvas-exemplar models convert CLEAN
+(13/14 untouched; 14/14 with a declared DuckDB profile);
 every remaining REVIEW/UNSUPPORTED is a real dynamic, backend-ambiguous, or
 semantic-layer construct a human must decide on); the DuckDB lifecycle — seeds, plan, run, test,
 state-aware re-runs — is verified end-to-end; and compile performance is

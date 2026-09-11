@@ -496,12 +496,14 @@ fn macro_outcome(name: &str, ctx: &Context) -> (Classification, Vec<MigrationIss
         )
     } else if name == "generate_schema_name" {
         match eval_schema_name_macro(def, ctx) {
-            Some(transformations) => (Classification::Clean, Vec::new(), transformations),
-            None => (
+            Ok(transformations) => (Classification::Clean, Vec::new(), transformations),
+            Err(reason) => (
                 Classification::Review,
                 vec![MigrationIssue::new(
                     codes::JINJA_STATEMENT,
-                    "`generate_schema_name` cannot be proven equivalent to the emitted schemas",
+                    format!(
+                        "`generate_schema_name` cannot be proven equivalent to the emitted schemas: {reason}"
+                    ),
                 )],
                 Vec::new(),
             ),
@@ -534,21 +536,34 @@ enum SchemaValue {
     Default,
 }
 
+/// The dbt target being evaluated: `name` is what `target.name` resolves to
+/// (unknown without a profile) and `default` is what
+/// `target.schema`/`default_schema` resolve to under that target.
+struct SchemaTarget {
+    name: Option<String>,
+    default: SchemaValue,
+}
+
 /// Statically evaluate a `generate_schema_name(custom_schema_name, node)`
 /// override. dbt calls it once per node with that node's `schema` config;
 /// we evaluate its `{% set %}` + `{% if/elif/else %}` chain for every
 /// `(resource_type, schema)` combination the project exercises and require
 /// each result to equal what the translation already emits for that case —
 /// `Literal(custom)` for a configured schema, `Default` otherwise.
-/// Returns per-case notes when provably equivalent, `None` → REVIEW.
-fn eval_schema_name_macro(def: &MacroDef, ctx: &Context) -> Option<Vec<String>> {
+///
+/// When the macro references `target.name` and the profile declares more
+/// than one output, every target is evaluated — an emitted Phlo workspace
+/// is not dbt-target-specific, so the schema layout must agree under all
+/// of them. `Err` explains the first target/case that diverges or cannot
+/// be proven; it becomes a REVIEW issue.
+fn eval_schema_name_macro(def: &MacroDef, ctx: &Context) -> Result<Vec<String>, String> {
     if ctx.schema_case_dynamic {
-        return None;
+        return Err("a model or seed has a non-static `schema` config".to_string());
     }
 
     // Split the body into leading `{% set %}` bindings and a single
     // top-level if/elif/else chain; anything else is not provable.
-    let mut bindings: BTreeMap<String, SchemaValue> = BTreeMap::new();
+    let mut set_stmts: Vec<(String, String)> = Vec::new();
     let mut arms: Vec<(Option<String>, Vec<&Segment>)> = Vec::new();
     let mut current: Option<(Option<String>, Vec<&Segment>)> = None;
     let mut chain_closed = false;
@@ -558,107 +573,193 @@ fn eval_schema_name_macro(def: &MacroDef, ctx: &Context) -> Option<Vec<String>> 
             Segment::Stmt { inner, .. } => {
                 let inner = inner.trim();
                 if chain_closed {
-                    return None;
+                    return Err("statements after the `{% endif %}` are not provable".to_string());
                 }
                 if let Some(rest) = inner.strip_prefix("set ") {
                     if current.is_some() {
-                        // `{% set %}` inside a chain arm.
-                        return None;
+                        return Err("`{% set %}` inside the chain is not provable".to_string());
                     }
-                    let (name, expr) = rest.split_once('=')?;
-                    bindings.insert(
-                        name.trim().to_string(),
-                        eval_schema_expr(expr.trim(), "", &None, &bindings, ctx)?,
-                    );
+                    let Some((name, expr)) = rest.split_once('=') else {
+                        return Err("block-form `{% set %}` is not provable".to_string());
+                    };
+                    set_stmts.push((name.trim().to_string(), expr.trim().to_string()));
                     continue;
                 }
                 let keyword = inner.split_whitespace().next().unwrap_or("");
                 match keyword {
                     "if" => {
                         if current.is_some() {
-                            // Nested `{% if %}` inside an arm.
-                            return None;
+                            return Err("nested `{% if %}` is not provable".to_string());
                         }
                         current = Some((Some(inner[2..].trim().to_string()), Vec::new()));
                     }
                     "elif" => {
-                        let (cond, body) = current.take()?;
+                        let Some((cond, body)) = current.take() else {
+                            return Err("`{% elif %}` without `{% if %}`".to_string());
+                        };
                         arms.push((cond, body));
                         current = Some((Some(inner[4..].trim().to_string()), Vec::new()));
                     }
                     "else" => {
-                        let (cond, body) = current.take()?;
+                        let Some((cond, body)) = current.take() else {
+                            return Err("`{% else %}` without `{% if %}`".to_string());
+                        };
                         arms.push((cond, body));
                         current = Some((None, Vec::new()));
                     }
                     "endif" => {
-                        let (cond, body) = current.take()?;
+                        let Some((cond, body)) = current.take() else {
+                            return Err("`{% endif %}` without `{% if %}`".to_string());
+                        };
                         arms.push((cond, body));
                         chain_closed = true;
                     }
-                    _ => return None,
+                    _ => {
+                        return Err(format!("`{{{{ {keyword} ... }}}}` is not provable"));
+                    }
                 }
             }
             Segment::Text(text) => {
                 if let Some((_, body)) = current.as_mut() {
                     body.push(segment);
                 } else if !text.trim().is_empty() {
-                    return None;
+                    return Err("literal text outside the chain is not provable".to_string());
                 }
             }
             Segment::Expr { .. } => {
                 if let Some((_, body)) = current.as_mut() {
                     body.push(segment);
                 } else {
-                    return None;
+                    return Err("`{{ ... }}` outside the chain is not provable".to_string());
                 }
             }
         }
     }
-    if !chain_closed || arms.is_empty() {
-        return None;
+    if !chain_closed {
+        return Err("the `{% if %}` chain is never closed".to_string());
+    }
+    if arms.is_empty() {
+        return Err("no `{% if %}` chain found".to_string());
     }
 
-    // Evaluate the chain for each exercised case.
-    let mut notes = Vec::new();
-    for (resource_type, custom) in &ctx.schema_cases {
-        let resolved = resolve_schema_chain(&arms, resource_type, custom, &bindings, ctx)?;
-        let expected = match custom {
-            Some(schema) => SchemaValue::Literal(schema.clone()),
-            None => SchemaValue::Default,
-        };
-        if resolved != expected {
-            return None;
+    // Which targets to evaluate: a macro that branches on `target.name`
+    // under a multi-output profile must agree for every output — a Phlo
+    // workspace is not dbt-target-specific.
+    let uses_target_name = def.body.iter().any(|segment| match segment {
+        Segment::Stmt { inner, .. } | Segment::Expr { inner, .. } => inner.contains("target.name"),
+        _ => false,
+    });
+    let profile = ctx.project.profile.as_ref();
+    let outputs = profile.map(|p| &p.outputs);
+    let multi_target = uses_target_name && outputs.is_some_and(|o| o.len() > 1);
+    let selected_schema = profile.and_then(|p| p.schema.clone());
+    // What `target.schema`/`default_schema` resolve to under each target:
+    // symbolic `Default` in the single/unknown-target case (equivalent to
+    // what we emit by construction), the concrete schema per output when
+    // comparing across targets.
+    let targets: Vec<SchemaTarget> = if multi_target {
+        outputs
+            .expect("multi_target implies a profile")
+            .iter()
+            .map(|(name, schema)| SchemaTarget {
+                name: Some(name.clone()),
+                default: schema
+                    .clone()
+                    .map(SchemaValue::Literal)
+                    .unwrap_or(SchemaValue::Default),
+            })
+            .collect()
+    } else {
+        vec![SchemaTarget {
+            name: profile.and_then(|p| p.name.clone()),
+            default: SchemaValue::Default,
+        }]
+    };
+    // The emitted layout is fixed at translation time: a configured schema
+    // is emitted verbatim; an unconfigured one lands in the workspace
+    // default — the selected target's schema when we know it.
+    let expected_default = if multi_target {
+        selected_schema
+            .clone()
+            .map(SchemaValue::Literal)
+            .unwrap_or(SchemaValue::Default)
+    } else {
+        SchemaValue::Default
+    };
+
+    let render = |value: &SchemaValue| match value {
+        SchemaValue::Literal(schema) => format!("`{schema}`"),
+        SchemaValue::Default => "the default schema".to_string(),
+    };
+
+    let mut notes =
+        vec!["`generate_schema_name` evaluated statically for every exercised case".to_string()];
+    for target in &targets {
+        let mut bindings: BTreeMap<String, SchemaValue> = BTreeMap::new();
+        for (name, expr) in &set_stmts {
+            let value = eval_schema_expr(expr, "", &None, &bindings, target)
+                .ok_or_else(|| format!("`{{{{ set {name} = {expr} }}}}` is not provable"))?;
+            bindings.insert(name.clone(), value);
         }
-        let case = match custom {
-            Some(schema) => format!("{resource_type}+{schema}"),
-            None => format!("{resource_type}+default"),
-        };
-        let outcome = match &resolved {
-            SchemaValue::Literal(schema) => format!("schema `{schema}`"),
-            SchemaValue::Default => "default schema".to_string(),
-        };
-        notes.push(format!("{case} → {outcome}"));
+        for (resource_type, custom) in &ctx.schema_cases {
+            let case = match custom {
+                Some(schema) => format!("{resource_type} with schema `{schema}`"),
+                None => format!("{resource_type} with no schema"),
+            };
+            let resolved =
+                resolve_schema_chain(&arms, resource_type, custom, &bindings, ctx, target)
+                    .ok_or_else(|| {
+                        format!(
+                            "under target `{}`: {case} cannot be resolved statically",
+                            target.name.as_deref().unwrap_or("(default)")
+                        )
+                    })?;
+            let expected = match custom {
+                Some(schema) => SchemaValue::Literal(schema.clone()),
+                None => expected_default.clone(),
+            };
+            if resolved != expected {
+                return Err(format!(
+                    "under target `{}`: {case} resolves to {}, expected {}",
+                    target.name.as_deref().unwrap_or("(default)"),
+                    render(&resolved),
+                    render(&expected)
+                ));
+            }
+            if multi_target {
+                break;
+            }
+            let outcome = match &resolved {
+                SchemaValue::Literal(schema) => format!("schema `{schema}`"),
+                SchemaValue::Default => "default schema".to_string(),
+            };
+            notes.push(format!("{case} → {outcome}"));
+        }
     }
-    notes.insert(
-        0,
-        "`generate_schema_name` evaluated statically for every exercised case".to_string(),
-    );
-    Some(notes)
+    if multi_target {
+        notes.push(format!(
+            "equivalent across all {} declared targets",
+            targets.len()
+        ));
+    }
+    Ok(notes)
 }
 
 /// Evaluate the `generate_schema_name` if/elif/else chain for one
-/// `(resource_type, custom_schema_name)` case.
+/// `(resource_type, custom_schema_name)` case under one dbt target.
 fn resolve_schema_chain(
     arms: &[(Option<String>, Vec<&Segment>)],
     resource_type: &str,
     custom: &Option<String>,
     bindings: &BTreeMap<String, SchemaValue>,
     ctx: &Context,
+    target: &SchemaTarget,
 ) -> Option<SchemaValue> {
     for (cond, body) in arms {
         let fires = match cond {
-            Some(cond) => eval_schema_condition(cond, resource_type, custom, bindings, ctx)?,
+            Some(cond) => {
+                eval_schema_condition(cond, resource_type, custom, bindings, ctx, target)?
+            }
             None => true,
         };
         if !fires {
@@ -680,7 +781,7 @@ fn resolve_schema_chain(
                         resource_type,
                         custom,
                         bindings,
-                        ctx,
+                        target,
                     )?);
                 }
                 Segment::Stmt { .. } | Segment::Comment(_) => {}
@@ -710,14 +811,15 @@ fn resolve_schema_chain(
 /// Resolve an operand in the `generate_schema_name` scope: quoted literals,
 /// `none`, `target.*`, `node.resource_type`, `custom_schema_name`, or a
 /// `{% set %}` binding. `Default`-bound names resolve to the literal
-/// profile schema when one is known — inside a condition we need the
-/// concrete value, and an unknown value makes the condition unprovable.
+/// schema when one is known — inside a condition we need the concrete
+/// value, and an unknown value makes the condition unprovable.
 fn eval_schema_operand(
     text: &str,
     resource_type: &str,
     custom: &Option<String>,
     bindings: &BTreeMap<String, SchemaValue>,
     ctx: &Context,
+    target: &SchemaTarget,
 ) -> Option<Lit> {
     match text {
         "custom_schema_name" => Some(match custom {
@@ -725,43 +827,42 @@ fn eval_schema_operand(
             None => Lit::None,
         }),
         "node.resource_type" => Some(Lit::Str(resource_type.to_string())),
-        "target.name" => ctx
-            .project
-            .profile
-            .as_ref()
-            .and_then(|p| p.name.clone())
-            .map(Lit::Str),
-        "target.schema" => Some(
+        "target.name" => target.name.clone().map(Lit::Str),
+        "target.schema" => schema_value_lit(&target.default, ctx),
+        other => match bindings.get(other) {
+            Some(value) => schema_value_lit(value, ctx),
+            None => pylit::parse_value(other).ok(),
+        },
+    }
+}
+
+/// A `SchemaValue` as a `Lit` for condition operands — `Default` becomes
+/// the selected profile schema when known, else unprovable.
+fn schema_value_lit(value: &SchemaValue, ctx: &Context) -> Option<Lit> {
+    match value {
+        SchemaValue::Literal(lit) => Some(Lit::Str(lit.clone())),
+        SchemaValue::Default => Some(
             ctx.project
                 .profile
                 .as_ref()
                 .and_then(|p| p.schema.clone())
                 .map(Lit::Str)?,
         ),
-        other => match bindings.get(other) {
-            Some(SchemaValue::Literal(lit)) => Some(Lit::Str(lit.clone())),
-            Some(SchemaValue::Default) => Some(
-                ctx.project
-                    .profile
-                    .as_ref()
-                    .and_then(|p| p.schema.clone())
-                    .map(Lit::Str)?,
-            ),
-            None => pylit::parse_value(other).ok(),
-        },
     }
 }
 
-/// Evaluate one `{% if %}`/`{% elif %}` condition against a case.
-/// Supports `is none`/`is not none`, `==`/`!=`, `not`, and truthiness.
+/// Evaluate one `{% if %}`/`{% elif %}` condition against a case under one
+/// target. Supports `is none`/`is not none`, `==`/`!=`, `not`, truthiness.
 fn eval_schema_condition(
     cond: &str,
     resource_type: &str,
     custom: &Option<String>,
     bindings: &BTreeMap<String, SchemaValue>,
     ctx: &Context,
+    target: &SchemaTarget,
 ) -> Option<bool> {
-    let operand = |text: &str| eval_schema_operand(text, resource_type, custom, bindings, ctx);
+    let operand =
+        |text: &str| eval_schema_operand(text, resource_type, custom, bindings, ctx, target);
     let truthy = |lit: Lit| match lit {
         Lit::Bool(b) => Some(b),
         Lit::Int(n) => Some(n != 0),
@@ -791,7 +892,7 @@ fn eval_schema_condition(
 }
 
 /// Resolve a `{% set %}` right-hand side or an arm's `{{ expr }}` output to
-/// a `SchemaValue`: `target.schema`/`default_schema` → the symbolic
+/// a `SchemaValue`: `target.schema`/`default_schema` → the target's
 /// default, other idents → case inputs or bindings, literals → Literal.
 /// Trailing `| trim`/`| lower`/`| upper` filters apply to literals.
 fn eval_schema_expr(
@@ -799,26 +900,17 @@ fn eval_schema_expr(
     resource_type: &str,
     custom: &Option<String>,
     bindings: &BTreeMap<String, SchemaValue>,
-    ctx: &Context,
+    target: &SchemaTarget,
 ) -> Option<SchemaValue> {
     let (expr, filters) = match expr.split_once('|') {
         Some((value, filters)) => (value.trim(), Some(filters)),
         None => (expr.trim(), None),
     };
     let mut value = match expr {
-        "target.schema" | "default_schema"
-            if matches!(
-                bindings.get("default_schema"),
-                Some(SchemaValue::Default) | None
-            ) =>
-        {
-            SchemaValue::Default
-        }
+        "target.schema" => target.default.clone(),
         "custom_schema_name" => SchemaValue::Literal(custom.clone()?),
         "node.resource_type" => SchemaValue::Literal(resource_type.to_string()),
-        "target.name" => {
-            SchemaValue::Literal(ctx.project.profile.as_ref().and_then(|p| p.name.clone())?)
-        }
+        "target.name" => SchemaValue::Literal(target.name.clone()?),
         other => bindings.get(other).cloned().or_else(|| {
             pylit::parse_value(other).ok().and_then(|lit| match lit {
                 Lit::Str(text) | Lit::Ident(text) => Some(SchemaValue::Literal(text)),

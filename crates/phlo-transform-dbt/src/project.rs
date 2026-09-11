@@ -46,6 +46,9 @@ pub struct DbtPropertyFile {
 pub struct ProfileTarget {
     /// The selected target's name (`target: dev` → `dev`); `target.name` in Jinja.
     pub name: Option<String>,
+    /// Every declared output: name → schema. Used to evaluate
+    /// `generate_schema_name` across all targets, not just the selected one.
+    pub outputs: BTreeMap<String, Option<String>>,
     pub adapter_type: Option<String>,
     pub database: Option<String>,
     pub catalog: Option<String>,
@@ -410,6 +413,17 @@ fn read_profile(root: &Path, profile_name: Option<&str>) -> Option<ProfileTarget
                 .and_then(Value::as_str)
                 .map(str::to_string)
         }),
+        outputs: outputs
+            .iter()
+            .filter_map(|(name, output)| {
+                name.as_str().map(|name| {
+                    (
+                        name.to_string(),
+                        get_str(output, "schema").map(str::to_string),
+                    )
+                })
+            })
+            .collect(),
         adapter_type: get_str(target, "type").map(str::to_string),
         database: get_str(target, "database").map(str::to_string),
         catalog: get_str(target, "catalog").map(str::to_string),

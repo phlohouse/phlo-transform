@@ -78,7 +78,7 @@ existing files unless `--overwrite` is passed. The manifest lands at
 | `contract: enforced: true` | `[model.*.contract]` + column types in `phlo.toml` |
 | `models: <proj>: <dir>: +materialized/+schema/+tags` | `transform.toml` folder config |
 | `models: <proj>: +materialized` | `default_materialization` in `phlo.toml` |
-| `{% macro generate_schema_name(custom_schema_name, node) %}` overrides | evaluated statically: its `{% set %}`/`{% if/elif/else %}` chain is run for every `(resource_type, schema)` case the project exercises (`node.resource_type`, `custom_schema_name [is] none`, `target.name`, `target.schema`, `| trim/lower/upper`); CLEAN only when every case resolves to the schema Phlo already emits — otherwise REVIEW |
+| `{% macro generate_schema_name(custom_schema_name, node) %}` overrides | evaluated statically: its `{% set %}`/`{% if/elif/else %}` chain is run for every `(resource_type, schema)` case the project exercises (`node.resource_type`, `custom_schema_name [is] none`, `target.name`, `target.schema`, `| trim/lower/upper`); when the macro references `target.name` and `profiles.yml` declares multiple outputs, every output is evaluated and all must agree — a Phlo workspace is not dbt-target-specific. CLEAN only when every case resolves to the schema Phlo already emits; a diverging or unprovable case is REVIEW and names the target |
 | singular tests | `tests/**/*.sql` (same layout) |
 | sources | resolved to physical relations; metadata in the manifest |
 

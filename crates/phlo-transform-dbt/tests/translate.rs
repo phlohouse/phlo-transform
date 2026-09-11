@@ -349,6 +349,42 @@ fn seed_refs_arguments_syntax_and_dbt_builtins() {
     assert_eq!(spine.classification, Classification::Review);
 }
 
+/// Regression: `generate_schema_name` must not be marked CLEAN for only
+/// the selected target. With `target: dev` + a `prod` output, the `prod`
+/// arm places a custom-schematised model in `prod_custom` while the
+/// emitted layout uses `custom` — divergent across targets → REVIEW.
+#[test]
+fn multi_target_schema_macro_stays_review() {
+    let translation = translate_project(&fixture("dbt-schema-targets")).expect("dbt project loads");
+    let macro_outcome = translation
+        .report
+        .resources
+        .iter()
+        .find(|r| r.kind == ResourceKind::Macro && r.name == "generate_schema_name")
+        .expect("generate_schema_name outcome");
+    assert_eq!(macro_outcome.classification, Classification::Review);
+    assert!(
+        macro_outcome
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("`prod`")),
+        "the issue names the diverging target: {:?}",
+        macro_outcome.issues
+    );
+
+    // The models themselves are unaffected — the override only determines
+    // where dbt would have placed them.
+    assert!(
+        translation
+            .report
+            .resources
+            .iter()
+            .filter(|r| r.kind == ResourceKind::Model)
+            .all(|m| m.classification == Classification::Clean),
+        "models stay clean"
+    );
+}
+
 #[test]
 fn clean_fixture_verifies_with_the_native_compiler() {
     let translation = translate_project(&fixture("dbt-clean")).expect("load");
