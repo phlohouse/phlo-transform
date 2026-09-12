@@ -14,7 +14,9 @@ use std::ops::ControlFlow;
 
 use phlo_transform_sql::RelationName;
 use sqlparser::ast::Statement;
-use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, Query, TableFactor, VisitMut, VisitorMut};
+use sqlparser::ast::{
+    Ident, ObjectName, ObjectNamePart, Query, TableAlias, TableFactor, VisitMut, VisitorMut,
+};
 
 use crate::identity::ModelId;
 use crate::model::Relation;
@@ -23,12 +25,15 @@ use crate::resolve::{RegistryEntry, Resolution, Resolver};
 /// Rewrite a model's statements into compiled SQL.
 ///
 /// When `current` is `None` the rewrite uses global resolution (used for
-/// tests, which have no namespace context).
+/// tests, which have no namespace context). `ephemerals` maps ephemeral model
+/// ids to their already-expanded queries; references to them are inlined as
+/// derived tables rather than rewritten to a physical target.
 pub(crate) fn rewrite_statements(
     statements: &mut [Statement],
     current: Option<&RegistryEntry>,
     resolver: &Resolver,
     targets: &BTreeMap<ModelId, Relation>,
+    ephemerals: &BTreeMap<ModelId, Query>,
 ) -> String {
     for statement in statements.iter_mut() {
         let mut rewriter = RelationRewriter {
@@ -36,6 +41,7 @@ pub(crate) fn rewrite_statements(
             current,
             resolver,
             targets,
+            ephemerals,
         };
         let _ = statement.visit(&mut rewriter);
     }
@@ -52,6 +58,7 @@ struct RelationRewriter<'a> {
     current: Option<&'a RegistryEntry>,
     resolver: &'a Resolver,
     targets: &'a BTreeMap<ModelId, Relation>,
+    ephemerals: &'a BTreeMap<ModelId, Query>,
 }
 
 impl RelationRewriter<'_> {
@@ -91,37 +98,55 @@ impl VisitorMut for RelationRewriter<'_> {
     }
 
     fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
-        if let TableFactor::Table { name, args, .. } = factor {
-            if args.is_none() {
-                self.maybe_rewrite(name);
-            }
+        let TableFactor::Table {
+            name,
+            args,
+            alias: existing_alias,
+            ..
+        } = factor
+        else {
+            return ControlFlow::Continue(());
+        };
+        if args.is_some() {
+            return ControlFlow::Continue(());
         }
-        ControlFlow::Continue(())
-    }
-}
-
-impl RelationRewriter<'_> {
-    fn maybe_rewrite(&mut self, name: &mut ObjectName) {
         let parts: Vec<String> = name
             .0
             .iter()
             .filter_map(|part| part.as_ident().map(|ident| ident.value.clone()))
             .collect();
         let Some(relation) = RelationName::new(parts) else {
-            return;
+            return ControlFlow::Continue(());
         };
         if self.is_cte(&relation) {
-            return;
+            return ControlFlow::Continue(());
         }
         let resolution = match self.current {
             Some(current) => self.resolver.resolve(current, &relation),
             None => self.resolver.resolve_global(&relation),
         };
-        if let Resolution::Model(id) = resolution {
-            if let Some(target) = self.targets.get(&id) {
-                *name = object_name(target);
-            }
+        let Resolution::Model(id) = resolution else {
+            return ControlFlow::Continue(());
+        };
+        if let Some(subquery) = self.ephemerals.get(&id) {
+            // Keep the user's alias (`from x as y`) — outer column refs bind
+            // to it; otherwise name the derived table after the model.
+            let alias = existing_alias.take().or(Some(TableAlias {
+                explicit: true,
+                name: Ident::new(relation.last()),
+                columns: Vec::new(),
+                at: None,
+            }));
+            *factor = TableFactor::Derived {
+                lateral: false,
+                subquery: Box::new(subquery.clone()),
+                alias,
+                sample: None,
+            };
+        } else if let Some(target) = self.targets.get(&id) {
+            *name = object_name(target);
         }
+        ControlFlow::Continue(())
     }
 }
 

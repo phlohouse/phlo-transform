@@ -1,0 +1,18 @@
+{
+  "git:https://github.com/dbt-labs/dbt-audit-helper.git": {
+    "commit": "74072850a5bccd90235576d67530c98e3b7437f4",
+    "version": "74072850a5bccd90235576d67530c98e3b7437f4"
+  },
+  "hub:dbt-labs/dbt_utils": {
+    "tarball": "https://codeload.github.com/dbt-labs/dbt-utils/tar.gz/1.4.1",
+    "version": "1.4.1"
+  },
+  "hub:dbt-labs/spark_utils": {
+    "tarball": "https://codeload.github.com/dbt-labs/spark-utils/tar.gz/0.3.3",
+    "version": "0.3.3"
+  },
+  "hub:fivetran/fivetran_utils": {
+    "tarball": "https://codeload.github.com/fivetran/dbt_fivetran_utils/tar.gz/v0.4.13",
+    "version": "0.4.13"
+  }
+}

@@ -198,14 +198,25 @@ impl Planner {
         let blocked = !compilation.is_ok();
         let planned_ids = dependency_closure(compilation, selected);
 
+        // Ephemeral models are inlined into their dependents at compile time
+        // and never produce a relation, so they are not planned or executed.
         let order: Vec<ModelId> = compilation
             .topological_order()
             .unwrap_or_else(|| planned_ids.iter().cloned().collect())
             .into_iter()
             .filter(|id| planned_ids.contains(id))
+            .filter(|id| {
+                compilation
+                    .model(id)
+                    .map(|model| model.config.materialization != Materialization::Ephemeral)
+                    .unwrap_or(false)
+            })
             .collect();
 
-        // Seeds are planned for the source relations the selected models read.
+        // Seeds are planned for the source relations the selected models
+        // read — including ephemeral models: they are filtered out of `order`
+        // but their source reads are inlined into dependents, so a seed used
+        // only inside an ephemeral chain still has to be loaded.
         let default_catalog = compilation.defaults.catalog.as_deref();
         let default_schema = compilation
             .defaults
@@ -215,7 +226,7 @@ impl Planner {
         let mut needed_seeds: BTreeMap<String, &phlo_transform_core::CompiledSeed> =
             BTreeMap::new();
         let mut seed_sources: Vec<&SourceId> = Vec::new();
-        for id in &order {
+        for id in &planned_ids {
             let Some(model) = compilation.model(id) else {
                 continue;
             };

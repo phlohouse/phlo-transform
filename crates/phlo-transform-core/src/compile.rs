@@ -6,9 +6,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use phlo_transform_sql::{
-    extract_relations, parse_statements, Dialect, DirectiveIssueKind, RelationName,
+    extract_relations, parse_statements, Dialect, DirectiveIssueKind, Materialization, RelationName,
 };
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Query, Statement};
 
 use crate::analyze::Analyzer;
 use crate::compiled::{Compilation, CompiledModel, CompiledSeed, CompiledTest};
@@ -129,13 +129,18 @@ pub fn compile_with_options(
     }
     detect_target_collisions(&unique, &targets, &mut diagnostics);
 
-    // Resolve dependencies and compile SQL for each unique model.
+    // Resolve dependencies for every model first: ephemeral expansion needs
+    // each model's graph edges regardless of iteration order.
     let workflows: BTreeMap<ModelId, Option<String>> = unique
         .iter()
         .map(|entry| (entry.model.id.clone(), entry.model.workflow.clone()))
         .collect();
+    let lowered_by_id: std::collections::HashMap<&ModelId, &LoweredModel> = unique
+        .iter()
+        .map(|entry| (&entry.model.id, *entry))
+        .collect();
 
-    let mut compiled_models: Vec<CompiledModel> = Vec::with_capacity(unique.len());
+    let mut dependencies_by_id: BTreeMap<ModelId, Vec<Dependency>> = BTreeMap::new();
     for entry in &unique {
         let registry_entry = entry_for(entry);
         let mut dependencies: Vec<Dependency> = Vec::new();
@@ -188,10 +193,44 @@ pub fn compile_with_options(
                 }
             }
         }
+        dependencies_by_id.insert(entry.model.id.clone(), dependencies);
+    }
+
+    let mut expansion = Expansion {
+        lowered: lowered_by_id.clone(),
+        resolver: &resolver,
+        targets: &targets,
+        dependencies: &dependencies_by_id,
+        memo: BTreeMap::new(),
+        visiting: BTreeSet::new(),
+    };
+
+    let mut compiled_models: Vec<CompiledModel> = Vec::with_capacity(unique.len());
+    for entry in &unique {
+        let registry_entry = entry_for(entry);
+        let dependencies = dependencies_by_id[&entry.model.id].clone();
+
+        // References to ephemeral models are inlined as derived tables whose
+        // own ephemeral dependencies are already expanded.
+        let mut ephemerals: BTreeMap<ModelId, Query> = BTreeMap::new();
+        for dependency in &dependencies {
+            if let Dependency::Model(dependency_id) = dependency {
+                if expansion.is_ephemeral(dependency_id) {
+                    if let Some(query) = expansion.expand(dependency_id, &mut diagnostics) {
+                        ephemerals.insert(dependency_id.clone(), query);
+                    }
+                }
+            }
+        }
 
         let mut statements = entry.statements.clone();
-        let compiled_sql =
-            rewrite_statements(&mut statements, Some(&registry_entry), &resolver, &targets);
+        let compiled_sql = rewrite_statements(
+            &mut statements,
+            Some(&registry_entry),
+            &resolver,
+            &targets,
+            &ephemerals,
+        );
 
         compiled_models.push(CompiledModel {
             id: entry.model.id.clone(),
@@ -213,7 +252,13 @@ pub fn compile_with_options(
         });
     }
 
-    let compiled_tests = compile_tests(project, &resolver, &targets, &mut diagnostics);
+    let compiled_tests = compile_tests(
+        project,
+        &resolver,
+        &targets,
+        &mut expansion,
+        &mut diagnostics,
+    );
 
     let compiled_seeds: Vec<CompiledSeed> = project
         .seeds
@@ -256,10 +301,6 @@ pub fn compile_with_options(
     // Type, column and lineage analysis in dependency order. A cyclic graph is
     // already an error, so analysis is skipped in that case.
     if let Some(order) = compilation.topological_order() {
-        let lowered_by_id: std::collections::HashMap<&ModelId, &LoweredModel> = unique
-            .iter()
-            .map(|entry| (&entry.model.id, *entry))
-            .collect();
         let mut model_schemas: BTreeMap<ModelId, ModelSchema> = BTreeMap::new();
         let mut model_versions: ModelVersions = BTreeMap::new();
         let mut generated_tests: Vec<CompiledTest> = Vec::new();
@@ -280,8 +321,27 @@ pub fn compile_with_options(
                     &mut compilation.diagnostics,
                 );
             }
-            if let Some(model) = compilation.model(&id) {
-                generated_tests.extend(generate_tests(&id, &assertions, &model.target));
+            // Assertions on ephemeral models test the expanded query — the
+            // model is never materialised, so its physical target does not
+            // exist. Expansion failures already raised diagnostics above.
+            let (is_ephemeral, target_sql) = compilation
+                .model(&id)
+                .map(|model| {
+                    (
+                        model.config.materialization == Materialization::Ephemeral,
+                        model.target.sql(),
+                    )
+                })
+                .unwrap_or((false, String::new()));
+            let subject = if is_ephemeral {
+                expansion
+                    .expand(&id, &mut compilation.diagnostics)
+                    .map(|query| format!("({query}) AS {}", quote_ident(id.last_segment())))
+            } else {
+                Some(target_sql)
+            };
+            if let Some(subject) = subject {
+                generated_tests.extend(generate_tests(&id, &assertions, &subject));
             }
 
             // Compute the content-addressed version from upstream versions.
@@ -480,13 +540,15 @@ fn validate_contract(
     }
 }
 
-/// Generate logical runtime tests from assertions.
-fn generate_tests(id: &ModelId, assertions: &[Assertion], target: &Relation) -> Vec<CompiledTest> {
+/// Generate logical runtime tests from assertions. `subject` is the FROM
+/// target: the physical relation for materialised models, or the expanded
+/// derived table for ephemeral ones.
+fn generate_tests(id: &ModelId, assertions: &[Assertion], subject: &str) -> Vec<CompiledTest> {
     assertions
         .iter()
         .map(|assertion| {
             let slug = assertion_slug(assertion);
-            let compiled_sql = assertion_sql(assertion, target);
+            let compiled_sql = assertion_sql(assertion, subject);
             CompiledTest {
                 id: TestId::new(format!("{}.generated.{slug}", id.logical_name())),
                 origin: ModelOrigin {
@@ -510,11 +572,11 @@ fn assertion_slug(assertion: &Assertion) -> String {
     }
 }
 
-fn assertion_sql(assertion: &Assertion, target: &Relation) -> String {
+fn assertion_sql(assertion: &Assertion, subject: &str) -> String {
     match assertion {
         Assertion::NotNull { column } => format!(
             "select * from {} where {} is null",
-            target.sql(),
+            subject,
             quote_ident(column)
         ),
         Assertion::Unique { columns } => {
@@ -522,7 +584,7 @@ fn assertion_sql(assertion: &Assertion, target: &Relation) -> String {
             format!(
                 "select {}, count(*) as __phlo_count from {} group by {} having count(*) > 1",
                 quoted.join(", "),
-                target.sql(),
+                subject,
                 quoted.join(", ")
             )
         }
@@ -538,6 +600,90 @@ struct LoweredModel<'a> {
     path: Option<String>,
     pinned_id: Option<ModelId>,
     statements: Vec<Statement>,
+}
+
+/// Memoised expansion of ephemeral models into single queries with their own
+/// ephemeral dependencies already inlined.
+struct Expansion<'a> {
+    lowered: std::collections::HashMap<&'a ModelId, &'a LoweredModel<'a>>,
+    resolver: &'a Resolver,
+    targets: &'a BTreeMap<ModelId, Relation>,
+    dependencies: &'a BTreeMap<ModelId, Vec<Dependency>>,
+    memo: BTreeMap<ModelId, Option<Query>>,
+    visiting: BTreeSet<ModelId>,
+}
+
+impl<'a> Expansion<'a> {
+    fn is_ephemeral(&self, id: &ModelId) -> bool {
+        self.lowered
+            .get(id)
+            .map(|lowered| lowered.model.config.materialization == Materialization::Ephemeral)
+            .unwrap_or(false)
+    }
+
+    /// Compile an ephemeral model to its expanded query, or `None` when it
+    /// cannot be inlined (not a single query, or part of a dependency cycle).
+    /// Failures leave the reference rewritten to a physical target, but the
+    /// error diagnostics they raise block execution.
+    fn expand(&mut self, id: &ModelId, diagnostics: &mut Vec<Diagnostic>) -> Option<Query> {
+        if let Some(cached) = self.memo.get(id) {
+            return cached.clone();
+        }
+        let lowered = self.lowered.get(id).copied()?;
+        if !self.visiting.insert(id.clone()) {
+            // A cycle here is also reported by the graph cycle check.
+            return None;
+        }
+        let registry_entry = entry_for(lowered);
+        let mut statements = lowered.statements.clone();
+
+        let nested: Vec<ModelId> = self
+            .dependencies
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter_map(|dependency| match dependency {
+                Dependency::Model(dep_id) => Some(dep_id.clone()),
+                Dependency::Source(_) => None,
+            })
+            .filter(|dep_id| self.is_ephemeral(dep_id))
+            .collect();
+        let mut ephemerals: BTreeMap<ModelId, Query> = BTreeMap::new();
+        for dep_id in nested {
+            if let Some(query) = self.expand(&dep_id, diagnostics) {
+                ephemerals.insert(dep_id, query);
+            }
+        }
+
+        rewrite_statements(
+            &mut statements,
+            Some(&registry_entry),
+            self.resolver,
+            self.targets,
+            &ephemerals,
+        );
+        self.visiting.remove(id);
+
+        let expanded = match statements.as_slice() {
+            [Statement::Query(query)] => Some((**query).clone()),
+            _ => {
+                let mut diagnostic = Diagnostic::error(
+                    codes::MODEL_EPHEMERAL,
+                    format!(
+                        "ephemeral model `{}` must be a single query to be inlined",
+                        id.logical_name()
+                    ),
+                );
+                if let Some(path) = &lowered.path {
+                    diagnostic.labels.push(path.clone());
+                }
+                diagnostics.push(diagnostic);
+                None
+            }
+        };
+        self.memo.insert(id.clone(), expanded.clone());
+        expanded
+    }
 }
 
 fn entry_for(model: &LoweredModel<'_>) -> RegistryEntry {
@@ -609,6 +755,7 @@ fn compile_tests(
     project: &SemanticProject,
     resolver: &Resolver,
     targets: &BTreeMap<ModelId, Relation>,
+    expansion: &mut Expansion<'_>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<CompiledTest> {
     let mut tests = Vec::with_capacity(project.tests.len());
@@ -649,7 +796,16 @@ fn compile_tests(
             }
         }
 
-        let compiled_sql = rewrite_statements(&mut statements, None, resolver, targets);
+        let mut ephemerals: BTreeMap<ModelId, Query> = BTreeMap::new();
+        for id in &model_targets {
+            if expansion.is_ephemeral(id) {
+                if let Some(query) = expansion.expand(id, diagnostics) {
+                    ephemerals.insert(id.clone(), query);
+                }
+            }
+        }
+        let compiled_sql =
+            rewrite_statements(&mut statements, None, resolver, targets, &ephemerals);
 
         tests.push(CompiledTest {
             id: test.id.clone(),

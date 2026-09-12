@@ -41,9 +41,13 @@ existing files unless `--overwrite` is passed. The manifest lands at
   `sources:`, `exposures:`, `metrics:`, `semantic_models:`, `seeds:`,
   `snapshots:`).
 - `tests/**/*.sql` singular tests, `macros/`, `data/`, `snapshots/`,
-  `analyses/`, `packages.yml`/`dependencies.yml`, and a project-local
-  `profiles.yml` (non-secret target fields only: `type`, `database`,
-  `catalog`, `schema`).
+  `analyses/`, `packages.yml`/`dependencies.yml`/`package-lock.yml`, and a
+  project-local `profiles.yml` (non-secret target fields only: `type`,
+  `database`, `catalog`, `schema`).
+- `dbt_packages/<pkg>/` (installed package source) and `local:` package
+  directories: their `dbt_project.yml` name, `macros/**/*.sql` bodies and
+  `models/` names — read for static analysis only, never executed or
+  vendored into the output.
 
 ## What is translated
 
@@ -76,13 +80,17 @@ existing files unless `--overwrite` is passed. The manifest lands at
 | `{{ config(...) }}` with non-literal values (`target.type == 'x'`, `var()`, boolean project-macro wrappers) | evaluated statically; `enabled = false` marks the model UNSUPPORTED (Phlo has no disabled state) |
 | `config(schema = 'literal')` differing from the derived namespace | model relocated under a `custom/` folder with `-- @id` preserving its logical name; dynamic schemas stay REVIEW |
 | `{{ pkg.macro(...) }}` where `pkg` is the project's own name | inlined like an unqualified project macro; `adapter.dispatch('m', '<project>')` resolves to `default__m`/adapter variants |
+| `{{ pkg.macro(...) }}` where `pkg` is a declared dependency | inlined from `dbt_packages/`/`local:` source under the same static rules as project macros; a unique unqualified name defined by exactly one installed package also resolves. Calls into a package that is not installed, or into `ref('pkg', 'm')` package models, stay REVIEW |
+| `{{ fivetran_utils.partition_by_source_relation(pkg, ...) }}` | `partition by <alias.>source_relation`, `, <alias.>source_relation`, or empty — driven by the statically-known `*_union_schemas`/`*_union_databases`/`*_sources` vars, matching the upstream `default__` body. Only applies when the installed package's macro body fingerprint-matches the verified upstream source; a modified or unknown implementation stays REVIEW |
+| `{{ fivetran_utils.fill_pass_through_columns('var_name') }}` | `, field` per list entry; mapping entries honour `transform_sql`/`alias`/`name`. An unset var (which raises upstream) or non-list value stays REVIEW. Fingerprint-guarded like `partition_by_source_relation` |
 | Jinja ternaries `x if cond else y`, `~` concatenation, `not/and/or`, `in`, `is [not] sameas/none`, `> >= < <=` comparisons | evaluated statically |
 | `{% for x in <literal list> %}…{% endfor %}` (incl. `loop.index/first/last`) | unrolled statically |
 | `{% if <statically-known condition> %}` / `{% if execute %}` | resolved at translation time / gate removed |
 | `test: {arguments: {...}}` (modern) and `test: {...}` (legacy) | both argument spellings are read |
-| `{{ var('x') }}` / `var('x', default)` | the literal value from `vars:` |
+| `{{ var('x') }}` / `var('x', default)` | the literal value from `vars:` — the project-namespaced block `vars.<project>.x` is searched first (dbt precedence), then the root `vars.x` |
 | `{{ config(...) }}` | removed; its values become directives/config |
 | `materialized: table/view` | `-- @table` / `-- @view` (or inherited) |
+| `materialized: ephemeral` | `-- @ephemeral` — inlined into dependents as a subquery at compile time; never materialised |
 | `materialized: incremental` + `unique_key` | `-- @incremental key=…` |
 | `incremental` + `insert_overwrite` + `partition_by` | `-- @incremental partition=…` |
 | `incremental` + `append` | `-- @incremental append` |
@@ -108,22 +116,28 @@ Every resource is classified — nothing is silently treated as equivalent.
 - `CLEAN` — translated to native semantics with no residual Jinja.
 - `REVIEW` — emitted but requires human attention: residual Jinja
   (`{% set %}`/`{% for %}`/`{% if %}` whose values are not statically
-  known, dynamic macros, `run_query`), `ephemeral` materialisation
-  (emitted as a view), environment-dependent expressions (`env_var`,
-  `run_started_at`, `target.*`, `adapter.*` calls beyond dispatch),
-  unresolved `ref`/`source`/`var`, unrecognised incremental patterns
-  (degraded to full-refresh), unconvertible config (`grants`, hooks,
-  `database`), and package dependencies.
+  known, dynamic macros, `run_query`), environment-dependent expressions
+  (`env_var`, `run_started_at`, `target.*`, `adapter.*` calls beyond
+  dispatch), unresolved `ref`/`source`/`var`, unrecognised incremental
+  patterns (degraded to full-refresh), unconvertible config (`grants`,
+  hooks, `database`), and package dependencies.
 - `UNSUPPORTED` — not emitted: `snapshot`/`custom` materialisations, snapshot
   and analysis files, disabled models, exposures/metrics/semantic models,
   dbt `unit_tests`/`groups`, and macros that perform runtime operations.
 
 Package dependencies are CLEAN when every observed call site — model
 expressions and package-qualified generic tests — lowered to a native
-equivalent, and REVIEW when any call site could not be lowered (a package
-resource is only dependency accounting: unexercised package contents are
-never vendored). Packages that are declared but unused, or whose helpers we
-do not cover, stay REVIEW.
+equivalent, and REVIEW when any call site could not be lowered. A declared
+package with no installed source (`dbt_packages/` absent and not a `local:`
+path) reports that distinctly: its macro bodies cannot even be inspected,
+so every call stays REVIEW. Installed source is inspected statically only —
+adapter-dispatching helpers fall back to recognised `default__`
+implementations; `run_query`, `adapter.get_relation` and other warehouse
+introspection never lower. Project-level `dispatch:` configuration is
+honoured: a `macro_namespace` entry's `search_order` replaces the default
+search, so a root-project or earlier-package override wins — and when no
+ordered candidate exists the call stays REVIEW rather than falling back to
+an implementation dbt would not select.
 
 The report (`--check`) shows per-kind counts by classification, model
 conversion coverage, and deduplicated review reasons. `--json` returns the
@@ -148,4 +162,5 @@ idempotence auditing.
   used as workspace defaults.
 - Seeds load as `CREATE OR REPLACE TABLE … SELECT * FROM read_csv_auto(…)`
   (DuckDB); adapters without `load_csv` report seeds UNSUPPORTED at plan
-  time. Package dependencies are reported, not vendored.
+  time. Package dependencies are reported; installed package source is
+  read for static analysis but never vendored or executed.

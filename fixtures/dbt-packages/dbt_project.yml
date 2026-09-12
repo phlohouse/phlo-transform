@@ -1,0 +1,28 @@
+name: pkg_consumer
+profile: pkg_consumer
+version: "1.0"
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+vars:
+  demo_union_schemas: ["schema_a", "schema_b"]
+  not_a_list_var: "just a string"
+  # dbt resolves `var('x')` in this project's resources against the
+  # package-namespaced block first, then the root keys above.
+  pkg_consumer:
+    demo_pass_through:
+      - raw_a
+      - name: raw_b
+        alias: renamed_b
+      - name: raw_c
+        transform_sql: upper(raw_c)
+
+dispatch:
+  - macro_namespace: kit
+    search_order: [pkg_consumer, kit]
+  # Configured project-first order for fivetran_utils too — with no
+  # `default__partition_by_source_relation` in `macros/` the package's own
+  # implementation is still the one dbt would select.
+  - macro_namespace: fivetran_utils
+    search_order: [pkg_consumer, fivetran_utils]

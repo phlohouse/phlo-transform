@@ -19,6 +19,8 @@ pub enum Materialization {
     View,
     Table,
     Incremental,
+    /// Compiled inline into dependents as a subquery; never a relation.
+    Ephemeral,
 }
 
 impl Materialization {
@@ -27,6 +29,7 @@ impl Materialization {
             "view" => Some(Materialization::View),
             "table" => Some(Materialization::Table),
             "incremental" => Some(Materialization::Incremental),
+            "ephemeral" => Some(Materialization::Ephemeral),
             _ => None,
         }
     }
@@ -36,6 +39,7 @@ impl Materialization {
             Materialization::View => "view",
             Materialization::Table => "table",
             Materialization::Incremental => "incremental",
+            Materialization::Ephemeral => "ephemeral",
         }
     }
 }
@@ -158,6 +162,12 @@ pub fn parse_directives(sql: &str) -> Directives {
             "@table" => {
                 set_materialization(&mut directives, Materialization::Table, name, line_number)
             }
+            "@ephemeral" => set_materialization(
+                &mut directives,
+                Materialization::Ephemeral,
+                name,
+                line_number,
+            ),
             "@materialized" => {
                 if value.trim().is_empty() {
                     missing_value(&mut directives, name, line_number);

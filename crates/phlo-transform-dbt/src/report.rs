@@ -157,6 +157,29 @@ pub struct EmittedFile {
     pub contents: String,
 }
 
+/// How one declared (or vendored) package dependency resolved — recorded so
+/// reports and the corpus runner can see exactly which source was analysed.
+#[derive(Clone, Debug, Serialize)]
+pub struct PackageResolution {
+    /// The declared identifier (`org/name`, git URL, local path, project name).
+    pub spec: String,
+    /// The package's macro namespace.
+    pub name: String,
+    /// `hub` | `git` | `local` | `project` | `tarball` | `vendored`.
+    pub kind: &'static str,
+    /// Declared version range (hub) or revision (git).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<String>,
+    /// Exact version/commit from `package-lock.yml`, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub locked: Option<String>,
+    /// Package source was available for static analysis.
+    pub resolved: bool,
+    /// Source root relative to the project root, when resolved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+}
+
 /// The full analysis report.
 #[derive(Clone, Debug, Serialize)]
 pub struct MigrationReport {
@@ -167,6 +190,9 @@ pub struct MigrationReport {
     pub summary: BTreeMap<String, BTreeMap<String, usize>>,
     /// Model conversion coverage as a fraction 0..1.
     pub model_coverage: f64,
+    /// Package dependency resolution results, in declaration order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<PackageResolution>,
     /// Files that could not be read or parsed while loading the project.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub load_warnings: Vec<String>,

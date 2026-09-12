@@ -699,6 +699,17 @@ Candidate default for lightweight staging models.
 
 Fully materialised relation.
 
+### Ephemeral
+
+```sql
+-- @ephemeral
+```
+
+The model is never materialised. References to it are inlined into
+dependents as a derived-table subquery at compile time — including nested
+ephemeral chains — and the model is excluded from the execution plan.
+Ephemeral models must be single-statement selects.
+
 ### Incremental
 
 ```sql

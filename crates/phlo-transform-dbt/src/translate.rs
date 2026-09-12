@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 use crate::jinja::{self, Call, Segment};
 use crate::macros::{self, ArgsRef, MacroDef, Scope};
-use crate::project::{DbtProject, DbtSeed};
+use crate::project::{spec_short_name, DbtPackage, DbtProject, DbtSeed, PackageKind};
 use crate::pylit::{self, Lit};
 use crate::report::{
     codes, Classification, EmittedFile, MigrationIssue, MigrationManifest, MigrationReport,
@@ -351,46 +351,73 @@ pub fn translate(project: &DbtProject) -> Translation {
     }
 
     for package in &project.packages {
-        // Packages whose helpers we statically lower (call sites recorded via
-        // `note_package_call`) are Clean when every observed call lowered;
-        // the package resource only means "dependency accounted for" —
-        // unexercised package contents are never vendored anyway.
-        let short = package
-            .rsplit('/')
-            .next()
-            .unwrap_or(package.as_str())
-            .replace('-', "_");
-        let all_lowered = ctx.package_calls.borrow().get(&short).copied();
-        let (classification, notes, issues) = match all_lowered {
-            Some(true) => (
-                Classification::Clean,
-                vec![
-                    "every observed call site lowered to native SQL; unexercised package contents are not carried over"
-                        .to_string(),
-                ],
-                Vec::new(),
-            ),
-            Some(false) => (
+        // A resolved package contributes its macro source to static
+        // analysis; unexercised contents are never carried over. The
+        // package resource means "dependency accounted for": Clean when
+        // source resolved and every observed call site lowered.
+        let calls = ctx.package_calls.borrow().get(&package.name).copied();
+        let mut notes = Vec::new();
+        match (&package.requested, &package.locked) {
+            (Some(requested), Some(locked)) => {
+                notes.push(format!("declared `{requested}`, locked to `{locked}`"))
+            }
+            (None, Some(locked)) => notes.push(format!("locked to `{locked}`")),
+            (Some(requested), None) => notes.push(format!("declared `{requested}`")),
+            (None, None) => {}
+        }
+        let source_path = package.display_root(&project.root);
+        if let Some(root) = &source_path {
+            notes.push(format!("source resolved at `{root}`"));
+        }
+        let (classification, issues) = if package.root.is_some() {
+            match calls {
+                Some(false) => (
+                    Classification::Review,
+                    vec![MigrationIssue::new(
+                        codes::UNKNOWN_MACRO,
+                        "package dependency is not carried over; some call sites stay REVIEW",
+                    )],
+                ),
+                Some(true) => {
+                    notes.push(
+                        "every observed call site lowered to native SQL; unexercised package contents are not carried over"
+                            .to_string(),
+                    );
+                    (Classification::Clean, Vec::new())
+                }
+                None => {
+                    notes.push(
+                        "no macro call sites observed; unexercised package contents are not carried over"
+                            .to_string(),
+                    );
+                    (Classification::Clean, Vec::new())
+                }
+            }
+        } else {
+            let reason = match package.kind {
+                PackageKind::Project => {
+                    "cross-project `projects:` dependencies are dbt mesh references and are not resolved from disk"
+                }
+                PackageKind::Tarball => "tarball package sources are not resolved",
+                PackageKind::Local => {
+                    "the `local:` path does not contain a readable dbt project"
+                }
+                _ => {
+                    "not installed under `dbt_packages/` and not a `local:` path — install dependencies (e.g. `dbt deps`) to make source available for static analysis"
+                }
+            };
+            (
                 Classification::Review,
-                vec!["package macros used by models are classified per call site".to_string()],
                 vec![MigrationIssue::new(
                     codes::UNKNOWN_MACRO,
-                    "package dependency is not carried over; some call sites stay REVIEW",
+                    format!("package `{}` has no source on disk: {reason}", package.spec),
                 )],
-            ),
-            None => (
-                Classification::Review,
-                vec!["package macros used by models are classified per call site".to_string()],
-                vec![MigrationIssue::new(
-                    codes::UNKNOWN_MACRO,
-                    "package dependency is not carried over; usages are classified per call site",
-                )],
-            ),
+            )
         };
         outcomes.push(ResourceOutcome {
             kind: ResourceKind::Package,
-            name: package.clone(),
-            source_path: None,
+            name: package.spec.clone(),
+            source_path,
             classification,
             emitted_path: None,
             transformations: Vec::new(),
@@ -972,8 +999,13 @@ struct Context<'a> {
     /// A model/seed had a non-string `schema` config — schema macro
     /// evaluation cannot cover it.
     schema_case_dynamic: bool,
-    /// Declared package → whether every observed call site lowered statically.
+    /// Package namespace → whether every observed call site lowered
+    /// statically.
     package_calls: std::cell::RefCell<BTreeMap<String, bool>>,
+    /// Namespace of the package whose macro body is currently rendering.
+    /// Inside a package macro, the package's own definitions shadow the
+    /// project's for unqualified calls — mirroring dbt.
+    package_ns: std::cell::RefCell<Option<String>>,
     /// Stem of the model currently being lowered (`{{ this.name }}`).
     current_stem: Option<String>,
     /// Nested project-macro inlining depth — bounds recursion across all
@@ -1019,6 +1051,16 @@ impl<'a> Context<'a> {
         for file in &project.macro_files {
             macro_defs.extend(macros::parse_macro_defs(file));
         }
+        // Resolved package macros join the same static-inlining pool as
+        // project macros, namespaced as `package.macro` (their dbt lookup
+        // name). Package source is inspected, never executed.
+        for package in &project.packages {
+            for file in &package.macro_files {
+                for (name, def) in macros::parse_macro_defs(file) {
+                    macro_defs.insert(format!("{}.{}", package.name, name), def);
+                }
+            }
+        }
         Self {
             project,
             model_targets: BTreeMap::new(),
@@ -1037,6 +1079,7 @@ impl<'a> Context<'a> {
             schema_case_dynamic: false,
             inline_depth: std::cell::Cell::new(0),
             package_calls: std::cell::RefCell::new(BTreeMap::new()),
+            package_ns: std::cell::RefCell::new(None),
             current_stem: None,
         }
     }
@@ -1070,45 +1113,68 @@ impl<'a> Context<'a> {
         self.macro_files_classified.contains_key(name)
     }
 
-    /// Record a package call site's lowering outcome (only for declared
+    /// Record a package call site's lowering outcome (only for known
     /// packages — `dbt.*` builtins are not dependencies).
     fn note_package_call(&self, provider: &str, lowered_ok: bool) {
-        if self.has_package(provider) {
+        if let Some(package) = self.package_named(provider) {
             self.package_calls
                 .borrow_mut()
-                .entry(provider.to_string())
+                .entry(package.name.clone())
                 .and_modify(|ok| *ok &= lowered_ok)
                 .or_insert(lowered_ok);
         }
     }
 
-    /// Whether the project declares the package `short` (e.g. `dbt_utils`)
-    /// in `packages.yml`/`dependencies.yml`.
-    fn has_package(&self, short: &str) -> bool {
-        self.project.packages.iter().any(|dependency| {
-            dependency
-                .rsplit('/')
-                .next()
-                .unwrap_or(dependency.as_str())
-                .replace('-', "_")
-                == short
-        })
+    /// Whether the project has the package `name` (e.g. `dbt_utils`) as a
+    /// declared or vendored dependency.
+    fn has_package(&self, name: &str) -> bool {
+        self.package_named(name).is_some()
     }
 
-    fn package_of<'n>(&self, name: &'n str) -> Option<&'n str> {
-        let package = name.split('.').next()?;
+    /// The package whose macro namespace is `name` — matched on the
+    /// package's own `dbt_project.yml` name or on the name derivable from
+    /// the declared spec.
+    fn package_named(&self, name: &str) -> Option<&DbtPackage> {
         self.project
             .packages
             .iter()
-            .map(|dependency| {
-                dependency
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(dependency.as_str())
-                    .replace('-', "_")
+            .find(|package| package.name == name || spec_short_name(&package.spec) == name)
+    }
+
+    /// The package qualifying `name` (`dbt_utils.star` → the `dbt_utils`
+    /// package).
+    fn package_of(&self, name: &str) -> Option<&DbtPackage> {
+        let provider = name.split('.').next()?;
+        self.package_named(provider)
+    }
+
+    /// The package namespace currently rendering (inside an inlined
+    /// package macro), if any.
+    fn package_ns(&self) -> Option<String> {
+        self.package_ns.borrow().clone()
+    }
+
+    /// Run `render` with the package namespace set to `ns`, restoring the
+    /// caller's namespace afterwards.
+    fn with_package_ns<T>(&self, ns: &str, render: impl FnOnce() -> T) -> T {
+        let saved = self.package_ns.replace(Some(ns.to_string()));
+        let out = render();
+        self.package_ns.replace(saved);
+        out
+    }
+
+    /// Resolved packages whose source defines the macro `name` — the
+    /// providers an unqualified `{{ name(...) }}` could bind to.
+    fn package_providers(&self, name: &str) -> Vec<&DbtPackage> {
+        self.project
+            .packages
+            .iter()
+            .filter(|package| package.root.is_some())
+            .filter(|package| {
+                self.macro_defs
+                    .contains_key(&format!("{}.{name}", package.name))
             })
-            .any(|short| short == package)
-            .then_some(package)
+            .collect()
     }
 }
 
@@ -2065,12 +2131,28 @@ fn resolve_expr_call(
                 .split_once('.')
                 .filter(|(package, _)| *package == ctx.project.name.as_str())
                 .map(|(_, local)| local);
-            if name.contains('.') && own_macro.is_none() {
-                lower_builtin(name, &args, ctx, scope, lowered)
-            } else {
-                inline_project_macro(own_macro.unwrap_or(name), call, ctx, lowered, depth)
+            let rendered = if name.contains('.') && own_macro.is_none() {
+                inline_package_macro(name, call, ctx, lowered, depth)
                     .or_else(|| lower_builtin(name, &args, ctx, scope, lowered))
-            }
+            } else {
+                let bare = own_macro.unwrap_or(name);
+                match ctx
+                    .package_ns()
+                    .filter(|ns| ctx.macro_defs.contains_key(&format!("{ns}.{bare}")))
+                {
+                    // Inside a package macro body the package's own
+                    // definition binds — if it exists, it is the call's
+                    // meaning, even when it fails to render statically.
+                    Some(ns) => {
+                        inline_package_macro(&format!("{ns}.{bare}"), call, ctx, lowered, depth)
+                    }
+                    None => inline_project_macro(bare, call, ctx, lowered, depth)
+                        .or_else(|| inline_unique_package_macro(bare, call, ctx, lowered, depth))
+                        .or_else(|| lower_builtin(name, &args, ctx, scope, lowered)),
+                }
+            };
+            note_call_outcome(ctx, name, own_macro, rendered.is_some());
+            rendered
         }
     }
 }
@@ -2289,34 +2371,55 @@ fn translate_call(
         }
         name => {
             let args = ArgsRef::Strict(call);
-            // Recognised package helpers (qualified), then safe
-            // project-macro inlining; for unqualified names the project
-            // definition wins — matching dbt's resolution order. A call
-            // qualified by the project's own name (`shopify.macro()` in the
-            // `shopify` package) is still a project macro.
+            // Resolution order follows dbt: a call qualified by the
+            // project's own name is a project macro; other qualified names
+            // resolve against installed package source first (the real
+            // macro body, statically inlined) and recognised-helper
+            // lowerings second. A call qualified by the project's own name
+            // (`shopify.macro()` in the `shopify` package) is still a
+            // project macro.
             let own_macro = name
                 .split_once('.')
                 .filter(|(package, _)| *package == ctx.project.name.as_str())
                 .map(|(_, local)| local);
-            if name.contains('.') && own_macro.is_none() {
-                if let Some(sql) = lower_builtin(name, &args, ctx, scope, lowered) {
-                    return sql;
-                }
-            } else if let Some(sql) =
-                inline_project_macro(own_macro.unwrap_or(name), call, ctx, lowered, 0)
-            {
-                return sql;
-            } else if let Some(sql) = lower_builtin(name, &args, ctx, scope, lowered) {
+            let rendered = if name.contains('.') && own_macro.is_none() {
+                inline_package_macro(name, call, ctx, lowered, 0)
+                    .or_else(|| lower_builtin(name, &args, ctx, scope, lowered))
+            } else {
+                let bare = own_macro.unwrap_or(name);
+                inline_project_macro(bare, call, ctx, lowered, 0)
+                    .or_else(|| inline_unique_package_macro(bare, call, ctx, lowered, 0))
+                    .or_else(|| lower_builtin(name, &args, ctx, scope, lowered))
+            };
+            note_call_outcome(ctx, name, own_macro, rendered.is_some());
+            if let Some(sql) = rendered {
                 return sql;
             }
-            let detail = if let Some(package) = ctx.package_of(name) {
-                format!("package macro `{name}` (from `{package}`)")
-            } else if ctx.is_project_macro(name) {
-                format!("project macro `{name}`")
-            } else if name.contains('.') {
-                format!("qualified macro `{name}` (package not declared)")
-            } else {
-                format!("unknown macro `{name}`")
+            let detail = match own_macro {
+                Some(local) if ctx.is_project_macro(local) => {
+                    format!("project macro `{name}` could not be evaluated statically")
+                }
+                Some(_) => format!(
+                    "project-qualified macro `{name}` (no such macro in this project)"
+                ),
+                None => match ctx.package_of(name) {
+                    Some(package) if package.root.is_none() => format!(
+                        "package macro `{name}` (`{}` is not installed under `dbt_packages/`; install dependencies for static analysis)",
+                        package.spec
+                    ),
+                    Some(package) if !ctx.macro_defs.contains_key(name) => format!(
+                        "package macro `{name}` (no such macro in `{}`)",
+                        package.spec
+                    ),
+                    Some(package) => {
+                        format!("package macro `{name}` (from `{}`)", package.spec)
+                    }
+                    None if ctx.is_project_macro(name) => format!("project macro `{name}`"),
+                    None if name.contains('.') => {
+                        format!("qualified macro `{name}` (package not declared)")
+                    }
+                    None => format!("unknown macro `{name}`"),
+                },
             };
             lowered.review(
                 MigrationIssue::new(
@@ -2352,17 +2455,48 @@ fn lower_builtin(
                 ("dbt_utils", name)
             }
             "get_base_dates" => ("dbt_date", name),
+            "partition_by_source_relation" | "fill_pass_through_columns" => {
+                ("fivetran_utils", name)
+            }
             _ => return None,
         },
     };
-    if provider != "dbt" && provider != "dbt_utils" && provider != "dbt_date" {
+    if provider != "dbt"
+        && provider != "dbt_utils"
+        && provider != "dbt_date"
+        && provider != "fivetran_utils"
+    {
         return None;
     }
     if !name.contains('.') && !ctx.has_package(provider) {
         return None;
     }
+    // A `dispatch:` rule can make dbt select an implementation outside the
+    // package — e.g. a root-project override. Recognised lowerings stand in
+    // for the package's own `default__`/adapter implementation, so when a
+    // different namespace's variant is the one dbt would pick the lowering
+    // no longer applies: reaching here means that override already failed
+    // static evaluation, and the call must stay REVIEW rather than silently
+    // emit the package default. (`fivetran_utils` is checked inside
+    // `verified_fivetran_source`: its dispatched helper verifies the
+    // selected implementation, and its direct macros cannot be overridden
+    // this way upstream.)
+    if provider != "fivetran_utils" && provider != ctx.project.name {
+        if let Some((ns, ..)) = dispatch_selected(ctx, provider, helper) {
+            if ns != provider {
+                return None;
+            }
+        }
+    }
+    // Recognised fivetran helpers lower only against a verified upstream
+    // implementation: the installed package's macro body must fingerprint-
+    // match the source these rewrites were proven against. An uninstalled
+    // or modified package is an unknown implementation — REVIEW, not a
+    // guess (the `dbt_utils.surrogate_key` version-drift hazard).
+    if provider == "fivetran_utils" && !verified_fivetran_source(ctx, helper) {
+        return None;
+    }
     let rendered = lower_helper(provider, helper, args, ctx, scope);
-    ctx.note_package_call(provider, rendered.is_some());
     if let Some(rendered) = rendered {
         lowered
             .transformations
@@ -2620,9 +2754,172 @@ fn lower_helper(
                 _ => return None,
             }
         }
+        // `fivetran_utils.partition_by_source_relation(...)`: upstream
+        // `default__partition_by_source_relation` is a pure function of
+        // `vars:` — it appends `source_relation` to the partition list only
+        // when the connector unions multiple schemas/databases/sources.
+        // `fivetran_utils.union_connections` itself is NOT lowered: it calls
+        // `adapter.get_relation` (warehouse introspection), so its output
+        // depends on run-time state and stays REVIEW.
+        ("fivetran_utils", "partition_by_source_relation") => {
+            let package = args
+                .get(0, "package_name")
+                .map(resolve)
+                .and_then(|lit| lit.as_str().map(str::to_string))?;
+            let has_other = args
+                .get(1, "has_other_partitions")
+                .map(resolve)
+                .and_then(|lit| lit.as_str().map(str::to_string))
+                .unwrap_or_else(|| "yes".to_string());
+            let alias = args
+                .get(2, "alias")
+                .map(resolve)
+                .and_then(|lit| lit.as_str().map(str::to_string));
+            let prefix_union = match args.get(3, "package_prefix_union_variable").map(resolve) {
+                None | Some(Lit::None) => true,
+                Some(Lit::Bool(value)) => value,
+                _ => return None,
+            };
+            let (schemas_var, databases_var) = if prefix_union {
+                (
+                    format!("{package}_union_schemas"),
+                    format!("{package}_union_databases"),
+                )
+            } else {
+                ("union_schemas".to_string(), "union_databases".to_string())
+            };
+            let is_unioning = var_len(ctx, &schemas_var) > 1
+                || var_len(ctx, &databases_var) > 1
+                || var_len(ctx, &format!("{package}_sources")) > 1;
+            let prefix = alias.map(|a| format!("{a}.")).unwrap_or_default();
+            match (has_other.as_str() == "no", is_unioning) {
+                (true, true) => format!("partition by {prefix}source_relation"),
+                (false, true) => format!(", {prefix}source_relation"),
+                (_, false) => String::new(),
+            }
+        }
+        // `fivetran_utils.fill_pass_through_columns('var_name')`: iterates the
+        // literal var list — a string field emits `, field`; a mapping emits
+        // `, transform_sql as alias|name` or `, alias|name`. A missing var
+        // (which makes upstream `var()` raise) or a non-list value stays
+        // REVIEW.
+        ("fivetran_utils", "fill_pass_through_columns") => {
+            let var_name = args
+                .get(0, "pass_through_variable")
+                .map(resolve)
+                .and_then(|lit| lit.as_str().map(str::to_string))?;
+            let value = ctx
+                .project
+                .vars
+                .get(Value::String(var_name))
+                .map(yaml_to_lit)?;
+            let Lit::List(fields) = value else {
+                return None;
+            };
+            let mut rendered = String::new();
+            for field in fields {
+                match field {
+                    Lit::Dict(map) => {
+                        // Upstream uses `x if x else y` / `{% if x %}`: Jinja
+                        // truthiness over the literal. A Jinja-embedded value
+                        // is truthy-but-unrenderable, so the call stays
+                        // REVIEW rather than silently dropping the field.
+                        let lookup = |key: &str| map.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+                        let truthy = |lit: &Lit| -> Option<bool> {
+                            match lit {
+                                Lit::None => Some(false),
+                                Lit::Bool(value) => Some(*value),
+                                Lit::Str(value) | Lit::Ident(value) => Some(!value.is_empty()),
+                                Lit::Int(value) => Some(*value != 0),
+                                Lit::Float(value) => Some(*value != 0.0),
+                                Lit::List(items) => Some(!items.is_empty()),
+                                Lit::Dict(items) => Some(!items.is_empty()),
+                                Lit::Jinja(_) => None,
+                            }
+                        };
+                        let column = match lookup("alias").map(&truthy) {
+                            Some(Some(true)) => lookup("alias")?.as_str()?,
+                            Some(None) => return None,
+                            _ => lookup("name")?.as_str()?,
+                        };
+                        match lookup("transform_sql").map(&truthy) {
+                            Some(Some(true)) => {
+                                let sql = lookup("transform_sql")?.as_str()?;
+                                rendered += &format!(", {sql} as {column}");
+                            }
+                            Some(None) => return None,
+                            _ => rendered += &format!(", {column}"),
+                        }
+                    }
+                    other => rendered += &format!(", {}", other.as_str()?),
+                }
+            }
+            rendered
+        }
         _ => return None,
     };
     Some(rendered)
+}
+
+/// `true` when the implementation dbt would select for `helper` is the
+/// `fivetran_utils` body these lowerings were verified against
+/// (fivetran_utils 0.4.x — every corpus-pinned copy is byte-identical).
+/// The fingerprint is FNV-1a over the whitespace-collapsed body: stable
+/// across toolchains (unlike `DefaultHasher`) and insensitive only to
+/// blank space.
+fn verified_fivetran_source(ctx: &Context, helper: &str) -> bool {
+    match helper {
+        // Dispatched upstream: a `dispatch:` rule can make dbt select an
+        // implementation outside the package (e.g. a root-project
+        // override). Verify whichever `default__`/adapter variant the
+        // effective search order actually selects — and only when it is
+        // the package's own.
+        "partition_by_source_relation" => matches!(
+            dispatch_selected(ctx, "fivetran_utils", helper),
+            Some((ns, _, def))
+                if ns == "fivetran_utils"
+                    && body_fingerprint(def) == 0xfc1e0e9d56099378u64
+        ),
+        // A direct, non-dispatched package macro: `dispatch:` config cannot
+        // redirect a qualified call, so verify the package's body itself.
+        "fill_pass_through_columns" => ctx
+            .macro_defs
+            .get("fivetran_utils.fill_pass_through_columns")
+            .is_some_and(|def| body_fingerprint(def) == 0xd08e588f12c110b2u64),
+        _ => false,
+    }
+}
+
+fn body_fingerprint(def: &macros::MacroDef) -> u64 {
+    let normalized = def
+        .body
+        .iter()
+        .map(Segment::raw)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in normalized.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// `len(var(name))` for the `|length` checks in fivetran helpers: the var
+/// defaults to `[]` upstream, so an unset var is length 0.
+fn var_len(ctx: &Context, name: &str) -> usize {
+    ctx.project
+        .vars
+        .get(Value::String(name.to_string()))
+        .map(|value| match yaml_to_lit(value) {
+            Lit::Str(s) | Lit::Ident(s) => s.chars().count(),
+            Lit::List(items) => items.len(),
+            Lit::Dict(items) => items.len(),
+            _ => 0,
+        })
+        .unwrap_or(0)
 }
 
 /// `md5(concat_ws('-', coalesce(cast("col" as varchar), SENTINEL), ...))`
@@ -2703,6 +3000,88 @@ fn inline_project_macro(
     );
     ctx.inline_depth.set(ctx.inline_depth.get() - 1);
     rendered
+}
+
+/// Inline `pkg.macro(...)` when `pkg` is a known package with resolved
+/// source that defines `macro`. The body renders under the package's own
+/// namespace — inside it, the package's macros shadow the project's.
+fn inline_package_macro(
+    name: &str,
+    call: &Call,
+    ctx: &Context,
+    lowered: &mut Lowered,
+    depth: usize,
+) -> Option<String> {
+    if ctx.inline_depth.get() >= 32 {
+        return None;
+    }
+    let package = name
+        .split_once('.')
+        .and_then(|(ns, _)| ctx.package_named(ns))?;
+    package.root.as_ref()?;
+    let def = ctx.macro_defs.get(name)?;
+    let package_name = package.name.clone();
+    ctx.inline_depth.set(ctx.inline_depth.get() + 1);
+    let rendered = ctx.with_package_ns(&package_name, || {
+        inline_def(
+            def,
+            call.positional.clone(),
+            call.keyword.clone(),
+            ctx,
+            lowered,
+            depth,
+            name,
+        )
+    });
+    ctx.inline_depth.set(ctx.inline_depth.get() - 1);
+    rendered
+}
+
+/// Inline an unqualified `{{ name(...) }}` against package source when
+/// exactly one resolved package provides `name` — dbt's unqualified
+/// package lookup made deterministic (an ambiguous bare name stays
+/// unresolved rather than picking a winner).
+fn inline_unique_package_macro(
+    name: &str,
+    call: &Call,
+    ctx: &Context,
+    lowered: &mut Lowered,
+    depth: usize,
+) -> Option<String> {
+    match ctx.package_providers(name).as_slice() {
+        [only] => inline_package_macro(
+            &format!("{}.{}", only.name, name),
+            call,
+            ctx,
+            lowered,
+            depth,
+        ),
+        _ => None,
+    }
+}
+
+/// Record a call site's final lowering outcome against the package that
+/// owns the resolved macro — the qualifier for `pkg.macro(...)`, the
+/// current package namespace for calls inside a package body, or the
+/// unique provider for a bare name.
+fn note_call_outcome(ctx: &Context, name: &str, own_macro: Option<&str>, lowered_ok: bool) {
+    let bare = own_macro.unwrap_or(name);
+    let provider = if name.contains('.') && own_macro.is_none() {
+        ctx.package_of(name).map(|package| package.name.clone())
+    } else if let Some(ns) = ctx
+        .package_ns()
+        .filter(|ns| ctx.macro_defs.contains_key(&format!("{ns}.{bare}")))
+    {
+        Some(ns)
+    } else {
+        match ctx.package_providers(bare).as_slice() {
+            [only] => Some(only.name.clone()),
+            _ => None,
+        }
+    };
+    if let Some(provider) = provider {
+        ctx.note_package_call(&provider, lowered_ok);
+    }
 }
 
 fn inline_def(
@@ -2795,19 +3174,27 @@ fn render_macro_body(
                 } else {
                     inner
                 };
-                if let Some((dispatched, arg_texts)) = split_dispatch(expr, &ctx.project.name) {
+                if let Some((dispatched, namespaces, arg_texts)) = split_dispatch(expr) {
                     // `adapter.dispatch('m')(...)` resolves to the adapter's
-                    // variant or `default__m` — static selection.
-                    let adapter = ctx
-                        .project
-                        .profile
-                        .as_ref()
-                        .and_then(|p| p.adapter_type.as_deref());
-                    let variant = adapter
-                        .map(|a| format!("{a}__{dispatched}"))
-                        .filter(|v| ctx.macro_defs.contains_key(v))
-                        .unwrap_or_else(|| format!("default__{dispatched}"));
-                    let def = ctx.macro_defs.get(&variant)?;
+                    // variant or `default__m` — static selection. Search
+                    // order: the explicit namespace/`packages` argument when
+                    // given, else the calling macro's own namespace (its
+                    // package, or the project) — dbt's default dispatch.
+                    let search = if namespaces.is_empty() {
+                        vec![ctx.package_ns().unwrap_or_else(|| ctx.project.name.clone())]
+                    } else {
+                        namespaces
+                    };
+                    // `dispatch:` config replaces a namespace's search order
+                    // (e.g. `dbt_utils` → `['my_project', 'dbt_utils']`).
+                    let mut found = None;
+                    for ns in dispatch_search_order(ctx, &search) {
+                        if let Some((key, def)) = dispatch_lookup(ctx, &ns, &dispatched) {
+                            found = Some((def, key, ns));
+                            break;
+                        }
+                    }
+                    let (def, variant, variant_ns) = found?;
                     let mut args = Vec::new();
                     for text in arg_texts {
                         let lit = pylit::parse_value(&text).ok().and_then(|lit| match lit {
@@ -2816,15 +3203,26 @@ fn render_macro_body(
                         })?;
                         args.push(lit);
                     }
-                    out.push_str(&inline_def(
-                        def,
-                        args,
-                        Vec::new(),
-                        ctx,
-                        lowered,
-                        depth + 1,
-                        &variant,
-                    )?);
+                    let in_package = variant_ns != ctx.project.name;
+                    let rendered = if in_package {
+                        ctx.with_package_ns(&variant_ns, || {
+                            inline_def(
+                                def,
+                                args.clone(),
+                                Vec::new(),
+                                ctx,
+                                lowered,
+                                depth + 1,
+                                &variant,
+                            )
+                        })
+                    } else {
+                        inline_def(def, args, Vec::new(), ctx, lowered, depth + 1, &variant)
+                    };
+                    if in_package {
+                        ctx.note_package_call(&variant_ns, rendered.is_some());
+                    }
+                    out.push_str(&rendered?);
                 } else if let Some(call) = jinja::parse_call(expr) {
                     out.push_str(&resolve_expr_call(
                         &call,
@@ -2853,10 +3251,69 @@ fn render_macro_body(
     Some(out)
 }
 
-/// Split `adapter.dispatch('name'[, 'namespace'])(args)` into the macro
-/// name and its raw argument texts. A namespace argument makes dispatch
-/// resolve outside the project — rejected.
-fn split_dispatch(expr: &str, project_name: &str) -> Option<(String, Vec<String>)> {
+/// Expand each searched namespace through the project's `dispatch:` config:
+/// a configured `search_order` replaces the namespace's default, and the
+/// `dbt` namespace's built-in default puts the root project first.
+fn dispatch_search_order(ctx: &Context, searched: &[String]) -> Vec<String> {
+    let mut ordered = Vec::new();
+    for ns in searched {
+        if let Some(order) = ctx.project.dispatch.get(ns) {
+            ordered.extend(order.iter().cloned());
+        } else if ns == "dbt" {
+            ordered.push(ctx.project.name.clone());
+            ordered.push(ns.clone());
+        } else {
+            ordered.push(ns.clone());
+        }
+    }
+    ordered
+}
+
+/// The `{adapter}__{name}` or `default__{name}` definition namespace `ns`
+/// provides for a dispatched macro, in dbt's adapter-first preference.
+fn dispatch_lookup<'a>(ctx: &'a Context, ns: &str, name: &str) -> Option<(String, &'a MacroDef)> {
+    let adapter = ctx
+        .project
+        .profile
+        .as_ref()
+        .and_then(|p| p.adapter_type.as_deref());
+    let mut candidates = vec![format!("default__{name}")];
+    if let Some(adapter) = adapter {
+        candidates.insert(0, format!("{adapter}__{name}"));
+    }
+    for candidate in candidates {
+        let key = if ns == ctx.project.name {
+            candidate
+        } else {
+            format!("{ns}.{candidate}")
+        };
+        if let Some(def) = ctx.macro_defs.get(&key) {
+            return Some((key, def));
+        }
+    }
+    None
+}
+
+/// The implementation `adapter.dispatch('<name>', '<provider>')` would
+/// select under this project's `dispatch:` config: the first ordered
+/// namespace that provides a variant, and the variant's definition.
+fn dispatch_selected<'a>(
+    ctx: &'a Context,
+    provider: &str,
+    name: &str,
+) -> Option<(String, String, &'a MacroDef)> {
+    for ns in dispatch_search_order(ctx, &[provider.to_string()]) {
+        if let Some((key, def)) = dispatch_lookup(ctx, &ns, name) {
+            return Some((ns, key, def));
+        }
+    }
+    None
+}
+
+/// Split `adapter.dispatch('name'[, 'namespace' | packages=[...]])(args)`
+/// into the macro name, the explicit search namespaces (empty for the
+/// default search), and its raw argument texts.
+fn split_dispatch(expr: &str) -> Option<(String, Vec<String>, Vec<String>)> {
     let rest = expr.trim().strip_prefix("adapter.dispatch")?.trim_start();
     let rest = rest.strip_prefix('(')?;
     // Find the close of the dispatch-argument group, then the call group
@@ -2905,24 +3362,31 @@ fn split_dispatch(expr: &str, project_name: &str) -> Option<(String, Vec<String>
     if name.is_empty() {
         return None;
     }
-    // `adapter.dispatch('m', 'namespace')` — only the project's own package
-    // name resolves locally; anything else dispatches outside the project.
-    if dispatch_args.args.len() > 1 {
-        let namespace = dispatch_args.args[1]
-            .1
-            .trim()
-            .trim_matches('\'')
-            .trim_matches('"');
-        if namespace != project_name {
-            return None;
+    // `adapter.dispatch('m', 'ns')` / `dispatch('m', 'ns', ['a', 'b'])` /
+    // `dispatch('m', packages=['a'])` — namespace arguments restrict where
+    // implementations are searched.
+    let mut namespaces = Vec::new();
+    for (key, text) in dispatch_args.args.iter().skip(1) {
+        match key.as_deref() {
+            Some("packages") => {
+                let Lit::List(items) = pylit::parse_value(text).ok()? else {
+                    return None;
+                };
+                for item in items {
+                    let Lit::Str(ns) = item else { return None };
+                    namespaces.push(ns);
+                }
+            }
+            Some("macro_namespace") | None => {
+                namespaces.push(text.trim().trim_matches('\'').trim_matches('"').to_string())
+            }
+            Some(_) => return None,
         }
-    }
-    if dispatch_args.args.len() > 2 {
-        return None;
     }
     let call_args = jinja::parse_call_loose(&format!("f({after})"))?;
     Some((
         name,
+        namespaces,
         call_args
             .args
             .iter()
@@ -2962,10 +3426,24 @@ fn translate_ref(call: &Call, raw: &str, ctx: &Context, lowered: &mut Lowered) -
             if package == ctx.project.name {
                 resolve_model(name, raw, ctx, lowered)
             } else {
-                lowered.review(MigrationIssue::new(
-                    codes::COMPLEX_REF,
-                    format!("cross-package `ref('{package}', '{name}')` is not resolved"),
-                ));
+                let detail = match ctx.package_named(package) {
+                    Some(pkg) if pkg.model_names.iter().any(|m| m == name) => format!(
+                        "cross-package `ref('{package}', '{name}')` — `{name}` is a model in package `{}`; package models are not vendored into the translation",
+                        pkg.spec
+                    ),
+                    Some(pkg) if pkg.root.is_some() => format!(
+                        "cross-package `ref('{package}', '{name}')` — package `{}` has no model `{name}`",
+                        pkg.spec
+                    ),
+                    Some(pkg) => format!(
+                        "cross-package `ref('{package}', '{name}')` — `{}` is not installed under `dbt_packages/`",
+                        pkg.spec
+                    ),
+                    None => {
+                        format!("cross-package `ref('{package}', '{name}')` is not resolved")
+                    }
+                };
+                lowered.review(MigrationIssue::new(codes::COMPLEX_REF, detail));
                 raw.to_string()
             }
         }
@@ -3003,11 +3481,34 @@ fn resolve_model(name: &str, raw: &str, ctx: &Context, lowered: &mut Lowered) ->
                 relation.clone()
             }
             None => {
-                lowered.review(MigrationIssue::new(
-                    codes::UNRESOLVED_REF,
-                    format!("`ref('{name}')` has no known target"),
-                ));
-                raw.to_string()
+                // A bare ref may name a model owned by an installed
+                // package — dbt resolves it across the package boundary.
+                let owners: Vec<&DbtPackage> = ctx
+                    .project
+                    .packages
+                    .iter()
+                    .filter(|package| package.root.is_some())
+                    .filter(|package| package.model_names.iter().any(|m| m == name))
+                    .collect();
+                match owners.as_slice() {
+                    [pkg] => {
+                        lowered.review(MigrationIssue::new(
+                            codes::COMPLEX_REF,
+                            format!(
+                                "`ref('{name}')` resolves to a model in package `{}`; package models are not vendored into the translation",
+                                pkg.spec
+                            ),
+                        ));
+                        raw.to_string()
+                    }
+                    _ => {
+                        lowered.review(MigrationIssue::new(
+                            codes::UNRESOLVED_REF,
+                            format!("`ref('{name}')` has no known target"),
+                        ));
+                        raw.to_string()
+                    }
+                }
             }
         },
     }
@@ -3579,13 +4080,7 @@ fn translate_model(
     }
 
     match materialized.as_str() {
-        "view" | "table" | "incremental" => {}
-        "ephemeral" => {
-            outcome.issues.push(MigrationIssue::new(
-                codes::MATERIALIZATION,
-                "`ephemeral` materialisation has no native equivalent; emitted as a view",
-            ));
-        }
+        "view" | "table" | "incremental" | "ephemeral" => {}
         "snapshot" => {
             outcome.classification = Classification::Unsupported;
             outcome.emitted_path = None;
@@ -3603,9 +4098,11 @@ fn translate_model(
         }
     }
 
-    let effective = if materialized == "ephemeral" {
-        "view".to_string()
-    } else if materialized == "incremental" || materialized == "view" || materialized == "table" {
+    let effective = if materialized == "incremental"
+        || materialized == "view"
+        || materialized == "table"
+        || materialized == "ephemeral"
+    {
         materialized.clone()
     } else {
         "table".to_string()
@@ -3682,9 +4179,9 @@ fn translate_model(
         directives.push(directive);
     } else if materialized == "table" && effective != inherited_materialized {
         directives.push("-- @table".to_string());
-    } else if (materialized == "view" || materialized == "ephemeral")
-        && effective != inherited_materialized
-    {
+    } else if materialized == "ephemeral" && effective != inherited_materialized {
+        directives.push("-- @ephemeral".to_string());
+    } else if materialized == "view" && effective != inherited_materialized {
         directives.push("-- @view".to_string());
     }
 
@@ -4748,6 +5245,26 @@ fn build_report(project: &DbtProject, outcomes: &[ResourceOutcome]) -> Migration
         project_name: project.name.clone(),
         summary,
         model_coverage: coverage,
+        packages: project
+            .packages
+            .iter()
+            .map(|package| crate::report::PackageResolution {
+                spec: package.spec.clone(),
+                name: package.name.clone(),
+                kind: match package.kind {
+                    PackageKind::Hub => "hub",
+                    PackageKind::Git => "git",
+                    PackageKind::Local => "local",
+                    PackageKind::Project => "project",
+                    PackageKind::Tarball => "tarball",
+                    PackageKind::Vendored => "vendored",
+                },
+                requested: package.requested.clone(),
+                locked: package.locked.clone(),
+                resolved: package.root.is_some(),
+                root: package.display_root(&project.root),
+            })
+            .collect(),
         load_warnings: project.load_warnings.clone(),
         resources: outcomes.to_vec(),
     }

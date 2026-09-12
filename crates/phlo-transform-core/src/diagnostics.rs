@@ -36,6 +36,8 @@ pub mod codes {
     pub const TYPE_CONTRACT: &str = "TYPE005";
 
     pub const GRAPH_CYCLE: &str = "GRAPH001";
+
+    pub const MODEL_EPHEMERAL: &str = "MODEL001";
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
