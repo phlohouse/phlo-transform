@@ -13,22 +13,28 @@
 //!   dataset ──input──▶ model ──output──▶ dataset ──contains──▶ column
 //!        ╲                                                    ╱
 //!         ╰────────── derives (model·dataset·column) ────────╯
-//!   test ──tests──▶ dataset
+//!   dataset ──tests──▶ test
 //! ```
 //!
 //! Every edge points upstream → downstream in data-flow terms. Edge kinds:
 //!
 //! * [`LineageEdgeKind::Input`] — `dataset → model`: the model reads the
-//!   dataset (a source relation, a seed, or an upstream model's output).
+//!   dataset. This is the canonical dependency edge: a source relation, a
+//!   seed, or an upstream model's output dataset all connect identically,
+//!   so a future `External` dataset contributed by an ingestion system
+//!   needs no special case.
 //! * [`LineageEdgeKind::Output`] — `model → dataset`: the model produces
 //!   its output dataset.
 //! * [`LineageEdgeKind::Derives`] — `model → model`, `dataset → dataset` or
-//!   `column → column`: the target derives from the source. This is the
-//!   transform dependency graph at model granularity and the analyzer's
-//!   column lineage at column granularity.
+//!   `column → column`: the target derives from the source. Model- and
+//!   dataset-level `Derives` edges are rollups over the canonical
+//!   `model → output → dataset → input → model` chain — convenient for
+//!   one-hop queries, never a substitute for the `Input` edge. At column
+//!   granularity `Derives` is the analyzer's column lineage.
 //! * [`LineageEdgeKind::Contains`] — `dataset → column`: containment.
-//! * [`LineageEdgeKind::Tests`] — `test → dataset`: the test asserts on
-//!   the dataset.
+//! * [`LineageEdgeKind::Tests`] — `dataset → test`: the test consumes and
+//!   asserts on the dataset, so `impact(dataset)` reaches its tests
+//!   naturally.
 //!
 //! Column-level `Derives` edges carry the analyzer's
 //! [`ColumnInput`] metadata — [`Directness`], [`Transformation`],
@@ -216,7 +222,7 @@ pub enum LineageEdgeKind {
     Derives,
     /// `dataset → column`: the dataset contains the column.
     Contains,
-    /// `test → dataset`: the test asserts on the dataset.
+    /// `dataset → test`: the test consumes and asserts on the dataset.
     Tests,
 }
 
@@ -323,11 +329,18 @@ impl LineageGraph {
                 },
             );
             let output = DatasetId::model(&model.id);
+            // Only materializations that create a physical relation get a
+            // target — an ephemeral model must never advertise one.
+            let physical = !matches!(
+                model.config.materialization,
+                phlo_transform_sql::Materialization::Ephemeral
+            );
             graph.ensure_node(
                 LineageNode::Dataset(output.clone()),
                 NodeMeta {
                     dataset_kind: Some(DatasetKind::Model),
-                    target: Some(model.target.display()),
+                    target: physical.then(|| model.target.display()),
+                    materialization: Some(model.config.materialization.to_string()),
                     ..NodeMeta::default()
                 },
             );
@@ -356,29 +369,28 @@ impl LineageGraph {
         }
 
         // Model-level edges from the resolved dependencies — the same data
-        // the scheduling graph uses, in data-flow direction.
+        // the scheduling graph uses, in data-flow direction. Every input is
+        // a dataset: the canonical `dataset ──input──▶ model` edge exists
+        // for sources and upstream model outputs alike. The `model → model`
+        // and `dataset → dataset` edges are rollups for one-hop queries.
         for model in &compilation.models {
             for dependency in &model.dependencies {
-                let upstream = match dependency {
-                    crate::graph::Dependency::Model(id) => LineageNode::Model(id.clone()),
-                    crate::graph::Dependency::Source(id) => {
-                        LineageNode::Dataset(DatasetId::source(id))
-                    }
-                };
-                graph.add_edge(
-                    upstream.clone(),
-                    LineageNode::Model(model.id.clone()),
-                    LineageEdge::plain(match upstream {
-                        LineageNode::Model(_) => LineageEdgeKind::Derives,
-                        _ => LineageEdgeKind::Input,
-                    }),
-                );
-                // Dataset-level rollup: the output dataset derives from each
-                // input dataset.
                 let input_dataset = match dependency {
                     crate::graph::Dependency::Model(id) => DatasetId::model(id),
                     crate::graph::Dependency::Source(id) => DatasetId::source(id),
                 };
+                graph.add_edge(
+                    LineageNode::Dataset(input_dataset.clone()),
+                    LineageNode::Model(model.id.clone()),
+                    LineageEdge::plain(LineageEdgeKind::Input),
+                );
+                if let crate::graph::Dependency::Model(id) = dependency {
+                    graph.add_edge(
+                        LineageNode::Model(id.clone()),
+                        LineageNode::Model(model.id.clone()),
+                        LineageEdge::plain(LineageEdgeKind::Derives),
+                    );
+                }
                 graph.add_edge(
                     LineageNode::Dataset(input_dataset),
                     LineageNode::Dataset(DatasetId::model(&model.id)),
@@ -441,15 +453,15 @@ impl LineageGraph {
             );
             for target in &test.targets {
                 graph.add_edge(
-                    node.clone(),
                     LineageNode::Dataset(DatasetId::model(target)),
+                    node.clone(),
                     LineageEdge::plain(LineageEdgeKind::Tests),
                 );
             }
             for source in &test.sources {
                 graph.add_edge(
-                    node.clone(),
                     LineageNode::Dataset(DatasetId::source(source)),
+                    node.clone(),
                     LineageEdge::plain(LineageEdgeKind::Tests),
                 );
             }
@@ -523,6 +535,8 @@ impl LineageGraph {
     }
 
     /// The datasets a model reads (models' outputs and sources), sorted.
+    /// Every input is a `dataset ──input──▶ model` edge — source datasets
+    /// and upstream model outputs connect identically.
     pub fn input_datasets(&self, model: &ModelId) -> Vec<DatasetId> {
         let Some(index) = self.nodes.get(&LineageNode::Model(model.clone())) else {
             return Vec::new();
@@ -534,9 +548,6 @@ impl LineageGraph {
                 |edge| match (edge.weight().kind, self.graph.node_weight(edge.source())) {
                     (LineageEdgeKind::Input, Some(LineageNode::Dataset(dataset))) => {
                         Some(dataset.clone())
-                    }
-                    (LineageEdgeKind::Derives, Some(LineageNode::Model(upstream))) => {
-                        Some(DatasetId::model(upstream))
                     }
                     _ => None,
                 },
@@ -671,16 +682,18 @@ impl LineageGraph {
             .next()
     }
 
-    /// The tests asserting on a dataset, sorted.
+    /// The tests asserting on a dataset, sorted. Tests are consumers —
+    /// `dataset ──tests──▶ test` — so they are also reachable through
+    /// `impact(dataset)`.
     pub fn tests_for_dataset(&self, dataset: &DatasetId) -> Vec<TestId> {
         let Some(index) = self.nodes.get(&LineageNode::Dataset(dataset.clone())) else {
             return Vec::new();
         };
         let mut tests: Vec<TestId> = self
             .graph
-            .edges_directed(*index, Direction::Incoming)
+            .edges_directed(*index, Direction::Outgoing)
             .filter(|edge| edge.weight().kind == LineageEdgeKind::Tests)
-            .filter_map(|edge| match self.graph.node_weight(edge.source()) {
+            .filter_map(|edge| match self.graph.node_weight(edge.target()) {
                 Some(LineageNode::Test(id)) => Some(id.clone()),
                 _ => None,
             })

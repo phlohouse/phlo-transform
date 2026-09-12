@@ -145,7 +145,7 @@ fn model_to_model_lineage() {
     assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
     let graph = &compilation.lineage;
 
-    // Model-level and dataset-level derives edges both exist.
+    // Model-level and dataset-level derives rollup edges both exist.
     assert!(has_edge(
         &compilation,
         LineageNode::Model(id("assay.raw")),
@@ -157,6 +157,14 @@ fn model_to_model_lineage() {
         LineageNode::Dataset(dataset("assay.raw")),
         LineageNode::Dataset(dataset("assay.clean")),
         LineageEdgeKind::Derives,
+    ));
+    // The canonical input edge: the upstream model's output dataset is an
+    // input of the downstream model — identical to how a source connects.
+    assert!(has_edge(
+        &compilation,
+        LineageNode::Dataset(dataset("assay.raw")),
+        LineageNode::Model(id("assay.clean")),
+        LineageEdgeKind::Input,
     ));
     // The model produces its output dataset.
     assert!(has_edge(
@@ -405,14 +413,39 @@ fn tests_link_to_target_datasets() {
         graph.tests_for_dataset(&dataset("assay.clean")),
         vec![TestId::new("check_clean")]
     );
+    // Tests consume the dataset: dataset → test, so impact traversal
+    // reaches them without special-casing.
     assert!(has_edge(
         &compilation,
-        LineageNode::Test(TestId::new("check_clean")),
         LineageNode::Dataset(dataset("assay.clean")),
+        LineageNode::Test(TestId::new("check_clean")),
         LineageEdgeKind::Tests,
     ));
+    let impact = graph.impact(&LineageNode::Dataset(dataset("assay.clean")));
+    assert!(impact.contains(&LineageNode::Test(TestId::new("check_clean"))));
     // Tests do not attach to datasets they do not read.
     assert!(graph.tests_for_dataset(&dataset("assay.raw")).is_empty());
+}
+
+#[test]
+fn ephemeral_outputs_have_no_physical_target() {
+    let compilation = compile();
+    let graph = &compilation.lineage;
+
+    // The ephemeral model's dataset carries its materialization but no
+    // physical target — it must never be published as a relation.
+    let (_, ephemeral_meta) = graph
+        .node(&LineageNode::Dataset(dataset("assay.scaled")))
+        .unwrap();
+    assert_eq!(ephemeral_meta.materialization.as_deref(), Some("ephemeral"));
+    assert_eq!(ephemeral_meta.target, None);
+
+    // A default (view) model keeps its physical target.
+    let (_, view_meta) = graph
+        .node(&LineageNode::Dataset(dataset("assay.clean")))
+        .unwrap();
+    assert_eq!(view_meta.materialization.as_deref(), Some("view"));
+    assert!(view_meta.target.is_some());
 }
 
 #[test]
@@ -420,9 +453,16 @@ fn traversal_indexes() {
     let compilation = compile();
     let graph = &compilation.lineage;
 
-    // upstream(model) — one hop: the model reads assay.clean.
+    // upstream(model) — one hop: the model reads assay.clean's output
+    // dataset (canonical input edge) plus the model-level rollup edge.
     let upstream = graph.upstream(&LineageNode::Model(id("assay.daily")));
-    assert_eq!(upstream, vec![LineageNode::Model(id("assay.clean"))]);
+    assert_eq!(
+        upstream,
+        vec![
+            LineageNode::Model(id("assay.clean")),
+            LineageNode::Dataset(dataset("assay.clean")),
+        ]
+    );
 
     // upstream_transitive reaches the external source.
     let transitive = graph.upstream_transitive(&LineageNode::Dataset(dataset("assay.daily")));

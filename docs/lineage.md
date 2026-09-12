@@ -51,11 +51,23 @@ redesign. Run and ingestion-asset nodes extend the enum the same way.
 
 | Kind | Direction | Meaning |
 |---|---|---|
-| `input` | dataset → model | the model reads the dataset |
+| `input` | dataset → model | the model reads the dataset — the canonical dependency edge |
 | `output` | model → dataset | the model produces the dataset |
 | `derives` | model→model, dataset→dataset, column→column | value lineage |
 | `contains` | dataset → column | the column belongs to the dataset |
-| `tests` | test → dataset | the test asserts on the dataset |
+| `tests` | dataset → test | the test consumes and asserts on the dataset |
+
+Every input connects the same way — a declared source, a seed and an
+upstream model's output dataset are all `dataset ──input──▶ model`:
+
+```text
+model A ──output──▶ dataset A ──input──▶ model B ──output──▶ dataset B
+```
+
+The `model → model` and `dataset → dataset` `derives` edges are rollups over
+that chain for one-hop queries — never a substitute for the `input` edge.
+Because tests are consumers (`dataset → test`), `impact(dataset)` reaches
+them with no special-casing.
 
 Only column-level `derives` edges carry semantic metadata today; every field
 is optional so other edge kinds stay plain:
@@ -142,12 +154,22 @@ regardless of `--json`; selector terms scope it the same way they scope
 
 ## OpenLineage export
 
-`phlo-transform-openlineage` maps the graph to a design-time document — one
-`JobEvent` per model (inputs, outputs, `columnLineage` facet) and one
-`DatasetEvent` per dataset (`schema`, `datasetType`, `symlinks` for physical
-targets). Phlo metadata with no standard equivalent rides in custom `phlo`
-facets (dataset URI/kind, materialization/workflow/version, per-field
-confidence). No `RunEvent` is fabricated — this is declared lineage, not an
+`phlo-transform-openlineage` maps the graph to a design-time document — an
+`events` array containing one `JobEvent` per model (inputs, outputs,
+`columnLineage` facet) and one `DatasetEvent` per dataset (`schema`,
+`datasetType`, `symlinks` for physical targets). Every event carries the
+required `eventTime`, `producer` and `schemaURL` fields and validates
+against the OpenLineage 2-0-2 spec (the test suite checks this against the
+vendored JSON schemas), so each element can be POSTed to a `/lineage`
+endpoint as-is.
+
+Each standard facet names its own published schema URL; Phlo metadata with
+no standard equivalent rides in namespaced `phlo_job` / `phlo_dataset`
+facets whose immutable schemas are published under `schemas/facets/` in this
+repository. `datasetType` reflects the materialization — `TABLE` for
+tables/incrementals, `VIEW` for views, `JOB_OUTPUT`/`TEMPORARY` for
+ephemeral models — and `symlinks` only appear when a physical relation
+actually exists. No `run` is fabricated — this is declared lineage, not an
 observed run.
 
 OpenLineage is an **export boundary**, not the internal model: none of its

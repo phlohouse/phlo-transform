@@ -11,6 +11,9 @@ rust-version.workspace = true
 phlo-transform-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+time = { version = "0.3", features = ["formatting"] }
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
+jsonschema = "0.49.9"
+phlo-transform-sql = { workspace = true }

@@ -1205,6 +1205,11 @@ edges. Model outputs, sources and seeds are all `dataset://` nodes, so lineage
 is expressed between datasets rather than being tied to transform models;
 future ingestion systems contribute nodes and edges to the same graph.
 
+Every input connects identically: `dataset ──input──▶ model` covers sources,
+seeds and upstream model outputs alike (`model → model` and `dataset →
+dataset` edges exist only as one-hop rollups). Tests are consumers — `dataset
+──tests──▶ test` — so impact traversal reaches them naturally.
+
 Every report and export reads this one structure — `lineage`, `impact`,
 artifacts and the OpenLineage exporter never re-derive their own:
 
@@ -1241,7 +1246,9 @@ analytics.monthly_summary
 ```
 
 `lineage --format graph` prints the canonical document;
-`lineage --format openlineage` exports the OpenLineage design-time document.
+`lineage --format openlineage` exports the OpenLineage design-time document —
+an `events` array of spec-valid `JobEvent`s and `DatasetEvent`s, each with
+`eventTime`/`producer`/`schemaURL`, ready to POST to a `/lineage` endpoint.
 Both accept a model target or selector terms for scoping.
 
 ## 56. Column lineage
@@ -1514,7 +1521,7 @@ These files are interfaces, not incidental logs.
 
 `graph.json` includes nodes, edges, edge types, column edges, workflow relationships and external-source relationships.
 
-`lineage.json` holds the canonical lineage document — every model, dataset, column and test node with its edges and column-level metadata — and `openlineage.json` the same graph exported as an OpenLineage design-time document for tools such as OpenMetadata and DataHub.
+`lineage.json` holds the canonical lineage document — every model, dataset, column and test node with its edges and column-level metadata — and `openlineage.json` the same graph exported as an OpenLineage design-time document (`events`: spec-valid `JobEvent`s and `DatasetEvent`s) for tools such as OpenMetadata and DataHub.
 
 ## 74. Plan artifact
 

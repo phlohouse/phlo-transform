@@ -222,7 +222,7 @@ fn lineage_graph_format_scopes_to_a_model() {
 }
 
 #[test]
-fn lineage_openlineage_format_exports_jobs_and_datasets() {
+fn lineage_openlineage_format_exports_events() {
     let output = run(&[
         "--root",
         "fixtures/ephemeral",
@@ -234,11 +234,20 @@ fn lineage_openlineage_format_exports_jobs_and_datasets() {
     let body = stdout(&output);
     let document: serde_json::Value =
         serde_json::from_str(&body).expect("openlineage output is JSON");
-    assert_eq!(
-        document["producer"],
-        "https://github.com/phlohouse/phlo-transform"
-    );
-    let jobs = document["jobs"].as_array().expect("jobs array");
+    let events = document["events"].as_array().expect("events array");
+    // Every event is a complete OpenLineage event with the required fields.
+    for event in events {
+        assert!(event["eventTime"].is_string(), "{event}");
+        assert_eq!(
+            event["producer"],
+            "https://github.com/phlohouse/phlo-transform"
+        );
+        assert!(event["schemaURL"].is_string(), "{event}");
+    }
+    let jobs: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event.get("job").is_some())
+        .collect();
     let names: Vec<&str> = jobs
         .iter()
         .map(|job| job["job"]["name"].as_str().unwrap())
@@ -255,10 +264,30 @@ fn lineage_openlineage_format_exports_jobs_and_datasets() {
     // The output dataset carries the columnLineage facet.
     let lineage = &customers["outputs"][0]["facets"]["columnLineage"]["fields"];
     assert!(lineage["total"]["inputFields"].is_array(), "{lineage}");
-    let datasets = document["datasets"].as_array().unwrap();
-    assert!(datasets
-        .iter()
-        .any(|event| event["dataset"]["name"] == "external.raw_orders"));
+    // The ephemeral model is a temporary job output, not a physical table;
+    // the view model is a VIEW with a physical symlink.
+    let dataset = |name: &str| {
+        events
+            .iter()
+            .filter_map(|event| event.get("dataset"))
+            .find(|dataset| dataset["name"] == name)
+            .unwrap_or_else(|| panic!("no dataset event for {name}"))
+    };
+    let staged = dataset("main.stg_orders");
+    assert_eq!(staged["facets"]["datasetType"]["datasetType"], "JOB_OUTPUT");
+    assert_eq!(staged["facets"]["datasetType"]["subType"], "TEMPORARY");
+    assert!(staged["facets"]["symlinks"].is_null());
+    let customers_dataset = dataset("main.customers");
+    assert_eq!(
+        customers_dataset["facets"]["datasetType"]["datasetType"],
+        "VIEW"
+    );
+    assert!(customers_dataset["facets"]["symlinks"].is_object());
+    assert!(events.iter().any(|event| {
+        event
+            .get("dataset")
+            .is_some_and(|dataset| dataset["name"] == "external.raw_orders")
+    }));
 }
 
 #[test]

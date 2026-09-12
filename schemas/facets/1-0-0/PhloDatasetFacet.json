@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/phlohouse/phlo-transform/main/schemas/facets/1-0-0/PhloDatasetFacet.json",
+  "description": "Phlo Transform dataset metadata that has no standard OpenLineage equivalent.",
+  "type": "object",
+  "$defs": {
+    "PhloDatasetFacet": {
+      "allOf": [
+        {
+          "$ref": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/DatasetFacet"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "uri": {
+              "type": "string",
+              "description": "The dataset:// URI — the dataset's canonical Phlo identity."
+            },
+            "kind": {
+              "type": "string",
+              "description": "What produces the dataset: model|source|seed|external."
+            },
+            "materialization": {
+              "type": "string",
+              "description": "The producing model's materialization, for model-output datasets."
+            },
+            "path": {
+              "type": "string",
+              "description": "Workspace-relative CSV path, for seed datasets."
+            },
+            "fieldConfidence": {
+              "type": "object",
+              "description": "Lineage confidence per output field (exact|inferred|declared|runtime|unknown).",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": ["uri", "kind"],
+          "additionalProperties": true
+        }
+      ],
+      "type": "object"
+    }
+  }
+}

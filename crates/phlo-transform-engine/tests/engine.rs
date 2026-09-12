@@ -438,17 +438,23 @@ async fn persists_run_history_and_writes_artifacts() {
         );
     }
 
-    // `openlineage.json` carries the exported design-time document.
+    // `openlineage.json` carries the exported design-time document: a flat
+    // array of spec-valid OpenLineage events.
     let document: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(directory.path().join("openlineage.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        document["event"]["producer"],
-        "https://github.com/phlohouse/phlo-transform"
-    );
-    assert!(document["event"]["jobs"].is_array());
-    assert!(document["event"]["datasets"].is_array());
+    let events = document["document"]["events"]
+        .as_array()
+        .expect("events array");
+    assert!(!events.is_empty());
+    assert!(events.iter().all(|event| {
+        event["eventTime"].is_string()
+            && event["producer"] == "https://github.com/phlohouse/phlo-transform"
+            && event["schemaURL"].is_string()
+    }));
+    assert!(events.iter().any(|event| event.get("job").is_some()));
+    assert!(events.iter().any(|event| event.get("dataset").is_some()));
 }
 
 #[tokio::test]

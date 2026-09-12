@@ -264,7 +264,7 @@ Written under `.phlo/transform/` with `schema_version = 2`:
 | `manifest.json` | workspace root, roots, models, sources, tests |
 | `graph.json` | dependency-graph nodes and edges |
 | `lineage.json` | the canonical lineage graph document (models, datasets, columns, tests; direct/indirect/transformation/confidence on column edges) |
-| `openlineage.json` | the same graph exported as an OpenLineage design-time document |
+| `openlineage.json` | the same graph exported as an OpenLineage design-time document (`events`: valid `JobEvent`/`DatasetEvent`s) |
 | `plan.json` | plan id, adapter, environment, planned models/tests, diagnostics |
 | `run.json` | run id, plan id, status, model/test results, events |
 | `environment.json` | provisioned base/candidate references and candidate catalog |

@@ -85,11 +85,12 @@ pub struct LineageArtifact {
 }
 
 /// `openlineage.json` — the same graph exported as an OpenLineage
-/// static-lineage document.
+/// static-lineage document: an `events` array in which every element is a
+/// spec-valid `JobEvent` or `DatasetEvent`.
 #[derive(Clone, Debug, Serialize)]
 pub struct OpenLineageArtifact {
     pub schema_version: u32,
-    pub event: serde_json::Value,
+    pub document: serde_json::Value,
 }
 
 impl LineageArtifact {
@@ -150,7 +151,7 @@ impl ArtifactWriter {
             "openlineage",
             &OpenLineageArtifact {
                 schema_version: SCHEMA_VERSION,
-                event: serde_json::to_value(
+                document: serde_json::to_value(
                     phlo_transform_openlineage::OpenLineageExporter::new(&compilation.lineage)
                         .export(),
                 )

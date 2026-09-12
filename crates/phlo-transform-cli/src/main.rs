@@ -157,7 +157,8 @@ struct Cli {
 enum LineageFormat {
     /// Phlo's canonical lineage graph document.
     Graph,
-    /// An OpenLineage static-lineage document (jobs + datasets).
+    /// An OpenLineage document: an `events` array of spec-valid JobEvents
+    /// and DatasetEvents.
     Openlineage,
 }
 
@@ -202,7 +203,7 @@ enum Command {
         target: Option<String>,
         /// Export the canonical lineage graph instead of the human listing:
         /// `graph` emits Phlo's structured document, `openlineage` emits an
-        /// OpenLineage static-lineage document.
+        /// `events` array of OpenLineage JobEvents and DatasetEvents.
         #[arg(long, value_enum)]
         format: Option<LineageFormat>,
     },
