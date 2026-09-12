@@ -341,20 +341,39 @@ impl Planner {
             .collect();
 
         // A model whose dependency was excluded builds against whatever is
-        // already materialised — flag it so the gap is visible.
+        // already materialised. That is only valid when a materialisation
+        // actually exists — otherwise the plan would schedule a model that
+        // reads a relation that does not exist.
         let mut warnings = Vec::new();
         for id in &planned_ids {
             let Some(model) = compilation.model(id) else {
                 continue;
             };
             for dependency in model.model_dependencies() {
-                if excluded.contains(dependency) {
-                    warnings.push(format!(
-                        "{} depends on excluded model {}; it will read the existing materialisation",
-                        id.logical_name(),
-                        dependency.logical_name()
-                    ));
+                if !excluded.contains(dependency) {
+                    continue;
                 }
+                let Some(excluded_model) = compilation.model(dependency) else {
+                    continue;
+                };
+                // Ephemeral dependencies are inlined into the dependent's
+                // SQL, so excluding one needs no materialisation at all.
+                if excluded_model.config.materialization == Materialization::Ephemeral {
+                    continue;
+                }
+                if !blocked && !self.adapter.relation_exists(&excluded_model.target).await? {
+                    return Err(EngineError::InvalidPlan(format!(
+                        "{} depends on excluded model {}, and {} has never been materialised",
+                        id.logical_name(),
+                        dependency.logical_name(),
+                        excluded_model.target.display()
+                    )));
+                }
+                warnings.push(format!(
+                    "{} depends on excluded model {}; it will read the existing materialisation",
+                    id.logical_name(),
+                    dependency.logical_name()
+                ));
             }
         }
 

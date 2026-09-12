@@ -996,7 +996,10 @@ phlo transform plan --downstream assay.results
 Positional selector terms and `--select` are equivalent. `--exclude` is
 absolute: an excluded model is never pulled back in by `+` expansion or by
 dependency closure — a selected model that depends on it plans against the
-existing materialisation and the plan records a warning.
+existing materialisation and the plan records a warning. If the excluded
+model was never materialised the plan is rejected outright (excluding an
+ephemeral dependency is always fine — its SQL is inlined, so no relation is
+needed).
 
 ---
 
@@ -1625,7 +1628,9 @@ phlo transform plan assay.results 'assay.*'   # positional terms
 
 `changed` compares desired model versions against the recorded materialised
 version for the target environment (state-derived today; a Git-aware
-provider feeds the same term later).
+provider feeds the same term later). Ephemeral models are never reported
+changed — they are never materialised; their edits surface through
+dependents' dependency versions.
 
 ---
 

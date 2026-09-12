@@ -577,9 +577,47 @@ fn plan_positional_selector_scopes_the_plan() {
     assert!(body.contains("does not exist"), "{body}");
 }
 
-/// `--exclude` subtracts even from dependency closure and warns about it.
+/// `--exclude` subtracts even from dependency closure and warns about it —
+/// when the excluded relation exists to be read.
 #[test]
 fn plan_exclude_beats_dependency_closure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let duckdb_path = dir.path().join("local.duckdb");
+    {
+        let connection = duckdb::Connection::open(&duckdb_path).expect("open duckdb");
+        connection
+            .execute_batch(
+                "create schema assay;
+                 create table assay.raw as select 1 as id;",
+            )
+            .expect("materialise the excluded model");
+    }
+    let duckdb_arg = duckdb_path.to_str().expect("utf-8").to_string();
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "--adapter",
+        "duckdb",
+        "--duckdb-path",
+        duckdb_arg.as_str(),
+        "plan",
+        "assay.results",
+        "--exclude",
+        "assay.raw",
+    ]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("excluding assay.raw"), "{body}");
+    assert!(body.contains("warning:"), "{body}");
+    assert!(body.contains("assay.results"), "{body}");
+    assert!(!body.contains("BUILD  assay.raw"), "{body}");
+}
+
+/// Excluding a required dependency that was never materialised must fail —
+/// the plan would otherwise schedule a read from a relation that does not
+/// exist.
+#[test]
+fn plan_exclude_missing_dependency_fails() {
     let output = run(&[
         "--root",
         "fixtures/basic-multi-root",
@@ -592,12 +630,13 @@ fn plan_exclude_beats_dependency_closure() {
         "--exclude",
         "assay.raw",
     ]);
-    assert!(output.status.success(), "{}", stdout(&output));
+    assert!(!output.status.success());
     let body = stdout(&output);
-    assert!(body.contains("excluding assay.raw"), "{body}");
-    assert!(body.contains("warning:"), "{body}");
-    assert!(body.contains("assay.results"), "{body}");
-    assert!(!body.contains("BUILD  assay.raw"), "{body}");
+    let stderr = String::from_utf8(output.stderr.clone()).expect("utf-8 stderr");
+    assert!(
+        body.contains("never been materialised") || stderr.contains("never been materialised"),
+        "stdout: {body}\nstderr: {stderr}"
+    );
 }
 
 /// The JSON plan exposes the resolved selection and structured reasons.

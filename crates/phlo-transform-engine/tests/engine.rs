@@ -1518,11 +1518,18 @@ async fn downstream_expansion_is_explained() {
 }
 
 /// `--exclude` wins over dependency closure: the excluded model is not
-/// planned, and a warning explains the gap.
+/// planned, and a warning explains the gap — but only when the excluded
+/// relation actually exists to be read.
 #[tokio::test]
 async fn excluded_dependency_stays_out_and_warns() {
     let compilation = project_with_tests();
     let adapter = Arc::new(FakeAdapter::default());
+    // A previous materialisation of assay.raw exists to read from.
+    adapter
+        .existing
+        .lock()
+        .unwrap()
+        .insert("assay.raw".to_string());
     let set = SelectorSet::parse(
         &["assay.results".to_string()],
         &["assay.raw".to_string()],
@@ -1547,6 +1554,101 @@ async fn excluded_dependency_stays_out_and_warns() {
             .any(|warning| warning.contains("excluded model assay.raw")),
         "{:?}",
         plan.warnings
+    );
+}
+
+/// Excluding a required dependency that was never materialised would
+/// schedule a model reading a relation that does not exist — the plan must
+/// refuse rather than produce an impossible run.
+#[tokio::test]
+async fn excluding_a_missing_dependency_fails_the_plan() {
+    let compilation = project_with_tests();
+    // Fresh adapter: nothing exists.
+    let adapter = Arc::new(FakeAdapter::default());
+    let set = SelectorSet::parse(
+        &["assay.results".to_string()],
+        &["assay.raw".to_string()],
+        &[],
+        false,
+        false,
+    )
+    .unwrap();
+    let selection = resolve_selection(&compilation, &set, None).unwrap();
+
+    let error = Planner::new(adapter, None)
+        .plan(&compilation, &selection, None, &PlanOptions::default())
+        .await
+        .expect_err("plan must be rejected");
+    assert!(
+        matches!(error, phlo_transform_engine::EngineError::InvalidPlan(_)),
+        "{error:?}"
+    );
+    assert!(
+        error.to_string().contains("excluded model assay.raw"),
+        "{error}"
+    );
+}
+
+/// Ephemeral models are never materialised, so state-derived `changed`
+/// must not report them — otherwise they re-seed `changed+` expansion on
+/// every run. An ephemeral edit still surfaces through its dependents'
+/// dependency-version input.
+#[tokio::test]
+async fn changed_models_ignores_ephemeral_models() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state: Arc<dyn StateStore> = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let environment = Some("dev".to_string());
+
+    // materialised -> ephemeral -> materialised
+    let build = |ephemeral_sql: &str| {
+        let mut ephemeral = model("assay.stg", ephemeral_sql);
+        ephemeral.config.materialization = Materialization::Ephemeral;
+        compile_models(vec![
+            model("assay.raw", "select 1 as id"),
+            ephemeral,
+            model("assay.results", "select * from assay.stg"),
+        ])
+    };
+
+    let first = build("select id from assay.raw");
+    let selected = Selection::all(&first);
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(
+            &first,
+            &selected,
+            environment.clone(),
+            &PlanOptions::default(),
+        )
+        .await
+        .unwrap();
+    // The ephemeral is never planned itself.
+    assert!(plan.models.iter().all(|model| model.id != "assay.stg"));
+    Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &first,
+            &plan,
+            &RunOptions {
+                environment: environment.clone(),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // After a clean run nothing is changed — including the ephemeral,
+    // which has no recorded version by definition.
+    let changed = changed_models(&first, Some(&state), environment.as_deref()).unwrap();
+    assert!(changed.is_empty(), "{changed:?}");
+
+    // Editing the ephemeral's SQL changes the downstream materialised
+    // model's version without the ephemeral itself appearing.
+    let second = build("select id, id * 2 as doubled from assay.raw");
+    let changed = changed_models(&second, Some(&state), environment.as_deref()).unwrap();
+    let names: BTreeSet<String> = changed.iter().map(|id| id.logical_name()).collect();
+    assert_eq!(
+        names,
+        ["assay.results"].into_iter().map(String::from).collect()
     );
 }
 

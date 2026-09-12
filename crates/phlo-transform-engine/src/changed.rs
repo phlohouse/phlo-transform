@@ -14,13 +14,18 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use phlo_transform_core::{Compilation, ModelId};
+use phlo_transform_core::{Compilation, Materialization, ModelId};
 
 use crate::error::EngineError;
 use crate::state::StateStore;
 
 /// Models whose desired version differs from the version recorded for
 /// `environment` — the meaning of the `changed` selector.
+///
+/// Ephemeral models are never materialised, so they have no recorded
+/// version to compare against and are skipped entirely; an edit to an
+/// ephemeral still propagates into dependents' versions through the
+/// dependency hash, so `changed+` keeps working.
 ///
 /// With no state store, nothing can be proven unchanged, so every model is
 /// reported changed. Models are returned in deterministic order.
@@ -31,6 +36,9 @@ pub fn changed_models(
 ) -> Result<BTreeSet<ModelId>, EngineError> {
     let mut changed = BTreeSet::new();
     for model in &compilation.models {
+        if model.config.materialization == Materialization::Ephemeral {
+            continue;
+        }
         let changed_model = match state {
             Some(state) => {
                 match state.materialized_version(&model.id.logical_name(), environment)? {

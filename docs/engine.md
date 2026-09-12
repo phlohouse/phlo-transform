@@ -133,8 +133,9 @@ or `--trino-endpoint`, `--trino-user`, `--trino-password`, `--trino-catalog`,
 ## Planning
 
 `Planner::plan` resolves the selection, expands it to be dependency-closed
-(excluded models are never pulled back in — the plan records a warning
-instead), orders models topologically and compares each model's desired
+(excluded models are never pulled back in; a dependent plans against the
+existing materialisation with a warning, or the plan is rejected when none
+exists), orders models topologically and compares each model's desired
 content-addressed version against the version recorded for the target
 environment. Actions:
 
@@ -208,8 +209,10 @@ all | *              everything
 `--tag`/`--workflow` intersect; `--exclude` subtracts last and is absolute.
 `--changed` is shorthand for the `changed` term, whose change set comes
 from `changed_models()`: desired version vs. the materialised version
-recorded for the environment (no state ⇒ everything is changed). A
-Git-aware provider can feed the same term without touching resolution.
+recorded for the environment (no state ⇒ everything is changed; ephemeral
+models are never reported — their edits propagate through dependents'
+dependency versions). A Git-aware provider can feed the same term without
+touching resolution.
 
 Members carry provenance — which terms matched them directly and which
 pulled them in through `+` — so the planner can explain membership and the

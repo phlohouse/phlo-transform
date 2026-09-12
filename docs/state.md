@@ -93,7 +93,9 @@ the desired/current hashes, reasons, membership and the resolved selection.
 
 `changed_models(compilation, state, environment)` returns the set of models
 whose desired version differs from the recorded one — the change set behind
-the `changed` selector term.
+the `changed` selector term. Ephemeral models are never reported (they are
+never materialised, so they have no recorded version; their edits propagate
+to dependents through the dependency hash instead).
 
 ## Stale plans
 
