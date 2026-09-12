@@ -619,8 +619,7 @@ fn selector_set(cli: &Cli) -> Result<SelectorSet, String> {
             || cli.downstream)
     {
         return Err(
-            "selection flags apply to list, plan, apply, run, test, lineage and impact"
-                .to_string(),
+            "selection flags apply to list, plan, apply, run, test, lineage and impact".to_string(),
         );
     }
     let mut include: Vec<String> = positional.to_vec();
