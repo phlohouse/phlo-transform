@@ -20,6 +20,7 @@ pub mod config;
 pub mod consumers;
 pub mod diagnostics;
 pub mod discovery;
+pub mod git;
 pub mod graph;
 pub mod identity;
 pub mod model;
@@ -38,7 +39,11 @@ pub use compiled::{Compilation, CompiledModel, CompiledSeed, CompiledTest};
 pub use config::CrossWorkflowPolicy;
 pub use consumers::{ConsumerRegistry, EmptyConsumerRegistry, StaticConsumerRegistry};
 pub use diagnostics::{codes, Diagnostic, Severity};
-pub use discovery::load_project;
+pub use discovery::{load_project, model_id_for_path};
+pub use git::{
+    changes as git_changes, ChangedModel, ChangedPath, ChangedSeed, ChangedTest, DeletedModel,
+    GitChanges, GitError, PathStatus,
+};
 pub use graph::{Dependency, EdgeKind, GraphNode, TransformGraph};
 pub use identity::{IdentityError, ModelId, Namespace, SourceId};
 pub use model::{

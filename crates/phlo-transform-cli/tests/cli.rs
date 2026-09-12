@@ -775,3 +775,244 @@ fn invalid_and_unmatched_selectors_fail() {
     ]);
     assert!(!output.status.success());
 }
+
+// --- Git-aware change detection (`--since`) -------------------------------
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A git repo holding a two-model workspace: `assay.raw` reads source
+/// `raw.events`, `assay.results` reads `assay.raw`. Returns the tempdir.
+fn git_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms/assay")).expect("mkdir");
+    std::fs::create_dir_all(root.join("seeds")).expect("mkdir");
+    std::fs::write(
+        root.join("phlo.toml"),
+        "[transform]\nroots = [\"transforms\"]\n",
+    )
+    .expect("phlo.toml");
+    std::fs::write(
+        root.join("transforms/assay/raw.sql"),
+        "select * from raw.events\n",
+    )
+    .expect("raw.sql");
+    std::fs::write(
+        root.join("transforms/assay/results.sql"),
+        "select * from assay.raw\n",
+    )
+    .expect("results.sql");
+    std::fs::write(root.join("seeds/events.csv"), "id\n1\n").expect("seed");
+    git(root, &["init", "-q"]);
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+    git(root, &["branch", "-M", "main"]);
+    dir
+}
+
+fn plan_since(root: &std::path::Path, args: &[&str]) -> Output {
+    let root_arg = root.to_str().expect("utf-8").to_string();
+    let mut full = vec![
+        "--root",
+        root_arg.as_str(),
+        "--adapter",
+        "duckdb",
+        "--duckdb-path",
+        ":memory:",
+    ];
+    full.extend_from_slice(args);
+    run_unchecked(&full)
+}
+
+/// `--since` alone implies `changed`: a clean repo plans nothing.
+#[test]
+fn plan_since_clean_repo_selects_nothing() {
+    let dir = git_workspace();
+    let output = plan_since(dir.path(), &["plan", "--since", "main"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("Git changes since main"), "{body}");
+    assert!(body.contains("none"), "{body}");
+    assert!(body.contains("Models (0)"), "{body}");
+}
+
+/// A modified model is a direct Git change carrying file provenance.
+#[test]
+fn plan_since_marks_modified_model() {
+    let dir = git_workspace();
+    std::fs::write(
+        dir.path().join("transforms/assay/raw.sql"),
+        "select id from raw.events\n",
+    )
+    .expect("edit");
+    let output = plan_since(dir.path(), &["plan", "--since", "main"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(
+        body.contains("transforms/assay/raw.sql modified since main"),
+        "{body}"
+    );
+    assert!(body.contains("BUILD  assay.raw"), "{body}");
+    // Downstream results is not a direct change.
+    assert!(!body.contains("BUILD  assay.results"), "{body}");
+}
+
+/// `changed+` expands the Git change set downstream through the graph.
+#[test]
+fn plan_since_changed_plus_expands_downstream() {
+    let dir = git_workspace();
+    std::fs::write(
+        dir.path().join("transforms/assay/raw.sql"),
+        "select id from raw.events\n",
+    )
+    .expect("edit");
+    let output = plan_since(dir.path(), &["plan", "--since", "main", "changed+"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("BUILD  assay.raw"), "{body}");
+    assert!(body.contains("BUILD  assay.results"), "{body}");
+    assert!(body.contains("selected by `changed+`"), "{body}");
+}
+
+/// A changed seed selects the models that consume it.
+#[test]
+fn plan_since_seed_change_marks_consumers() {
+    let dir = git_workspace();
+    std::fs::write(dir.path().join("seeds/events.csv"), "id\n1\n2\n").expect("edit");
+    let output = plan_since(dir.path(), &["plan", "--since", "main"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("seed events"), "{body}");
+    assert!(body.contains("BUILD  assay.raw"), "{body}");
+}
+
+/// `--since` with include terms that don't use `changed` is an error —
+/// the flag must not silently warp an unrelated selection.
+#[test]
+fn plan_since_without_changed_term_errors() {
+    let dir = git_workspace();
+    let output = plan_since(dir.path(), &["plan", "--since", "main", "assay.raw"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr.clone()).expect("utf-8 stderr");
+    assert!(
+        stderr.contains("`--since` supplies the `changed` selector"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn plan_since_unknown_ref_errors() {
+    let dir = git_workspace();
+    let output = plan_since(dir.path(), &["plan", "--since", "no-such-ref"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr.clone()).expect("utf-8 stderr");
+    assert!(stderr.contains("unknown Git ref"), "{stderr}");
+}
+
+#[test]
+fn plan_since_outside_a_repository_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("transforms/assay")).expect("mkdir");
+    std::fs::write(
+        root.join("phlo.toml"),
+        "[transform]\nroots = [\"transforms\"]\n",
+    )
+    .expect("phlo.toml");
+    std::fs::write(root.join("transforms/assay/raw.sql"), "select 1\n").expect("raw.sql");
+    let output = plan_since(root, &["plan", "--since", "main"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr.clone()).expect("utf-8 stderr");
+    assert!(stderr.contains("not inside"), "{stderr}");
+}
+
+/// The JSON plan carries the structured Git change set and per-model
+/// `git_change` provenance reasons.
+#[test]
+fn plan_since_json_exposes_git_change_set() {
+    let dir = git_workspace();
+    std::fs::write(
+        dir.path().join("transforms/assay/raw.sql"),
+        "select id from raw.events\n",
+    )
+    .expect("edit");
+    let output = plan_since(dir.path(), &["--json", "plan", "--since", "main"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let plan: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("plan JSON");
+    assert_eq!(plan["git"]["since"], "main");
+    assert_eq!(
+        plan["git"]["merge_base"].as_str().unwrap_or_default().len(),
+        40
+    );
+    assert_eq!(
+        plan["git"]["models"][0]["model"], "assay.raw",
+        "{}",
+        plan["git"]["models"]
+    );
+    assert_eq!(
+        plan["git"]["paths"][0]["path"], "transforms/assay/raw.sql",
+        "{}",
+        plan["git"]["paths"]
+    );
+    let models = plan["models"].as_array().expect("models");
+    let raw = models
+        .iter()
+        .find(|model| model["id"] == "assay.raw")
+        .expect("raw planned");
+    assert!(
+        raw["reasons"]
+            .as_array()
+            .expect("reasons")
+            .iter()
+            .any(|reason| reason["kind"] == "git_change"),
+        "{raw}"
+    );
+}
+
+/// A dirty working tree counts: uncommitted edits are Git changes.
+#[test]
+fn plan_since_includes_working_tree_changes() {
+    let dir = git_workspace();
+    // Unstaged edit — never committed.
+    std::fs::write(
+        dir.path().join("transforms/assay/raw.sql"),
+        "select id, amount from raw.events\n",
+    )
+    .expect("edit");
+    let output = plan_since(dir.path(), &["plan", "--since", "main"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("BUILD  assay.raw"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+/// A deleted dependency marks its dependents.
+#[test]
+fn plan_since_deleted_dependency_marks_dependents() {
+    let dir = git_workspace();
+    git(dir.path(), &["rm", "-q", "transforms/assay/raw.sql"]);
+    let output = plan_since(dir.path(), &["plan", "--since", "main"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("deleted assay.raw"), "{body}");
+    assert!(
+        body.contains("dependency assay.raw was removed since main"),
+        "{body}"
+    );
+    assert!(body.contains("BUILD  assay.results"), "{body}");
+}

@@ -1599,7 +1599,9 @@ term    := "+"? body "+"?
 body    := "tag:" value            model carries the tag
         |  "namespace:" value      model's namespace (first name segment)
         |  "source:" value         model reads a matching source
-        |  "changed"               desired version differs from recorded state
+        |  "changed"               desired version differs from recorded
+                                   state — or, under `--since`, from a
+                                   Git ref
         |  "all" | "*"             every model
         |  pattern                 name, `model://` URI, `prefix.*` glob,
                                    or a unique name suffix
@@ -1622,15 +1624,63 @@ phlo transform plan assay.results 'assay.*'   # positional terms
 --exclude assay.legacy_raw                    # subtract (applied last)
 --tag qc --workflow assay_ingest              # intersect filters
 --changed                                     # shorthand for `changed`
+--since main                                  # `changed` resolves via Git
 --upstream / --downstream                     # expand the filtered base
 --force                                       # rebuild regardless of state
 ```
 
-`changed` compares desired model versions against the recorded materialised
-version for the target environment (state-derived today; a Git-aware
-provider feeds the same term later). Ephemeral models are never reported
-changed — they are never materialised; their edits surface through
-dependents' dependency versions.
+The `changed` term has two providers answering different questions:
+
+- **State-derived** (default): the desired model version differs from the
+  version recorded as materialised for the target environment. Because a
+  moved upstream version changes dependents' versions, this set naturally
+  includes downstream models. Ephemeral models are never reported changed —
+  they are never materialised; their edits surface through dependents'
+  dependency versions.
+- **Git-derived** (`--since <ref>`): semantic project inputs changed
+  relative to a Git ref — the *directly changed* set only. Downstream
+  impact comes from selector expansion (`changed+`), not from the diff.
+
+```bash
+phlo transform plan --since main            # shorthand for --select changed --since main
+phlo transform plan --since main --select changed+
+phlo transform run --since origin/main
+phlo transform impact --since main          # blast radius of the diff
+```
+
+`--since` compares `merge-base(<ref>, HEAD)` against the working tree —
+the fork point, so a moving `main` doesn't inflate the diff — and counts
+staged, unstaged and untracked files. It requires a `changed` term
+somewhere in the selector set (implied when no include terms are given);
+`--since <ref> <model>` without `changed` is an error rather than a
+silently ignored flag.
+
+The Git provider maps each changed workspace path once — model files
+(semantic comparison: canonical SQL plus directives, so comment- and
+formatting-only edits don't count), `seeds/*.csv` (consumers of the seed's
+source relation; unused seeds are still reported), `tests/*.sql` (the
+test's target models, so `test --since` covers them), `transform.toml`
+(every model under its directory) and `phlo.toml` (narrowed to changed
+sections; `[transform]`/`[dependencies]`/defaults widen to all models).
+Added, modified, renamed, deleted and untracked files all count; a deleted
+or renamed-away model marks its dependents, since they now read a source
+where a model used to be. When a path cannot be proven narrow, the
+provider widens rather than guesses.
+
+Direct changes carry `git_change` selection provenance into the plan —
+distinct from rebuild reasons, which stay state/version-based:
+
+```text
+BUILD assay.raw       selected because transforms/assay/raw.sql modified since main
+                      SQL semantics changed
+BUILD assay.results   selected by `changed+`
+                      upstream assay.raw will rebuild
+```
+
+Plan JSON exposes `plan.git`: the requested ref, resolved merge-base and
+HEAD, every changed workspace path with its status, the directly changed
+models with causes, changed seeds and consumers, changed tests, deleted
+model identities, and paths outside the workspace.
 
 ---
 

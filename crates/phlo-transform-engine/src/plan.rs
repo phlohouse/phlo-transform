@@ -22,8 +22,9 @@ use serde::Serialize;
 
 use phlo_transform_core::graph::Dependency;
 use phlo_transform_core::{
-    classify_schema_change, Compilation, CompiledModel, DataType, Diagnostic, IncrementalStrategy,
-    Materialization, ModelId, Nullability, SchemaChangeSafety, SchemaColumn, Selection, SourceId,
+    classify_schema_change, Compilation, CompiledModel, DataType, Diagnostic, GitChanges,
+    IncrementalStrategy, Materialization, ModelId, Nullability, SchemaChangeSafety, SchemaColumn,
+    Selection, SourceId,
 };
 
 use crate::adapter::Adapter;
@@ -89,6 +90,9 @@ pub enum ReasonKind {
     SelectionExpansion,
     /// No state store was available to compare against.
     StateUnavailable,
+    /// Selected because a Git-aware change provider marked it changed
+    /// (selection provenance — not a rebuild decision).
+    GitChange,
 }
 
 impl ReasonKind {
@@ -113,6 +117,7 @@ impl ReasonKind {
             ReasonKind::SelectedDependency => "selected_dependency",
             ReasonKind::SelectionExpansion => "selection_expansion",
             ReasonKind::StateUnavailable => "state_unavailable",
+            ReasonKind::GitChange => "git_change",
         }
     }
 }
@@ -248,6 +253,9 @@ pub struct Plan {
     pub blocked: bool,
     /// The selection that produced this plan.
     pub selection: PlanSelection,
+    /// The Git-derived change set, when the plan was built with `--since`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitChanges>,
     /// Non-fatal conditions worth surfacing, e.g. planning against a
     /// materialisation whose model was excluded.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -459,7 +467,22 @@ impl Planner {
                 None => Membership::Dependency,
             };
             let mut reasons: Vec<PlanReason> = match membership {
-                Membership::Selected => Vec::new(),
+                Membership::Selected => selection
+                    .causes
+                    .get(&id.logical_name())
+                    .map(|causes| {
+                        causes
+                            .iter()
+                            .map(|cause| {
+                                PlanReason::about(
+                                    ReasonKind::GitChange,
+                                    format!("selected because {}", cause.detail),
+                                    cause.path.clone(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 Membership::Expanded => selection
                     .get(id)
                     .map(|member| {
@@ -711,6 +734,7 @@ impl Planner {
             compiler_semantics_version: phlo_transform_core::COMPILER_SEMANTICS_VERSION.to_string(),
             blocked,
             selection: plan_selection,
+            git: None,
             warnings,
             seeds,
             models,

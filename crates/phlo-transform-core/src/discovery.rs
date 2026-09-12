@@ -430,6 +430,26 @@ fn walk_sql_files(
     files
 }
 
+/// The identity a workspace-relative path would produce under the current
+/// discovery rules and `phlo.toml`, or `None` when the path is not a model
+/// (not a `.sql` file, outside the include globs, excluded, or its root
+/// cannot be derived). Used to name models whose files no longer exist —
+/// e.g. deleted paths in Git change detection.
+pub fn model_id_for_path(workspace_root: &Path, relative_path: &Path) -> Option<ModelId> {
+    if relative_path.extension().and_then(|ext| ext.to_str()) != Some("sql") {
+        return None;
+    }
+    let config = read_phlo_config(workspace_root).ok()?;
+    let include = build_globset(&combined_includes(&config)).ok()?;
+    let exclude = build_globset(&combined_excludes(&config)).ok()?;
+    let display = display_path(relative_path);
+    if !include.is_match(&display) || exclude.is_match(&display) {
+        return None;
+    }
+    let identity = derive_identity(workspace_root, relative_path, &config).ok()?;
+    ModelId::new(identity.namespace, identity.path).ok()
+}
+
 fn should_descend(entry: &DirEntry) -> bool {
     if entry.depth() == 0 || !entry.file_type().is_dir() {
         return true;
