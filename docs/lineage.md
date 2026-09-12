@@ -154,19 +154,20 @@ regardless of `--json`; selector terms scope it the same way they scope
 
 ## OpenLineage export
 
-`phlo-transform-openlineage` maps the graph to a design-time document — an
-`events` array containing one `JobEvent` per model (inputs, outputs,
+`phlo-transform-openlineage` maps the graph to a design-time document — a
+bare JSON array containing one `JobEvent` per model (inputs, outputs,
 `columnLineage` facet) and one `DatasetEvent` per dataset (`schema`,
 `datasetType`, `symlinks` for physical targets). Every event carries the
 required `eventTime`, `producer` and `schemaURL` fields and validates
 against the OpenLineage 2-0-2 spec (the test suite checks this against the
-vendored JSON schemas), so each element can be POSTed to a `/lineage`
-endpoint as-is.
+vendored JSON schemas). The document serializes as the event array itself,
+so it is a valid request body for the OpenLineage batch endpoint.
 
 Each standard facet names its own published schema URL; Phlo metadata with
 no standard equivalent rides in namespaced `phlo_job` / `phlo_dataset`
-facets whose immutable schemas are published under `schemas/facets/` in this
-repository. `datasetType` reflects the materialization — `TABLE` for
+facets whose schemas are published under `schemas/facets/` in this
+repository, referenced by the immutable `schemas-facets-1.0.0` tag rather
+than a branch. `datasetType` reflects the materialization — `TABLE` for
 tables/incrementals, `VIEW` for views, `JOB_OUTPUT`/`TEMPORARY` for
 ephemeral models — and `symlinks` only appear when a physical relation
 actually exists. No `run` is fabricated — this is declared lineage, not an

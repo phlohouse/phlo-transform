@@ -439,14 +439,12 @@ async fn persists_run_history_and_writes_artifacts() {
     }
 
     // `openlineage.json` carries the exported design-time document: a flat
-    // array of spec-valid OpenLineage events.
+    // array of spec-valid OpenLineage events (a valid batch payload).
     let document: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(directory.path().join("openlineage.json")).unwrap(),
     )
     .unwrap();
-    let events = document["document"]["events"]
-        .as_array()
-        .expect("events array");
+    let events = document["document"].as_array().expect("event array");
     assert!(!events.is_empty());
     assert!(events.iter().all(|event| {
         event["eventTime"].is_string()

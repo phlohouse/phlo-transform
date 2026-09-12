@@ -74,22 +74,24 @@ pub mod facet_schema_url {
     pub const JOB_TYPE: &str =
         "https://openlineage.io/spec/facets/2-0-3/JobTypeJobFacet.json#/$defs/JobTypeJobFacet";
     /// Custom Phlo facets — immutable, versioned-by-path schemas published
-    /// in this repository under `schemas/facets/`.
+    /// in this repository under `schemas/facets/`. The ref is the
+    /// `schemas-facets-1.0.0` tag, not a branch, so the URL is immutable.
+    /// Bump the tag when the schema versions under `schemas/facets/` change.
     pub const PHLO_JOB: &str =
-        "https://raw.githubusercontent.com/phlohouse/phlo-transform/main/schemas/facets/1-0-0/PhloJobFacet.json#/$defs/PhloJobFacet";
+        "https://raw.githubusercontent.com/phlohouse/phlo-transform/schemas-facets-1.0.0/schemas/facets/1-0-0/PhloJobFacet.json#/$defs/PhloJobFacet";
     pub const PHLO_DATASET: &str =
-        "https://raw.githubusercontent.com/phlohouse/phlo-transform/main/schemas/facets/1-0-0/PhloDatasetFacet.json#/$defs/PhloDatasetFacet";
+        "https://raw.githubusercontent.com/phlohouse/phlo-transform/schemas-facets-1.0.0/schemas/facets/1-0-0/PhloDatasetFacet.json#/$defs/PhloDatasetFacet";
 }
 
-/// The design-time lineage document: a flat list of valid OpenLineage
+/// The design-time lineage document: a flat array of valid OpenLineage
 /// events — one `JobEvent` per model followed by one `DatasetEvent` per
 /// dataset, in deterministic order.
+///
+/// Serializes transparently as a bare JSON array, so the document is itself
+/// a valid request body for the OpenLineage batch endpoint.
 #[derive(Clone, Debug, Serialize)]
-pub struct OpenLineageDocument {
-    /// Every element is a complete OpenLineage event that can be sent to a
-    /// `/lineage` endpoint individually.
-    pub events: Vec<OpenLineageEvent>,
-}
+#[serde(transparent)]
+pub struct OpenLineageDocument(pub Vec<OpenLineageEvent>);
 
 /// One event in the document — a `JobEvent` or a `DatasetEvent`.
 #[derive(Clone, Debug, Serialize)]
@@ -418,13 +420,12 @@ impl<'a> OpenLineageExporter<'a> {
 
         jobs.sort_by(|left, right| left.job.name.cmp(&right.job.name));
         datasets.sort_by(|left, right| left.dataset.dataset.name.cmp(&right.dataset.dataset.name));
-        OpenLineageDocument {
-            events: jobs
-                .into_iter()
+        OpenLineageDocument(
+            jobs.into_iter()
                 .map(OpenLineageEvent::Job)
                 .chain(datasets.into_iter().map(OpenLineageEvent::Dataset))
                 .collect(),
-        }
+        )
     }
 
     fn job_event(

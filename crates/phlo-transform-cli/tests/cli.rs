@@ -232,9 +232,10 @@ fn lineage_openlineage_format_exports_events() {
     ]);
     assert!(output.status.success());
     let body = stdout(&output);
+    // The document is a bare JSON array — a valid batch-endpoint payload.
     let document: serde_json::Value =
         serde_json::from_str(&body).expect("openlineage output is JSON");
-    let events = document["events"].as_array().expect("events array");
+    let events = document.as_array().expect("event array");
     // Every event is a complete OpenLineage event with the required fields.
     for event in events {
         assert!(event["eventTime"].is_string(), "{event}");

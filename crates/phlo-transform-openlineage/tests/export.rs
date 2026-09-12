@@ -84,9 +84,9 @@ fn export(compilation: &Compilation) -> serde_json::Value {
     .unwrap()
 }
 
-/// The job events in a document.
+/// The job events in a document (the document is a bare event array).
 fn jobs(document: &serde_json::Value) -> Vec<&serde_json::Value> {
-    document["events"]
+    document
         .as_array()
         .unwrap()
         .iter()
@@ -96,7 +96,7 @@ fn jobs(document: &serde_json::Value) -> Vec<&serde_json::Value> {
 
 /// The dataset events in a document.
 fn dataset_events(document: &serde_json::Value) -> Vec<&serde_json::Value> {
-    document["events"]
+    document
         .as_array()
         .unwrap()
         .iter()
@@ -145,11 +145,11 @@ impl Spec {
             ),
             // The custom facet schemas published by this repository.
             (
-                "https://raw.githubusercontent.com/phlohouse/phlo-transform/main/schemas/facets/1-0-0/PhloJobFacet.json",
+                "https://raw.githubusercontent.com/phlohouse/phlo-transform/schemas-facets-1.0.0/schemas/facets/1-0-0/PhloJobFacet.json",
                 include_str!("../../../schemas/facets/1-0-0/PhloJobFacet.json"),
             ),
             (
-                "https://raw.githubusercontent.com/phlohouse/phlo-transform/main/schemas/facets/1-0-0/PhloDatasetFacet.json",
+                "https://raw.githubusercontent.com/phlohouse/phlo-transform/schemas-facets-1.0.0/schemas/facets/1-0-0/PhloDatasetFacet.json",
                 include_str!("../../../schemas/facets/1-0-0/PhloDatasetFacet.json"),
             ),
         ];
@@ -183,7 +183,7 @@ impl Spec {
 /// against the facet schema its `_schemaURL` names.
 fn assert_document_valid(document: &serde_json::Value) {
     let spec = Spec::new();
-    for event in document["events"].as_array().unwrap() {
+    for event in document.as_array().unwrap() {
         // The event's schemaURL names the spec definition it must satisfy.
         let schema_url = event["schemaURL"].as_str().unwrap();
         let (base, def) = schema_url.split_once("#/$defs/").unwrap();
@@ -241,7 +241,7 @@ fn dataset_level_export() {
     }
 
     // Every event carries the required BaseEvent fields.
-    for event in document["events"].as_array().unwrap() {
+    for event in document.as_array().unwrap() {
         assert_eq!(event["eventTime"], EVENT_TIME);
         assert_eq!(event["producer"], PRODUCER);
         assert!(

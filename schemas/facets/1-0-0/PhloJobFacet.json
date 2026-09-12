@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/phlohouse/phlo-transform/main/schemas/facets/1-0-0/PhloJobFacet.json",
+  "$id": "https://raw.githubusercontent.com/phlohouse/phlo-transform/schemas-facets-1.0.0/schemas/facets/1-0-0/PhloJobFacet.json",
   "description": "Phlo Transform job metadata that has no standard OpenLineage equivalent.",
   "type": "object",
   "$defs": {

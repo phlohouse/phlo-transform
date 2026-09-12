@@ -17,4 +17,7 @@ To refresh, re-download from the canonical URLs:
 
 The custom `phlo_*` facet schemas are *not* vendored — the tests read them
 from `schemas/facets/` at the repository root so the published schema and
-the tested schema can never drift apart.
+the tested schema can never drift apart. Their `_schemaURL`s reference the
+immutable `schemas-facets-1.0.0` git tag rather than a branch — when the
+schemas change, add a new versioned directory under `schemas/facets/` and
+cut a new tag rather than editing the tagged files.
