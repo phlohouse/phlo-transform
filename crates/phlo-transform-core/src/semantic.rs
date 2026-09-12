@@ -252,14 +252,109 @@ impl ColumnRef {
     }
 }
 
+impl serde::Serialize for ColumnRef {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.display())
+    }
+}
+
+/// Whether an input column contributes its values to an output directly or
+/// only influences which rows and values appear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Directness {
+    /// The input's values flow into the output column.
+    Direct,
+    /// The input influences the output without flowing into it — join
+    /// constraints, filters, grouping keys, sort keys and the like.
+    Indirect,
+}
+
+/// How an input column is transformed on its way into an output column.
+///
+/// The variants follow the OpenLineage column-lineage subtypes so the export
+/// boundary can map them one-to-one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transformation {
+    /// The value passes through unchanged (bare column or alias).
+    Identity,
+    /// The input participates in a value-producing expression.
+    Transformation,
+    /// The input is aggregated.
+    Aggregation,
+    /// The input participates in a join constraint.
+    Join,
+    /// The input participates in a row filter (WHERE, HAVING, QUALIFY).
+    Filter,
+    /// The input is a grouping key.
+    GroupBy,
+    /// The input is a sort key.
+    Sort,
+    /// The input feeds a window function.
+    Window,
+    /// The input participates in conditional logic (CASE, `if`, `coalesce`).
+    Conditional,
+}
+
+/// Confidence in a lineage claim.
+///
+/// `Exact` means the SQL AST proved the link. `Inferred` is for name-based or
+/// heuristic links, `Declared` for user-asserted lineage, `Runtime` for links
+/// observed during execution and `Unknown` for lineage the compiler could not
+/// prove. Only `Exact` is produced today; the other variants exist so future
+/// producers do not have to smuggle weaker claims in as exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LineageConfidence {
+    Exact,
+    Inferred,
+    Declared,
+    Runtime,
+    Unknown,
+}
+
+/// One upstream column an output column draws from, with provenance.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub struct ColumnInput {
+    /// The upstream column.
+    pub column: ColumnRef,
+    /// Whether the input's values flow into the output.
+    pub directness: Directness,
+    /// How the input is transformed.
+    pub transformation: Transformation,
+    /// Provenance of this link. AST-proven links are
+    /// [`LineageConfidence::Exact`].
+    pub confidence: LineageConfidence,
+    /// The SQL expression producing this link, when recorded.
+    pub expression: Option<String>,
+}
+
+impl ColumnInput {
+    /// The leaf link created when a column resolves to a relation column.
+    pub fn identity(column: ColumnRef) -> Self {
+        Self {
+            column,
+            directness: Directness::Direct,
+            transformation: Transformation::Identity,
+            confidence: LineageConfidence::Exact,
+            expression: None,
+        }
+    }
+}
+
 /// A column produced by a model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputColumn {
     pub name: String,
     pub data_type: DataType,
     pub nullability: Nullability,
-    /// Direct inputs of this column, used to derive lineage.
-    pub inputs: Vec<ColumnRef>,
+    /// Inputs of this column, with how each contributes.
+    pub inputs: Vec<ColumnInput>,
+    /// Confidence that `inputs` is complete: `Exact` when every part of the
+    /// producing expression was analysed, `Unknown` when part of it could not
+    /// be reasoned about (the recorded inputs may then be incomplete).
+    pub confidence: LineageConfidence,
 }
 
 /// The output schema of a model.

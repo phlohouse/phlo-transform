@@ -143,6 +143,10 @@ pub struct Compilation {
     /// The workspace defaults that physical targeting used.
     pub defaults: WorkspaceDefaults,
     pub graph: TransformGraph,
+    /// The canonical lineage graph. It is populated once analysis has run —
+    /// a `Compilation` built before analysis (or for a cyclic project)
+    /// carries an empty graph.
+    pub lineage: crate::lineage::LineageGraph,
     pub diagnostics: Vec<Diagnostic>,
     index: BTreeMap<ModelId, usize>,
     test_index: BTreeMap<TestId, usize>,
@@ -178,6 +182,7 @@ impl Compilation {
             seeds,
             defaults,
             graph,
+            lineage: crate::lineage::LineageGraph::default(),
             diagnostics,
             index,
             test_index,

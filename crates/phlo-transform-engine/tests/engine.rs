@@ -428,6 +428,7 @@ async fn persists_run_history_and_writes_artifacts() {
         "manifest.json",
         "graph.json",
         "lineage.json",
+        "openlineage.json",
         "plan.json",
         "run.json",
     ] {
@@ -436,6 +437,18 @@ async fn persists_run_history_and_writes_artifacts() {
             "missing artifact {name}"
         );
     }
+
+    // `openlineage.json` carries the exported design-time document.
+    let document: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(directory.path().join("openlineage.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        document["event"]["producer"],
+        "https://github.com/phlohouse/phlo-transform"
+    );
+    assert!(document["event"]["jobs"].is_array());
+    assert!(document["event"]["datasets"].is_array());
 }
 
 #[tokio::test]

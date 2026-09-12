@@ -127,6 +127,48 @@ impl SchemaProvider for StaticSchemaProvider {
     }
 }
 
+/// Wraps a provider with a fallback that synthesises schemas for CSV seeds.
+///
+/// A seed loads its header columns into a relation named after the file, so
+/// when the catalogue knows nothing about `country_codes` but the workspace
+/// ships `seeds/country_codes.csv`, the analyzer can still resolve its
+/// columns — as `varchar`, since CSV loads are untyped. The same matching
+/// rule applies here as in `git` change detection: a source matches a seed
+/// when its name equals the seed name or ends with `.<seed-name>`.
+pub struct SeedSchemaProvider<'a> {
+    inner: &'a dyn SchemaProvider,
+    seeds: &'a [crate::model::SemanticSeed],
+}
+
+impl<'a> SeedSchemaProvider<'a> {
+    pub fn new(inner: &'a dyn SchemaProvider, seeds: &'a [crate::model::SemanticSeed]) -> Self {
+        Self { inner, seeds }
+    }
+}
+
+impl SchemaProvider for SeedSchemaProvider<'_> {
+    fn source_schema(&self, source: &SourceId) -> Option<RelationSchema> {
+        if let Some(schema) = self.inner.source_schema(source) {
+            return Some(schema);
+        }
+        let name = source.logical_name();
+        let seed = self
+            .seeds
+            .iter()
+            .find(|seed| name == seed.name || name.ends_with(&format!(".{}", seed.name)))?;
+        Some(RelationSchema::new(
+            seed.columns
+                .iter()
+                .map(|column| SchemaColumn {
+                    name: column.clone(),
+                    data_type: DataType::Varchar,
+                    nullability: Nullability::Nullable,
+                })
+                .collect(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

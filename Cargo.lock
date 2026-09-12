@@ -2243,6 +2243,7 @@ dependencies = [
  "phlo-transform-duckdb",
  "phlo-transform-engine",
  "phlo-transform-nessie",
+ "phlo-transform-openlineage",
  "phlo-transform-trino",
  "serde",
  "serde_json",
@@ -2259,6 +2260,7 @@ dependencies = [
  "petgraph",
  "phlo-transform-sql",
  "serde",
+ "serde_json",
  "sha2",
  "sqlparser",
  "tempfile",
@@ -2318,6 +2320,7 @@ dependencies = [
  "async-trait",
  "phlo-transform-core",
  "phlo-transform-nessie",
+ "phlo-transform-openlineage",
  "phlo-transform-sql",
  "rusqlite",
  "serde",
@@ -2340,6 +2343,16 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "phlo-transform-openlineage"
+version = "0.1.0"
+dependencies = [
+ "insta",
+ "phlo-transform-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -23,6 +23,7 @@ pub mod discovery;
 pub mod git;
 pub mod graph;
 pub mod identity;
+pub mod lineage;
 pub mod model;
 pub mod report;
 pub mod resolve;
@@ -46,6 +47,10 @@ pub use git::{
 };
 pub use graph::{Dependency, EdgeKind, GraphNode, TransformGraph};
 pub use identity::{IdentityError, ModelId, Namespace, SourceId};
+pub use lineage::{
+    DatasetColumn, DatasetId, DatasetKind, LineageDocument, LineageEdge, LineageEdgeKind,
+    LineageGraph, LineageNode, NodeMeta,
+};
 pub use model::{
     FrontendKind, ModelConfig, ModelOrigin, Relation, RootKind, RootNamespaceStrategy, RootRef,
     SemanticModel, SemanticProject, SemanticSeed, SemanticTest, TestId, TransformRoot,
@@ -66,8 +71,9 @@ pub use select::{
     SelectorSet, SelectorTerm,
 };
 pub use semantic::{
-    Assertion, ColumnContract, ColumnRef, ColumnTolerance, DataType, DiffPolicySpec, ModelContract,
-    ModelSchema, Nullability, OutputColumn, RelationRef,
+    Assertion, ColumnContract, ColumnInput, ColumnRef, ColumnTolerance, DataType, DiffPolicySpec,
+    Directness, LineageConfidence, ModelContract, ModelSchema, Nullability, OutputColumn,
+    RelationRef, Transformation,
 };
 pub use version::{
     model_version, EmptySourceStateProvider, ModelVersion, SourceStateProvider,

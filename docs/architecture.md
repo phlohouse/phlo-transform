@@ -14,17 +14,20 @@ multi-root workspace, parse ordinary SQL, resolve workspace relations without
 
 ```text
 crates/
-├── phlo-transform-sql/    SQL parsing, directives and relation extraction
-├── phlo-transform-core/   discovery, identity, resolution, DAG, diagnostics, reports
-└── phlo-transform-cli/    the `phlo-transform` binary
+├── phlo-transform-sql/         SQL parsing, directives and relation extraction
+├── phlo-transform-core/        discovery, identity, resolution, DAG, lineage graph, diagnostics, reports
+├── phlo-transform-openlineage/ canonical graph → OpenLineage document export
+└── phlo-transform-cli/         the `phlo-transform` binary
 ```
 
 Crates are intentionally coarse. There is no executor, adapter, state or
 daemon crate yet; those are later phases and adding them now would be
 speculative.
 
-Dependency direction is one-way: `cli → core → sql`. The SQL crate knows
-nothing about workspaces, namespaces or model identity.
+Dependency direction is one-way: `cli → {core, openlineage} → core → sql`.
+The SQL crate knows nothing about workspaces, namespaces or model identity,
+and `openlineage` is a pure export boundary — OpenLineage types never appear
+in the compiler.
 
 ## Frontend → semantic → compiler boundary
 
@@ -124,6 +127,16 @@ to each relation it depends on. Given the same input, output is deterministic:
   dependencies always come before dependents and ties break by identity;
 - cycles are detected and reported with a concrete path
   (`assay.a -> assay.b -> assay.c -> assay.a`) via a coloured DFS.
+
+## Lineage graph
+
+`Compilation` also builds `compilation.lineage` — a canonical
+`petgraph`-backed `LineageGraph` over models, datasets (model outputs,
+sources, seeds), columns and tests. It is the single structure `lineage`,
+`impact`, artifacts and the OpenLineage exporter read; see
+[`docs/lineage.md`](lineage.md) for the node/edge model, directness and
+confidence semantics, and the indexed query API. Like the dependency graph it
+is built once per compilation and is fully deterministic.
 
 ## Diagnostics
 

@@ -1,0 +1,16 @@
+[package]
+name = "phlo-transform-openlineage"
+description = "OpenLineage export for the Phlo Transform lineage graph."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+phlo-transform-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+insta = { version = "1", features = ["json"] }

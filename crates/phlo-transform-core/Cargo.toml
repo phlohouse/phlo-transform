@@ -20,4 +20,5 @@ phlo-transform-sql = { workspace = true }
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
+serde_json = { workspace = true }
 tempfile = "3"

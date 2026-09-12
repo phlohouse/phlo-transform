@@ -21,7 +21,7 @@ use crate::model::{
 };
 use crate::resolve::{RegistryEntry, Resolution, Resolver};
 use crate::rewrite::rewrite_statements;
-use crate::schema::{EmptySchemaProvider, SchemaProvider};
+use crate::schema::{EmptySchemaProvider, SchemaProvider, SeedSchemaProvider};
 use crate::semantic::{Assertion, ModelContract, ModelSchema, Nullability};
 use crate::version::{
     model_version, EmptySourceStateProvider, ModelVersions, SourceStateProvider, VersionDetail,
@@ -47,6 +47,9 @@ pub fn compile_with_options(
     provider: &dyn SchemaProvider,
     source_states: &dyn SourceStateProvider,
 ) -> Compilation {
+    // Seeds contribute their CSV header columns as varchar schemas when the
+    // catalogue does not know the source relation.
+    let provider = SeedSchemaProvider::new(provider, &project.seeds);
     let mut diagnostics: Vec<Diagnostic> = project.diagnostics.clone();
 
     // Lower directives and parse SQL for each model.
@@ -311,7 +314,7 @@ pub fn compile_with_options(
                 continue;
             };
             let entry = entry_for(lowered);
-            let analyzer = Analyzer::new(&resolver, &model_schemas, provider);
+            let analyzer = Analyzer::new(&resolver, &model_schemas, &provider);
             let analysis = analyzer.analyze(&entry, &lowered.statements, &id);
             let assertions = assertions_for(lowered.model);
 
@@ -370,6 +373,12 @@ pub fn compile_with_options(
         }
         compilation.add_generated_tests(generated_tests);
     }
+
+    // The canonical lineage graph is built once, after analysis has filled
+    // in schemas, versions and generated tests. Every downstream consumer —
+    // reports, planning, OpenLineage — reads this structure rather than
+    // re-deriving lineage.
+    compilation.lineage = crate::lineage::LineageGraph::build(&compilation);
 
     compilation
 }

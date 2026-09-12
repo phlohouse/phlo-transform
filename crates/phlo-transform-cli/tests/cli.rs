@@ -161,6 +161,137 @@ fn impact_accepts_a_model_argument() {
 }
 
 #[test]
+fn lineage_graph_format_emits_canonical_document() {
+    let output = run(&[
+        "--root",
+        "fixtures/ephemeral",
+        "lineage",
+        "--format",
+        "graph",
+    ]);
+    assert!(output.status.success());
+    let body = stdout(&output);
+    let document: serde_json::Value = serde_json::from_str(&body).expect("graph output is JSON");
+    let nodes = document["nodes"].as_array().expect("nodes array");
+    let edges = document["edges"].as_array().expect("edges array");
+    let uris: Vec<&str> = nodes
+        .iter()
+        .map(|node| node["uri"].as_str().unwrap())
+        .collect();
+    for expected in [
+        "model://main/customers",
+        "model://main/order_filters",
+        "model://main/stg_orders",
+        "dataset://main/customers",
+        "dataset://external/raw_orders",
+    ] {
+        assert!(uris.contains(&expected), "missing node {expected}");
+    }
+    // Columns join the graph and tests attach to datasets.
+    assert!(uris.contains(&"dataset://main/customers#total"));
+    assert!(uris.iter().any(|uri| uri.starts_with("test://")));
+    let pairs: Vec<(&str, &str)> = edges
+        .iter()
+        .map(|edge| (edge["from"].as_str().unwrap(), edge["to"].as_str().unwrap()))
+        .collect();
+    assert!(pairs.contains(&("dataset://external/raw_orders", "model://main/stg_orders")));
+}
+
+#[test]
+fn lineage_graph_format_scopes_to_a_model() {
+    let output = run(&[
+        "--root",
+        "fixtures/ephemeral",
+        "lineage",
+        "main.customers",
+        "--format",
+        "graph",
+    ]);
+    assert!(output.status.success());
+    let body = stdout(&output);
+    let document: serde_json::Value = serde_json::from_str(&body).expect("graph output is JSON");
+    let uris: Vec<&str> = document["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| node["uri"].as_str().unwrap())
+        .collect();
+    assert!(uris.contains(&"model://main/customers"));
+    assert!(uris.contains(&"dataset://main/order_filters"));
+    assert!(!uris.contains(&"model://main/stg_orders"));
+}
+
+#[test]
+fn lineage_openlineage_format_exports_jobs_and_datasets() {
+    let output = run(&[
+        "--root",
+        "fixtures/ephemeral",
+        "lineage",
+        "--format",
+        "openlineage",
+    ]);
+    assert!(output.status.success());
+    let body = stdout(&output);
+    let document: serde_json::Value =
+        serde_json::from_str(&body).expect("openlineage output is JSON");
+    assert_eq!(
+        document["producer"],
+        "https://github.com/phlohouse/phlo-transform"
+    );
+    let jobs = document["jobs"].as_array().expect("jobs array");
+    let names: Vec<&str> = jobs
+        .iter()
+        .map(|job| job["job"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["main.customers", "main.order_filters", "main.stg_orders"]
+    );
+    let customers = jobs
+        .iter()
+        .find(|job| job["job"]["name"] == "main.customers")
+        .unwrap();
+    assert_eq!(customers["job"]["facets"]["jobType"]["jobType"], "MODEL");
+    // The output dataset carries the columnLineage facet.
+    let lineage = &customers["outputs"][0]["facets"]["columnLineage"]["fields"];
+    assert!(lineage["total"]["inputFields"].is_array(), "{lineage}");
+    let datasets = document["datasets"].as_array().unwrap();
+    assert!(datasets
+        .iter()
+        .any(|event| event["dataset"]["name"] == "external.raw_orders"));
+}
+
+#[test]
+fn impact_accepts_a_source_column() {
+    // `raw.raw_events` is a seed — its CSV header supplies the schema, so
+    // column-level impact works without an adapter.
+    let output = run(&[
+        "--root",
+        "fixtures/native-seeds",
+        "impact",
+        "raw.raw_events.status",
+    ]);
+    assert!(output.status.success());
+    let body = stdout(&output);
+    assert!(body.contains("main.stg_events"), "{body}");
+}
+
+#[test]
+fn column_lineage_reports_indirect_inputs() {
+    let output = run(&[
+        "--root",
+        "fixtures/ephemeral",
+        "lineage",
+        "main.customers.total",
+    ]);
+    assert!(output.status.success());
+    let body = stdout(&output);
+    // `o.amount` is the direct aggregation input; `customer_id` join keys
+    // show up as indirect lineage.
+    assert!(body.contains("Indirect:"), "{body}");
+}
+
+#[test]
 fn init_scaffolds_a_runnable_workspace() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().to_str().expect("utf-8 path");
@@ -991,7 +1122,7 @@ fn plan_since_includes_working_tree_changes() {
     // Unstaged edit — never committed.
     std::fs::write(
         dir.path().join("transforms/assay/raw.sql"),
-        "select id, amount from raw.events\n",
+        "select id as event_id from raw.events\n",
     )
     .expect("edit");
     let output = plan_since(dir.path(), &["plan", "--since", "main"]);

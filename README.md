@@ -66,12 +66,15 @@ implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
   See [`docs/engine.md`](docs/engine.md). Retries are not automated.
 - **Phase 2 — typed compiler and lineage: partial.** Typed semantic IR, schema
   provider boundary and catalogue enrichment, column resolution and type
-  inference, inferred output schemas, `lineage`/`impact`, config-file schema
-  contracts, `@key`/`@not-null` assertions with generated SQL tests, and a
-  `lineage.json` artifact. Nested `array`/`map`/`row` types parse recursively;
-  `lineage` direction flags and model-level `impact` work. See
-  [`docs/semantic.md`](docs/semantic.md). Gaps: offline column lineage/impact
-  need schemas; unsupported SQL is `Unknown`.
+  inference, inferred output schemas, a canonical lineage graph behind
+  `lineage`/`impact`, direct/indirect column edges with confidence, config-file
+  schema contracts, `@key`/`@not-null` assertions with generated SQL tests, and
+  `lineage.json`/`openlineage.json` artifacts. Nested `array`/`map`/`row` types
+  parse recursively; `lineage` direction flags, `--format graph|openlineage`
+  and source/seed-column `impact` work. See [`docs/semantic.md`](docs/semantic.md)
+  and [`docs/lineage.md`](docs/lineage.md). Gaps: offline column
+  lineage/impact need schemas; unsupported SQL degrades to `unknown`
+  confidence.
 - **Phase 3 — state-aware execution: partial.** Content-addressed model
   versions, materialised-version state, state-aware plan
   (`build`/`skip`/`cached` with reasons) and stale-plan rejection. Source
@@ -187,6 +190,7 @@ runs a disposable container and is executed explicitly in CI.
 - [Phase 0 compiler architecture](docs/architecture.md)
 - [Phase 1 engine architecture](docs/engine.md)
 - [Phase 2 semantic compiler](docs/semantic.md)
+- [Canonical lineage graph and OpenLineage export](docs/lineage.md)
 - [Phase 3 state-aware execution](docs/state.md)
 - [dbt migration](docs/dbt-migration.md) and the [migration guide](docs/dbt-migration-guide.md)
 - [Phase 4 incremental models](docs/incremental.md)

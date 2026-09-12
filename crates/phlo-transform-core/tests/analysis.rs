@@ -3,9 +3,9 @@
 use std::collections::BTreeSet;
 
 use phlo_transform_core::{
-    compile_with_provider, ColumnContract, ColumnRef, Compilation, DataType, ModelContract,
-    ModelId, Nullability, RelationSchema, SchemaColumn, SemanticModel, SemanticProject, SourceId,
-    StaticSchemaProvider,
+    compile_with_provider, ColumnContract, ColumnInput, ColumnRef, Compilation, DataType,
+    ModelContract, ModelId, Nullability, RelationSchema, SchemaColumn, SemanticModel,
+    SemanticProject, SourceId, StaticSchemaProvider,
 };
 
 fn column(name: &str, data_type: DataType, nullability: Nullability) -> SchemaColumn {
@@ -76,7 +76,7 @@ fn input_names(compilation: &Compilation, model: &str, column_name: &str) -> BTr
         .unwrap()
         .inputs
         .iter()
-        .map(ColumnRef::display)
+        .map(|input| input.column.display())
         .collect()
 }
 
@@ -99,7 +99,10 @@ fn expands_star_and_tracks_source_lineage() {
     );
     assert_eq!(
         raw.schema.column("signal").unwrap().inputs,
-        vec![source(&["external", "raw_results"], "signal")]
+        vec![ColumnInput::identity(source(
+            &["external", "raw_results"],
+            "signal"
+        ))]
     );
 }
 
@@ -131,6 +134,9 @@ fn infers_expression_types_and_expression_lineage() {
         BTreeSet::from([
             "assay.raw_results.signal".to_string(),
             "external.samples.volume".to_string(),
+            // `USING (sample_id)` contributes both join keys indirectly.
+            "assay.raw_results.sample_id".to_string(),
+            "external.samples.sample_id".to_string(),
         ])
     );
 }

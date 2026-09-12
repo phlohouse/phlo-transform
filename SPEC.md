@@ -1199,6 +1199,31 @@ This may become a promotion quality gate.
 
 ## 55. Model lineage
 
+Compilation produces one canonical `LineageGraph` — model, dataset, column
+and test nodes joined by `input`, `output`, `derives`, `contains` and `tests`
+edges. Model outputs, sources and seeds are all `dataset://` nodes, so lineage
+is expressed between datasets rather than being tied to transform models;
+future ingestion systems contribute nodes and edges to the same graph.
+
+Every report and export reads this one structure — `lineage`, `impact`,
+artifacts and the OpenLineage exporter never re-derive their own:
+
+```text
+Compilation ─▶ LineageGraph ─▶ OpenLineageExporter
+```
+
+Column `derives` edges carry optional metadata: `directness`
+(`direct`/`indirect`), `transformation` (`identity`, `transformation`,
+`aggregation`, `join`, `filter`, `group_by`, `sort`, `window`, `conditional`),
+`confidence` (`exact` for AST-proven lineage, `unknown` when analysis is
+incomplete; `inferred`/`declared`/`runtime` reserved for other producers) and
+the responsible SQL expression. Join keys, filters, grouping and sort keys are
+recorded as indirect inputs rather than dropped.
+
+The graph is indexed and deterministic; `document()` serialises it and
+`document_for`/`subgraph` scope it to a selection. See
+[`docs/lineage.md`](docs/lineage.md).
+
 ```bash
 phlo transform lineage assay.assay_results
 ```
@@ -1214,6 +1239,10 @@ assay.assay_results
     ↓
 analytics.monthly_summary
 ```
+
+`lineage --format graph` prints the canonical document;
+`lineage --format openlineage` exports the OpenLineage design-time document.
+Both accept a model target or selector terms for scoping.
 
 ## 56. Column lineage
 
@@ -1231,13 +1260,21 @@ assay.clean_results.corrected_signal
 assay.assay_results.result
 ```
 
+The report separates direct inputs from indirect ones (join keys, filters,
+grouping/sort keys) and prints the column's confidence when it is not
+`exact`.
+
 ## 57. Impact analysis
 
 ```bash
 phlo transform impact assay.results.result
+phlo transform impact external.samples.volume
 ```
 
-Returns downstream columns, models, workflows, tests and registered published consumers.
+Returns downstream columns, models, workflows, tests and registered published
+consumers. Source and seed columns are valid targets — the walk traverses the
+canonical graph, so a raw input column reports every downstream column and
+model it feeds.
 
 ---
 
@@ -1463,6 +1500,7 @@ Every run should emit structured artifacts:
     ├── plan.json
     ├── run.json
     ├── lineage.json
+    ├── openlineage.json
     └── state/
 ```
 
@@ -1475,6 +1513,8 @@ These files are interfaces, not incidental logs.
 ## 73. Graph artifact
 
 `graph.json` includes nodes, edges, edge types, column edges, workflow relationships and external-source relationships.
+
+`lineage.json` holds the canonical lineage document — every model, dataset, column and test node with its edges and column-level metadata — and `openlineage.json` the same graph exported as an OpenLineage design-time document for tools such as OpenMetadata and DataHub.
 
 ## 74. Plan artifact
 
