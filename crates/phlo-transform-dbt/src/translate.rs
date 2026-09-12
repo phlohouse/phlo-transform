@@ -2471,6 +2471,23 @@ fn lower_builtin(
     if !name.contains('.') && !ctx.has_package(provider) {
         return None;
     }
+    // A `dispatch:` rule can make dbt select an implementation outside the
+    // package — e.g. a root-project override. Recognised lowerings stand in
+    // for the package's own `default__`/adapter implementation, so when a
+    // different namespace's variant is the one dbt would pick the lowering
+    // no longer applies: reaching here means that override already failed
+    // static evaluation, and the call must stay REVIEW rather than silently
+    // emit the package default. (`fivetran_utils` is checked inside
+    // `verified_fivetran_source`: its dispatched helper verifies the
+    // selected implementation, and its direct macros cannot be overridden
+    // this way upstream.)
+    if provider != "fivetran_utils" && provider != ctx.project.name {
+        if let Some((ns, ..)) = dispatch_selected(ctx, provider, helper) {
+            if ns != provider {
+                return None;
+            }
+        }
+    }
     // Recognised fivetran helpers lower only against a verified upstream
     // implementation: the installed package's macro body must fingerprint-
     // match the source these rewrites were proven against. An uninstalled
@@ -2844,27 +2861,33 @@ fn lower_helper(
     Some(rendered)
 }
 
-/// `true` when the installed `fivetran_utils` source defines `helper` with
-/// the exact body these lowerings were verified against (fivetran_utils
-/// 0.4.x — every corpus-pinned copy is byte-identical). The fingerprint is
-/// FNV-1a over the whitespace-collapsed body: stable across toolchains
-/// (unlike `DefaultHasher`) and insensitive only to blank space.
+/// `true` when the implementation dbt would select for `helper` is the
+/// `fivetran_utils` body these lowerings were verified against
+/// (fivetran_utils 0.4.x — every corpus-pinned copy is byte-identical).
+/// The fingerprint is FNV-1a over the whitespace-collapsed body: stable
+/// across toolchains (unlike `DefaultHasher`) and insensitive only to
+/// blank space.
 fn verified_fivetran_source(ctx: &Context, helper: &str) -> bool {
-    let (key, expected) = match helper {
-        "partition_by_source_relation" => (
-            "fivetran_utils.default__partition_by_source_relation",
-            0xfc1e0e9d56099378u64,
+    match helper {
+        // Dispatched upstream: a `dispatch:` rule can make dbt select an
+        // implementation outside the package (e.g. a root-project
+        // override). Verify whichever `default__`/adapter variant the
+        // effective search order actually selects — and only when it is
+        // the package's own.
+        "partition_by_source_relation" => matches!(
+            dispatch_selected(ctx, "fivetran_utils", helper),
+            Some((ns, _, def))
+                if ns == "fivetran_utils"
+                    && body_fingerprint(def) == 0xfc1e0e9d56099378u64
         ),
-        "fill_pass_through_columns" => (
-            "fivetran_utils.fill_pass_through_columns",
-            0xd08e588f12c110b2u64,
-        ),
-        _ => return false,
-    };
-    ctx.macro_defs
-        .get(key)
-        .map(|def| body_fingerprint(def) == expected)
-        .unwrap_or(false)
+        // A direct, non-dispatched package macro: `dispatch:` config cannot
+        // redirect a qualified call, so verify the package's body itself.
+        "fill_pass_through_columns" => ctx
+            .macro_defs
+            .get("fivetran_utils.fill_pass_through_columns")
+            .is_some_and(|def| body_fingerprint(def) == 0xd08e588f12c110b2u64),
+        _ => false,
+    }
 }
 
 fn body_fingerprint(def: &macros::MacroDef) -> u64 {
@@ -3157,50 +3180,18 @@ fn render_macro_body(
                     // order: the explicit namespace/`packages` argument when
                     // given, else the calling macro's own namespace (its
                     // package, or the project) — dbt's default dispatch.
-                    let adapter = ctx
-                        .project
-                        .profile
-                        .as_ref()
-                        .and_then(|p| p.adapter_type.as_deref());
-                    let mut search = namespaces;
-                    if search.is_empty() {
-                        search.push(ctx.package_ns().unwrap_or_else(|| ctx.project.name.clone()));
-                    }
+                    let search = if namespaces.is_empty() {
+                        vec![ctx.package_ns().unwrap_or_else(|| ctx.project.name.clone())]
+                    } else {
+                        namespaces
+                    };
                     // `dispatch:` config replaces a namespace's search order
                     // (e.g. `dbt_utils` → `['my_project', 'dbt_utils']`).
-                    // dbt's built-in default also puts the root project
-                    // first for the `dbt` namespace itself.
-                    let mut ordered = Vec::new();
-                    for ns in &search {
-                        if let Some(order) = ctx.project.dispatch.get(ns) {
-                            ordered.extend(order.iter().cloned());
-                        } else if ns == "dbt" {
-                            ordered.push(ctx.project.name.clone());
-                            ordered.push(ns.clone());
-                        } else {
-                            ordered.push(ns.clone());
-                        }
-                    }
-                    let search = ordered;
                     let mut found = None;
-                    'search: for ns in &search {
-                        let key = |prefix: &str| {
-                            if ns == ctx.project.name.as_str() {
-                                prefix.to_string()
-                            } else {
-                                format!("{ns}.{prefix}")
-                            }
-                        };
-                        let mut candidates = vec![format!("default__{dispatched}")];
-                        if let Some(adapter) = adapter {
-                            candidates.insert(0, format!("{adapter}__{dispatched}"));
-                        }
-                        for candidate in candidates {
-                            let key = key(&candidate);
-                            if let Some(def) = ctx.macro_defs.get(&key) {
-                                found = Some((def, key, ns.clone()));
-                                break 'search;
-                            }
+                    for ns in dispatch_search_order(ctx, &search) {
+                        if let Some((key, def)) = dispatch_lookup(ctx, &ns, &dispatched) {
+                            found = Some((def, key, ns));
+                            break;
                         }
                     }
                     let (def, variant, variant_ns) = found?;
@@ -3258,6 +3249,65 @@ fn render_macro_body(
         index += 1;
     }
     Some(out)
+}
+
+/// Expand each searched namespace through the project's `dispatch:` config:
+/// a configured `search_order` replaces the namespace's default, and the
+/// `dbt` namespace's built-in default puts the root project first.
+fn dispatch_search_order(ctx: &Context, searched: &[String]) -> Vec<String> {
+    let mut ordered = Vec::new();
+    for ns in searched {
+        if let Some(order) = ctx.project.dispatch.get(ns) {
+            ordered.extend(order.iter().cloned());
+        } else if ns == "dbt" {
+            ordered.push(ctx.project.name.clone());
+            ordered.push(ns.clone());
+        } else {
+            ordered.push(ns.clone());
+        }
+    }
+    ordered
+}
+
+/// The `{adapter}__{name}` or `default__{name}` definition namespace `ns`
+/// provides for a dispatched macro, in dbt's adapter-first preference.
+fn dispatch_lookup<'a>(ctx: &'a Context, ns: &str, name: &str) -> Option<(String, &'a MacroDef)> {
+    let adapter = ctx
+        .project
+        .profile
+        .as_ref()
+        .and_then(|p| p.adapter_type.as_deref());
+    let mut candidates = vec![format!("default__{name}")];
+    if let Some(adapter) = adapter {
+        candidates.insert(0, format!("{adapter}__{name}"));
+    }
+    for candidate in candidates {
+        let key = if ns == ctx.project.name {
+            candidate
+        } else {
+            format!("{ns}.{candidate}")
+        };
+        if let Some(def) = ctx.macro_defs.get(&key) {
+            return Some((key, def));
+        }
+    }
+    None
+}
+
+/// The implementation `adapter.dispatch('<name>', '<provider>')` would
+/// select under this project's `dispatch:` config: the first ordered
+/// namespace that provides a variant, and the variant's definition.
+fn dispatch_selected<'a>(
+    ctx: &'a Context,
+    provider: &str,
+    name: &str,
+) -> Option<(String, String, &'a MacroDef)> {
+    for ns in dispatch_search_order(ctx, &[provider.to_string()]) {
+        if let Some((key, def)) = dispatch_lookup(ctx, &ns, name) {
+            return Some((ns, key, def));
+        }
+    }
+    None
 }
 
 /// Split `adapter.dispatch('name'[, 'namespace' | packages=[...]])(args)`

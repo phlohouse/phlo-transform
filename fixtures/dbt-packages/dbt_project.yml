@@ -21,3 +21,8 @@ vars:
 dispatch:
   - macro_namespace: kit
     search_order: [pkg_consumer, kit]
+  # Configured project-first order for fivetran_utils too — with no
+  # `default__partition_by_source_relation` in `macros/` the package's own
+  # implementation is still the one dbt would select.
+  - macro_namespace: fivetran_utils
+    search_order: [pkg_consumer, fivetran_utils]

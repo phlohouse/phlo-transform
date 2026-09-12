@@ -749,3 +749,55 @@ fn tampered_fivetran_source_is_not_lowered() {
     // Non-fivetran package inlining is unaffected by the guard.
     assert_eq!(outcome("uses_package"), Classification::Clean);
 }
+
+/// A `dispatch:` rule can make dbt select a project override for a package
+/// macro. When that override cannot be statically evaluated, the call must
+/// stay REVIEW — the recognised package lowering stands in for the
+/// package's own implementation and must not run for one dbt would not
+/// select.
+#[test]
+fn dispatch_override_of_fivetran_helper_stays_review() {
+    fn copy_dir(src: &std::path::Path, dest: &std::path::Path) {
+        std::fs::create_dir_all(dest).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let target = dest.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    copy_dir(&fixture("dbt-packages"), dir.path());
+
+    // The fixture already configures `fivetran_utils` to search the project
+    // first; give the project an unprovable `default__` implementation and
+    // dbt would select it over the verified package body.
+    std::fs::write(
+        dir.path().join("macros/partition_override.sql"),
+        "{% macro default__partition_by_source_relation(package_name, has_other_partitions, alias='') %}\n  {{ run_query('select 1') }}\n{% endmacro %}\n",
+    )
+    .unwrap();
+
+    let translation = translate_project(dir.path()).expect("dbt project loads");
+    let report = &translation.report;
+    let outcome = |name: &str| {
+        report
+            .resources
+            .iter()
+            .find(|r| r.kind == ResourceKind::Model && r.name.ends_with(&format!(".{name}")))
+            .unwrap_or_else(|| panic!("no model named {name}"))
+            .classification
+    };
+    // The override is selected by dbt but cannot be statically evaluated —
+    // the recognised package lowering must not fire.
+    assert_eq!(outcome("fivetran_partitioned"), Classification::Review);
+    assert_eq!(outcome("fivetran_partition_only"), Classification::Review);
+    assert_eq!(outcome("fivetran_not_unioning"), Classification::Review);
+    // The direct (non-dispatched) `fill_pass_through_columns` cannot be
+    // overridden by dispatch config upstream — its lowering still applies.
+    assert_eq!(outcome("fivetran_pass_through"), Classification::Clean);
+}
