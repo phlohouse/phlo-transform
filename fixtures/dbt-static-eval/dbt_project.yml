@@ -1,0 +1,10 @@
+name: static_eval
+profile: static_eval
+version: "1.0"
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+vars:
+  feature_on: true
+  tz: "UTC"

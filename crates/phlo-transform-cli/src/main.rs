@@ -4,6 +4,7 @@
 //! command supports `--json`; human and JSON output are derived from the same
 //! report structures.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -151,7 +152,8 @@ enum Command {
     /// Show upstream/downstream model lineage or a column's lineage.
     Lineage {
         /// Model (`assay.results`) or column (`assay.results.concentration`).
-        target: String,
+        /// Omit to print the whole model graph.
+        target: Option<String>,
     },
     /// Show downstream impact of a column.
     Impact {
@@ -344,7 +346,7 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
         Command::Apply => run_apply(cli, &compilation, false).await,
         Command::Run => run_apply(cli, &compilation, true).await,
         Command::Test => run_test(cli, &compilation).await,
-        Command::Lineage { target } => run_lineage(cli, &compilation, target),
+        Command::Lineage { target } => run_lineage(cli, &compilation, target.as_deref()),
         Command::Impact { column } => run_impact(cli, &compilation, column),
         Command::Explain { model } => run_explain(cli, &compilation, model).await,
         Command::Translate { .. } | Command::Doctor | Command::Init | Command::Manifest => {
@@ -424,6 +426,7 @@ fn run_inspect(cli: &Cli, compilation: &Compilation, model: &str) -> Result<Exit
         .map_err(|error| format!("invalid model reference `{model}`: {error}"))?;
     match compilation.inspect_report(&id) {
         Some(report) => {
+            let diagnostics = model_diagnostics(compilation, &report);
             let desired = report.model.version.clone();
             let current = open_state(cli).and_then(|state| {
                 state
@@ -445,6 +448,8 @@ fn run_inspect(cli: &Cli, compilation: &Compilation, model: &str) -> Result<Exit
                     "current": current.as_ref().map(|record| record.version.hash.clone()),
                     "status": status,
                 });
+                value["diagnostics"] = serde_json::to_value(&diagnostics)
+                    .map_err(|error| format!("could not serialise JSON: {error}"))?;
                 print_json(&value)?;
             } else {
                 print_inspect_human(&report);
@@ -459,6 +464,7 @@ fn run_inspect(cli: &Cli, compilation: &Compilation, model: &str) -> Result<Exit
                 );
                 println!("  status:   {status}");
                 println!();
+                render_diagnostics(&diagnostics);
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -472,6 +478,19 @@ fn run_inspect(cli: &Cli, compilation: &Compilation, model: &str) -> Result<Exit
             Ok(ExitCode::FAILURE)
         }
     }
+}
+
+/// Diagnostics whose path is the model's source file.
+fn model_diagnostics(compilation: &Compilation, report: &InspectReport) -> Vec<Diagnostic> {
+    let Some(path) = report.model.path.as_deref() else {
+        return Vec::new();
+    };
+    compilation
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.path.as_deref() == Some(path))
+        .cloned()
+        .collect()
 }
 
 fn selection(cli: &Cli) -> SelectionOptions {
@@ -832,7 +851,12 @@ async fn run_plan(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, Stri
         print_json(&plan)?;
     } else {
         print_plan_human(&plan);
-        render_diagnostics(&plan.diagnostics);
+        // `print_plan_human` already surfaces diagnostics up front when
+        // the plan is blocked; only trailing (non-blocking) diagnostics
+        // are printed here.
+        if !plan.blocked {
+            render_diagnostics(&plan.diagnostics);
+        }
     }
 
     Ok(if plan.blocked {
@@ -859,7 +883,6 @@ async fn run_apply(
             print_json(&plan)?;
         } else {
             print_plan_human(&plan);
-            render_diagnostics(&plan.diagnostics);
         }
         return Ok(ExitCode::FAILURE);
     }
@@ -947,7 +970,15 @@ async fn run_test(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, Stri
     })
 }
 
-fn run_lineage(cli: &Cli, compilation: &Compilation, target: &str) -> Result<ExitCode, String> {
+fn run_lineage(
+    cli: &Cli,
+    compilation: &Compilation,
+    target: Option<&str>,
+) -> Result<ExitCode, String> {
+    let Some(target) = target else {
+        return run_graph_lineage(cli, compilation);
+    };
+
     // A model target shows model lineage; otherwise the last segment is a
     // column and the prefix is the model.
     if let Ok(id) = ModelId::parse(target) {
@@ -992,6 +1023,59 @@ fn run_lineage(cli: &Cli, compilation: &Compilation, target: &str) -> Result<Exi
             Ok(ExitCode::FAILURE)
         }
     }
+}
+
+/// `lineage` with no target: the whole model graph as a compact edge list.
+fn run_graph_lineage(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, String> {
+    let report = compilation.list_report();
+    let mut downstream: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for model in &report.models {
+        for dependency in &model.depends_on {
+            downstream
+                .entry(dependency.as_str())
+                .or_default()
+                .push(model.name.as_str());
+        }
+    }
+
+    if cli.json {
+        let models: Vec<serde_json::Value> = report
+            .models
+            .iter()
+            .map(|model| {
+                serde_json::json!({
+                    "name": model.name,
+                    "upstream": model.depends_on,
+                    "sources": model.sources,
+                    "downstream": downstream.get(model.name.as_str()).cloned().unwrap_or_default(),
+                })
+            })
+            .collect();
+        print_json(&serde_json::json!({ "models": models }))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    println!("Models ({})", report.models.len());
+    let width = report
+        .models
+        .iter()
+        .map(|model| model.name.len())
+        .max()
+        .unwrap_or(0);
+    for model in &report.models {
+        let mut edges = String::new();
+        if !model.depends_on.is_empty() {
+            edges.push_str(&format!(" <- {}", model.depends_on.join(", ")));
+        }
+        if let Some(dependents) = downstream.get(model.name.as_str()) {
+            edges.push_str(&format!(" -> {}", dependents.join(", ")));
+        }
+        if edges.is_empty() {
+            edges.push_str("   (isolated)");
+        }
+        println!("  {:<width$}{}", model.name, edges, width = width + 2);
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_impact(cli: &Cli, compilation: &Compilation, column: &str) -> Result<ExitCode, String> {
@@ -1245,7 +1329,11 @@ fn render_diagnostics(diagnostics: &[Diagnostic]) {
     for diagnostic in diagnostics {
         println!("{}", diagnostic.render_human());
         if let Some(path) = &diagnostic.path {
-            println!("  --> {path}");
+            match (diagnostic.line, diagnostic.column) {
+                (Some(line), Some(column)) => println!("  --> {path}:{line}:{column}"),
+                (Some(line), None) => println!("  --> {path}:{line}"),
+                _ => println!("  --> {path}"),
+            }
         }
     }
 }
@@ -1374,10 +1462,35 @@ fn print_plan_human(plan: &Plan) {
     println!();
 
     if plan.blocked {
-        println!("plan blocked by compilation errors");
+        // The errors are the actionable output — show them before the
+        // model table so they are not buried under a long listing.
+        println!("plan blocked by compilation errors:");
+        println!();
+        render_diagnostics(&plan.diagnostics);
+        println!();
     }
 
-    println!("Models ({})", plan.models.len());
+    let mut counts = [0usize; 4]; // build, skip, cached, unknown
+    for model in &plan.models {
+        counts[match model.action {
+            PlanAction::Build => 0,
+            PlanAction::Skip => 1,
+            PlanAction::Cached => 2,
+            PlanAction::Unknown => 3,
+        }] += 1;
+    }
+    println!(
+        "Models ({}) — {} build, {} skip, {} cached{}",
+        plan.models.len(),
+        counts[0],
+        counts[1],
+        counts[2],
+        if counts[3] > 0 {
+            format!(", {} unknown", counts[3])
+        } else {
+            String::new()
+        }
+    );
     for model in &plan.models {
         let action = match model.action {
             PlanAction::Build => "BUILD",
@@ -1912,7 +2025,7 @@ async fn run_doctor(cli: &Cli) -> Result<ExitCode, String> {
             format!("{}", cli.root.display())
         } else {
             format!(
-                "no phlo.toml, transforms/ or workflows/ under {}; run `phlo-transform init`",
+                "no phlo.toml, transforms/ or workflows/ under {}; run `phlo-transform init` or pass `-r <workspace>`",
                 cli.root.display()
             )
         },
@@ -1923,18 +2036,28 @@ async fn run_doctor(cli: &Cli) -> Result<ExitCode, String> {
         Ok(project) => {
             let compilation = compile(&project);
             let check = compilation.check_report();
-            let errors = compilation
+            let errors: Vec<&Diagnostic> = compilation
                 .diagnostics
                 .iter()
                 .filter(|d| matches!(d.severity, phlo_transform_core::Severity::Error))
-                .count();
+                .collect();
+            let mut detail = format!(
+                "{} models, {} sources, {} tests; {} error(s)",
+                check.model_count,
+                check.source_count,
+                check.test_count,
+                errors.len()
+            );
+            if let Some(first) = errors.first() {
+                detail.push_str(&format!(" — first: [{}] {}", first.code, first.message));
+            }
+            if !errors.is_empty() {
+                detail.push_str("; run `phlo-transform check`");
+            }
             record(DoctorCheck {
                 name: "compile",
                 status: if compilation.is_ok() { "ok" } else { "fail" },
-                detail: format!(
-                    "{} models, {} sources, {} tests; {} error(s)",
-                    check.model_count, check.source_count, check.test_count, errors
-                ),
+                detail,
             });
         }
         Err(diagnostics) => {
@@ -2058,6 +2181,7 @@ async fn run_explain(
     let Some(report) = compilation.inspect_report(&id) else {
         return Err(format!("no such model: {}", id.logical_name()));
     };
+    let diagnostics = model_diagnostics(compilation, &report);
     let compiled = compilation.model(&id).expect("inspect report exists");
 
     // Scope a plan to this model when an adapter is available.
@@ -2088,6 +2212,7 @@ async fn run_explain(
             "model": report,
             "version": compiled.version.hash,
             "plan": plan_model,
+            "diagnostics": diagnostics,
         }))?;
     } else {
         print_inspect_human(&report);
@@ -2106,6 +2231,10 @@ async fn run_explain(
             }
         } else {
             println!("Action:        (unknown — no adapter configured)");
+        }
+        if !diagnostics.is_empty() {
+            println!();
+            render_diagnostics(&diagnostics);
         }
         println!();
     }

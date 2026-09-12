@@ -410,6 +410,121 @@ fn later_diverging_case_is_still_caught_across_targets() {
     );
 }
 
+/// Regression: static evaluation of config values and macro bodies.
+/// `enabled = target.type == 'duckdb'` resolves against the profile;
+/// `boolean_var(...)` (a project macro wrapping `var` with `{% do return %}`)
+/// proves `enabled = false`; own-package-qualified and adapter-dispatched
+/// project macros inline; `{% set %}` capture, `{% raw %}`, `{% do log %}`,
+/// `dbt_utils.group_by`, and literal per-model `schema` all lower.
+#[test]
+fn static_eval_lowering() {
+    let translation = translate_project(&fixture("dbt-static-eval")).expect("dbt project loads");
+    let report = &translation.report;
+
+    let outcome = |name: &str| -> &phlo_transform_dbt::ResourceOutcome {
+        report
+            .resources
+            .iter()
+            .find(|r| r.kind == ResourceKind::Model && r.name.ends_with(name))
+            .unwrap_or_else(|| panic!("no model named {name}"))
+    };
+
+    // `target.type == 'duckdb'` is true under the dev profile.
+    assert_eq!(
+        outcome("enabled_by_target").classification,
+        Classification::Clean
+    );
+
+    // `boolean_var('missing_flag', false)` → `enabled = false` → the model
+    // is disabled; Phlo has no disabled state.
+    let disabled = outcome("disabled_model");
+    assert_eq!(disabled.classification, Classification::Unsupported);
+    assert!(
+        disabled
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("enabled = false")),
+        "{:?}",
+        disabled.issues
+    );
+
+    // Capture blocks, `{% raw %}`, `{% do %}`, own-package-qualified and
+    // adapter-dispatched macros, and `group_by` all lower statically.
+    let constructs = outcome("static_constructs");
+    assert_eq!(constructs.classification, Classification::Clean);
+
+    let file = |path: &str| {
+        translation
+            .files
+            .iter()
+            .find(|file| file.rel_path == path)
+            .unwrap_or_else(|| panic!("no emitted file {path}"))
+            .contents
+            .clone()
+    };
+
+    let sql = file("transforms/static_constructs.sql");
+    assert!(
+        sql.contains("convert_timezone('UTC', 'UTC', created_at)"),
+        "{sql}"
+    );
+    assert!(
+        sql.contains("(amount_cents / 100)::numeric(16, 2)"),
+        "{sql}"
+    );
+    assert!(sql.contains("concat('region', '_', 'eu')"), "{sql}");
+    assert!(sql.contains("group by 1, 2"), "{sql}");
+    assert!(sql.contains("this_looks_like_jinja"), "{sql}");
+    assert!(!sql.contains("{%"), "{sql}");
+
+    // A literal `schema = 'custom'` relocates the model into a
+    // schema-named folder preserving its logical name via `-- @id`.
+    let relocated = file("transforms/custom/custom_schema.sql");
+    assert!(relocated.contains("-- @id"), "{relocated}");
+
+    // Upstream-equivalence: `dbt.hash` casts to the string type before
+    // hashing, and `dbt.split_part` keeps dbt's argument order
+    // (string, delimiter, part_number).
+    let equiv = file("transforms/upstream_equivalence.sql");
+    assert!(equiv.contains("md5(cast(id as varchar))"), "{equiv}");
+    assert!(equiv.contains("split_part(code, '-', 2)"), "{equiv}");
+    // `{% do return(...) %}` exits the macro: nothing after it (in the
+    // branch or the tail) is emitted. The returned string value is
+    // emitted bare, matching upstream `{{ return(...) }}` rendering.
+    assert!(equiv.contains("flag_on"), "{equiv}");
+    assert!(!equiv.contains("unreached"), "{equiv}");
+
+    // `dbt_utils.surrogate_key` is deprecated upstream (raises a compiler
+    // error; historical null semantics differ) and bare `type_numeric()`
+    // is not the `dbt.` builtin — both stay REVIEW. `default`, `escape`
+    // and `list` filters are excluded from the static subset because
+    // faithful Jinja semantics (undefined-only defaulting, HTML escaping,
+    // string→char-list) differ from naive approximations.
+    let not_provable = outcome("not_provable");
+    assert_eq!(not_provable.classification, Classification::Review);
+    let np = file("transforms/not_provable.sql");
+    assert!(np.contains("surrogate_key"), "{np}");
+    assert!(np.contains("type_numeric"), "{np}");
+    assert!(np.contains("default"), "{np}");
+    assert!(np.contains("escape"), "{np}");
+    assert!(np.contains("list"), "{np}");
+
+    // The generated workspace compiles except for the REVIEW model, whose
+    // residual Jinja must fail loudly — not silently change meaning.
+    let out = tempfile::tempdir().expect("tempdir");
+    phlo_transform_dbt::write_translation(out.path(), &translation).expect("write");
+    let project = phlo_transform_core::load_project(out.path()).expect("generated project loads");
+    let report = phlo_transform_core::compile(&project).check_report();
+    assert!(!report.ok, "expected not_provable.sql to fail check");
+    for diagnostic in &report.diagnostics {
+        assert_eq!(
+            diagnostic.path.as_deref(),
+            Some("transforms/not_provable.sql"),
+            "unexpected diagnostic outside not_provable.sql: {diagnostic:?}"
+        );
+    }
+}
+
 #[test]
 fn clean_fixture_verifies_with_the_native_compiler() {
     let translation = translate_project(&fixture("dbt-clean")).expect("load");

@@ -1,4 +1,7 @@
 /target
 **/.phlo/
+/corpus/repos/
+/corpus/results/
+/corpus/results-baseline/
 *.snap.new
 .DS_Store

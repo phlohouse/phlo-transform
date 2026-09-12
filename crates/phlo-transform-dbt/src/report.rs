@@ -255,10 +255,19 @@ impl MigrationReport {
                 }
             }
         }
-        out.push_str(&format!(
-            "\nModel conversion coverage: {:.1}%\n",
-            self.model_coverage * 100.0
-        ));
+        let model_count: usize = self
+            .summary
+            .get("models")
+            .map(|classes| classes.values().sum())
+            .unwrap_or(0);
+        if model_count == 0 {
+            out.push_str("\nModel conversion coverage: n/a (no models)\n");
+        } else {
+            out.push_str(&format!(
+                "\nModel conversion coverage: {:.1}%\n",
+                self.model_coverage * 100.0
+            ));
+        }
         let reasons = self.reason_summary();
         if !reasons.is_empty() {
             out.push_str("\nReview reasons\n");

@@ -5,7 +5,7 @@
 //! includes, derives stable logical identities, and lowers everything into a
 //! frontend-agnostic [`SemanticProject`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -66,7 +66,14 @@ pub fn load_project(workspace_root: &Path) -> Result<SemanticProject, Vec<Diagno
         Err(diagnostic) => return Err(vec![diagnostic]),
     };
 
-    let files = walk_sql_files(workspace_root, &include, &exclude, &mut diagnostics);
+    let mut walk_warnings: BTreeSet<String> = BTreeSet::new();
+    let files = walk_sql_files(
+        workspace_root,
+        &include,
+        &exclude,
+        &mut diagnostics,
+        &mut walk_warnings,
+    );
 
     // First pass: derive identity and root membership for each file.
     let mut derived: Vec<DerivedFile> = Vec::with_capacity(files.len());
@@ -131,8 +138,25 @@ pub fn load_project(workspace_root: &Path) -> Result<SemanticProject, Vec<Diagno
         }
     }
 
-    let tests = load_tests(workspace_root, &mut diagnostics);
+    let tests = load_tests(workspace_root, &mut diagnostics, &mut walk_warnings);
     let seeds = load_seeds(workspace_root, &config, &mut diagnostics);
+
+    if roots.is_empty() {
+        diagnostics.push(
+            Diagnostic::warning(
+                codes::PROJECT_NO_ROOTS,
+                format!(
+                    "no transforms discovered under `{}`",
+                    workspace_root.to_string_lossy().replace('\\', "/")
+                ),
+            )
+            .with_help(
+                "expected `transforms/**` or `workflows/*/transforms/**`, or a \
+                 `[transform.discovery] include` glob in phlo.toml — pass `-r` if this is \
+                 not the workspace you meant",
+            ),
+        );
+    }
 
     Ok(SemanticProject {
         workspace_root: Some(workspace_root.to_path_buf()),
@@ -364,6 +388,7 @@ fn walk_sql_files(
     include: &GlobSet,
     exclude: &GlobSet,
     diagnostics: &mut Vec<Diagnostic>,
+    reported_warnings: &mut BTreeSet<String>,
 ) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for entry in WalkDir::new(workspace_root)
@@ -374,10 +399,14 @@ fn walk_sql_files(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                diagnostics.push(Diagnostic::warning(
-                    codes::PROJECT_FILE_READ,
-                    format!("could not read a workspace entry: {error}"),
-                ));
+                // The walk runs once per include set (models, tests); report
+                // each unreadable entry once rather than per pass.
+                if reported_warnings.insert(error.to_string()) {
+                    diagnostics.push(Diagnostic::warning(
+                        codes::PROJECT_FILE_READ,
+                        format!("could not read a workspace entry: {error}"),
+                    ));
+                }
                 continue;
             }
         };
@@ -412,7 +441,11 @@ fn should_descend(entry: &DirEntry) -> bool {
 }
 
 /// Discover custom SQL tests from the conventional `tests/**/*.sql` location.
-fn load_tests(workspace_root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Vec<SemanticTest> {
+fn load_tests(
+    workspace_root: &Path,
+    diagnostics: &mut Vec<Diagnostic>,
+    walk_warnings: &mut BTreeSet<String>,
+) -> Vec<SemanticTest> {
     let include = match build_globset(&["tests/**".to_string()]) {
         Ok(globset) => globset,
         Err(diagnostic) => {
@@ -433,7 +466,13 @@ fn load_tests(workspace_root: &Path, diagnostics: &mut Vec<Diagnostic>) -> Vec<S
         }
     };
 
-    let files = walk_sql_files(workspace_root, &include, &exclude, diagnostics);
+    let files = walk_sql_files(
+        workspace_root,
+        &include,
+        &exclude,
+        diagnostics,
+        walk_warnings,
+    );
     let mut tests = Vec::with_capacity(files.len());
     for relative_path in files {
         let display = display_path(&relative_path);
