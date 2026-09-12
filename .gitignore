@@ -5,3 +5,4 @@
 /corpus/results-baseline/
 *.snap.new
 .DS_Store
+/corpus/packages-cache/

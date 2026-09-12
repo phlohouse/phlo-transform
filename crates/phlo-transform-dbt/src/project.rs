@@ -41,6 +41,88 @@ pub struct DbtPropertyFile {
     pub root: Value,
 }
 
+/// How a dbt package dependency was declared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackageKind {
+    /// dbt Hub: `package: org/name` with a `version:` range.
+    Hub,
+    /// `git: <url>` with an optional `revision:`.
+    Git,
+    /// `local: <path>` — resolved relative to the project root.
+    Local,
+    /// `projects:` entry in `dependencies.yml` — a dbt mesh cross-project
+    /// dependency. Source is never installed under `dbt_packages/` by
+    /// `dbt deps`, so it stays unresolved.
+    Project,
+    /// `tarball:` URL dependency — not resolved from disk.
+    Tarball,
+    /// Present under the package install path without a matching
+    /// declaration — a transitive package or a stale install.
+    Vendored,
+}
+
+/// A dbt package dependency plus its resolved on-disk source, when present.
+///
+/// Package source is loaded for static analysis only — macro definitions are
+/// inlined through the same provable-subset machinery as project macros, and
+/// no Jinja is ever executed. Nothing here creates a dbt package runtime.
+#[derive(Clone, Debug)]
+pub struct DbtPackage {
+    /// The declared identifier: `org/name`, git URL, local path, or project
+    /// name. For vendored packages, the install-path-relative directory.
+    pub spec: String,
+    pub kind: PackageKind,
+    /// Macro namespace — the package's own `dbt_project.yml` `name:` when the
+    /// source resolved, else derived from the spec.
+    pub name: String,
+    /// Declared version range (Hub) or revision (git), when present.
+    pub requested: Option<String>,
+    /// Exact resolved version/commit recorded in `package-lock.yml`.
+    pub locked: Option<String>,
+    /// Package source root, when available for static analysis.
+    pub root: Option<PathBuf>,
+    /// `.sql` files under the package's `macro-paths`.
+    pub macro_files: Vec<DbtSqlFile>,
+    /// Model file stems under the package's `model-paths`. Used only to make
+    /// `ref('pkg', 'model')` diagnostics precise — package models are not
+    /// translated.
+    pub model_names: Vec<String>,
+}
+
+impl DbtPackage {
+    fn declared(spec: &str, kind: PackageKind) -> Self {
+        DbtPackage {
+            spec: spec.to_string(),
+            kind,
+            name: spec_short_name(spec),
+            requested: None,
+            locked: None,
+            root: None,
+            macro_files: Vec::new(),
+            model_names: Vec::new(),
+        }
+    }
+
+    /// The package source root relative to the project root, for reports.
+    pub fn display_root(&self, project_root: &Path) -> Option<String> {
+        self.root
+            .as_ref()
+            .map(|root| display(root.strip_prefix(project_root).unwrap_or(root.as_path())))
+    }
+}
+
+/// The package name derivable from a declaration: the final `org/name`
+/// segment for Hub, the repository basename for git, the last path
+/// component for `local:`. Normalised to a valid namespace (`-` → `_`).
+pub(crate) fn spec_short_name(spec: &str) -> String {
+    spec.trim_end_matches('/')
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(spec)
+        .trim_end_matches(".git")
+        .replace('-', "_")
+}
+
 /// Non-secret target fields read from `profiles.yml`, when present.
 #[derive(Clone, Debug, Default)]
 pub struct ProfileTarget {
@@ -86,7 +168,8 @@ pub struct DbtProject {
     pub seeds: Vec<DbtSeed>,
     pub snapshots: Vec<DbtSqlFile>,
     pub analyses: Vec<DbtSqlFile>,
-    pub packages: Vec<String>,
+    /// Declared and vendored package dependencies.
+    pub packages: Vec<DbtPackage>,
     pub profile: Option<ProfileTarget>,
     /// Files that could not be read or parsed; surfaced as review issues.
     pub load_warnings: Vec<String>,
@@ -116,11 +199,25 @@ pub fn load(root: &Path) -> Result<DbtProject, ProjectError> {
     let name = get_str(&project_yaml, "name")
         .map(str::to_string)
         .unwrap_or_else(|| "dbt".to_string());
-    let vars = project_yaml
+    let mut vars = project_yaml
         .get("vars")
         .and_then(Value::as_mapping)
         .cloned()
         .unwrap_or_default();
+    // dbt resolves `var('x')` against the invoking node's package namespace
+    // (`vars.<package>.x`) before the root `vars.x`. Every node we translate
+    // belongs to this project, so the project-named block merges on top.
+    // (YAML duplicate keys keep only the last block — a serde_yaml limit —
+    // so a `vars:` that repeats the package name loses earlier blocks.)
+    if let Some(namespaced) = vars
+        .get(Value::String(name.clone()))
+        .and_then(Value::as_mapping)
+        .cloned()
+    {
+        for (key, value) in namespaced {
+            vars.insert(key, value);
+        }
+    }
     let models_tree = project_yaml.get("models").cloned().unwrap_or(Value::Null);
 
     let model_paths = paths(&project_yaml, "model-paths", &["models"]);
@@ -228,7 +325,7 @@ pub fn load(root: &Path) -> Result<DbtProject, ProjectError> {
             }
         }
     }
-    project.packages = read_packages(root, &mut warnings);
+    project.packages = load_packages(root, &project_yaml, &mut warnings);
     let profile_name = get_str(&project_yaml, "profile").map(str::to_string);
     project.profile = read_profile(root, profile_name.as_deref());
     project.load_warnings = warnings;
@@ -360,7 +457,116 @@ fn macro_names(sql: &str) -> Vec<String> {
     names
 }
 
-fn read_packages(root: &Path, warnings: &mut Vec<String>) -> Vec<String> {
+/// A package directory found under the install path.
+struct VendoredPackage {
+    dir_name: String,
+    /// The package's own `dbt_project.yml` `name:`, when readable.
+    name: Option<String>,
+    path: PathBuf,
+}
+
+/// A `package-lock.yml` entry: the declared spec and the exact resolution
+/// dbt recorded (hub version or git commit).
+struct LockedPackage {
+    spec: String,
+    name: Option<String>,
+    resolution: String,
+}
+
+/// Resolve every declared and vendored package to on-disk source.
+///
+/// Resolution is read-only: `local:` entries resolve against the project
+/// root; Hub and git entries match directories already installed under
+/// `dbt_packages/` (or `packages-install-path:`/`deps/`). Nothing is
+/// fetched and nothing is executed — the translator only ever *inspects*
+/// package source, and an uninstalled package simply stays unresolved.
+fn load_packages(root: &Path, project: &Value, warnings: &mut Vec<String>) -> Vec<DbtPackage> {
+    let declared = declared_packages(root, warnings);
+    let locked = read_package_lock(root, warnings);
+    let vendored = vendored_packages(root, project, warnings);
+
+    let mut matched = vec![false; vendored.len()];
+    let mut packages = Vec::new();
+    for mut package in declared {
+        if packages
+            .iter()
+            .any(|seen: &DbtPackage| seen.spec == package.spec)
+        {
+            warnings.push(format!("duplicate package declaration `{}`", package.spec));
+            continue;
+        }
+        package.locked = locked
+            .iter()
+            .find(|entry| {
+                entry.spec == package.spec
+                    || entry
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name == package.name)
+            })
+            .map(|entry| entry.resolution.clone());
+        package.root = match package.kind {
+            PackageKind::Local => {
+                let path = root.join(&package.spec);
+                if path.join("dbt_project.yml").is_file() {
+                    Some(path)
+                } else {
+                    warnings.push(format!(
+                        "local package `{}` has no dbt_project.yml at {}",
+                        package.spec,
+                        display(&path)
+                    ));
+                    None
+                }
+            }
+            PackageKind::Hub | PackageKind::Git => {
+                match_vendored(&package, &vendored, &mut matched)
+            }
+            PackageKind::Project | PackageKind::Tarball | PackageKind::Vendored => None,
+        };
+        packages.push(package);
+    }
+
+    // Vendored directories no declaration claimed are still inspectable —
+    // transitive installs land here.
+    for (index, dir) in vendored.iter().enumerate() {
+        if matched[index] {
+            continue;
+        }
+        let mut package = DbtPackage::declared(&dir.dir_name, PackageKind::Vendored);
+        package.spec = format!(
+            "{}/{}",
+            dir.path
+                .parent()
+                .and_then(|base| base.file_name())
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default(),
+            dir.dir_name
+        );
+        if let Some(name) = &dir.name {
+            package.name = name.clone();
+        }
+        package.root = Some(dir.path.clone());
+        packages.push(package);
+    }
+
+    let mut namespaces = std::collections::BTreeSet::new();
+    for package in &mut packages {
+        load_package_source(package, root, warnings);
+        if package.root.is_some() && !namespaces.insert(package.name.clone()) {
+            warnings.push(format!(
+                "multiple packages provide the `{}` macro namespace",
+                package.name
+            ));
+        }
+    }
+    packages
+}
+
+/// `packages:` and `projects:` entries across `packages.yml` and
+/// `dependencies.yml` (dbt reads both).
+fn declared_packages(root: &Path, warnings: &mut Vec<String>) -> Vec<DbtPackage> {
+    let mut packages = Vec::new();
     for candidate in ["packages.yml", "dependencies.yml"] {
         let path = root.join(candidate);
         if !path.is_file() {
@@ -369,25 +575,239 @@ fn read_packages(root: &Path, warnings: &mut Vec<String>) -> Vec<String> {
         let Some(file) = read_yaml(root, &path, warnings) else {
             continue;
         };
-        return file
+        for item in file
             .root
             .get("packages")
             .and_then(Value::as_sequence)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| {
-                        item.get("package")
-                            .or_else(|| item.get("git"))
-                            .or_else(|| item.get("local"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+            .into_iter()
+            .flatten()
+        {
+            if let Some(package) = package_entry(item, warnings) {
+                packages.push(package);
+            }
+        }
+        for item in file
+            .root
+            .get("projects")
+            .and_then(Value::as_sequence)
+            .into_iter()
+            .flatten()
+        {
+            // `projects: [{name: foo}]` or the bare `projects: [foo]`.
+            if let Some(name) = item
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| item.as_str())
+            {
+                packages.push(DbtPackage::declared(name, PackageKind::Project));
+            }
+        }
     }
-    Vec::new()
+    packages
+}
+
+/// One `packages:` list entry: `- package: org/name`, `- git: <url>` or
+/// `- local: <path>`.
+fn package_entry(item: &Value, warnings: &mut Vec<String>) -> Option<DbtPackage> {
+    let get = |key: &str| item.get(key).and_then(Value::as_str).map(str::to_string);
+    if let Some(spec) = get("package") {
+        let mut package = DbtPackage::declared(&spec, PackageKind::Hub);
+        package.requested = item.get("version").and_then(package_version);
+        return Some(package);
+    }
+    if let Some(spec) = get("git") {
+        let mut package = DbtPackage::declared(&spec, PackageKind::Git);
+        package.requested = item.get("revision").and_then(package_version);
+        return Some(package);
+    }
+    if let Some(spec) = get("local") {
+        return Some(DbtPackage::declared(&spec, PackageKind::Local));
+    }
+    if let Some(spec) = get("tarball") {
+        return Some(DbtPackage::declared(&spec, PackageKind::Tarball));
+    }
+    warnings.push(format!("unrecognised package declaration `{item:?}`"));
+    None
+}
+
+/// A `version:`/`revision:` field — a scalar or a list of range bounds.
+fn package_version(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Sequence(items) => Some(
+            items
+                .iter()
+                .filter_map(package_version)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        _ => None,
+    }
+}
+
+/// Exact resolved versions/revisions from `package-lock.yml`.
+fn read_package_lock(root: &Path, warnings: &mut Vec<String>) -> Vec<LockedPackage> {
+    let path = root.join("package-lock.yml");
+    if !path.is_file() {
+        return Vec::new();
+    }
+    let mut locked = Vec::new();
+    let Some(file) = read_yaml(root, &path, warnings) else {
+        return locked;
+    };
+    for item in file
+        .root
+        .get("packages")
+        .and_then(Value::as_sequence)
+        .into_iter()
+        .flatten()
+    {
+        let spec = item
+            .get("package")
+            .or_else(|| item.get("git"))
+            .or_else(|| item.get("local"))
+            .and_then(Value::as_str);
+        let resolution = item
+            .get("version")
+            .or_else(|| item.get("revision"))
+            .and_then(package_version);
+        if let (Some(spec), Some(resolution)) = (spec, resolution) {
+            locked.push(LockedPackage {
+                spec: spec.to_string(),
+                name: item.get("name").and_then(Value::as_str).map(str::to_string),
+                resolution,
+            });
+        }
+    }
+    locked
+}
+
+/// Directories already installed under `packages-install-path` (default
+/// `dbt_packages`) or `deps`, each with the package's own `name:`.
+fn vendored_packages(
+    root: &Path,
+    project: &Value,
+    warnings: &mut Vec<String>,
+) -> Vec<VendoredPackage> {
+    let install = get_str(project, "packages-install-path").unwrap_or("dbt_packages");
+    let mut bases = vec![root.join(install)];
+    let deps = root.join("deps");
+    if deps != bases[0] {
+        bases.push(deps);
+    }
+    let mut vendored = Vec::new();
+    for base in bases {
+        let mut paths: Vec<PathBuf> = match std::fs::read_dir(&base) {
+            Ok(entries) => entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| path.is_dir())
+                .collect(),
+            Err(_) => continue,
+        };
+        paths.sort();
+        for path in paths {
+            let dir_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if dir_name.starts_with('.') {
+                continue;
+            }
+            vendored.push(VendoredPackage {
+                name: package_yaml(&path)
+                    .as_ref()
+                    .and_then(|yaml| get_str(yaml, "name"))
+                    .map(str::to_string),
+                dir_name,
+                path,
+            });
+        }
+    }
+    let _ = warnings;
+    vendored
+}
+
+/// Match a declared Hub/git package to an installed directory, by directory
+/// name or by the package's own `name:`.
+fn match_vendored(
+    package: &DbtPackage,
+    vendored: &[VendoredPackage],
+    matched: &mut [bool],
+) -> Option<PathBuf> {
+    let wanted = spec_short_name(&package.spec);
+    let position = vendored.iter().enumerate().find(|(index, dir)| {
+        !matched[*index]
+            && (names_match(&dir.dir_name, &wanted)
+                || dir
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| names_match(name, &wanted)))
+    });
+    position.map(|(index, dir)| {
+        matched[index] = true;
+        dir.path.clone()
+    })
+}
+
+fn names_match(left: &str, right: &str) -> bool {
+    left == right || left.replace('-', "_") == right.replace('-', "_")
+}
+
+/// Parse a package's `dbt_project.yml`, when present.
+fn package_yaml(package_root: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(package_root.join("dbt_project.yml")).ok()?;
+    serde_yaml::from_str(&text).ok()
+}
+
+/// Load a resolved package's macro files and model stems for static
+/// analysis.
+fn load_package_source(package: &mut DbtPackage, project_root: &Path, warnings: &mut Vec<String>) {
+    let Some(pkg_root) = package.root.clone() else {
+        return;
+    };
+    let yaml = package_yaml(&pkg_root);
+    if let Some(name) = yaml.as_ref().and_then(|yaml| get_str(yaml, "name")) {
+        package.name = name.to_string();
+    }
+    let empty = Value::Null;
+    let yaml = yaml.as_ref().unwrap_or(&empty);
+    for dir in paths(yaml, "macro-paths", &["macros"]) {
+        for file in walk(&pkg_root, &dir, warnings) {
+            if extension(&file) != Some("sql") {
+                continue;
+            }
+            if let Some(sql) = read_sql(&pkg_root, &file, warnings) {
+                package.macro_files.push(DbtSqlFile {
+                    rel_path: file
+                        .strip_prefix(project_root)
+                        .unwrap_or(&file)
+                        .to_path_buf(),
+                    dir: dir_segments(&pkg_root, &dir, &file),
+                    stem: file
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    sql,
+                });
+            }
+        }
+    }
+    for dir in paths(yaml, "model-paths", &["models"]) {
+        for file in walk(&pkg_root, &dir, warnings) {
+            if extension(&file) == Some("sql") {
+                package.model_names.push(
+                    file.file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+    }
+    package.model_names.sort();
+    package.model_names.dedup();
 }
 
 /// Read non-secret target fields from a project-local `profiles.yml`.

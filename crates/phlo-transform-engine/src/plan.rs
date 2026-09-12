@@ -198,11 +198,19 @@ impl Planner {
         let blocked = !compilation.is_ok();
         let planned_ids = dependency_closure(compilation, selected);
 
+        // Ephemeral models are inlined into their dependents at compile time
+        // and never produce a relation, so they are not planned or executed.
         let order: Vec<ModelId> = compilation
             .topological_order()
             .unwrap_or_else(|| planned_ids.iter().cloned().collect())
             .into_iter()
             .filter(|id| planned_ids.contains(id))
+            .filter(|id| {
+                compilation
+                    .model(id)
+                    .map(|model| model.config.materialization != Materialization::Ephemeral)
+                    .unwrap_or(false)
+            })
             .collect();
 
         // Seeds are planned for the source relations the selected models read.

@@ -533,3 +533,73 @@ fn csv_seeds_are_discovered_and_compiled() {
         vec!["raw.raw_events"]
     );
 }
+
+/// `-- @ephemeral` models are inlined into dependents as derived tables,
+/// transitively expanded, and stay in the dependency graph for lineage.
+#[test]
+fn ephemeral_models_inline_into_dependents() {
+    let compilation = compile_fixture("ephemeral");
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+    assert_eq!(
+        model_names(&compilation),
+        vec!["main.customers", "main.order_filters", "main.stg_orders"]
+    );
+
+    // Graph edges still record the ephemeral hops for lineage and versions.
+    assert_eq!(
+        dependency_names(&compilation, "main.order_filters"),
+        vec!["main.stg_orders"]
+    );
+    assert_eq!(
+        dependency_names(&compilation, "main.customers"),
+        vec!["main.order_filters"]
+    );
+
+    let customers = compilation
+        .model(&ModelId::parse("main.customers").unwrap())
+        .unwrap();
+    // Both references to `order_filters` become derived tables; the nested
+    // `stg_orders` reference is expanded inside them. The user's aliases
+    // (`o`, `o2`) are preserved on the derived tables.
+    assert!(
+        customers.compiled_sql.contains(") o JOIN"),
+        "{}",
+        customers.compiled_sql
+    );
+    assert!(
+        customers.compiled_sql.contains(") o2 ON"),
+        "{}",
+        customers.compiled_sql
+    );
+    assert!(
+        customers
+            .compiled_sql
+            .contains(") AS stg_orders WHERE amount > 0"),
+        "{}",
+        customers.compiled_sql
+    );
+    assert_eq!(
+        customers
+            .compiled_sql
+            .matches("external.raw_orders")
+            .count(),
+        2,
+        "{}",
+        customers.compiled_sql
+    );
+    assert!(
+        !customers.compiled_sql.contains("main__"),
+        "{}",
+        customers.compiled_sql
+    );
+
+    // The ephemeral model itself compiles to the fully expanded form.
+    let order_filters = compilation
+        .model(&ModelId::parse("main.order_filters").unwrap())
+        .unwrap();
+    assert!(
+        order_filters.compiled_sql.contains("external.raw_orders"),
+        "{}",
+        order_filters.compiled_sql
+    );
+}

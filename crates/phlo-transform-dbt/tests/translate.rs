@@ -71,11 +71,19 @@ fn jaffle_classification() {
         Classification::Clean
     );
 
-    // Review: ephemeral and else-branch incremental models, packages.
+    // Ephemeral models translate to `-- @ephemeral` and stay clean.
     assert_eq!(
         class_of("helpers", ResourceKind::Model),
-        Classification::Review
+        Classification::Clean
     );
+    assert!(report
+        .resources
+        .iter()
+        .find(|r| r.name.ends_with("helpers") && r.kind == ResourceKind::Model)
+        .map(|r| r.emitted_path.as_deref().map(|_| true).unwrap_or(false))
+        .unwrap_or(false));
+
+    // Review: else-branch incremental models and packages.
     assert_eq!(
         class_of("daily_rollup", ResourceKind::Model),
         Classification::Review
@@ -173,10 +181,11 @@ fn jaffle_emitted_sql() {
         "{customers}"
     );
 
-    // Ephemeral degrades to a view (the workspace default — no directive
-    // needed; the REVIEW note records the change).
+    // Ephemeral maps to the native `-- @ephemeral` directive; the model is
+    // inlined into dependents at compile time rather than materialised.
     let helpers = file("transforms/helpers.sql");
     assert!(!helpers.contains("{{ config"), "{helpers}");
+    assert!(helpers.contains("-- @ephemeral"), "{helpers}");
 
     // Folder-level config lands in transform.toml.
     let staging_toml = file("transforms/staging/transform.toml");
@@ -523,6 +532,133 @@ fn static_eval_lowering() {
             "unexpected diagnostic outside not_provable.sql: {diagnostic:?}"
         );
     }
+}
+
+/// Package source resolution: vendored (`dbt_packages/`) and `local:`
+/// packages contribute macro source for static inlining — qualified calls,
+/// unique bare calls, and `{% for %}` bodies all lower from the real
+/// upstream source. Runtime-dependent calls, cross-package `ref()`s, and
+/// uninstalled packages stay REVIEW.
+#[test]
+fn package_source_resolution() {
+    let translation = translate_project(&fixture("dbt-packages")).expect("dbt project loads");
+    let report = &translation.report;
+
+    let outcome = |kind: ResourceKind, name: &str| -> &phlo_transform_dbt::ResourceOutcome {
+        report
+            .resources
+            .iter()
+            .find(|r| r.kind == kind && (r.name == name || r.name.ends_with(&format!(".{name}"))))
+            .unwrap_or_else(|| panic!("no {kind:?} resource named {name}"))
+    };
+    let file = |path: &str| {
+        translation
+            .files
+            .iter()
+            .find(|file| file.rel_path == path)
+            .unwrap_or_else(|| panic!("no emitted file {path}"))
+            .contents
+            .clone()
+    };
+
+    // Qualified calls (`kit.squared`, `localpkg.prefixed`, `kit.unroll`)
+    // and the unique bare `signature()` all inline from package source.
+    let uses = outcome(ResourceKind::Model, "uses_package");
+    assert_eq!(uses.classification, Classification::Clean);
+    let sql = file("transforms/uses_package.sql");
+    assert!(sql.contains("(price * price)"), "{sql}");
+    assert!(sql.contains("stg_orders"), "{sql}");
+    assert!(sql.contains("a, b"), "{sql}");
+    assert!(sql.contains("'kit-v1'"), "{sql}");
+    assert!(!sql.contains("{{"), "{sql}");
+
+    // Package models are not vendored — the cross-package ref stays REVIEW
+    // with a precise reason.
+    let pkg_ref = outcome(ResourceKind::Model, "uses_package_ref");
+    assert_eq!(pkg_ref.classification, Classification::Review);
+    assert!(
+        pkg_ref
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("model in package")),
+        "{:?}",
+        pkg_ref.issues
+    );
+
+    // `kit.dynamic` calls `run_query` — runtime-dependent → REVIEW, and the
+    // failed call site marks the package itself REVIEW.
+    let dynamic = outcome(ResourceKind::Model, "uses_dynamic");
+    assert_eq!(dynamic.classification, Classification::Review);
+
+    let kit = outcome(ResourceKind::Package, "acme/kit");
+    assert_eq!(kit.classification, Classification::Review);
+    assert_eq!(kit.source_path.as_deref(), Some("dbt_packages/kit"));
+    assert!(
+        kit.notes
+            .iter()
+            .any(|note| note.contains("locked to `1.0.0`")),
+        "{:?}",
+        kit.notes
+    );
+
+    let localpkg = outcome(ResourceKind::Package, "localpkg");
+    assert_eq!(localpkg.classification, Classification::Clean);
+    assert_eq!(localpkg.source_path.as_deref(), Some("localpkg"));
+
+    let missing = outcome(ResourceKind::Package, "acme/missing_pkg");
+    assert_eq!(missing.classification, Classification::Review);
+    assert!(
+        missing
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("not installed")),
+        "{:?}",
+        missing.issues
+    );
+
+    // `fivetran_utils` is vendored verbatim from upstream; its adapter-
+    // dispatching helpers fail inline evaluation but lower through the
+    // recognised-helper rewrites of the `default__` implementations. The
+    // unprovable call sites in `fivetran_review` mark the package REVIEW.
+    let fivetran = outcome(ResourceKind::Package, "fivetran/fivetran_utils");
+    assert_eq!(fivetran.classification, Classification::Review);
+
+    // `demo_union_schemas` has two entries → the connector unions, so the
+    // helper appends `source_relation` to the partition list.
+    let partitioned = outcome(ResourceKind::Model, "fivetran_partitioned");
+    assert_eq!(partitioned.classification, Classification::Clean);
+    let sql = file("transforms/fivetran_partitioned.sql");
+    assert!(sql.contains("partition by s.id\n"), "{sql}");
+    assert!(sql.contains(", s.source_relation"), "{sql}");
+    assert!(!sql.contains("{{"), "{sql}");
+
+    // `has_other_partitions='no'` starts a fresh `partition by` clause.
+    let only = outcome(ResourceKind::Model, "fivetran_partition_only");
+    assert_eq!(only.classification, Classification::Clean);
+    let sql = file("transforms/fivetran_partition_only.sql");
+    assert!(sql.contains("partition by s.source_relation"), "{sql}");
+
+    // Bare call with `package_prefix_union_variable=false`: the unprefixed
+    // `union_schemas`/`union_databases` vars are unset and `demo_sources`
+    // has one entry → not unioning → the helper emits nothing.
+    let not_unioning = outcome(ResourceKind::Model, "fivetran_not_unioning");
+    assert_eq!(not_unioning.classification, Classification::Clean);
+    let sql = file("transforms/fivetran_not_unioning.sql");
+    assert!(!sql.contains("source_relation"), "{sql}");
+    assert!(sql.contains("over (\n"), "{sql}");
+
+    // String entries emit bare; mappings honour `alias`/`transform_sql`.
+    let pass = outcome(ResourceKind::Model, "fivetran_pass_through");
+    assert_eq!(pass.classification, Classification::Clean);
+    let sql = file("transforms/fivetran_pass_through.sql");
+    assert!(sql.contains(", raw_a"), "{sql}");
+    assert!(sql.contains(", renamed_b"), "{sql}");
+    assert!(sql.contains(", upper(raw_c) as raw_c"), "{sql}");
+
+    // An unset var raises upstream and a non-list var is not provable:
+    // both stay REVIEW rather than guessing.
+    let review = outcome(ResourceKind::Model, "fivetran_review");
+    assert_eq!(review.classification, Classification::Review);
 }
 
 #[test]

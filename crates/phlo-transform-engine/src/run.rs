@@ -116,6 +116,8 @@ fn exec_op(model: &phlo_transform_core::CompiledModel, info: Option<&PlannedMode
     match model.config.materialization {
         Materialization::View => ExecOp::View,
         Materialization::Table => ExecOp::Table,
+        // Ephemeral models are inlined into dependents and never planned.
+        Materialization::Ephemeral => unreachable!("ephemeral models are inlined at compile time"),
         Materialization::Incremental => {
             let needs_bootstrap = info
                 .map(|model| model.full_rebuild || !model.exists)

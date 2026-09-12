@@ -1,0 +1,8 @@
+pkg_consumer:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: 'pkg_consumer.duckdb'
+      schema: main
+      threads: 4

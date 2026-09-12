@@ -1,0 +1,8 @@
+packages:
+  - package: acme/kit
+    name: kit
+    version: 1.0.0
+  - package: acme/missing_pkg
+    name: missing_pkg
+    version: 2.1.0
+sha1_hash: 0123456789abcdef0123456789abcdef01234567
