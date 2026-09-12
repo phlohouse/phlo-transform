@@ -12,12 +12,12 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 use phlo_transform_core::{
-    compile, select_models, IncrementalStrategy, Materialization, ModelId, SemanticModel,
+    compile, IncrementalStrategy, Materialization, ModelId, Selection, SemanticModel,
     SemanticProject, WorkspaceDefaults,
 };
 use phlo_transform_engine::{
-    diff, Adapter, CatalogRequest, DiffPolicy, DiffRequest, DiffStrategy, Planner, RunOptions,
-    Runner, SqliteStateStore,
+    diff, Adapter, CatalogRequest, DiffPolicy, DiffRequest, DiffStrategy, PlanOptions, Planner,
+    RunOptions, Runner, SqliteStateStore,
 };
 use phlo_transform_nessie::{NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -52,9 +52,14 @@ async fn apply(
     state: Arc<SqliteStateStore>,
     compilation: &phlo_transform_core::Compilation,
 ) -> phlo_transform_engine::RunResult {
-    let selected = select_models(compilation, &Default::default());
+    let selected = Selection::all(compilation);
     let plan = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(compilation, &selected, Some("main".to_string()))
+        .plan(
+            compilation,
+            &selected,
+            Some("main".to_string()),
+            &PlanOptions::default(),
+        )
         .await
         .expect("plan");
     Runner::new(adapter, Some(state))

@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use phlo_transform_core::ModelVersion;
+use phlo_transform_core::{ModelVersion, VersionDetail};
 
 use crate::error::EngineError;
 use crate::events::ExecutionStatus;
@@ -74,6 +74,11 @@ pub struct MaterializedRecord {
     pub model_id: String,
     pub environment: Option<String>,
     pub version: ModelVersion,
+    /// The named version inputs at materialisation time — which dependency
+    /// versions and source states the recorded version was derived from.
+    /// `None` for rows written before detail was persisted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<VersionDetail>,
     pub target: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incremental_strategy: Option<String>,
@@ -230,6 +235,7 @@ impl SqliteStateStore {
                     materialized_at TEXT NOT NULL,
                     incremental_strategy TEXT,
                     incremental_key TEXT,
+                    version_detail TEXT,
                     PRIMARY KEY (model_id, environment)
                 );
                 CREATE TABLE IF NOT EXISTS incremental_state (
@@ -259,6 +265,10 @@ impl SqliteStateStore {
         );
         let _ = connection.execute(
             "ALTER TABLE model_versions ADD COLUMN incremental_key TEXT",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE model_versions ADD COLUMN version_detail TEXT",
             [],
         );
         Ok(Self {
@@ -434,13 +444,17 @@ impl StateStore for SqliteStateStore {
 
     fn record_materialized(&self, record: &MaterializedRecord) -> Result<(), EngineError> {
         let connection = self.lock()?;
+        let detail = record
+            .detail
+            .as_ref()
+            .map(|detail| serde_json::to_string(detail).unwrap_or_default());
         connection
             .execute(
                 "INSERT OR REPLACE INTO model_versions
                  (model_id, environment, version_hash, sql_hash, config_hash, contract_hash,
                   dependency_hash, source_state_hash, compiler_version, target_hash, target,
-                  run_id, materialized_at, incremental_strategy, incremental_key)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                  run_id, materialized_at, incremental_strategy, incremental_key, version_detail)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 rusqlite::params![
                     record.model_id,
                     record.environment.clone().unwrap_or_default(),
@@ -457,6 +471,7 @@ impl StateStore for SqliteStateStore {
                     record.materialized_at,
                     record.incremental_strategy,
                     record.incremental_key,
+                    detail,
                 ],
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
@@ -625,7 +640,7 @@ impl StateStore for SqliteStateStore {
 
 const MATERIALIZED_COLUMNS: &str = "model_id, environment, version_hash, sql_hash, config_hash, \
      contract_hash, dependency_hash, source_state_hash, compiler_version, target_hash, target, \
-     run_id, materialized_at, incremental_strategy, incremental_key";
+     run_id, materialized_at, incremental_strategy, incremental_key, version_detail";
 
 fn materialized_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MaterializedRecord> {
     let environment: String = row.get(1)?;
@@ -646,6 +661,9 @@ fn materialized_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Materializ
             compiler_version: row.get(8)?,
             target_hash: row.get(9)?,
         },
+        detail: row
+            .get::<_, Option<String>>(15)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
         target: row.get(10)?,
         incremental_strategy: row.get(13)?,
         incremental_key: row.get(14)?,

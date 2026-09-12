@@ -5,7 +5,7 @@
 //! source state and compiler semantics. Formatting and comment-only changes do
 //! not alter the version.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::identity::{ModelId, SourceId};
@@ -48,6 +48,17 @@ pub struct VersionInputs {
     pub sources: Vec<(String, String)>,
     /// Physical target display and materialisation.
     pub target: String,
+}
+
+/// The named version inputs, retained so plans and `explain` can say *which*
+/// dependency version or source state changed rather than just *that* one
+/// did. Persisted alongside materialised-version records in state.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionDetail {
+    /// `dependency logical name -> dependency version hash`.
+    pub dependencies: std::collections::BTreeMap<String, String>,
+    /// `source logical name -> observed source state` (`""` when unobserved).
+    pub sources: std::collections::BTreeMap<String, String>,
 }
 
 /// Derive a model version from its inputs.

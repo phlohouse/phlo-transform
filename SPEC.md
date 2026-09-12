@@ -922,45 +922,42 @@ Planning is a core command:
 phlo transform plan
 ```
 
-Example:
+Every decided model carries at least one structured reason; the human
+output prints each reason's detail under the model:
 
 ```text
+Plan:  4f6c…
+Adapter: trino
 Environment: feature/new-assay
-Base: main
+Selection: assay.results+ — excluding assay.legacy_raw
 
-4 model changes
+Models (4) — 3 build, 1 skip, 0 cached
+  SKIP   assay.reference             [view]  iceberg.assay.reference
+           SQL, config, contract and inputs unchanged
+  BUILD  assay.clean_results         [table] iceberg.assay.clean_results
+           SQL semantics changed
+           source raw.lims changed (snap:81f2… → snap:9c40…)
+  BUILD  assay.assay_results         [table] iceberg.assay.assay_results
+           upstream version changed: assay.clean_results
+           upstream assay.clean_results will rebuild in this plan
+           strategy: key
+  BUILD  analytics.monthly_summary   [table] iceberg.analytics.monthly_summary
+           selected by `assay.results+`
+           upstream assay.assay_results will rebuild in this plan
 
-SKIP
-  assay.raw_results
-  unchanged
-
-BUILD
-  assay.clean_results
-  SQL changed
-
-BUILD
-  assay.assay_results
-  upstream changed
-  incremental key=experiment_id
-
-BUILD
-  analytics.monthly_summary
-  downstream dependency
-
-Schema impact
-  + assay.assay_results.dilution_factor DOUBLE
-
-Tests
-  18 planned
-
-Downstream consumers affected
-  3 models
-  1 API dataset
-
-Estimated physical changes
-  2 Iceberg tables
-  1 view
+Tests (18)
+  …
 ```
+
+Reason kinds are stable machine-readable codes (`sql_semantic_change`,
+`config_change`, `contract_change`, `dependency_change`, `upstream_rebuild`,
+`source_change`, `target_change`, `compiler_semantics_change`,
+`incremental_change`, `schema_change`, `missing_relation`, `unknown_state`,
+`cache_reuse`, `forced`, `unchanged`, `selected_dependency`,
+`selection_expansion`, `state_unavailable`). `--json` exposes them with an
+optional `subject` (the dependency or source the reason is about), plus the
+resolved `selection` (terms, matched, expanded, required, exclude) and each
+model's `membership` (`selected` / `expanded` / `dependency`).
 
 ## 41. `apply`
 
@@ -982,14 +979,24 @@ A plan becomes stale when relevant conditions change, including source snapshot,
 
 ## 43. Selective planning
 
-Examples:
+All planning commands share one selector engine (see §82). Examples:
 
 ```bash
-phlo transform plan assay.results
-phlo transform plan --select assay.*
-phlo transform plan --changed
+phlo transform plan assay.results        # one model + its dependencies
+phlo transform plan assay.results+       # …plus transitive dependents
+phlo transform plan +assay.results       # explicit upstream expansion
+phlo transform plan 'assay.*'            # namespace glob
+phlo transform plan source:lims+         # models reading lims + dependents
+phlo transform plan --tag qc             # intersect the selection by tag
+phlo transform plan --changed            # desired version ≠ recorded state
+phlo transform plan --select assay.* --exclude assay.legacy_raw
 phlo transform plan --downstream assay.results
 ```
+
+Positional selector terms and `--select` are equivalent. `--exclude` is
+absolute: an excluded model is never pulled back in by `+` expansion or by
+dependency closure — a selected model that depends on it plans against the
+existing materialisation and the plan records a warning.
 
 ---
 
@@ -1468,7 +1475,7 @@ These files are interfaces, not incidental logs.
 
 ## 74. Plan artifact
 
-`plan.json` includes plan ID, current environment state, desired state, models selected, reasons for change, proposed physical operations, schema impacts, tests, data-diff requirements and promotion constraints.
+`plan.json` includes plan ID, current environment state, desired state, models selected, the resolved selection (terms, excludes, matched/expanded/required provenance), structured per-model reasons with stable kind codes, proposed physical operations, schema impacts, tests, data-diff requirements and promotion constraints.
 
 ## 75. Run artifact
 
@@ -1495,6 +1502,7 @@ phlo transform apply
 phlo transform run
 phlo transform test
 phlo transform inspect
+phlo transform explain
 phlo transform lineage
 phlo transform impact
 phlo transform diff
@@ -1549,6 +1557,29 @@ State:
   status: changed
 ```
 
+### `explain`
+
+`explain` is the per-model companion to `plan`: identity, dependencies,
+recorded state, and the current build decision with the same structured
+reasons `plan` reports (the state diff needs no adapter; when one is
+configured the relation-existence check makes the decision identical to
+`plan`):
+
+```bash
+phlo transform explain assay.results
+```
+
+```text
+Model:         assay.results
+…
+Version:       b74a02e…
+Recorded:      a621ee3… in dev (materialised 2026-02-10T08:41:07Z)
+Decision:      build
+Reasons:
+  upstream version changed: assay.clean_results
+  upstream assay.clean_results will rebuild in this plan
+```
+
 ## 81. Machine output
 
 Every relevant command should support `--json`.
@@ -1557,20 +1588,44 @@ No semantic information should exist only in formatted CLI output.
 
 ## 82. Selectors
 
-Keep selectors small and orthogonal:
+One selector language is shared by `plan`, `apply`, `run`, `test`,
+`lineage`, `impact` and `list`. Per term:
 
-```bash
---select assay.results
---select assay.*
---changed
---upstream
---downstream
---tag qc
---workflow assay_ingest
---materialization incremental
+```text
+term    := "+"? body "+"?
+body    := "tag:" value            model carries the tag
+        |  "namespace:" value      model's namespace (first name segment)
+        |  "source:" value         model reads a matching source
+        |  "changed"               desired version differs from recorded state
+        |  "all" | "*"             every model
+        |  pattern                 name, `model://` URI, `prefix.*` glob,
+                                   or a unique name suffix
 ```
 
-Avoid inventing a complex selector language until necessary.
+A leading `+` adds every transitive dependency of the matched models; a
+trailing `+` adds every transitive dependent; `+model+` does both. Include
+terms union; `--tag`/`--workflow` intersect; `--exclude` terms subtract last
+and are absolute (excluded models are never re-added by expansion or
+dependency closure). Selection is deterministic — topological order where
+the graph allows — and errors are explicit: empty, invalid, ambiguous and
+unmatched selectors all fail with named candidates or suggestions rather
+than silently widening.
+
+CLI mapping:
+
+```bash
+phlo transform plan assay.results 'assay.*'   # positional terms
+--select tag:qc                               # same grammar via flag
+--exclude assay.legacy_raw                    # subtract (applied last)
+--tag qc --workflow assay_ingest              # intersect filters
+--changed                                     # shorthand for `changed`
+--upstream / --downstream                     # expand the filtered base
+--force                                       # rebuild regardless of state
+```
+
+`changed` compares desired model versions against the recorded materialised
+version for the target environment (state-derived today; a Git-aware
+provider feeds the same term later).
 
 ---
 

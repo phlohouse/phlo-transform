@@ -12,16 +12,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use phlo_transform_core::{
-    compile, compile_with_options, select_models, Compilation, DataType, EmptySchemaProvider,
+    compile, compile_with_options, resolve_selection, Compilation, DataType, EmptySchemaProvider,
     EmptySourceStateProvider, IncrementalStrategy, Materialization, ModelId, ModelOrigin,
-    Nullability, Relation, RelationSchema, SchemaColumn, SelectionOptions, SemanticModel,
+    Nullability, Relation, RelationSchema, SchemaColumn, Selection, SelectorSet, SemanticModel,
     SemanticProject, SemanticSeed, SemanticTest, SourceId, SourceStateProvider,
     StaticSchemaProvider, StaticSourceStateProvider, TestId,
 };
 use phlo_transform_engine::{
-    collect_source_states, Adapter, AdapterError, ArtifactWriter, CancelHandle, CatalogRequest,
-    ChangeReason, ColumnInfo, ExecutionStatus, Plan, PlanAction, Planner, QueryResult, RunOptions,
-    Runner, SqliteStateStore, StateStore,
+    changed_models, collect_source_states, Adapter, AdapterError, ArtifactWriter, CancelHandle,
+    CatalogRequest, ColumnInfo, ExecutionStatus, Membership, Plan, PlanAction, PlanOptions,
+    Planner, QueryResult, ReasonKind, RunOptions, Runner, SqliteStateStore, StateStore,
 };
 
 #[derive(Default)]
@@ -288,9 +288,9 @@ fn project_with_tests() -> Compilation {
 }
 
 async fn plan_all(compilation: &Compilation, adapter: Arc<FakeAdapter>) -> Plan {
-    let selected = select_models(compilation, &SelectionOptions::default());
+    let selected = Selection::all(compilation);
     Planner::new(adapter, None)
-        .plan(compilation, &selected, None)
+        .plan(compilation, &selected, None, &PlanOptions::default())
         .await
         .expect("plan succeeds")
 }
@@ -483,11 +483,16 @@ async fn state_aware_second_run_skips_unchanged_models() {
     let adapter = Arc::new(FakeAdapter::default());
     adapter.set_test_rows(0);
     let state = Arc::new(SqliteStateStore::in_memory().unwrap());
-    let selected = select_models(&compilation, &SelectionOptions::default());
+    let selected = Selection::all(&compilation);
     let environment = Some("dev".to_string());
 
     let first = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(&compilation, &selected, environment.clone())
+        .plan(
+            &compilation,
+            &selected,
+            environment.clone(),
+            &PlanOptions::default(),
+        )
         .await
         .unwrap();
     assert!(
@@ -515,7 +520,12 @@ async fn state_aware_second_run_skips_unchanged_models() {
     assert_eq!(run.status, ExecutionStatus::Passed);
 
     let second = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(&compilation, &selected, environment.clone())
+        .plan(
+            &compilation,
+            &selected,
+            environment.clone(),
+            &PlanOptions::default(),
+        )
         .await
         .unwrap();
     assert!(
@@ -597,9 +607,14 @@ async fn incremental_key_bootstraps_then_merges() {
     let environment = Some("dev".to_string());
 
     let first = compile_models(vec![incremental_model("select 1 as id, 10 as value", "id")]);
-    let selected = select_models(&first, &SelectionOptions::default());
+    let selected = Selection::all(&first);
     let plan = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(&first, &selected, environment.clone())
+        .plan(
+            &first,
+            &selected,
+            environment.clone(),
+            &PlanOptions::default(),
+        )
         .await
         .unwrap();
     assert!(plan.models[0].full_rebuild, "{:?}", plan.models[0]);
@@ -622,7 +637,12 @@ async fn incremental_key_bootstraps_then_merges() {
     // Changed SQL, same key: merge instead of full rebuild.
     let second = compile_models(vec![incremental_model("select 2 as id, 20 as value", "id")]);
     let plan = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(&second, &selected, environment.clone())
+        .plan(
+            &second,
+            &selected,
+            environment.clone(),
+            &PlanOptions::default(),
+        )
         .await
         .unwrap();
     assert_eq!(plan.models[0].action, PlanAction::Build);
@@ -649,9 +669,14 @@ async fn changing_incremental_key_requires_full_rebuild() {
     let environment = Some("dev".to_string());
 
     let first = compile_models(vec![incremental_model("select 1 as id, 10 as value", "id")]);
-    let selected = select_models(&first, &SelectionOptions::default());
+    let selected = Selection::all(&first);
     let plan = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(&first, &selected, environment.clone())
+        .plan(
+            &first,
+            &selected,
+            environment.clone(),
+            &PlanOptions::default(),
+        )
         .await
         .unwrap();
     Runner::new(adapter.clone(), Some(state.clone()))
@@ -672,13 +697,14 @@ async fn changing_incremental_key_requires_full_rebuild() {
         "value",
     )]);
     let plan = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(&second, &selected, environment)
+        .plan(&second, &selected, environment, &PlanOptions::default())
         .await
         .unwrap();
     assert!(plan.models[0].full_rebuild, "{:?}", plan.models[0]);
     assert!(plan.models[0]
         .reasons
-        .contains(&ChangeReason::IncrementalChange));
+        .iter()
+        .any(|reason| reason.kind == ReasonKind::IncrementalChange));
 }
 
 #[tokio::test]
@@ -687,10 +713,15 @@ async fn cache_reuse_across_environments_is_reported_as_cached() {
     let adapter = Arc::new(FakeAdapter::default());
     adapter.set_test_rows(0);
     let state = Arc::new(SqliteStateStore::in_memory().unwrap());
-    let selected = select_models(&compilation, &SelectionOptions::default());
+    let selected = Selection::all(&compilation);
 
     let plan = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(&compilation, &selected, Some("dev".to_string()))
+        .plan(
+            &compilation,
+            &selected,
+            Some("dev".to_string()),
+            &PlanOptions::default(),
+        )
         .await
         .unwrap();
     Runner::new(adapter.clone(), Some(state.clone()))
@@ -709,7 +740,12 @@ async fn cache_reuse_across_environments_is_reported_as_cached() {
     // `prod` has no recorded materialisation, but the exact desired versions
     // exist in `dev`, so they are cache candidates.
     let plan = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(&compilation, &selected, Some("prod".to_string()))
+        .plan(
+            &compilation,
+            &selected,
+            Some("prod".to_string()),
+            &PlanOptions::default(),
+        )
         .await
         .unwrap();
     assert!(
@@ -743,9 +779,14 @@ async fn source_state_change_marks_model_for_rebuild() {
     };
 
     let first = build("snapshot-1");
-    let selected = select_models(&first, &SelectionOptions::default());
+    let selected = Selection::all(&first);
     let plan = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(&first, &selected, Some("dev".to_string()))
+        .plan(
+            &first,
+            &selected,
+            Some("dev".to_string()),
+            &PlanOptions::default(),
+        )
         .await
         .unwrap();
     Runner::new(adapter.clone(), Some(state.clone()))
@@ -763,11 +804,19 @@ async fn source_state_change_marks_model_for_rebuild() {
 
     let second = build("snapshot-2");
     let plan = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(&second, &selected, Some("dev".to_string()))
+        .plan(
+            &second,
+            &selected,
+            Some("dev".to_string()),
+            &PlanOptions::default(),
+        )
         .await
         .unwrap();
     assert_eq!(plan.models[0].action, PlanAction::Build);
-    assert!(plan.models[0].reasons.contains(&ChangeReason::SourceChange));
+    assert!(plan.models[0]
+        .reasons
+        .iter()
+        .any(|r| r.kind == ReasonKind::SourceChange));
 }
 
 #[tokio::test]
@@ -825,9 +874,14 @@ async fn run_once(
     compilation: &Compilation,
     environment: &str,
 ) -> phlo_transform_engine::RunResult {
-    let selected = select_models(compilation, &SelectionOptions::default());
+    let selected = Selection::all(compilation);
     let plan = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(compilation, &selected, Some(environment.to_string()))
+        .plan(
+            compilation,
+            &selected,
+            Some(environment.to_string()),
+            &PlanOptions::default(),
+        )
         .await
         .unwrap();
     Runner::new(adapter, Some(state))
@@ -866,9 +920,14 @@ async fn incremental_partition_replaces_after_bootstrap() {
             columns: vec!["d".to_string()],
         },
     )]);
-    let selected = select_models(&second, &SelectionOptions::default());
+    let selected = Selection::all(&second);
     let plan = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(&second, &selected, Some("dev".to_string()))
+        .plan(
+            &second,
+            &selected,
+            Some("dev".to_string()),
+            &PlanOptions::default(),
+        )
         .await
         .unwrap();
     assert!(!plan.models[0].full_rebuild, "{:?}", plan.models[0]);
@@ -943,13 +1002,21 @@ async fn schema_removal_forces_full_rebuild() {
     ]);
 
     let second = build("select id, updated_at from external.events where id > 0");
-    let selected = select_models(&second, &SelectionOptions::default());
+    let selected = Selection::all(&second);
     let plan = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(&second, &selected, Some("dev".to_string()))
+        .plan(
+            &second,
+            &selected,
+            Some("dev".to_string()),
+            &PlanOptions::default(),
+        )
         .await
         .unwrap();
     assert!(plan.models[0].full_rebuild, "{:?}", plan.models[0]);
-    assert!(plan.models[0].reasons.contains(&ChangeReason::SchemaChange));
+    assert!(plan.models[0]
+        .reasons
+        .iter()
+        .any(|r| r.kind == ReasonKind::SchemaChange));
 }
 
 #[tokio::test]
@@ -1024,9 +1091,14 @@ async fn seed_loads_before_models_and_skips_when_unchanged() {
     assert!(loaded[0].ends_with("seeds/raw_events.csv"), "{loaded:?}");
 
     // Second plan: relation exists and the recorded hash matches → Skip.
-    let selected = select_models(&compilation, &SelectionOptions::default());
+    let selected = Selection::all(&compilation);
     let plan = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(&compilation, &selected, Some("dev".to_string()))
+        .plan(
+            &compilation,
+            &selected,
+            Some("dev".to_string()),
+            &PlanOptions::default(),
+        )
         .await
         .unwrap();
     assert_eq!(plan.seeds.len(), 1);
@@ -1071,9 +1143,14 @@ async fn seed_read_through_ephemeral_chain_is_loaded() {
     let adapter = Arc::new(FakeAdapter::default());
     let state = Arc::new(SqliteStateStore::in_memory().unwrap());
 
-    let selected = select_models(&compilation, &SelectionOptions::default());
+    let selected = Selection::all(&compilation);
     let plan = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(&compilation, &selected, Some("dev".to_string()))
+        .plan(
+            &compilation,
+            &selected,
+            Some("dev".to_string()),
+            &PlanOptions::default(),
+        )
         .await
         .unwrap();
     // The ephemeral chain is inlined into `main.events`: only the
@@ -1121,10 +1198,15 @@ async fn seed_content_change_replans_the_load() {
     let state = Arc::new(SqliteStateStore::in_memory().unwrap());
     run_once(adapter.clone(), state.clone(), &build("hash-v1"), "dev").await;
 
-    let selected = select_models(&build("hash-v2"), &SelectionOptions::default());
+    let selected = Selection::all(&build("hash-v2"));
     let compilation = build("hash-v2");
     let plan = Planner::new(adapter.clone(), Some(state.clone()))
-        .plan(&compilation, &selected, Some("dev".to_string()))
+        .plan(
+            &compilation,
+            &selected,
+            Some("dev".to_string()),
+            &PlanOptions::default(),
+        )
         .await
         .unwrap();
     assert_eq!(plan.seeds[0].action, PlanAction::Build);
@@ -1274,4 +1356,313 @@ async fn seed_tests_pull_the_seed_into_the_plan() {
         .expect("run succeeds");
     assert_eq!(result.status, ExecutionStatus::Failed);
     assert!(result.tests.is_empty(), "{:?}", result.tests);
+}
+
+/// The second plan after a run is all Skip with an `unchanged` reason; the
+/// same plan with `force` is all Build with a `forced` reason.
+#[tokio::test]
+async fn skips_explain_unchanged_and_force_overrides() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let selected = Selection::all(&compilation);
+    let environment = Some("dev".to_string());
+
+    let first = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(
+            &compilation,
+            &selected,
+            environment.clone(),
+            &PlanOptions::default(),
+        )
+        .await
+        .unwrap();
+    Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &compilation,
+            &first,
+            &RunOptions {
+                environment: environment.clone(),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let second = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(
+            &compilation,
+            &selected,
+            environment.clone(),
+            &PlanOptions::default(),
+        )
+        .await
+        .unwrap();
+    for model in &second.models {
+        assert_eq!(model.action, PlanAction::Skip);
+        assert!(
+            model
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == ReasonKind::Unchanged),
+            "{:?}",
+            model.reasons
+        );
+    }
+
+    let forced = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(
+            &compilation,
+            &selected,
+            environment,
+            &PlanOptions { force: true },
+        )
+        .await
+        .unwrap();
+    for model in &forced.models {
+        assert_eq!(model.action, PlanAction::Build);
+        assert!(
+            model
+                .reasons
+                .iter()
+                .any(|reason| reason.kind == ReasonKind::Forced),
+            "{:?}",
+            model.reasons
+        );
+    }
+}
+
+/// Selecting one model pulls its dependencies into the plan with
+/// `dependency` membership and a reason naming the requiring model.
+#[tokio::test]
+async fn dependency_closure_membership_is_explained() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    let set =
+        SelectorSet::parse(&["reporting.monthly".to_string()], &[], &[], false, false).unwrap();
+    let selection = resolve_selection(&compilation, &set, None).unwrap();
+
+    let plan = Planner::new(adapter, None)
+        .plan(&compilation, &selection, None, &PlanOptions::default())
+        .await
+        .unwrap();
+
+    let by_id: BTreeMap<&str, _> = plan
+        .models
+        .iter()
+        .map(|model| (model.id.as_str(), model))
+        .collect();
+    assert_eq!(by_id.len(), 3, "{:?}", by_id.keys());
+    assert_eq!(by_id["reporting.monthly"].membership, Membership::Selected);
+    assert_eq!(by_id["assay.results"].membership, Membership::Dependency);
+    assert_eq!(by_id["assay.raw"].membership, Membership::Dependency);
+    assert!(
+        by_id["assay.raw"]
+            .reasons
+            .iter()
+            .any(|reason| reason.kind == ReasonKind::SelectedDependency
+                && reason.detail.contains("reporting.monthly")),
+        "{:?}",
+        by_id["assay.raw"].reasons
+    );
+    assert_eq!(
+        plan.selection.matched,
+        vec!["reporting.monthly".to_string()]
+    );
+    assert_eq!(
+        plan.selection.required,
+        vec!["assay.raw".to_string(), "assay.results".to_string()]
+    );
+}
+
+/// `model+` pulls dependents in with `expanded` membership and records the
+/// responsible term.
+#[tokio::test]
+async fn downstream_expansion_is_explained() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    let set = SelectorSet::parse(&["assay.results+".to_string()], &[], &[], false, false).unwrap();
+    let selection = resolve_selection(&compilation, &set, None).unwrap();
+
+    let plan = Planner::new(adapter, None)
+        .plan(&compilation, &selection, None, &PlanOptions::default())
+        .await
+        .unwrap();
+
+    let by_id: BTreeMap<&str, _> = plan
+        .models
+        .iter()
+        .map(|model| (model.id.as_str(), model))
+        .collect();
+    // assay.raw is pulled in by dependency closure, reporting.monthly by
+    // the `+` expansion.
+    assert_eq!(by_id.len(), 3, "{:?}", by_id.keys());
+    assert_eq!(by_id["assay.results"].membership, Membership::Selected);
+    assert_eq!(by_id["reporting.monthly"].membership, Membership::Expanded);
+    assert!(
+        by_id["reporting.monthly"]
+            .reasons
+            .iter()
+            .any(|reason| reason.kind == ReasonKind::SelectionExpansion
+                && reason.detail.contains("assay.results+")),
+        "{:?}",
+        by_id["reporting.monthly"].reasons
+    );
+    assert_eq!(by_id["assay.raw"].membership, Membership::Dependency);
+    assert_eq!(
+        plan.selection.expanded,
+        vec!["reporting.monthly".to_string()]
+    );
+}
+
+/// `--exclude` wins over dependency closure: the excluded model is not
+/// planned, and a warning explains the gap.
+#[tokio::test]
+async fn excluded_dependency_stays_out_and_warns() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    let set = SelectorSet::parse(
+        &["assay.results".to_string()],
+        &["assay.raw".to_string()],
+        &[],
+        false,
+        false,
+    )
+    .unwrap();
+    let selection = resolve_selection(&compilation, &set, None).unwrap();
+
+    let plan = Planner::new(adapter, None)
+        .plan(&compilation, &selection, None, &PlanOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(plan.models.len(), 1, "{:?}", plan.models);
+    assert_eq!(plan.models[0].id, "assay.results");
+    assert_eq!(plan.selection.exclude, vec!["assay.raw".to_string()]);
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|warning| warning.contains("excluded model assay.raw")),
+        "{:?}",
+        plan.warnings
+    );
+}
+
+/// `changed_models` feeds the `changed` selector: after a run nothing is
+/// changed; a SQL edit changes the edited model and — because dependency
+/// versions are a version input — its dependent.
+#[tokio::test]
+async fn changed_models_reflects_recorded_state() {
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    let state: Arc<dyn StateStore> = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let environment = Some("dev".to_string());
+
+    let build = |raw_sql: &str| {
+        compile_models(vec![
+            model("assay.raw", raw_sql),
+            model("assay.results", "select * from assay.raw"),
+            model("analytics.other", "select 2 as id"),
+        ])
+    };
+
+    let first = build("select 1 as id");
+    let selected = Selection::all(&first);
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(
+            &first,
+            &selected,
+            environment.clone(),
+            &PlanOptions::default(),
+        )
+        .await
+        .unwrap();
+    Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &first,
+            &plan,
+            &RunOptions {
+                environment: environment.clone(),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let changed = changed_models(&first, Some(&state), environment.as_deref()).unwrap();
+    assert!(changed.is_empty(), "{changed:?}");
+
+    let second = build("select 1 as id, 'x' as extra");
+    let changed = changed_models(&second, Some(&state), environment.as_deref()).unwrap();
+    let names: BTreeSet<String> = changed.iter().map(|id| id.logical_name()).collect();
+    assert_eq!(
+        names,
+        ["assay.raw", "assay.results"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    );
+}
+
+/// When an upstream's SQL changes, the dependent's plan reason names the
+/// moved input — the `VersionDetail` recorded at materialisation time makes
+/// the diff specific rather than "something upstream changed".
+#[tokio::test]
+async fn dependency_change_reason_names_the_moved_input() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let environment = Some("dev".to_string());
+
+    let build = |raw_sql: &str| {
+        compile_models(vec![
+            model("assay.raw", raw_sql),
+            model("assay.results", "select * from assay.raw"),
+        ])
+    };
+
+    let first = build("select 1 as id");
+    let selected = Selection::all(&first);
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(
+            &first,
+            &selected,
+            environment.clone(),
+            &PlanOptions::default(),
+        )
+        .await
+        .unwrap();
+    Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &first,
+            &plan,
+            &RunOptions {
+                environment: environment.clone(),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let second = build("select 1 as id, 'x' as extra");
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&second, &selected, environment, &PlanOptions::default())
+        .await
+        .unwrap();
+    let results = plan
+        .models
+        .iter()
+        .find(|model| model.id == "assay.results")
+        .unwrap();
+    assert_eq!(results.action, PlanAction::Build);
+    let reason = results
+        .reasons
+        .iter()
+        .find(|reason| reason.kind == ReasonKind::DependencyChange)
+        .expect("a dependency-change reason");
+    assert!(reason.detail.contains("assay.raw"), "{}", reason.detail);
+    assert_eq!(reason.subject.as_deref(), Some("assay.raw"));
 }

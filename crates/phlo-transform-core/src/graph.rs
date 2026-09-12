@@ -317,6 +317,7 @@ mod tests {
             assertions: Vec::new(),
             contract: None,
             version: Default::default(),
+            version_detail: Default::default(),
             pinned_id: None,
             dependencies,
             id,

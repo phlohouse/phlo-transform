@@ -57,7 +57,8 @@ the same state store. This is covered by
 
 The SQLite state store gains a `model_versions` table recording, per model and
 environment, the `ModelVersion` attached to the most recent successful
-materialisation (plus target, run id and timestamp). API:
+materialisation (plus target, run id, timestamp, incremental strategy/key and
+`version_detail`). API:
 
 ```text
 record_materialized(record)
@@ -67,18 +68,32 @@ materialized_by_hash(version_hash)
 
 The runner records a materialisation after each `passed` build.
 
+`version_detail` is a `VersionDetail`: the named inputs behind the opaque
+component hashes — each dependency's logical name → version hash and each
+source's logical name → observed state. It exists so a changed hash can be
+*explained* (`upstream version changed: assay.raw`, `source raw.lims changed
+(snap:… → snap:…)`) rather than just detected. Rows recorded before detail
+was tracked simply yield generic dependency/source reasons.
+
 ## State-aware planning
 
 `Planner` now takes an optional `StateStore`. For each model it decides:
 
-- `build` — missing relation, unknown state, or any component changed;
+- `build` — missing relation, unknown state, any component changed, or
+  `--force`;
 - `skip` — the desired hash already matches the materialised version here;
 - `cached` — the desired hash is materialised in another environment.
 
-Each `build` carries structured `ChangeReason`s (`sql_semantic_change`,
-`config_change`, `contract_change`, `dependency_change`, `source_change`,
-`target_change`, `compiler_semantics_change`, `missing_relation`,
-`unknown_state`). `plan.json` exposes the desired/current hashes and reasons.
+Every decided model carries structured `PlanReason`s (stable `kind` codes
+such as `sql_semantic_change`, `dependency_change`, `source_change`,
+`missing_relation`, `unchanged`, `forced`, plus membership reasons
+`selected_dependency`/`selection_expansion`) with a human-readable `detail`
+and an optional `subject` naming the input that moved. `plan.json` exposes
+the desired/current hashes, reasons, membership and the resolved selection.
+
+`changed_models(compilation, state, environment)` returns the set of models
+whose desired version differs from the recorded one — the change set behind
+the `changed` selector term.
 
 ## Stale plans
 

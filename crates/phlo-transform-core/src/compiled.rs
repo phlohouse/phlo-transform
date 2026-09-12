@@ -36,6 +36,9 @@ pub struct CompiledModel {
     pub contract: Option<crate::semantic::ModelContract>,
     /// Content-addressed desired version.
     pub version: crate::version::ModelVersion,
+    /// The named inputs behind `version`, kept so plans and `explain` can say
+    /// which dependency or source changed rather than just that one did.
+    pub version_detail: crate::version::VersionDetail,
     /// Pinned identity from `-- @id`, when present and valid.
     pub pinned_id: Option<ModelId>,
     /// Resolved dependencies, sorted and deduplicated.

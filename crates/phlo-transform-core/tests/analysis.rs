@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 
 use phlo_transform_core::{
     compile_with_provider, ColumnContract, ColumnRef, Compilation, DataType, ModelContract,
-    ModelId, Nullability, RelationSchema, SchemaColumn, SelectionOptions, SemanticModel,
-    SemanticProject, SourceId, StaticSchemaProvider,
+    ModelId, Nullability, RelationSchema, SchemaColumn, SemanticModel, SemanticProject, SourceId,
+    StaticSchemaProvider,
 };
 
 fn column(name: &str, data_type: DataType, nullability: Nullability) -> SchemaColumn {
@@ -264,8 +264,8 @@ fn selection_options_are_unaffected_by_analysis() {
         model("assay.raw_results", "select * from external.raw_results"),
         model("assay.results", "select sample_id from assay.raw_results"),
     ]);
-    let selected = phlo_transform_core::select_models(&compilation, &SelectionOptions::default());
-    assert_eq!(selected.len(), 2);
+    let selected = phlo_transform_core::Selection::all(&compilation);
+    assert_eq!(selected.members.len(), 2);
 }
 
 #[test]

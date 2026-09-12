@@ -132,11 +132,35 @@ or `--trino-endpoint`, `--trino-user`, `--trino-password`, `--trino-catalog`,
 
 ## Planning
 
-`Planner::plan` expands the selection to be dependency-closed, orders models
-topologically, checks relation existence and assigns a conservative action:
-missing → `create`, existing → `replace`. `plan` performs no mutation. If the
-workspace has compilation errors the plan is marked `blocked`, carries the
-diagnostics, and `apply` refuses to run.
+`Planner::plan` resolves the selection, expands it to be dependency-closed
+(excluded models are never pulled back in — the plan records a warning
+instead), orders models topologically and compares each model's desired
+content-addressed version against the version recorded for the target
+environment. Actions:
+
+- `build` — the relation is missing, the recorded version differs, or
+  `--force` was passed;
+- `skip` — the recorded version matches;
+- `cached` — the identical version is materialised in another environment;
+- `unknown` — compilation errors block a decision.
+
+Every decided model carries structured `PlanReason`s — a stable `kind`
+(`sql_semantic_change`, `dependency_change`, `source_change`,
+`missing_relation`, `unchanged`, `forced`, `selected_dependency`,
+`selection_expansion`, …), a human-readable `detail`, and an optional
+`subject` naming the dependency or source that moved. Which input moved
+comes from `VersionDetail`: the per-dependency version hashes and per-source
+observed states recorded alongside each materialised version in the state
+store. Each planned model also records its `membership` — `selected`,
+`expanded` (`+` terms, `--upstream`/`--downstream`) or `dependency`
+(closure) — and the plan echoes the resolved selection (terms, excludes,
+matched, expanded, required) so `plan.json` is self-describing.
+
+`plan` performs no mutation. If the workspace has compilation errors the
+plan is marked `blocked`, carries the diagnostics, and `apply` refuses to
+run. `phlo-transform explain <model>` shares the same diff
+(`diff_reasons`), so a per-model explanation cannot drift from what `plan`
+reports.
 
 ## Execution
 
@@ -164,23 +188,41 @@ the current target; `apply`/`run` run them after building.
 
 ## Selectors
 
-Small and orthogonal, no expression language:
+One selector engine (`phlo-transform-core::select`) is shared by `plan`,
+`apply`, `run`, `test`, `lineage`, `impact` and `list` — commands differ
+only in what they do with the resolved `Selection`, never in how terms
+parse or match. Per term:
 
-```bash
---select assay.results
---select 'assay.*'
---upstream
---downstream
---tag qc
---workflow assay
+```text
+assay.results        exact name, model:// URI, or unique name suffix
+assay.*              prefix glob
+tag:qc               -- @tags membership
+namespace:assay      model namespace
+source:lims          model reads a matching source
+changed              desired version differs from recorded state
+all | *              everything
 ```
+
+`+name` adds transitive dependencies, `name+` adds transitive dependents,
+`+name+` does both. Include terms (positional and `--select`) union;
+`--tag`/`--workflow` intersect; `--exclude` subtracts last and is absolute.
+`--changed` is shorthand for the `changed` term, whose change set comes
+from `changed_models()`: desired version vs. the materialised version
+recorded for the environment (no state ⇒ everything is changed). A
+Git-aware provider can feed the same term without touching resolution.
+
+Members carry provenance — which terms matched them directly and which
+pulled them in through `+` — so the planner can explain membership and the
+JSON plan can echo the resolved selection back to the caller.
 
 ## Operational state
 
 A `StateStore` trait with a SQLite implementation (`rusqlite`, bundled)
-records runs, per-model executions and per-test executions at
-`.phlo/transform/state.db`. This is operational history, not the
-content-addressed desired-state engine of Phase 3.
+records runs, per-model executions, per-test executions and materialised
+model versions (including `version_detail` — the named dependency/source
+inputs behind each version hash) at `.phlo/transform/state.db`. The version
+records are what make planning and the `changed` selector state-aware; see
+[`docs/state.md`](state.md).
 
 ## Artifacts
 
