@@ -1930,8 +1930,13 @@ fn print_plan_human(plan: &Plan) {
                 } else {
                     format!(" -> {}", seed.consumers.join(", "))
                 };
+                let from = seed
+                    .renamed_from
+                    .as_deref()
+                    .map(|old| format!(" (renamed from {old})"))
+                    .unwrap_or_default();
                 println!(
-                    "  seed {}: {} {}{consumers}",
+                    "  seed {}: {} {}{from}{consumers}",
                     seed.name, seed.path, seed.status
                 );
             }

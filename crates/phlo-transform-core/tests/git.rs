@@ -215,6 +215,41 @@ fn changed_seed_marks_consumers() {
 }
 
 #[test]
+fn seed_rename_marks_old_and_new_consumers() {
+    let root = repo();
+    // `assay.orders` read raw.orders as an external source at the base.
+    write(
+        &root,
+        "transforms/assay/orders.sql",
+        "select * from raw.orders\n",
+    );
+    write(&root, "seeds/events.csv", "id\n1\n");
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-qm", "orders consumer"]);
+    // Identical bytes, different name: `events` disappears, `orders`
+    // appears — not a no-op.
+    git(&root, &["mv", "seeds/events.csv", "seeds/orders.csv"]);
+    let changes = changes(&root, "main");
+    assert_eq!(model_names(&changes), ["assay.orders", "assay.raw"]);
+    let raw = &changes.models[1];
+    assert_eq!(
+        raw.causes[0].detail,
+        "consumes seed events, renamed to orders since main"
+    );
+    // Both sides of the rename are reported.
+    assert_eq!(changes.seeds.len(), 2, "{:?}", changes.seeds);
+    let events = &changes.seeds[0];
+    assert_eq!(events.name, "events");
+    assert_eq!(events.status, PathStatus::Deleted);
+    assert_eq!(events.consumers, ["assay.raw"]);
+    let orders = &changes.seeds[1];
+    assert_eq!(orders.name, "orders");
+    assert_eq!(orders.status, PathStatus::Renamed);
+    assert_eq!(orders.renamed_from.as_deref(), Some("events"));
+    assert_eq!(orders.consumers, ["assay.orders"]);
+}
+
+#[test]
 fn unused_seed_change_is_reported_not_dropped() {
     let root = repo();
     write(&root, "seeds/unused.csv", "id\n1\n");
@@ -264,6 +299,35 @@ fn transform_toml_semantic_noop_marks_nothing() {
     );
     let changes = changes(&root, "main");
     assert!(changes.models.is_empty(), "{:?}", changes.models);
+}
+
+#[test]
+fn transform_toml_rename_marks_old_and_new_scopes() {
+    let root = repo();
+    write(
+        &root,
+        "transforms/assay/transform.toml",
+        "namespace = \"assay\"\nmaterialized = \"table\"\n",
+    );
+    write(&root, "transforms/other/keep.sql", "select 1\n");
+    git(&root, &["add", "-A"]);
+    git(&root, &["commit", "-qm", "scoped config"]);
+    // Moving the config rewrites both scopes: `assay` loses it and
+    // `other` gains it — the identical bytes are not a no-op.
+    git(
+        &root,
+        &[
+            "mv",
+            "transforms/assay/transform.toml",
+            "transforms/other/transform.toml",
+        ],
+    );
+    let changes = changes(&root, "main");
+    // `other.keep` compiles under the moved config's namespace.
+    assert_eq!(
+        model_names(&changes),
+        ["assay.keep", "assay.raw", "assay.results"]
+    );
 }
 
 #[test]

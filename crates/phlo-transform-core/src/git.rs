@@ -94,6 +94,9 @@ pub struct ChangedSeed {
     /// Workspace-relative CSV path.
     pub path: String,
     pub status: PathStatus,
+    /// For a name-changing rename, the base-side seed name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renamed_from: Option<String>,
     /// Models reading the seed's source relation.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub consumers: Vec<String>,
@@ -307,9 +310,12 @@ pub fn changes(
                 entry.status,
                 PathStatus::Modified | PathStatus::Deleted | PathStatus::Renamed
             ),
-            PathKind::PhloConfig | PathKind::RootConfig => {
+            // A renamed transform.toml never compares contents (the scope
+            // itself moved); a renamed phlo.toml still does.
+            PathKind::PhloConfig => {
                 matches!(entry.status, PathStatus::Modified | PathStatus::Renamed)
             }
+            PathKind::RootConfig => matches!(entry.status, PathStatus::Modified),
             _ => false,
         };
         if wants_old {
@@ -507,7 +513,8 @@ impl<'a> Mapper<'a> {
 
     /// A `transform.toml` configures the subtree rooted at its directory:
     /// any change there can move the identity or config of every model
-    /// beneath it.
+    /// beneath it. A rename moves the configuration itself — the old scope
+    /// loses it and the new one gains it — so both subtrees are marked.
     fn map_root_config(
         &mut self,
         workspace_root: &Path,
@@ -515,19 +522,32 @@ impl<'a> Mapper<'a> {
         blobs: &BTreeMap<String, Option<String>>,
         prefix: &Path,
     ) {
-        let Some(dir) = entry.path.rsplit_once('/').map(|(dir, _)| dir) else {
-            // A transform.toml at the workspace root is never consulted.
+        // A transform.toml at the workspace root is never consulted.
+        let dir_of = |path: &str| path.rsplit_once('/').map(|(dir, _)| dir.to_string());
+        let mut dirs: Vec<String> = Vec::new();
+        if let Some(dir) = dir_of(&entry.path) {
+            dirs.push(dir);
+        }
+        if entry.status == PathStatus::Renamed {
+            if let Some(dir) = entry
+                .old_path
+                .as_deref()
+                .map(|old| relativize(old, prefix).unwrap_or_else(|| old.to_string()))
+                .and_then(|old| dir_of(&old))
+            {
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        if dirs.is_empty() {
             self.unaffected.push(entry.clone());
             return;
-        };
-        let changed = if matches!(entry.status, PathStatus::Modified | PathStatus::Renamed) {
+        }
+
+        let changed = if entry.status == PathStatus::Modified {
             let old = blobs
-                .get(
-                    &entry
-                        .old_path
-                        .clone()
-                        .unwrap_or_else(|| join_repo(prefix, &entry.path)),
-                )
+                .get(&join_repo(prefix, &entry.path))
                 .and_then(|content| content.as_deref())
                 .and_then(|text| toml::from_str::<TransformRootConfig>(text).ok());
             let new = std::fs::read_to_string(workspace_root.join(&entry.path))
@@ -535,31 +555,36 @@ impl<'a> Mapper<'a> {
                 .and_then(|text| toml::from_str::<TransformRootConfig>(&text).ok());
             old != new
         } else {
+            // Added, deleted, renamed: a scope gained or lost its config.
             true
         };
         if !changed {
             return;
         }
-        let under_dir = format!("{dir}/");
-        for model in &self.compilation.models {
-            let under = model
-                .path_display()
-                .map(|path| path.starts_with(&under_dir))
-                .unwrap_or(false);
-            if under {
-                self.cause(
-                    model.id.logical_name(),
-                    entry.path.clone(),
-                    format!("{} changed since {}", entry.path, self.since),
-                );
+        for dir in dirs {
+            let under_dir = format!("{dir}/");
+            for model in &self.compilation.models {
+                let under = model
+                    .path_display()
+                    .map(|path| path.starts_with(&under_dir))
+                    .unwrap_or(false);
+                if under {
+                    self.cause(
+                        model.id.logical_name(),
+                        entry.path.clone(),
+                        format!("{} changed since {}", entry.path, self.since),
+                    );
+                }
             }
         }
     }
 
     /// A changed seed selects the models consuming its source relation.
-    /// Byte-identical content (a pure move) is not a change. Matching is
-    /// name-suffix based (`raw.events` consumes seed `events`), which is
-    /// conservative when two relations share a stem.
+    /// Seed identity is filename-derived: a byte-identical move is a no-op
+    /// only when the name held — `events.csv → orders.csv` removes `events`
+    /// and adds `orders` even with identical bytes. Matching is name-suffix
+    /// based (`raw.events` consumes seed `events`), which is conservative
+    /// when two relations share a stem.
     fn map_seed(
         &mut self,
         workspace_root: &Path,
@@ -567,7 +592,12 @@ impl<'a> Mapper<'a> {
         entry: &ChangedPath,
         blobs: &BTreeMap<String, Option<String>>,
     ) {
-        if matches!(entry.status, PathStatus::Modified | PathStatus::Renamed) {
+        let name = seed_name(&entry.path);
+        let old_name = entry.old_path.as_deref().map(seed_name);
+        let renamed =
+            entry.status == PathStatus::Renamed && old_name.as_deref() != Some(name.as_str());
+
+        if matches!(entry.status, PathStatus::Modified | PathStatus::Renamed) && !renamed {
             let old = blobs
                 .get(
                     &entry
@@ -581,34 +611,80 @@ impl<'a> Mapper<'a> {
                 return;
             }
         }
-        let name = Path::new(&entry.path)
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or_default()
-            .to_string();
-        let consumers = self.seed_consumers(&name);
-        for consumer in &consumers {
-            let verb = if entry.status == PathStatus::Deleted {
-                "was removed"
+
+        // The current side: the new (or surviving) seed name's consumers.
+        if entry.status != PathStatus::Deleted {
+            let consumers = self.seed_consumers(&name);
+            let detail = if renamed {
+                format!(
+                    "consumes seed {name}, renamed from {} since {}",
+                    old_name.clone().expect("renamed"),
+                    self.since
+                )
             } else {
-                "changed"
+                let verb = match entry.status {
+                    PathStatus::Added | PathStatus::Untracked => "was added",
+                    _ => "changed",
+                };
+                format!("consumes seed {name}, which {verb} since {}", self.since)
             };
-            self.cause(
-                consumer.clone(),
-                entry.path.clone(),
-                format!("consumes seed {name}, which {verb} since {}", self.since),
+            for consumer in &consumers {
+                self.cause(consumer.clone(), entry.path.clone(), detail.clone());
+            }
+            self.seeds.insert(
+                name.clone(),
+                ChangedSeed {
+                    name: name.clone(),
+                    path: entry.path.clone(),
+                    status: entry.status,
+                    renamed_from: renamed.then(|| old_name.clone().expect("renamed")),
+                    used: !consumers.is_empty(),
+                    consumers,
+                },
             );
         }
-        self.seeds.insert(
-            name.clone(),
-            ChangedSeed {
-                name,
-                path: entry.path.clone(),
-                status: entry.status,
-                used: !consumers.is_empty(),
-                consumers,
-            },
-        );
+
+        // The vacated side: a deletion, or a rename that changed the name.
+        let gone = if entry.status == PathStatus::Deleted {
+            Some(name.clone())
+        } else if renamed {
+            old_name.clone()
+        } else {
+            None
+        };
+        if let Some(gone) = gone {
+            let old_ws_path = entry
+                .old_path
+                .as_deref()
+                .map(|old| relativize(old, prefix).unwrap_or_else(|| old.to_string()))
+                .unwrap_or_else(|| entry.path.clone());
+            let consumers = self.seed_consumers(&gone);
+            let detail = if renamed {
+                format!(
+                    "consumes seed {gone}, renamed to {name} since {}",
+                    self.since
+                )
+            } else {
+                format!(
+                    "consumes seed {gone}, which was removed since {}",
+                    self.since
+                )
+            };
+            for consumer in &consumers {
+                self.cause(consumer.clone(), old_ws_path.clone(), detail.clone());
+            }
+            self.seeds.insert(
+                gone.clone(),
+                ChangedSeed {
+                    name: gone,
+                    path: old_ws_path,
+                    status: PathStatus::Deleted,
+                    renamed_from: None,
+                    used: !consumers.is_empty(),
+                    consumers,
+                },
+            );
+        }
     }
 
     /// A changed test selects the models it targets so `test --since`
@@ -810,6 +886,15 @@ impl<'a> Mapper<'a> {
             .map(|model| model.id.logical_name())
             .collect()
     }
+}
+
+/// The seed name a path carries — its CSV stem.
+fn seed_name(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn union_keys<'a, V>(
