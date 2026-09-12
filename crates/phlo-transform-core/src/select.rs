@@ -238,6 +238,18 @@ impl SelectedModel {
     }
 }
 
+/// Why a `changed`-style term selected a model — caller-supplied
+/// provenance, e.g. the Git provider's per-model cause. Selection records
+/// *how a model got here*; plan reasons still decide *why it builds*.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SelectionCause {
+    /// The workspace-relative path responsible for the change.
+    pub path: String,
+    /// A complete phrase, e.g. `transforms/assay/raw.sql modified since
+    /// main` or `consumes seed raw.events, which changed since main`.
+    pub detail: String,
+}
+
 /// The resolved selection: which models are in, and why.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Selection {
@@ -252,6 +264,10 @@ pub struct Selection {
     /// The exclude terms as written.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exclude_terms: Vec<String>,
+    /// Per-model change provenance supplied by the caller (the Git change
+    /// provider under `--since`), keyed by logical model name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub causes: BTreeMap<String, Vec<SelectionCause>>,
 }
 
 impl Selection {
@@ -273,6 +289,7 @@ impl Selection {
             excluded: Vec::new(),
             terms: Vec::new(),
             exclude_terms: Vec::new(),
+            causes: BTreeMap::new(),
         }
     }
 
@@ -292,6 +309,7 @@ impl Selection {
             excluded: Vec::new(),
             terms: Vec::new(),
             exclude_terms: Vec::new(),
+            causes: BTreeMap::new(),
         }
     }
 
@@ -441,6 +459,7 @@ pub fn resolve_selection(
             .collect::<Vec<_>>(),
         terms: set.include.iter().map(|term| term.text.clone()).collect(),
         exclude_terms: set.exclude.iter().map(|term| term.text.clone()).collect(),
+        causes: BTreeMap::new(),
     })
 }
 

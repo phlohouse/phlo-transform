@@ -207,12 +207,39 @@ all | *              everything
 `+name` adds transitive dependencies, `name+` adds transitive dependents,
 `+name+` does both. Include terms (positional and `--select`) union;
 `--tag`/`--workflow` intersect; `--exclude` subtracts last and is absolute.
-`--changed` is shorthand for the `changed` term, whose change set comes
-from `changed_models()`: desired version vs. the materialised version
-recorded for the environment (no state ⇒ everything is changed; ephemeral
-models are never reported — their edits propagate through dependents'
-dependency versions). A Git-aware provider can feed the same term without
-touching resolution.
+`--changed` is shorthand for the `changed` term. Its change set has two
+providers:
+
+- **State-derived** (`changed_models()`): desired version vs. the
+  materialised version recorded for the environment (no state ⇒ everything
+  is changed; ephemeral models are never reported — their edits propagate
+  through dependents' dependency versions).
+- **Git-derived** (`--since <ref>`, `phlo-transform-core::git`): semantic
+  inputs that differ from `merge-base(<ref>, HEAD)` through the working
+  tree — staged, unstaged and untracked files all count. This is the
+  *directly changed* set only: unlike the state-derived set it does not
+  include downstream models unless they were themselves touched; `changed+`
+  adds the blast radius through the graph.
+
+`--since` alone implies `--select changed`; combined with other include
+terms it requires a `changed` term somewhere in the set (else the flag
+would be silently ignored — an error instead). The provider runs a fixed
+handful of Git invocations — `rev-parse`, `merge-base`, one
+`diff --name-status -M`, `ls-files --others`, one `cat-file --batch` — and
+maps each changed path once: model files by semantic signature (canonical
+SQL + directives, so comment/format-only edits don't count), `seeds/*.csv`
+to their consumers, `tests/*.sql` to their targets, `transform.toml` to
+every model beneath it, `phlo.toml` narrowed by changed section
+(`[transform]`/`[dependencies]`/defaults widen to all models). Deleted or
+renamed-away models mark their dependents (they now read a source where a
+model was). Anything not provably narrow widens rather than guesses.
+
+Git changes surface as `git_change` *selection provenance* on the plan —
+why the model was selected — while rebuild reasons stay state/version-
+based. `plan.git` carries the whole change set: requested ref, resolved
+merge-base/HEAD, changed paths with statuses, direct models with causes,
+seeds and consumers, tests, deleted model identities and out-of-workspace
+paths.
 
 Members carry provenance — which terms matched them directly and which
 pulled them in through `+` — so the planner can explain membership and the

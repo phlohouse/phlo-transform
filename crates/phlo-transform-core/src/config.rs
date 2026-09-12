@@ -12,7 +12,7 @@ use serde::Deserialize;
 use crate::diagnostics::{codes, Diagnostic};
 
 /// Contents of `phlo.toml`.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct PhloConfig {
     pub transform: TransformConfig,
@@ -26,7 +26,7 @@ pub struct PhloConfig {
 }
 
 /// The `[seeds]` section: defaults for `seeds/**/*.csv` files.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct SeedsConfig {
     /// Schema the seed CSVs are loaded into (workspace default schema
@@ -35,7 +35,7 @@ pub struct SeedsConfig {
 }
 
 /// A `[seed."<name>"]` section.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct SeedConfig {
     /// Per-seed target schema override.
@@ -52,14 +52,14 @@ pub enum CrossWorkflowPolicy {
     Error,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct DependenciesConfig {
     pub cross_workflow: CrossWorkflowPolicy,
 }
 
 /// A `[model.<name>]` section.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct ModelContractConfig {
     /// `[model.<name>.contract]`.
@@ -73,7 +73,7 @@ pub struct ModelContractConfig {
 }
 
 /// The `[model.<name>.diff]` settings.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct DiffConfig {
     pub max_added_rows: Option<i64>,
@@ -87,7 +87,7 @@ pub struct DiffConfig {
 }
 
 /// Per-column numeric tolerances for diffing.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct ToleranceConfig {
     pub absolute_tolerance: Option<f64>,
@@ -95,7 +95,7 @@ pub struct ToleranceConfig {
 }
 
 /// The `[model.<name>.incremental]` settings.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct IncrementalModelConfig {
     pub strategy: Option<String>,
@@ -107,7 +107,7 @@ pub struct IncrementalModelConfig {
 }
 
 /// The `[model.<name>.contract]` settings.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct ContractSettings {
     /// When true, contract violations are errors; otherwise warnings.
@@ -115,7 +115,7 @@ pub struct ContractSettings {
 }
 
 /// A `[model.<name>.columns.<column>]` section.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct ColumnContractConfig {
     #[serde(rename = "type")]
@@ -123,7 +123,7 @@ pub struct ColumnContractConfig {
     pub nullable: Option<bool>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct TransformConfig {
     /// Namespace used for files directly inside `transforms/`.
@@ -137,7 +137,7 @@ pub struct TransformConfig {
     pub discovery: DiscoveryConfig,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct DiscoveryConfig {
     /// Additional include globs, relative to the workspace root.
@@ -147,7 +147,7 @@ pub struct DiscoveryConfig {
 }
 
 /// Contents of an optional `transform.toml` at a transform root.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct TransformRootConfig {
     pub namespace: Option<String>,
@@ -162,7 +162,7 @@ pub struct TransformRootConfig {
 }
 
 /// A `[folder.<path>]` section inside `transform.toml`.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct FolderConfig {
     pub materialized: Option<String>,

@@ -92,10 +92,18 @@ and an optional `subject` naming the input that moved. `plan.json` exposes
 the desired/current hashes, reasons, membership and the resolved selection.
 
 `changed_models(compilation, state, environment)` returns the set of models
-whose desired version differs from the recorded one — the change set behind
-the `changed` selector term. Ephemeral models are never reported (they are
-never materialised, so they have no recorded version; their edits propagate
-to dependents through the dependency hash instead).
+whose desired version differs from the recorded one — the state-derived
+change set behind the `changed` selector term. Ephemeral models are never
+reported (they are never materialised, so they have no recorded version;
+their edits propagate to dependents through the dependency hash instead).
+
+The same `changed` term accepts a second provider: `--since <ref>` feeds
+`phlo-transform-core::git`'s diff-derived change set instead of recorded
+state. The two answer different questions — "what differs from what's
+materialised" vs. "what changed relative to a Git ref" — and differ in
+shape: the Git set is *direct* changes only (downstream propagation comes
+from `changed+`, not the diff) and includes ephemeral models when their
+files changed. See `docs/engine.md` §Selectors.
 
 ## Stale plans
 

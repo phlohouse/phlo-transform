@@ -13,10 +13,10 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use phlo_transform_core::{
-    compile, compile_with_options, load_project, resolve_selection, Assertion, CheckReport,
-    Compilation, DataType, Diagnostic, IncrementalStrategy, InspectReport, ListReport, ModelId,
-    Nullability, Relation, RelationSchema, SchemaColumn, Selection, SelectorSet,
-    StaticSchemaProvider,
+    compile, compile_with_options, git_changes, load_project, parse_selector, resolve_selection,
+    Assertion, CheckReport, Compilation, DataType, Diagnostic, GitChanges, IncrementalStrategy,
+    InspectReport, ListReport, ModelId, Nullability, Relation, RelationSchema, SchemaColumn,
+    Selection, SelectorKind, SelectorSet, StaticSchemaProvider,
 };
 use phlo_transform_daemon::{serve, spawn_watcher, WorkspaceService};
 use phlo_transform_duckdb::DuckDbAdapter;
@@ -74,6 +74,12 @@ struct Cli {
     /// Select models whose desired version differs from recorded state.
     #[arg(long, global = true)]
     changed: bool,
+
+    /// Compare the workspace against a Git ref (merge base through the
+    /// working tree) and use that change set for the `changed` selector.
+    /// Implies `changed` when no other include terms are given.
+    #[arg(long, global = true)]
+    since: Option<String>,
 
     /// Rebuild selected models regardless of recorded state (plan/apply/run).
     #[arg(long, global = true)]
@@ -379,16 +385,29 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
         }
     };
 
+    // `--since` resolves the Git diff once against the compiled workspace;
+    // every selection-consuming command then shares it.
+    let git = match &cli.since {
+        Some(since) => {
+            Some(git_changes(&cli.root, &compilation, since).map_err(|error| error.to_string())?)
+        }
+        None => None,
+    };
+
     match &cli.command {
         Command::Check => run_check(cli, &compilation),
-        Command::List { .. } => run_list(cli, &compilation, &set),
+        Command::List { .. } => run_list(cli, &compilation, &set, git.as_ref()),
         Command::Inspect { model } => run_inspect(cli, &compilation, model),
-        Command::Plan { .. } => run_plan(cli, &compilation, &set).await,
-        Command::Apply { .. } => run_apply(cli, &compilation, &set, false).await,
-        Command::Run { .. } => run_apply(cli, &compilation, &set, true).await,
-        Command::Test { .. } => run_test(cli, &compilation, &set).await,
-        Command::Lineage { target } => run_lineage(cli, &compilation, target.as_deref(), &set),
-        Command::Impact { column } => run_impact(cli, &compilation, column.as_deref(), &set),
+        Command::Plan { .. } => run_plan(cli, &compilation, &set, git.as_ref()).await,
+        Command::Apply { .. } => run_apply(cli, &compilation, &set, git.as_ref(), false).await,
+        Command::Run { .. } => run_apply(cli, &compilation, &set, git.as_ref(), true).await,
+        Command::Test { .. } => run_test(cli, &compilation, &set, git.as_ref()).await,
+        Command::Lineage { target } => {
+            run_lineage(cli, &compilation, target.as_deref(), &set, git.as_ref())
+        }
+        Command::Impact { column } => {
+            run_impact(cli, &compilation, column.as_deref(), &set, git.as_ref())
+        }
         Command::Explain { model } => run_explain(cli, &compilation, model).await,
         Command::Translate { .. } | Command::Doctor | Command::Init | Command::Manifest => {
             unreachable!("handled before workspace load")
@@ -452,10 +471,15 @@ fn run_check(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, String> {
     })
 }
 
-fn run_list(cli: &Cli, compilation: &Compilation, set: &SelectorSet) -> Result<ExitCode, String> {
+fn run_list(
+    cli: &Cli,
+    compilation: &Compilation,
+    set: &SelectorSet,
+    git: Option<&GitChanges>,
+) -> Result<ExitCode, String> {
     let mut report = compilation.list_report();
     if !set.is_unrestricted() {
-        let selection = resolve(cli, compilation, set)?;
+        let selection = resolve(cli, compilation, set, git)?;
         filter_list_report(compilation, &mut report, &selection);
     }
     if cli.json {
@@ -615,6 +639,7 @@ fn selector_set(cli: &Cli) -> Result<SelectorSet, String> {
             || cli.tag.is_some()
             || cli.workflow.is_some()
             || cli.changed
+            || cli.since.is_some()
             || cli.upstream
             || cli.downstream)
     {
@@ -634,30 +659,68 @@ fn selector_set(cli: &Cli) -> Result<SelectorSet, String> {
     if let Some(workflow) = &cli.workflow {
         filter.push(format!("namespace:{workflow}"));
     }
-    SelectorSet::parse(
+    let mut set = SelectorSet::parse(
         &include,
         &cli.exclude,
         &filter,
         cli.upstream,
         cli.downstream,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+
+    if cli.since.is_some() {
+        // `--since` supplies the change set for the `changed` selector. With
+        // no include terms it means `--select changed`; an exclude-only
+        // `changed` ("everything except what changed") is already coherent.
+        let exclude_uses_changed = set
+            .exclude
+            .iter()
+            .any(|term| term.kind == SelectorKind::Changed);
+        if set.include.is_empty() && !exclude_uses_changed {
+            set.include
+                .push(parse_selector("changed").expect("`changed` parses"));
+        }
+        if !set.uses_changed() {
+            return Err(
+                "`--since` supplies the `changed` selector's change set — add a \
+                 `changed` term (e.g. `--select changed+`) or drop the selection flags"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(set)
 }
 
 /// Resolve the selector set against the compilation. The `changed` term
 /// compares desired versions against the recorded state for the effective
-/// environment.
-fn resolve(cli: &Cli, compilation: &Compilation, set: &SelectorSet) -> Result<Selection, String> {
+/// environment — or, when `--since` was given, against the Git-derived
+/// change set, which also carries per-model provenance into the selection.
+fn resolve(
+    cli: &Cli,
+    compilation: &Compilation,
+    set: &SelectorSet,
+    git: Option<&GitChanges>,
+) -> Result<Selection, String> {
     let changed = if set.uses_changed() {
-        let state = open_state(cli);
-        Some(
-            changed_models(compilation, state.as_ref(), environment(cli).as_deref())
-                .map_err(|error| error.to_string())?,
-        )
+        match git {
+            Some(git) => Some(git.changed_model_ids()),
+            None => {
+                let state = open_state(cli);
+                Some(
+                    changed_models(compilation, state.as_ref(), environment(cli).as_deref())
+                        .map_err(|error| error.to_string())?,
+                )
+            }
+        }
     } else {
         None
     };
-    resolve_selection(compilation, set, changed.as_ref()).map_err(|error| error.to_string())
+    let mut selection =
+        resolve_selection(compilation, set, changed.as_ref()).map_err(|error| error.to_string())?;
+    if let Some(git) = git {
+        selection.causes = git.selection_causes();
+    }
+    Ok(selection)
 }
 
 /// Resolve a single model reference through the selector engine, so bare
@@ -682,11 +745,12 @@ async fn build_plan(
     compilation: &Compilation,
     set: &SelectorSet,
     state: Option<Arc<dyn StateStore>>,
+    git: Option<&GitChanges>,
 ) -> Result<(Plan, ArtifactWriter), String> {
-    let selection = resolve(cli, compilation, set)?;
+    let selection = resolve(cli, compilation, set, git)?;
     let adapter = build_adapter(cli)?;
     let planner = Planner::new(adapter, state);
-    let plan = planner
+    let mut plan = planner
         .plan(
             compilation,
             &selection,
@@ -695,6 +759,7 @@ async fn build_plan(
         )
         .await
         .map_err(|error| error.to_string())?;
+    plan.git = git.cloned();
     Ok((plan, ArtifactWriter::for_workspace(&cli.root)))
 }
 
@@ -1024,8 +1089,9 @@ async fn run_plan(
     cli: &Cli,
     compilation: &Compilation,
     set: &SelectorSet,
+    git: Option<&GitChanges>,
 ) -> Result<ExitCode, String> {
-    let (plan, writer) = build_plan(cli, compilation, set, open_state(cli)).await?;
+    let (plan, writer) = build_plan(cli, compilation, set, open_state(cli), git).await?;
     writer
         .write_project(compilation)
         .and_then(|_| writer.write_plan(&plan))
@@ -1054,10 +1120,11 @@ async fn run_apply(
     cli: &Cli,
     compilation: &Compilation,
     set: &SelectorSet,
+    git: Option<&GitChanges>,
     convenience_run: bool,
 ) -> Result<ExitCode, String> {
     let state = open_state(cli);
-    let (plan, writer) = build_plan(cli, compilation, set, state.clone()).await?;
+    let (plan, writer) = build_plan(cli, compilation, set, state.clone(), git).await?;
     writer
         .write_project(compilation)
         .and_then(|_| writer.write_plan(&plan))
@@ -1110,6 +1177,7 @@ async fn run_test(
     cli: &Cli,
     compilation: &Compilation,
     set: &SelectorSet,
+    git: Option<&GitChanges>,
 ) -> Result<ExitCode, String> {
     let adapter = build_adapter(cli)?;
     // A test runs when every model it reads is selected; tests that only
@@ -1117,7 +1185,7 @@ async fn run_test(
     let members: Option<std::collections::BTreeSet<String>> = if set.is_unrestricted() {
         None
     } else {
-        let selection = resolve(cli, compilation, set)?;
+        let selection = resolve(cli, compilation, set, git)?;
         Some(
             selection
                 .members
@@ -1188,9 +1256,10 @@ fn run_lineage(
     compilation: &Compilation,
     target: Option<&str>,
     set: &SelectorSet,
+    git: Option<&GitChanges>,
 ) -> Result<ExitCode, String> {
     let Some(target) = target else {
-        return run_graph_lineage(cli, compilation, set);
+        return run_graph_lineage(cli, compilation, set, git);
     };
     // A target takes the whole report for one model; selectors only make
     // sense for the graph listing.
@@ -1252,10 +1321,11 @@ fn run_graph_lineage(
     cli: &Cli,
     compilation: &Compilation,
     set: &SelectorSet,
+    git: Option<&GitChanges>,
 ) -> Result<ExitCode, String> {
     let mut report = compilation.list_report();
     if !set.is_unrestricted() {
-        let selection = resolve(cli, compilation, set)?;
+        let selection = resolve(cli, compilation, set, git)?;
         filter_list_report(compilation, &mut report, &selection);
     }
     let mut downstream: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
@@ -1337,6 +1407,7 @@ fn run_impact(
     compilation: &Compilation,
     column: Option<&str>,
     set: &SelectorSet,
+    git: Option<&GitChanges>,
 ) -> Result<ExitCode, String> {
     // `impact --select ...` with no positional argument: the blast radius
     // of a selection — every downstream dependent outside the set, plus the
@@ -1348,14 +1419,14 @@ fn run_impact(
                     .to_string(),
             );
         }
-        return run_selection_impact(cli, compilation, set);
+        return run_selection_impact(cli, compilation, set, git);
     };
 
     // An active selection scopes the reported impact to selected models.
     let members: Option<std::collections::BTreeSet<String>> = if set.is_unrestricted() {
         None
     } else {
-        let selection = resolve(cli, compilation, set)?;
+        let selection = resolve(cli, compilation, set, git)?;
         Some(
             selection
                 .members
@@ -1457,8 +1528,9 @@ fn run_selection_impact(
     cli: &Cli,
     compilation: &Compilation,
     set: &SelectorSet,
+    git: Option<&GitChanges>,
 ) -> Result<ExitCode, String> {
-    let selection = resolve(cli, compilation, set)?;
+    let selection = resolve(cli, compilation, set, git)?;
     let members: std::collections::BTreeSet<ModelId> = selection.ids().into_iter().collect();
     let mut impacted: std::collections::BTreeSet<ModelId> = std::collections::BTreeSet::new();
     let mut frontier: Vec<ModelId> = members.iter().cloned().collect();
@@ -1831,6 +1903,56 @@ fn print_plan_human(plan: &Plan) {
             ));
         }
         println!("{line}");
+    }
+    if let Some(git) = &plan.git {
+        println!(
+            "Git changes since {} (merge-base {}):",
+            git.since,
+            &git.merge_base[..git.merge_base.len().min(12)]
+        );
+        if git.models.is_empty()
+            && git.seeds.is_empty()
+            && git.tests.is_empty()
+            && git.deleted_models.is_empty()
+            && git.unaffected.is_empty()
+        {
+            println!("  none");
+        } else {
+            for model in &git.models {
+                println!("  {}", model.model);
+                for cause in &model.causes {
+                    println!("    {}", cause.detail);
+                }
+            }
+            for seed in &git.seeds {
+                let consumers = if seed.consumers.is_empty() {
+                    " (unused)".to_string()
+                } else {
+                    format!(" -> {}", seed.consumers.join(", "))
+                };
+                let from = seed
+                    .renamed_from
+                    .as_deref()
+                    .map(|old| format!(" (renamed from {old})"))
+                    .unwrap_or_default();
+                println!(
+                    "  seed {}: {} {}{from}{consumers}",
+                    seed.name, seed.path, seed.status
+                );
+            }
+            for deleted in &git.deleted_models {
+                match &deleted.id {
+                    Some(id) => println!("  deleted {id} ({})", deleted.path),
+                    None => println!("  deleted {}", deleted.path),
+                }
+            }
+            for test in &git.tests {
+                println!("  test {} {}", test.path, test.status);
+            }
+            for path in &git.unaffected {
+                println!("  unaffected {} {}", path.path, path.status);
+            }
+        }
     }
     for warning in &plan.warnings {
         println!("warning: {warning}");
