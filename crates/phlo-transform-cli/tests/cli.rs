@@ -817,6 +817,8 @@ fn git_workspace() -> tempfile::TempDir {
     .expect("results.sql");
     std::fs::write(root.join("seeds/events.csv"), "id\n1\n").expect("seed");
     git(root, &["init", "-q"]);
+    git(root, &["config", "user.email", "test@phlo.dev"]);
+    git(root, &["config", "user.name", "Phlo Test"]);
     git(root, &["add", "-A"]);
     git(root, &["commit", "-qm", "init"]);
     git(root, &["branch", "-M", "main"]);

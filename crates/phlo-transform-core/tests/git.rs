@@ -48,6 +48,8 @@ fn repo() -> PathBuf {
     let dir = tempfile::tempdir().expect("tempdir").keep();
     workspace(&dir);
     git(&dir, &["init", "-q"]);
+    git(&dir, &["config", "user.email", "test@phlo.dev"]);
+    git(&dir, &["config", "user.name", "Phlo Test"]);
     git(&dir, &["add", "-A"]);
     git(&dir, &["commit", "-qm", "init"]);
     git(&dir, &["branch", "-M", "main"]);
