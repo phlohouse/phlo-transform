@@ -12,12 +12,12 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 use phlo_transform_core::{
-    compile, select_models, ColumnTolerance, Compilation, Materialization, ModelId, ModelOrigin,
-    Relation, SemanticModel, SemanticProject, SemanticTest, TestId, WorkspaceDefaults,
+    compile, ColumnTolerance, Compilation, Materialization, ModelId, ModelOrigin, Relation,
+    Selection, SemanticModel, SemanticProject, SemanticTest, TestId, WorkspaceDefaults,
 };
 use phlo_transform_engine::{
-    diff, Adapter, DiffPolicy, DiffRequest, DiffStrategy, ExecutionStatus, Planner, RunOptions,
-    Runner,
+    diff, Adapter, DiffPolicy, DiffRequest, DiffStrategy, ExecutionStatus, PlanOptions, Planner,
+    RunOptions, Runner,
 };
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
 
@@ -87,9 +87,14 @@ async fn executes_models_and_tests_against_trino() {
         .expect("schema created");
 
     let compilation = fixture_project();
-    let selected = select_models(&compilation, &Default::default());
+    let selected = Selection::all(&compilation);
     let plan = Planner::new(adapter.clone(), None)
-        .plan(&compilation, &selected, Some("ci".to_string()))
+        .plan(
+            &compilation,
+            &selected,
+            Some("ci".to_string()),
+            &PlanOptions::default(),
+        )
         .await
         .expect("plan succeeds");
     assert!(!plan.blocked);

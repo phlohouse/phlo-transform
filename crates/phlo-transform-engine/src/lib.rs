@@ -9,6 +9,7 @@
 pub mod adapter;
 pub mod artifacts;
 pub mod cancel;
+pub mod changed;
 pub mod diff;
 pub mod environment;
 pub mod error;
@@ -27,6 +28,7 @@ pub use artifacts::{
     RunArtifact, SCHEMA_VERSION,
 };
 pub use cancel::CancelHandle;
+pub use changed::changed_models;
 pub use diff::{
     diff, DiffPolicy, DiffReport, DiffRequest, DiffStrategy, PolicyResult, RowSummary, SchemaChange,
 };
@@ -34,8 +36,8 @@ pub use environment::{ensure_environment, EnvironmentSetup, EnvironmentSpec};
 pub use error::{AdapterError, EngineError};
 pub use events::{EngineEvent, ExecutionStatus};
 pub use plan::{
-    dependency_closure, ChangeReason, Plan, PlanAction, PlannedModel, PlannedSeed, PlannedTest,
-    Planner,
+    dependency_closure, diff_reasons, Membership, Plan, PlanAction, PlanOptions, PlanReason,
+    PlanSelection, PlannedModel, PlannedSeed, PlannedTest, Planner, ReasonKind,
 };
 pub use promotion::{promote, PromotionRecord, PromotionRequest};
 pub use run::{ModelResult, RunOptions, RunResult, Runner, SeedResult, TestResult};

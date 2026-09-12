@@ -56,14 +56,17 @@ pub use schema::{
     classify_schema_change, EmptySchemaProvider, RelationSchema, SchemaChangeSafety, SchemaColumn,
     SchemaProvider, StaticSchemaProvider,
 };
-pub use select::{select_models, SelectionOptions};
+pub use select::{
+    parse_selector, resolve_selection, SelectedModel, Selection, SelectorError, SelectorKind,
+    SelectorSet, SelectorTerm,
+};
 pub use semantic::{
     Assertion, ColumnContract, ColumnRef, ColumnTolerance, DataType, DiffPolicySpec, ModelContract,
     ModelSchema, Nullability, OutputColumn, RelationRef,
 };
 pub use version::{
     model_version, EmptySourceStateProvider, ModelVersion, SourceStateProvider,
-    StaticSourceStateProvider, VersionInputs, COMPILER_SEMANTICS_VERSION,
+    StaticSourceStateProvider, VersionDetail, VersionInputs, COMPILER_SEMANTICS_VERSION,
 };
 
 /// Load a native workspace and compile it in one step.

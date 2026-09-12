@@ -13,17 +13,19 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use phlo_transform_core::{
-    compile, compile_with_options, load_project, select_models, Assertion, CheckReport,
+    compile, compile_with_options, load_project, resolve_selection, Assertion, CheckReport,
     Compilation, DataType, Diagnostic, IncrementalStrategy, InspectReport, ListReport, ModelId,
-    Nullability, Relation, RelationSchema, SchemaColumn, SelectionOptions, StaticSchemaProvider,
+    Nullability, Relation, RelationSchema, SchemaColumn, Selection, SelectorSet,
+    StaticSchemaProvider,
 };
 use phlo_transform_daemon::{serve, spawn_watcher, WorkspaceService};
 use phlo_transform_duckdb::DuckDbAdapter;
 use phlo_transform_engine::{
-    adapter_default_schema, collect_source_states, diff, ensure_environment, promote,
-    relation_for_source, Adapter, ArtifactWriter, CancelHandle, DiffPolicy, DiffRequest,
-    DiffStrategy, EnvironmentSetup, EnvironmentSpec, ExecutionStatus, Plan, PlanAction, Planner,
-    PromotionRequest, RunOptions, RunResult, Runner, SqliteStateStore, StateStore,
+    adapter_default_schema, changed_models, collect_source_states, diff, diff_reasons,
+    ensure_environment, promote, relation_for_source, Adapter, ArtifactWriter, CancelHandle,
+    DiffPolicy, DiffRequest, DiffStrategy, EnvironmentSetup, EnvironmentSpec, ExecutionStatus,
+    Membership, Plan, PlanAction, PlanOptions, PlanReason, Planner, PromotionRequest, ReasonKind,
+    RunOptions, RunResult, Runner, SqliteStateStore, StateStore,
 };
 use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -43,9 +45,15 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
-    /// Select models by exact name or namespace glob (repeatable).
+    /// Select models by name, glob or selector term (repeatable).
+    /// Terms: `model`, `model+`, `+model`, `+model+`, `tag:x`,
+    /// `namespace:x`, `source:x`, `source:x+`, `changed`, `changed+`, `all`.
     #[arg(long, global = true)]
     select: Vec<String>,
+
+    /// Exclude models matching a selector term (repeatable, applied last).
+    #[arg(long, global = true)]
+    exclude: Vec<String>,
 
     /// Include every transitive dependency of the selected models.
     #[arg(long, global = true)]
@@ -62,6 +70,14 @@ struct Cli {
     /// Select models belonging to a workflow namespace.
     #[arg(long, global = true)]
     workflow: Option<String>,
+
+    /// Select models whose desired version differs from recorded state.
+    #[arg(long, global = true)]
+    changed: bool,
+
+    /// Rebuild selected models regardless of recorded state (plan/apply/run).
+    #[arg(long, global = true)]
+    force: bool,
 
     /// Execution adapter: `trino` or `duckdb`. Defaults to `trino` when a
     /// Trino endpoint is configured.
@@ -135,30 +151,47 @@ enum Command {
     /// Compile the workspace and report diagnostics.
     Check,
     /// List discovered models, sources and tests.
-    List,
+    List {
+        /// Selector terms (see `--select`). Omit to list everything.
+        selectors: Vec<String>,
+    },
     /// Show details for a single model.
     Inspect {
         /// Model name (`assay.results`) or URI (`model://assay/results`).
         model: String,
     },
     /// Show the work that would be done, without mutating anything.
-    Plan,
+    Plan {
+        /// Selector terms (see `--select`). Omit to plan everything.
+        selectors: Vec<String>,
+    },
     /// Execute the plan.
-    Apply,
+    Apply {
+        /// Selector terms (see `--select`). Omit to plan everything.
+        selectors: Vec<String>,
+    },
     /// Convenience: plan + apply.
-    Run,
+    Run {
+        /// Selector terms (see `--select`). Omit to run everything.
+        selectors: Vec<String>,
+    },
     /// Run custom SQL tests against the current target.
-    Test,
+    Test {
+        /// Selector terms (see `--select`). Omit to test everything.
+        selectors: Vec<String>,
+    },
     /// Show upstream/downstream model lineage or a column's lineage.
     Lineage {
         /// Model (`assay.results`) or column (`assay.results.concentration`).
-        /// Omit to print the whole model graph.
+        /// Omit to print the model graph (optionally scoped by selectors).
         target: Option<String>,
     },
-    /// Show downstream impact of a column.
+    /// Show downstream impact of a column or a selection.
     Impact {
-        /// Column reference (`assay.results.concentration`).
-        column: String,
+        /// Column reference (`assay.results.concentration`) or model
+        /// (`assay.results`). Omit and pass `--select` for the impact of a
+        /// selection.
+        column: Option<String>,
     },
     /// Promote an audited candidate Nessie reference to a target.
     Promote {
@@ -304,8 +337,16 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
     let original_catalog = project.defaults.catalog.clone();
     let original_schema = project.defaults.schema.clone();
 
+    // Parse selectors up front: errors surface before compilation, and the
+    // `changed` term decides whether the compile needs source-state
+    // enrichment even for commands that do not otherwise touch an adapter.
+    let set = selector_set(cli)?;
+    let wants_changed = set.uses_changed();
+
     let environment = match &cli.command {
-        Command::Plan | Command::Apply | Command::Run => provision_environment(cli).await?,
+        Command::Plan { .. } | Command::Apply { .. } | Command::Run { .. } => {
+            provision_environment(cli).await?
+        }
         _ => None,
     };
     if let Some(catalog) = cli
@@ -323,7 +364,7 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
 
     let compilation = {
         let base = compile(&project);
-        if should_enrich(cli) {
+        if should_enrich(cli) || wants_changed {
             enrich(
                 cli,
                 &project,
@@ -340,14 +381,14 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
 
     match &cli.command {
         Command::Check => run_check(cli, &compilation),
-        Command::List => run_list(cli, &compilation),
+        Command::List { .. } => run_list(cli, &compilation, &set),
         Command::Inspect { model } => run_inspect(cli, &compilation, model),
-        Command::Plan => run_plan(cli, &compilation).await,
-        Command::Apply => run_apply(cli, &compilation, false).await,
-        Command::Run => run_apply(cli, &compilation, true).await,
-        Command::Test => run_test(cli, &compilation).await,
-        Command::Lineage { target } => run_lineage(cli, &compilation, target.as_deref()),
-        Command::Impact { column } => run_impact(cli, &compilation, column),
+        Command::Plan { .. } => run_plan(cli, &compilation, &set).await,
+        Command::Apply { .. } => run_apply(cli, &compilation, &set, false).await,
+        Command::Run { .. } => run_apply(cli, &compilation, &set, true).await,
+        Command::Test { .. } => run_test(cli, &compilation, &set).await,
+        Command::Lineage { target } => run_lineage(cli, &compilation, target.as_deref(), &set),
+        Command::Impact { column } => run_impact(cli, &compilation, column.as_deref(), &set),
         Command::Explain { model } => run_explain(cli, &compilation, model).await,
         Command::Translate { .. } | Command::Doctor | Command::Init | Command::Manifest => {
             unreachable!("handled before workspace load")
@@ -411,14 +452,62 @@ fn run_check(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, String> {
     })
 }
 
-fn run_list(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, String> {
-    let report = compilation.list_report();
+fn run_list(cli: &Cli, compilation: &Compilation, set: &SelectorSet) -> Result<ExitCode, String> {
+    let mut report = compilation.list_report();
+    if !set.is_unrestricted() {
+        let selection = resolve(cli, compilation, set)?;
+        filter_list_report(compilation, &mut report, &selection);
+    }
     if cli.json {
         print_json(&report)?;
     } else {
         print_list_human(&report);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Scope a list report to a resolved selection: the selected models, the
+/// sources they read, the seeds backing those sources, and tests whose
+/// targets are all in the selection.
+fn filter_list_report(compilation: &Compilation, report: &mut ListReport, selection: &Selection) {
+    let members: std::collections::BTreeSet<&str> = selection
+        .members
+        .iter()
+        .map(|member| member.id.as_str())
+        .collect();
+    report
+        .models
+        .retain(|model| members.contains(model.name.as_str()));
+    report.tests.retain(|test| {
+        !test.targets.is_empty()
+            && test
+                .targets
+                .iter()
+                .all(|target| members.contains(target.as_str()))
+    });
+    let mut sources: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for member in &selection.members {
+        if let Ok(id) = ModelId::parse(&member.id) {
+            if let Some(model) = compilation.model(&id) {
+                sources.extend(
+                    model
+                        .source_dependencies()
+                        .map(|source| source.logical_name()),
+                );
+            }
+        }
+    }
+    report
+        .sources
+        .retain(|source| sources.contains(source.name.as_str()));
+    // A seed backs the source whose relation lands on its table.
+    let seed_names: std::collections::BTreeSet<&str> = sources
+        .iter()
+        .filter_map(|source| source.rsplit('.').next())
+        .collect();
+    report
+        .seeds
+        .retain(|seed| seed_names.contains(seed.name.as_str()));
 }
 
 fn run_inspect(cli: &Cli, compilation: &Compilation, model: &str) -> Result<ExitCode, String> {
@@ -493,26 +582,117 @@ fn model_diagnostics(compilation: &Compilation, report: &InspectReport) -> Vec<D
         .collect()
 }
 
-fn selection(cli: &Cli) -> SelectionOptions {
-    SelectionOptions {
-        select: cli.select.clone(),
-        upstream: cli.upstream,
-        downstream: cli.downstream,
-        tag: cli.tag.clone(),
-        workflow: cli.workflow.clone(),
+/// The selector set for this invocation: positional selectors, `--select`
+/// and `--changed` unioned as include terms; `--tag`/`--workflow` intersect;
+/// `--exclude` subtracts last; `--upstream`/`--downstream` expand.
+fn selector_set(cli: &Cli) -> Result<SelectorSet, String> {
+    let positional: &[String] = match &cli.command {
+        Command::List { selectors }
+        | Command::Plan { selectors }
+        | Command::Apply { selectors }
+        | Command::Run { selectors }
+        | Command::Test { selectors } => selectors,
+        _ => &[],
+    };
+    // Selector flags are global so they can precede the subcommand, but they
+    // are meaningless on commands that never resolve them — fail loudly
+    // rather than silently ignoring them. (`lineage <target>` is exempt for
+    // --upstream/--downstream, which double as direction filters.)
+    let consumes = matches!(
+        cli.command,
+        Command::List { .. }
+            | Command::Plan { .. }
+            | Command::Apply { .. }
+            | Command::Run { .. }
+            | Command::Test { .. }
+            | Command::Lineage { .. }
+            | Command::Impact { .. }
+    );
+    if !consumes
+        && (!positional.is_empty()
+            || !cli.select.is_empty()
+            || !cli.exclude.is_empty()
+            || cli.tag.is_some()
+            || cli.workflow.is_some()
+            || cli.changed
+            || cli.upstream
+            || cli.downstream)
+    {
+        return Err(
+            "selection flags apply to list, plan, apply, run, test, lineage and impact".to_string(),
+        );
+    }
+    let mut include: Vec<String> = positional.to_vec();
+    include.extend(cli.select.iter().cloned());
+    if cli.changed {
+        include.push("changed".to_string());
+    }
+    let mut filter = Vec::new();
+    if let Some(tag) = &cli.tag {
+        filter.push(format!("tag:{tag}"));
+    }
+    if let Some(workflow) = &cli.workflow {
+        filter.push(format!("namespace:{workflow}"));
+    }
+    SelectorSet::parse(
+        &include,
+        &cli.exclude,
+        &filter,
+        cli.upstream,
+        cli.downstream,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Resolve the selector set against the compilation. The `changed` term
+/// compares desired versions against the recorded state for the effective
+/// environment.
+fn resolve(cli: &Cli, compilation: &Compilation, set: &SelectorSet) -> Result<Selection, String> {
+    let changed = if set.uses_changed() {
+        let state = open_state(cli);
+        Some(
+            changed_models(compilation, state.as_ref(), environment(cli).as_deref())
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    resolve_selection(compilation, set, changed.as_ref()).map_err(|error| error.to_string())
+}
+
+/// Resolve a single model reference through the selector engine, so bare
+/// unique suffixes work the same way everywhere.
+fn resolve_model(cli_arg: &str, compilation: &Compilation) -> Result<ModelId, String> {
+    let set = SelectorSet::parse(&[cli_arg.to_string()], &[], &[], false, false)
+        .map_err(|error| error.to_string())?;
+    let selection =
+        resolve_selection(compilation, &set, None).map_err(|error| error.to_string())?;
+    let ids = selection.ids();
+    match ids.len() {
+        1 => Ok(ids.into_iter().next().expect("one id")),
+        _ => Err(format!(
+            "`{cli_arg}` matched {} models; explain needs exactly one",
+            ids.len()
+        )),
     }
 }
 
 async fn build_plan(
     cli: &Cli,
     compilation: &Compilation,
+    set: &SelectorSet,
     state: Option<Arc<dyn StateStore>>,
 ) -> Result<(Plan, ArtifactWriter), String> {
+    let selection = resolve(cli, compilation, set)?;
     let adapter = build_adapter(cli)?;
-    let selected = select_models(compilation, &selection(cli));
     let planner = Planner::new(adapter, state);
     let plan = planner
-        .plan(compilation, &selected, environment(cli))
+        .plan(
+            compilation,
+            &selection,
+            environment(cli),
+            &PlanOptions { force: cli.force },
+        )
         .await
         .map_err(|error| error.to_string())?;
     Ok((plan, ArtifactWriter::for_workspace(&cli.root)))
@@ -840,8 +1020,12 @@ fn print_promotion_human(record: &phlo_transform_engine::PromotionRecord) {
     println!();
 }
 
-async fn run_plan(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, String> {
-    let (plan, writer) = build_plan(cli, compilation, open_state(cli)).await?;
+async fn run_plan(
+    cli: &Cli,
+    compilation: &Compilation,
+    set: &SelectorSet,
+) -> Result<ExitCode, String> {
+    let (plan, writer) = build_plan(cli, compilation, set, open_state(cli)).await?;
     writer
         .write_project(compilation)
         .and_then(|_| writer.write_plan(&plan))
@@ -869,10 +1053,11 @@ async fn run_plan(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, Stri
 async fn run_apply(
     cli: &Cli,
     compilation: &Compilation,
+    set: &SelectorSet,
     convenience_run: bool,
 ) -> Result<ExitCode, String> {
     let state = open_state(cli);
-    let (plan, writer) = build_plan(cli, compilation, state.clone()).await?;
+    let (plan, writer) = build_plan(cli, compilation, set, state.clone()).await?;
     writer
         .write_project(compilation)
         .and_then(|_| writer.write_plan(&plan))
@@ -921,11 +1106,39 @@ async fn run_apply(
     })
 }
 
-async fn run_test(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, String> {
+async fn run_test(
+    cli: &Cli,
+    compilation: &Compilation,
+    set: &SelectorSet,
+) -> Result<ExitCode, String> {
     let adapter = build_adapter(cli)?;
+    // A test runs when every model it reads is selected; tests that only
+    // read sources are left to unrestricted runs.
+    let members: Option<std::collections::BTreeSet<String>> = if set.is_unrestricted() {
+        None
+    } else {
+        let selection = resolve(cli, compilation, set)?;
+        Some(
+            selection
+                .members
+                .iter()
+                .map(|member| member.id.clone())
+                .collect(),
+        )
+    };
     let mut results = Vec::new();
     let mut failed = false;
     for test in &compilation.tests {
+        if let Some(members) = &members {
+            let covered = !test.targets.is_empty()
+                && test
+                    .targets
+                    .iter()
+                    .all(|target| members.contains(target.logical_name().as_str()));
+            if !covered {
+                continue;
+            }
+        }
         let outcome = adapter.execute(&test.compiled_sql).await;
         let (status, row_count, error) = match outcome {
             Ok(query) if query.row_count == 0 => (ExecutionStatus::Passed, 0, None),
@@ -974,10 +1187,16 @@ fn run_lineage(
     cli: &Cli,
     compilation: &Compilation,
     target: Option<&str>,
+    set: &SelectorSet,
 ) -> Result<ExitCode, String> {
     let Some(target) = target else {
-        return run_graph_lineage(cli, compilation);
+        return run_graph_lineage(cli, compilation, set);
     };
+    // A target takes the whole report for one model; selectors only make
+    // sense for the graph listing.
+    if !set.include.is_empty() || !set.exclude.is_empty() || !set.filter.is_empty() {
+        return Err("pass either a lineage target or selector terms, not both".to_string());
+    }
 
     // A model target shows model lineage; otherwise the last segment is a
     // column and the prefix is the model.
@@ -1025,16 +1244,34 @@ fn run_lineage(
     }
 }
 
-/// `lineage` with no target: the whole model graph as a compact edge list.
-fn run_graph_lineage(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, String> {
-    let report = compilation.list_report();
+/// `lineage` with no target: the model graph as a compact edge list,
+/// optionally scoped to a selection. Edges are restricted to selected
+/// models — the listing answers "the selected subgraph", not "everything
+/// touching it" (`+` terms already add the neighbourhood when wanted).
+fn run_graph_lineage(
+    cli: &Cli,
+    compilation: &Compilation,
+    set: &SelectorSet,
+) -> Result<ExitCode, String> {
+    let mut report = compilation.list_report();
+    if !set.is_unrestricted() {
+        let selection = resolve(cli, compilation, set)?;
+        filter_list_report(compilation, &mut report, &selection);
+    }
     let mut downstream: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let names: std::collections::BTreeSet<&str> = report
+        .models
+        .iter()
+        .map(|model| model.name.as_str())
+        .collect();
     for model in &report.models {
         for dependency in &model.depends_on {
-            downstream
-                .entry(dependency.as_str())
-                .or_default()
-                .push(model.name.as_str());
+            if names.contains(dependency.as_str()) {
+                downstream
+                    .entry(dependency.as_str())
+                    .or_default()
+                    .push(model.name.as_str());
+            }
         }
     }
 
@@ -1043,9 +1280,14 @@ fn run_graph_lineage(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, S
             .models
             .iter()
             .map(|model| {
+                let upstream: Vec<&String> = model
+                    .depends_on
+                    .iter()
+                    .filter(|dependency| names.contains(dependency.as_str()))
+                    .collect();
                 serde_json::json!({
                     "name": model.name,
-                    "upstream": model.depends_on,
+                    "upstream": upstream,
                     "sources": model.sources,
                     "downstream": downstream.get(model.name.as_str()).cloned().unwrap_or_default(),
                 })
@@ -1063,9 +1305,21 @@ fn run_graph_lineage(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, S
         .max()
         .unwrap_or(0);
     for model in &report.models {
+        let upstream: Vec<&String> = model
+            .depends_on
+            .iter()
+            .filter(|dependency| names.contains(dependency.as_str()))
+            .collect();
         let mut edges = String::new();
-        if !model.depends_on.is_empty() {
-            edges.push_str(&format!(" <- {}", model.depends_on.join(", ")));
+        if !upstream.is_empty() {
+            edges.push_str(&format!(
+                " <- {}",
+                upstream
+                    .iter()
+                    .map(|dependency| dependency.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
         if let Some(dependents) = downstream.get(model.name.as_str()) {
             edges.push_str(&format!(" -> {}", dependents.join(", ")));
@@ -1078,29 +1332,76 @@ fn run_graph_lineage(cli: &Cli, compilation: &Compilation) -> Result<ExitCode, S
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_impact(cli: &Cli, compilation: &Compilation, column: &str) -> Result<ExitCode, String> {
+fn run_impact(
+    cli: &Cli,
+    compilation: &Compilation,
+    column: Option<&str>,
+    set: &SelectorSet,
+) -> Result<ExitCode, String> {
+    // `impact --select ...` with no positional argument: the blast radius
+    // of a selection — every downstream dependent outside the set, plus the
+    // tests covering it.
+    let Some(column) = column else {
+        if set.is_unrestricted() {
+            return Err(
+                "impact needs a column (`impact assay.results.titre`) or selector terms"
+                    .to_string(),
+            );
+        }
+        return run_selection_impact(cli, compilation, set);
+    };
+
+    // An active selection scopes the reported impact to selected models.
+    let members: Option<std::collections::BTreeSet<String>> = if set.is_unrestricted() {
+        None
+    } else {
+        let selection = resolve(cli, compilation, set)?;
+        Some(
+            selection
+                .members
+                .iter()
+                .map(|member| member.id.clone())
+                .collect(),
+        )
+    };
+    let in_scope = |name: &str| members.as_ref().map(|m| m.contains(name)).unwrap_or(true);
+    let member_tests = |model_name: &str| -> Vec<String> {
+        ModelId::parse(model_name)
+            .ok()
+            .map(|id| {
+                compilation
+                    .tests_for(&id)
+                    .iter()
+                    .map(|test| test.id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
     // A model-only argument reports downstream models/tests (works offline).
     if let Some(model) = compilation.model_by_name(column) {
         let lineage = compilation
             .model_lineage_report(&model.id)
             .expect("model exists");
+        let downstream: Vec<String> = lineage
+            .downstream
+            .iter()
+            .filter(|name| in_scope(name))
+            .cloned()
+            .collect();
         let mut tests: Vec<String> = Vec::new();
-        for dependent in &lineage.downstream {
-            if let Ok(id) = ModelId::parse(dependent) {
-                for test in compilation.tests_for(&id) {
-                    tests.push(test.id.to_string());
-                }
-            }
+        for dependent in &downstream {
+            tests.extend(member_tests(dependent));
         }
         if cli.json {
             print_json(&serde_json::json!({
                 "model": model.id.logical_name(),
-                "downstream_models": lineage.downstream,
+                "downstream_models": downstream,
                 "tests": tests,
             }))?;
         } else {
             println!("Model:             {}", model.id.logical_name());
-            println!("Downstream models: {}", join_or_none(&lineage.downstream));
+            println!("Downstream models: {}", join_or_none(&downstream));
             println!("Tests:             {}", join_or_none(&tests));
         }
         return Ok(ExitCode::SUCCESS);
@@ -1114,7 +1415,22 @@ fn run_impact(cli: &Cli, compilation: &Compilation, column: &str) -> Result<Exit
         return Err(format!("no such model: {}", id.logical_name()));
     }
     let target = phlo_transform_core::ColumnRef::model(id, name);
-    let report = compilation.impact_report(&target);
+    let mut report = compilation.impact_report(&target);
+    if let Some(members) = &members {
+        report
+            .downstream_models
+            .retain(|name| members.contains(name));
+        report.downstream_columns.retain(|name| {
+            name.rsplit_once('.')
+                .map(|(model, _)| members.contains(model))
+                .unwrap_or(false)
+        });
+        let member_test_ids: std::collections::BTreeSet<String> = members
+            .iter()
+            .flat_map(|model| member_tests(model))
+            .collect();
+        report.tests.retain(|test| member_test_ids.contains(test));
+    }
     if cli.json {
         print_json(&report)?;
     } else {
@@ -1131,6 +1447,48 @@ fn run_impact(cli: &Cli, compilation: &Compilation, column: &str) -> Result<Exit
         if !report.consumers.is_empty() {
             println!("Consumers:          {}", join_or_none(&report.consumers));
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `impact --select <terms>`: the selection's blast radius — dependents
+/// outside the selected set, and the tests covering them.
+fn run_selection_impact(
+    cli: &Cli,
+    compilation: &Compilation,
+    set: &SelectorSet,
+) -> Result<ExitCode, String> {
+    let selection = resolve(cli, compilation, set)?;
+    let members: std::collections::BTreeSet<ModelId> = selection.ids().into_iter().collect();
+    let mut impacted: std::collections::BTreeSet<ModelId> = std::collections::BTreeSet::new();
+    let mut frontier: Vec<ModelId> = members.iter().cloned().collect();
+    while let Some(id) = frontier.pop() {
+        for dependent in compilation.dependents(&id) {
+            if impacted.insert(dependent.clone()) {
+                frontier.push(dependent);
+            }
+        }
+    }
+    for member in &members {
+        impacted.remove(member);
+    }
+    let mut tests: Vec<String> = Vec::new();
+    for id in &impacted {
+        for test in compilation.tests_for(id) {
+            tests.push(test.id.to_string());
+        }
+    }
+    let impacted: Vec<String> = impacted.iter().map(|id| id.logical_name()).collect();
+    if cli.json {
+        print_json(&serde_json::json!({
+            "selected": selection,
+            "impacted_models": impacted,
+            "tests": tests,
+        }))?;
+    } else {
+        println!("Selected:          {}", join_or_none(&selection.terms));
+        println!("Impacted models:   {}", join_or_none(&impacted));
+        println!("Tests:             {}", join_or_none(&tests));
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1240,7 +1598,8 @@ fn state_path(cli: &Cli) -> PathBuf {
     cli.root.join(".phlo").join("transform").join("state.db")
 }
 
-/// Whether a command benefits from catalogue-enriched schemas.
+/// Whether a command benefits from catalogue-enriched schemas and observed
+/// source states.
 fn should_enrich(cli: &Cli) -> bool {
     cli.catalogue
         || matches!(
@@ -1249,9 +1608,10 @@ fn should_enrich(cli: &Cli) -> bool {
                 | Command::Lineage { .. }
                 | Command::Impact { .. }
                 | Command::Explain { .. }
-                | Command::Plan
-                | Command::Apply
-                | Command::Run
+                | Command::Plan { .. }
+                | Command::Apply { .. }
+                | Command::Run { .. }
+                | Command::Test { .. }
         )
 }
 
@@ -1459,6 +1819,22 @@ fn print_plan_human(plan: &Plan) {
     if let Some(environment) = &plan.environment {
         println!("Environment: {environment}");
     }
+    if !plan.selection.terms.is_empty() || !plan.selection.exclude.is_empty() {
+        let mut line = format!("Selection: {}", plan.selection.terms.join(", "));
+        if plan.selection.terms.is_empty() {
+            line = "Selection: (all)".to_string();
+        }
+        if !plan.selection.exclude.is_empty() {
+            line.push_str(&format!(
+                " — excluding {}",
+                plan.selection.exclude.join(", ")
+            ));
+        }
+        println!("{line}");
+    }
+    for warning in &plan.warnings {
+        println!("warning: {warning}");
+    }
     println!();
 
     if plan.blocked {
@@ -1503,7 +1879,7 @@ fn print_plan_human(plan: &Plan) {
             action, model.id, model.materialization, model.target
         );
         for reason in &model.reasons {
-            println!("           reason: {}", reason.label());
+            println!("           {}", reason.detail);
         }
         if let Some(incremental) = &model.incremental {
             println!("           strategy: {incremental}");
@@ -1524,6 +1900,9 @@ fn print_plan_human(plan: &Plan) {
                 PlanAction::Unknown => "UNKNOWN",
             };
             println!("  {:<6} {:<28} {}", action, seed.name, seed.target);
+            for reason in &seed.reasons {
+                println!("           {}", reason.detail);
+            }
         }
     }
 
@@ -1560,6 +1939,16 @@ fn print_run_human(result: &RunResult) {
             model.model,
             model.duration_ms
         );
+        // Skipped and blocked models keep their plan reasons visible —
+        // "unchanged" and "required by …" explain the outcome.
+        if matches!(
+            model.status,
+            ExecutionStatus::Skipped | ExecutionStatus::Blocked
+        ) {
+            for reason in &model.reasons {
+                println!("           {reason}");
+            }
+        }
         if let Some(error) = &model.error {
             println!("           {error}");
         }
@@ -2170,40 +2559,76 @@ fn run_manifest(cli: &Cli) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `explain <model>`: identity, dependencies, state and planned action.
+/// `explain <model>`: identity, state and the current plan decision.
+///
+/// The state comparison (which version inputs moved since the recorded
+/// materialisation) needs no adapter; when one is configured the planner
+/// also checks whether the target relation exists, so the decision is the
+/// same one `plan` would report.
 async fn run_explain(
     cli: &Cli,
     compilation: &Compilation,
     model: &str,
 ) -> Result<ExitCode, String> {
-    let id = ModelId::parse(model)
-        .map_err(|error| format!("invalid model reference `{model}`: {error}"))?;
+    let id = resolve_model(model, compilation)?;
     let Some(report) = compilation.inspect_report(&id) else {
         return Err(format!("no such model: {}", id.logical_name()));
     };
     let diagnostics = model_diagnostics(compilation, &report);
     let compiled = compilation.model(&id).expect("inspect report exists");
 
-    // Scope a plan to this model when an adapter is available.
-    let mut plan_model: Option<serde_json::Value> = None;
-    if build_adapter(cli).is_ok() {
-        let mut sel = selection(cli);
-        sel.select = vec![id.logical_name()];
-        let selected = select_models(compilation, &sel);
-        if let Ok(adapter) = build_adapter(cli) {
-            let planner = Planner::new(adapter, open_state(cli));
-            if let Ok(plan) = planner.plan(compilation, &selected, environment(cli)).await {
-                if let Some(entry) = plan
-                    .models
-                    .iter()
-                    .find(|entry| entry.id == id.to_string() || entry.id == id.logical_name())
-                {
-                    plan_model = Some(
-                        serde_json::to_value(entry)
-                            .map_err(|error| format!("could not serialise JSON: {error}"))?,
-                    );
-                }
-            }
+    let state = open_state(cli);
+    let env = environment(cli);
+    let current = state.as_ref().and_then(|state| {
+        state
+            .materialized_version(&id.logical_name(), env.as_deref())
+            .ok()
+            .flatten()
+    });
+
+    // Which version inputs moved since the recorded materialisation —
+    // the same reasons `plan` reports for a hash mismatch.
+    let state_reasons: Vec<PlanReason> = match &current {
+        Some(record) if record.version.hash == compiled.version.hash => vec![PlanReason {
+            kind: ReasonKind::Unchanged,
+            detail: "SQL, config, contract and inputs unchanged".to_string(),
+            subject: None,
+        }],
+        Some(record) => diff_reasons(compiled, record),
+        None => vec![PlanReason {
+            kind: if state.is_some() {
+                ReasonKind::UnknownState
+            } else {
+                ReasonKind::StateUnavailable
+            },
+            detail: if state.is_some() {
+                "no version recorded for this environment".to_string()
+            } else {
+                "no state store; cannot compare against a recorded version".to_string()
+            },
+            subject: None,
+        }],
+    };
+
+    // The full decision needs relation existence, which needs an adapter.
+    let mut plan_model: Option<phlo_transform_engine::PlannedModel> = None;
+    if let Ok(adapter) = build_adapter(cli) {
+        let planner = Planner::new(adapter, state.clone());
+        let scoped = Selection::of(compilation, std::slice::from_ref(&id));
+        if let Ok(plan) = planner
+            .plan(
+                compilation,
+                &scoped,
+                env.clone(),
+                &PlanOptions { force: cli.force },
+            )
+            .await
+        {
+            plan_model = plan
+                .models
+                .iter()
+                .find(|entry| entry.id == id.logical_name())
+                .cloned();
         }
     }
 
@@ -2211,26 +2636,68 @@ async fn run_explain(
         print_json(&serde_json::json!({
             "model": report,
             "version": compiled.version.hash,
+            "state": {
+                "environment": env,
+                "recorded_version": current.as_ref().map(|record| record.version.hash.clone()),
+                "materialized_at": current.as_ref().map(|record| record.materialized_at.clone()),
+                "target": current.as_ref().map(|record| record.target.clone()),
+                "reasons": state_reasons,
+            },
             "plan": plan_model,
             "diagnostics": diagnostics,
         }))?;
     } else {
         print_inspect_human(&report);
         println!("Version:       {}", compiled.version.short());
-        if let Some(plan) = &plan_model {
-            println!(
-                "Action:        {}",
-                plan.get("action").and_then(|v| v.as_str()).unwrap_or("?")
-            );
-            if let Some(reasons) = plan.get("reasons").and_then(|v| v.as_array()) {
-                for reason in reasons {
-                    if let Some(label) = reason.as_str() {
-                        println!("  reason: {label}");
+        println!(
+            "Recorded:      {}",
+            current
+                .as_ref()
+                .map(|record| format!(
+                    "{} in {} (materialised {})",
+                    record.version.short(),
+                    record.environment.as_deref().unwrap_or("default"),
+                    record.materialized_at
+                ))
+                .unwrap_or_else(|| "(none)".to_string())
+        );
+        match &plan_model {
+            Some(entry) => {
+                println!(
+                    "Decision:      {}",
+                    match entry.action {
+                        PlanAction::Build => "build",
+                        PlanAction::Skip => "skip",
+                        PlanAction::Cached => "cached",
+                        PlanAction::Unknown => "unknown",
+                    }
+                );
+                if entry.membership != Membership::Selected {
+                    println!(
+                        "Selection:     {}",
+                        match entry.membership {
+                            Membership::Expanded => "via `+` expansion",
+                            Membership::Dependency => "dependency of the selection",
+                            Membership::Selected => unreachable!(),
+                        }
+                    );
+                }
+                if !entry.reasons.is_empty() {
+                    println!("Reasons:");
+                    for reason in &entry.reasons {
+                        println!("  {}", reason.detail);
                     }
                 }
             }
-        } else {
-            println!("Action:        (unknown — no adapter configured)");
+            None => {
+                println!("Decision:      (needs an adapter to check the target relation)");
+                if !state_reasons.is_empty() {
+                    println!("Versus recorded:");
+                    for reason in &state_reasons {
+                        println!("  {}", reason.detail);
+                    }
+                }
+            }
         }
         if !diagnostics.is_empty() {
             println!();

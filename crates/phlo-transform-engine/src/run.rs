@@ -743,6 +743,7 @@ impl Runner {
                                 model_id: result.model.clone(),
                                 environment: options.environment.clone(),
                                 version: model.version.clone(),
+                                detail: Some(model.version_detail.clone()),
                                 target: result.target.clone(),
                                 incremental_strategy: model
                                     .config
@@ -919,7 +920,7 @@ fn plan_result_fields(info: Option<&PlannedModel>) -> (String, Option<String>, V
             model
                 .reasons
                 .iter()
-                .map(|reason| reason.label().to_string())
+                .map(|reason| reason.detail.clone())
                 .collect(),
         ),
         None => (String::new(), None, Vec::new()),

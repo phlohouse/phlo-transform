@@ -13,12 +13,13 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 use phlo_transform_core::{
-    compile, select_models, Compilation, Materialization, ModelId, ModelOrigin, Relation,
+    compile, Compilation, Materialization, ModelId, ModelOrigin, Relation, Selection,
     SemanticModel, SemanticProject, SemanticTest, TestId, WorkspaceDefaults,
 };
 use phlo_transform_engine::{
     diff, ensure_environment, promote, Adapter, CatalogRequest, DiffPolicy, DiffRequest,
-    DiffStrategy, EnvironmentSpec, ExecutionStatus, Planner, PromotionRequest, RunOptions, Runner,
+    DiffStrategy, EnvironmentSpec, ExecutionStatus, PlanOptions, Planner, PromotionRequest,
+    RunOptions, Runner,
 };
 use phlo_transform_nessie::{NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -74,9 +75,14 @@ async fn apply(
     compilation: &Compilation,
     environment: &str,
 ) -> phlo_transform_engine::RunResult {
-    let selected = select_models(compilation, &Default::default());
+    let selected = Selection::all(compilation);
     let plan = Planner::new(adapter.clone(), None)
-        .plan(compilation, &selected, Some(environment.to_string()))
+        .plan(
+            compilation,
+            &selected,
+            Some(environment.to_string()),
+            &PlanOptions::default(),
+        )
         .await
         .expect("plan");
     Runner::new(adapter, None)

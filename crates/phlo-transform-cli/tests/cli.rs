@@ -550,3 +550,228 @@ fn unqualified_source_appends_trigger_rebuilds_on_duckdb() {
         "expected a rebuild after source append: {body}"
     );
 }
+
+/// Positional selectors scope the plan; dependency closure pulls in what
+/// the selection needs and says so.
+#[test]
+fn plan_positional_selector_scopes_the_plan() {
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "--adapter",
+        "duckdb",
+        "--duckdb-path",
+        ":memory:",
+        "plan",
+        "assay.results",
+    ]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("assay.results"), "{body}");
+    // Dependency closure pulls assay.raw into the plan.
+    assert!(body.contains("assay.raw"), "{body}");
+    assert!(body.contains("required by selected model"), "{body}");
+    // reporting.monthly is downstream — not part of this plan.
+    assert!(!body.contains("reporting.monthly"), "{body}");
+    // Every decided model carries a human-readable reason.
+    assert!(body.contains("does not exist"), "{body}");
+}
+
+/// `--exclude` subtracts even from dependency closure and warns about it —
+/// when the excluded relation exists to be read.
+#[test]
+fn plan_exclude_beats_dependency_closure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let duckdb_path = dir.path().join("local.duckdb");
+    {
+        let connection = duckdb::Connection::open(&duckdb_path).expect("open duckdb");
+        connection
+            .execute_batch(
+                "create schema assay;
+                 create table assay.raw as select 1 as id;",
+            )
+            .expect("materialise the excluded model");
+    }
+    let duckdb_arg = duckdb_path.to_str().expect("utf-8").to_string();
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "--adapter",
+        "duckdb",
+        "--duckdb-path",
+        duckdb_arg.as_str(),
+        "plan",
+        "assay.results",
+        "--exclude",
+        "assay.raw",
+    ]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("excluding assay.raw"), "{body}");
+    assert!(body.contains("warning:"), "{body}");
+    assert!(body.contains("assay.results"), "{body}");
+    assert!(!body.contains("BUILD  assay.raw"), "{body}");
+}
+
+/// Excluding a required dependency that was never materialised must fail —
+/// the plan would otherwise schedule a read from a relation that does not
+/// exist.
+#[test]
+fn plan_exclude_missing_dependency_fails() {
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "--adapter",
+        "duckdb",
+        "--duckdb-path",
+        ":memory:",
+        "plan",
+        "assay.results",
+        "--exclude",
+        "assay.raw",
+    ]);
+    assert!(!output.status.success());
+    let body = stdout(&output);
+    let stderr = String::from_utf8(output.stderr.clone()).expect("utf-8 stderr");
+    assert!(
+        body.contains("never been materialised") || stderr.contains("never been materialised"),
+        "stdout: {body}\nstderr: {stderr}"
+    );
+}
+
+/// The JSON plan exposes the resolved selection and structured reasons.
+#[test]
+fn plan_json_exposes_selection_and_reasons() {
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "--adapter",
+        "duckdb",
+        "--duckdb-path",
+        ":memory:",
+        "--json",
+        "plan",
+        "assay.results+",
+    ]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let plan: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("plan JSON");
+    assert_eq!(plan["selection"]["matched"][0], "assay.results");
+    assert_eq!(plan["selection"]["expanded"][0], "reporting.monthly");
+    let models = plan["models"].as_array().expect("models");
+    let monthly = models
+        .iter()
+        .find(|model| model["id"] == "reporting.monthly")
+        .expect("monthly planned");
+    assert_eq!(monthly["membership"], "expanded");
+    assert!(
+        monthly["reasons"]
+            .as_array()
+            .expect("reasons")
+            .iter()
+            .any(|reason| reason["kind"] == "selection_expansion"),
+        "{monthly}"
+    );
+    let raw = models
+        .iter()
+        .find(|model| model["id"] == "assay.raw")
+        .expect("raw planned by closure");
+    assert_eq!(raw["membership"], "dependency");
+}
+
+/// `--changed` works with no recorded state: nothing can be proven
+/// unchanged, so everything builds.
+#[test]
+fn plan_changed_selector_without_state_builds_all() {
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "--adapter",
+        "duckdb",
+        "--duckdb-path",
+        ":memory:",
+        "plan",
+        "--changed",
+    ]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    for model in ["assay.raw", "assay.results", "reporting.monthly"] {
+        assert!(body.contains(&format!("BUILD  {model}")), "{body}");
+    }
+}
+
+/// Positional globs work on `list` too — one engine everywhere.
+#[test]
+fn list_positional_glob_filters_models() {
+    let output = run(&["--root", "fixtures/basic-multi-root", "list", "assay.*"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("assay.raw"), "{body}");
+    assert!(body.contains("assay.results"), "{body}");
+    assert!(!body.contains("reporting.monthly"), "{body}");
+}
+
+/// `lineage --select` prints the selected subgraph.
+#[test]
+fn lineage_select_scopes_the_graph() {
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "lineage",
+        "--select",
+        "assay.results+",
+    ]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("assay.results"), "{body}");
+    assert!(body.contains("reporting.monthly"), "{body}");
+    assert!(!body.contains("assay.raw"), "{body}");
+}
+
+/// `impact --select` reports the blast radius of a selection.
+#[test]
+fn impact_select_reports_blast_radius() {
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "impact",
+        "--select",
+        "assay.raw",
+    ]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("assay.results"), "{body}");
+    assert!(body.contains("reporting.monthly"), "{body}");
+}
+
+/// `explain` resolves a unique suffix and reports the state comparison even
+/// without a configured adapter.
+#[test]
+fn explain_resolves_suffix_and_reports_state() {
+    let output = run(&["--root", "fixtures/basic-multi-root", "explain", "results"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("assay.results"), "{body}");
+    assert!(body.contains("Versus recorded:"), "{body}");
+}
+
+/// Unknown `kind:` terms and unmatched names are errors, not silent
+/// selection of everything.
+#[test]
+fn invalid_and_unmatched_selectors_fail() {
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "plan",
+        "--select",
+        "bogus:xyz",
+    ]);
+    assert!(!output.status.success());
+
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "plan",
+        "assay.reslts",
+    ]);
+    assert!(!output.status.success());
+}

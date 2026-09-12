@@ -24,7 +24,8 @@ use crate::rewrite::rewrite_statements;
 use crate::schema::{EmptySchemaProvider, SchemaProvider};
 use crate::semantic::{Assertion, ModelContract, ModelSchema, Nullability};
 use crate::version::{
-    model_version, EmptySourceStateProvider, ModelVersions, SourceStateProvider, VersionInputs,
+    model_version, EmptySourceStateProvider, ModelVersions, SourceStateProvider, VersionDetail,
+    VersionInputs,
 };
 
 /// Compile a semantic project into models and a dependency graph.
@@ -247,6 +248,7 @@ pub fn compile_with_options(
             assertions: Vec::new(),
             contract: entry.model.contract.clone(),
             version: Default::default(),
+            version_detail: Default::default(),
             pinned_id: entry.pinned_id.clone(),
             dependencies,
         });
@@ -345,15 +347,15 @@ pub fn compile_with_options(
             }
 
             // Compute the content-addressed version from upstream versions.
-            let version = match compilation.model(&id) {
-                Some(model) => model_version(&version_inputs(
-                    lowered,
-                    model,
-                    source_states,
-                    &model_versions,
-                )),
-                None => Default::default(),
+            let inputs = match compilation.model(&id) {
+                Some(model) => version_inputs(lowered, model, source_states, &model_versions),
+                None => VersionInputs::default(),
             };
+            let detail = VersionDetail {
+                dependencies: inputs.dependencies.iter().cloned().collect(),
+                sources: inputs.sources.iter().cloned().collect(),
+            };
+            let version = model_version(&inputs);
             model_versions.insert(id.clone(), version.clone());
 
             if let Some(position) = compilation.model_position(&id) {
@@ -361,6 +363,7 @@ pub fn compile_with_options(
                 compilation.models[position].limitations = analysis.limitations;
                 compilation.models[position].assertions = assertions;
                 compilation.models[position].version = version;
+                compilation.models[position].version_detail = detail;
             }
             compilation.diagnostics.extend(analysis.diagnostics);
             model_schemas.insert(id, analysis.schema);

@@ -1,11 +1,20 @@
 //! Planning: turn a compilation and selection into inspectable work.
 //!
-//! Phase 3 makes planning state-aware: each model's desired content-addressed
-//! version is compared against the version recorded for the target
-//! environment, and the plan explains why a model will be built, skipped or
-//! reused from cache.
+//! Planning is state-aware: each model's desired content-addressed version
+//! is compared against the version recorded for the target environment, and
+//! every build, skip and reuse decision carries structured [`PlanReason`]s
+//! explaining *why* — including which dependency version or source state
+//! changed when the recorded detail is available.
+//!
+//! The plan is always dependency-closed: every model the selection needs is
+//! planned even when it was not matched directly. Models pulled in by
+//! closure carry `membership: "dependency"`; models matched by a term carry
+//! `"selected"`, and `+`-expanded matches carry `"expanded"`. Excluded
+//! models are never pulled back in by closure — a model whose dependency is
+//! excluded plans against the existing materialisation and the plan records
+//! a warning.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -13,9 +22,8 @@ use serde::Serialize;
 
 use phlo_transform_core::graph::Dependency;
 use phlo_transform_core::{
-    classify_schema_change, Compilation, DataType, Diagnostic, IncrementalStrategy,
-    Materialization, ModelId, ModelVersion, Nullability, SchemaChangeSafety, SchemaColumn,
-    SourceId,
+    classify_schema_change, Compilation, CompiledModel, DataType, Diagnostic, IncrementalStrategy,
+    Materialization, ModelId, Nullability, SchemaChangeSafety, SchemaColumn, Selection, SourceId,
 };
 
 use crate::adapter::Adapter;
@@ -23,7 +31,7 @@ use crate::error::EngineError;
 use crate::source_state::{
     adapter_default_schema, relation_for_source, seed_for_relation, seed_relation,
 };
-use crate::state::StateStore;
+use crate::state::{MaterializedRecord, StateStore};
 use crate::util::{now_rfc3339, sha256_hex};
 
 /// What the planner intends to do to a model's physical relation.
@@ -40,39 +48,123 @@ pub enum PlanAction {
     Unknown,
 }
 
-/// Why a model needs work.
+/// The kind of a [`PlanReason`] — stable for programmatic consumers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ChangeReason {
+pub enum ReasonKind {
+    /// The canonical SQL changed.
     SqlSemanticChange,
+    /// Semantics-affecting configuration changed.
     ConfigChange,
+    /// Contract or assertions changed.
     ContractChange,
+    /// A dependency's recorded version input changed.
     DependencyChange,
+    /// An upstream model in this plan will also build.
+    UpstreamRebuild,
+    /// An observed source state changed.
     SourceChange,
+    /// The physical target relation changed.
     TargetChange,
+    /// The compiler semantics version changed.
     CompilerSemanticsChange,
+    /// Incremental strategy or key changed; forces a full rebuild.
     IncrementalChange,
+    /// The output schema changes incompatibly.
     SchemaChange,
+    /// The target relation does not exist.
     MissingRelation,
+    /// Nothing is recorded for this environment.
     UnknownState,
+    /// The identical version is materialised in another environment.
+    CacheReuse,
+    /// `--force` was requested.
+    Forced,
+    /// The recorded version matches the desired version.
+    Unchanged,
+    /// Included because a selected model depends on it.
+    SelectedDependency,
+    /// Included because a `+` expansion term or `--upstream`/`--downstream`
+    /// matched it.
+    SelectionExpansion,
+    /// No state store was available to compare against.
+    StateUnavailable,
 }
 
-impl ChangeReason {
-    pub fn label(self) -> &'static str {
+impl ReasonKind {
+    /// Stable machine-readable code.
+    pub fn code(self) -> &'static str {
         match self {
-            ChangeReason::SqlSemanticChange => "SQL semantics changed",
-            ChangeReason::ConfigChange => "configuration changed",
-            ChangeReason::ContractChange => "contract or assertions changed",
-            ChangeReason::DependencyChange => "an upstream model version changed",
-            ChangeReason::SourceChange => "a source state changed",
-            ChangeReason::TargetChange => "physical target changed",
-            ChangeReason::CompilerSemanticsChange => "compiler semantics changed",
-            ChangeReason::IncrementalChange => "incremental strategy or key changed",
-            ChangeReason::SchemaChange => "output schema changed incompatibly",
-            ChangeReason::MissingRelation => "target relation does not exist",
-            ChangeReason::UnknownState => "no recorded materialised version",
+            ReasonKind::SqlSemanticChange => "sql_semantic_change",
+            ReasonKind::ConfigChange => "config_change",
+            ReasonKind::ContractChange => "contract_change",
+            ReasonKind::DependencyChange => "dependency_change",
+            ReasonKind::UpstreamRebuild => "upstream_rebuild",
+            ReasonKind::SourceChange => "source_change",
+            ReasonKind::TargetChange => "target_change",
+            ReasonKind::CompilerSemanticsChange => "compiler_semantics_change",
+            ReasonKind::IncrementalChange => "incremental_change",
+            ReasonKind::SchemaChange => "schema_change",
+            ReasonKind::MissingRelation => "missing_relation",
+            ReasonKind::UnknownState => "unknown_state",
+            ReasonKind::CacheReuse => "cache_reuse",
+            ReasonKind::Forced => "forced",
+            ReasonKind::Unchanged => "unchanged",
+            ReasonKind::SelectedDependency => "selected_dependency",
+            ReasonKind::SelectionExpansion => "selection_expansion",
+            ReasonKind::StateUnavailable => "state_unavailable",
         }
     }
+}
+
+/// One structured reason attached to a planned model or seed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PlanReason {
+    /// Stable reason kind.
+    pub kind: ReasonKind,
+    /// Human-readable explanation, e.g. `source raw.lims changed
+    /// (csv:aaa… → csv:bbb…)`.
+    pub detail: String,
+    /// The model or source this reason is about, when relevant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+impl PlanReason {
+    fn simple(kind: ReasonKind, detail: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+            subject: None,
+        }
+    }
+
+    fn about(kind: ReasonKind, detail: impl Into<String>, subject: impl Into<String>) -> Self {
+        Self {
+            kind,
+            detail: detail.into(),
+            subject: Some(subject.into()),
+        }
+    }
+}
+
+/// How a model entered the plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Membership {
+    /// Matched a selector term directly (or the default all-selection).
+    Selected,
+    /// Pulled in by a `+` expansion term or `--upstream`/`--downstream`.
+    Expanded,
+    /// Not selected — included because a planned model depends on it.
+    Dependency,
+}
+
+/// Options that shape a plan beyond the selection itself.
+#[derive(Clone, Debug, Default)]
+pub struct PlanOptions {
+    /// Rebuild every planned model regardless of recorded state.
+    pub force: bool,
 }
 
 /// A model in a plan.
@@ -82,7 +174,10 @@ pub struct PlannedModel {
     pub target: String,
     pub materialization: String,
     pub action: PlanAction,
-    pub reasons: Vec<ChangeReason>,
+    /// Why this action was chosen — never empty for decided models.
+    pub reasons: Vec<PlanReason>,
+    /// How the model entered the plan.
+    pub membership: Membership,
     pub exists: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incremental: Option<String>,
@@ -109,6 +204,8 @@ pub struct PlannedSeed {
     pub action: PlanAction,
     /// The CSV's content hash — the seed's version.
     pub desired_version: String,
+    /// Why the seed will (re)load.
+    pub reasons: Vec<PlanReason>,
 }
 
 /// A test in a plan.
@@ -121,6 +218,24 @@ pub struct PlannedTest {
     pub sources: Vec<String>,
 }
 
+/// How the resolved selection shaped this plan.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PlanSelection {
+    /// The include terms as written.
+    pub terms: Vec<String>,
+    /// The exclude terms as written.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+    /// Models matched by a term directly.
+    pub matched: Vec<String>,
+    /// Models pulled in by `+` expansion.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub expanded: Vec<String>,
+    /// Models pulled in by dependency closure.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub required: Vec<String>,
+}
+
 /// An inspectable, state-aware plan.
 #[derive(Clone, Debug, Serialize)]
 pub struct Plan {
@@ -131,6 +246,12 @@ pub struct Plan {
     pub compiler_semantics_version: String,
     /// True when compilation errors block execution.
     pub blocked: bool,
+    /// The selection that produced this plan.
+    pub selection: PlanSelection,
+    /// Non-fatal conditions worth surfacing, e.g. planning against a
+    /// materialisation whose model was excluded.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// Seeds the planned models read through `source(...)`, in load order.
     pub seeds: Vec<PlannedSeed>,
     pub models: Vec<PlannedModel>,
@@ -185,18 +306,24 @@ impl Planner {
         Self { adapter, state }
     }
 
-    /// Build a plan for the selected models.
+    /// Build a plan for a resolved selection.
     ///
-    /// The selection is expanded to include every transitive workspace
-    /// dependency so that execution is always dependency-closed.
+    /// The plan is dependency-closed: every transitive workspace dependency
+    /// of a selected model is planned too, except models removed by
+    /// `--exclude` — those stay excluded and the plan records a warning.
+    /// Ephemeral models are inlined into dependents at compile time and are
+    /// never planned.
     pub async fn plan(
         &self,
         compilation: &Compilation,
-        selected: &[ModelId],
+        selection: &Selection,
         environment: Option<String>,
+        options: &PlanOptions,
     ) -> Result<Plan, EngineError> {
         let blocked = !compilation.is_ok();
-        let planned_ids = dependency_closure(compilation, selected);
+        let excluded = selection.excluded_ids();
+        let member_ids: BTreeSet<ModelId> = selection.ids().into_iter().collect();
+        let planned_ids = dependency_closure_excluding(compilation, &member_ids, &excluded);
 
         // Ephemeral models are inlined into their dependents at compile time
         // and never produce a relation, so they are not planned or executed.
@@ -212,6 +339,43 @@ impl Planner {
                     .unwrap_or(false)
             })
             .collect();
+
+        // A model whose dependency was excluded builds against whatever is
+        // already materialised. That is only valid when a materialisation
+        // actually exists — otherwise the plan would schedule a model that
+        // reads a relation that does not exist.
+        let mut warnings = Vec::new();
+        for id in &planned_ids {
+            let Some(model) = compilation.model(id) else {
+                continue;
+            };
+            for dependency in model.model_dependencies() {
+                if !excluded.contains(dependency) {
+                    continue;
+                }
+                let Some(excluded_model) = compilation.model(dependency) else {
+                    continue;
+                };
+                // Ephemeral dependencies are inlined into the dependent's
+                // SQL, so excluding one needs no materialisation at all.
+                if excluded_model.config.materialization == Materialization::Ephemeral {
+                    continue;
+                }
+                if !blocked && !self.adapter.relation_exists(&excluded_model.target).await? {
+                    return Err(EngineError::InvalidPlan(format!(
+                        "{} depends on excluded model {}, and {} has never been materialised",
+                        id.logical_name(),
+                        dependency.logical_name(),
+                        excluded_model.target.display()
+                    )));
+                }
+                warnings.push(format!(
+                    "{} depends on excluded model {}; it will read the existing materialisation",
+                    id.logical_name(),
+                    dependency.logical_name()
+                ));
+            }
+        }
 
         // Seeds are planned for the source relations the selected models
         // read — including ephemeral models: they are filtered out of `order`
@@ -259,25 +423,15 @@ impl Planner {
         for seed in needed_seeds.into_values() {
             let relation =
                 seed_relation(seed, default_catalog, default_schema, self.adapter.name());
-            let action = if blocked {
-                PlanAction::Unknown
+            let (action, reasons) = if blocked {
+                (PlanAction::Unknown, Vec::new())
             } else {
                 let exists = self.adapter.relation_exists(&relation).await?;
                 let current = match &self.state {
                     Some(state) => state.seed_state(&seed.name, environment.as_deref())?,
                     None => None,
                 };
-                let current_ok = current
-                    .map(|record| {
-                        record.content_hash == seed.content_hash
-                            && record.target == relation.display()
-                    })
-                    .unwrap_or(false);
-                if exists && current_ok {
-                    PlanAction::Skip
-                } else {
-                    PlanAction::Build
-                }
+                self.decide_seed(seed, &relation.display(), exists, current.as_ref(), options)
             };
             seeds.push(PlannedSeed {
                 name: seed.name.clone(),
@@ -285,17 +439,59 @@ impl Planner {
                 path: seed.path.clone(),
                 action,
                 desired_version: seed.content_hash.clone(),
+                reasons,
             });
         }
 
         let mut models = Vec::with_capacity(order.len());
+        let mut will_build: BTreeSet<ModelId> = BTreeSet::new();
         for id in &order {
             let Some(model) = compilation.model(id) else {
                 continue;
             };
             let desired = model.version.clone();
 
-            let (action, mut reasons, current_record, exists) = if blocked {
+            // How the model entered the plan — the answer to "why is this
+            // here" — comes before the change reasons.
+            let membership = match selection.get(id) {
+                Some(member) if member.is_direct() => Membership::Selected,
+                Some(_) => Membership::Expanded,
+                None => Membership::Dependency,
+            };
+            let mut reasons: Vec<PlanReason> = match membership {
+                Membership::Selected => Vec::new(),
+                Membership::Expanded => selection
+                    .get(id)
+                    .map(|member| {
+                        member
+                            .expanded
+                            .iter()
+                            .map(|term| {
+                                PlanReason::about(
+                                    ReasonKind::SelectionExpansion,
+                                    format!("selected by `{term}`"),
+                                    term.clone(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                Membership::Dependency => {
+                    vec![match requiring_model(compilation, id, &member_ids) {
+                        Some(required_by) => PlanReason::about(
+                            ReasonKind::SelectedDependency,
+                            format!("required by selected model {required_by}"),
+                            required_by,
+                        ),
+                        None => PlanReason::simple(
+                            ReasonKind::SelectedDependency,
+                            "required by the selection",
+                        ),
+                    }]
+                }
+            };
+
+            let (action, mut change_reasons, current_record, exists) = if blocked {
                 (PlanAction::Unknown, Vec::new(), None, false)
             } else {
                 let exists = self.adapter.relation_exists(&model.target).await?;
@@ -305,10 +501,37 @@ impl Planner {
                     }
                     None => None,
                 };
-                let (action, reasons) =
-                    self.decide(&desired, current.as_ref(), exists, environment.as_deref())?;
+                let (action, reasons) = self.decide(
+                    model,
+                    current.as_ref(),
+                    exists,
+                    environment.as_deref(),
+                    options,
+                )?;
                 (action, reasons, current, exists)
             };
+            reasons.append(&mut change_reasons);
+
+            if action == PlanAction::Build {
+                will_build.insert(id.clone());
+            }
+
+            // Name the upstreams that will rebuild in this same plan so the
+            // propagation is legible without cross-referencing rows.
+            if action == PlanAction::Build {
+                for dependency in model.model_dependencies() {
+                    if will_build.contains(dependency) {
+                        reasons.push(PlanReason::about(
+                            ReasonKind::UpstreamRebuild,
+                            format!(
+                                "upstream {} will rebuild in this plan",
+                                dependency.logical_name()
+                            ),
+                            dependency.logical_name(),
+                        ));
+                    }
+                }
+            }
 
             // A changed incremental strategy or key needs a full rebuild.
             let mut full_rebuild = false;
@@ -332,9 +555,15 @@ impl Planner {
                             || record.incremental_key != desired_key
                         {
                             full_rebuild = true;
-                            if !reasons.contains(&ChangeReason::IncrementalChange) {
-                                reasons.push(ChangeReason::IncrementalChange);
-                            }
+                            let detail = match (&record.incremental_strategy, &desired_strategy) {
+                                (Some(was), Some(now)) if was != now => format!(
+                                    "incremental strategy changed ({was} → {now}); full rebuild"
+                                ),
+                                _ => {
+                                    "incremental strategy or key changed; full rebuild".to_string()
+                                }
+                            };
+                            reasons.push(PlanReason::simple(ReasonKind::IncrementalChange, detail));
                         }
                     }
                     None => full_rebuild = true,
@@ -364,9 +593,10 @@ impl Planner {
                         .collect();
                     let safety = classify_schema_change(&desired_schema, &current_schema);
                     if safety != SchemaChangeSafety::Safe {
-                        if !reasons.contains(&ChangeReason::SchemaChange) {
-                            reasons.push(ChangeReason::SchemaChange);
-                        }
+                        reasons.push(PlanReason::simple(
+                            ReasonKind::SchemaChange,
+                            schema_change_detail(&desired_schema, &current_schema, safety),
+                        ));
                         if matches!(
                             safety,
                             SchemaChangeSafety::FullRebuildRequired | SchemaChangeSafety::Error
@@ -395,6 +625,7 @@ impl Planner {
                 materialization: model.config.materialization.to_string(),
                 action,
                 reasons,
+                membership,
                 exists,
                 incremental: model
                     .config
@@ -442,6 +673,36 @@ impl Planner {
             })
             .collect();
 
+        let plan_selection = PlanSelection {
+            terms: selection.terms.clone(),
+            exclude: selection.exclude_terms.clone(),
+            matched: order
+                .iter()
+                .filter(|id| {
+                    selection
+                        .get(id)
+                        .map(|member| member.is_direct())
+                        .unwrap_or(false)
+                })
+                .map(|id| id.logical_name())
+                .collect(),
+            expanded: order
+                .iter()
+                .filter(|id| {
+                    selection
+                        .get(id)
+                        .map(|member| !member.is_direct())
+                        .unwrap_or(false)
+                })
+                .map(|id| id.logical_name())
+                .collect(),
+            required: order
+                .iter()
+                .filter(|id| !member_ids.contains(id))
+                .map(|id| id.logical_name())
+                .collect(),
+        };
+
         Ok(Plan {
             id: uuid::Uuid::new_v4().to_string(),
             created_at: now_rfc3339(),
@@ -449,6 +710,8 @@ impl Planner {
             adapter: self.adapter.name().to_string(),
             compiler_semantics_version: phlo_transform_core::COMPILER_SEMANTICS_VERSION.to_string(),
             blocked,
+            selection: plan_selection,
+            warnings,
             seeds,
             models,
             tests,
@@ -456,75 +719,361 @@ impl Planner {
         })
     }
 
+    /// The seed analogue of [`Planner::decide`]: content hash + target are
+    /// the seed's version.
+    fn decide_seed(
+        &self,
+        seed: &phlo_transform_core::CompiledSeed,
+        target: &str,
+        exists: bool,
+        current: Option<&crate::state::SeedRecord>,
+        options: &PlanOptions,
+    ) -> (PlanAction, Vec<PlanReason>) {
+        if options.force {
+            return (
+                PlanAction::Build,
+                vec![PlanReason::simple(
+                    ReasonKind::Forced,
+                    "reload forced by --force",
+                )],
+            );
+        }
+        if !exists {
+            return (
+                PlanAction::Build,
+                vec![PlanReason::simple(
+                    ReasonKind::MissingRelation,
+                    format!("seed relation {target} does not exist"),
+                )],
+            );
+        }
+        match current {
+            Some(record) if record.content_hash == seed.content_hash && record.target == target => {
+                (
+                    PlanAction::Skip,
+                    vec![PlanReason::simple(
+                        ReasonKind::Unchanged,
+                        "seed content unchanged",
+                    )],
+                )
+            }
+            Some(_) => (
+                PlanAction::Build,
+                vec![PlanReason::simple(
+                    ReasonKind::SourceChange,
+                    format!("seed {} content changed", seed.name),
+                )],
+            ),
+            None => (
+                PlanAction::Build,
+                vec![PlanReason::simple(
+                    ReasonKind::UnknownState,
+                    if self.state.is_some() {
+                        "no seed load recorded for this environment".to_string()
+                    } else {
+                        "no state store; cannot compare against a recorded load".to_string()
+                    },
+                )],
+            ),
+        }
+    }
+
     fn decide(
         &self,
-        desired: &ModelVersion,
-        current: Option<&crate::state::MaterializedRecord>,
+        model: &CompiledModel,
+        current: Option<&MaterializedRecord>,
         exists: bool,
         environment: Option<&str>,
-    ) -> Result<(PlanAction, Vec<ChangeReason>), EngineError> {
+        options: &PlanOptions,
+    ) -> Result<(PlanAction, Vec<PlanReason>), EngineError> {
+        let desired = &model.version;
+        if options.force {
+            return Ok((
+                PlanAction::Build,
+                vec![PlanReason::simple(
+                    ReasonKind::Forced,
+                    "rebuild forced by --force",
+                )],
+            ));
+        }
         if !exists {
-            return Ok((PlanAction::Build, vec![ChangeReason::MissingRelation]));
+            return Ok((
+                PlanAction::Build,
+                vec![PlanReason::simple(
+                    ReasonKind::MissingRelation,
+                    format!("target relation {} does not exist", model.target.display()),
+                )],
+            ));
         }
         let Some(current) = current else {
             // Not materialised in this environment; if the exact version
             // exists elsewhere it is a cache candidate.
             if let Some(state) = &self.state {
                 let elsewhere = state.materialized_by_hash(&desired.hash)?;
-                if elsewhere
+                if let Some(hit) = elsewhere
                     .iter()
-                    .any(|record| record.environment.as_deref() != environment)
+                    .find(|record| record.environment.as_deref() != environment)
                 {
-                    return Ok((PlanAction::Cached, Vec::new()));
+                    let source_env = hit
+                        .environment
+                        .as_deref()
+                        .unwrap_or("the default environment");
+                    return Ok((
+                        PlanAction::Cached,
+                        vec![PlanReason::about(
+                            ReasonKind::CacheReuse,
+                            format!(
+                                "identical version materialised in {source_env} (run {})",
+                                short(&hit.run_id, 12)
+                            ),
+                            source_env.to_string(),
+                        )],
+                    ));
                 }
             }
-            return Ok((PlanAction::Build, vec![ChangeReason::UnknownState]));
+            return Ok((
+                PlanAction::Build,
+                vec![PlanReason::simple(
+                    if self.state.is_some() {
+                        ReasonKind::UnknownState
+                    } else {
+                        ReasonKind::StateUnavailable
+                    },
+                    if self.state.is_some() {
+                        "no version recorded for this environment".to_string()
+                    } else {
+                        "no state store; cannot compare against a recorded version".to_string()
+                    },
+                )],
+            ));
         };
 
         if current.version.hash == desired.hash {
-            return Ok((PlanAction::Skip, Vec::new()));
+            return Ok((
+                PlanAction::Skip,
+                vec![PlanReason::simple(
+                    ReasonKind::Unchanged,
+                    "SQL, config, contract and inputs unchanged",
+                )],
+            ));
         }
 
-        let mut reasons = Vec::new();
-        if current.version.sql_hash != desired.sql_hash {
-            reasons.push(ChangeReason::SqlSemanticChange);
-        }
-        if current.version.config_hash != desired.config_hash {
-            reasons.push(ChangeReason::ConfigChange);
-        }
-        if current.version.contract_hash != desired.contract_hash {
-            reasons.push(ChangeReason::ContractChange);
-        }
-        if current.version.dependency_hash != desired.dependency_hash {
-            reasons.push(ChangeReason::DependencyChange);
-        }
-        if current.version.source_state_hash != desired.source_state_hash {
-            reasons.push(ChangeReason::SourceChange);
-        }
-        if current.version.target_hash != desired.target_hash {
-            reasons.push(ChangeReason::TargetChange);
-        }
-        if current.version.compiler_version != desired.compiler_version {
-            reasons.push(ChangeReason::CompilerSemanticsChange);
-        }
+        let mut reasons = diff_reasons(model, current);
         if reasons.is_empty() {
-            reasons.push(ChangeReason::UnknownState);
+            reasons.push(PlanReason::simple(
+                ReasonKind::UnknownState,
+                "version hash changed but no component differs",
+            ));
         }
         Ok((PlanAction::Build, reasons))
     }
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
+/// Compare a model's desired version against the recorded materialisation
+/// and produce one reason per differing component. Shared by `plan` and
+/// `explain` so both describe change identically.
+pub fn diff_reasons(model: &CompiledModel, current: &MaterializedRecord) -> Vec<PlanReason> {
+    let desired = &model.version;
+    let mut reasons = Vec::new();
+    if current.version.sql_hash != desired.sql_hash {
+        reasons.push(PlanReason::simple(
+            ReasonKind::SqlSemanticChange,
+            "SQL semantics changed",
+        ));
+    }
+    if current.version.config_hash != desired.config_hash {
+        reasons.push(PlanReason::simple(
+            ReasonKind::ConfigChange,
+            "configuration changed",
+        ));
+    }
+    if current.version.contract_hash != desired.contract_hash {
+        reasons.push(PlanReason::simple(
+            ReasonKind::ContractChange,
+            "contract or assertions changed",
+        ));
+    }
+    if current.version.dependency_hash != desired.dependency_hash {
+        reasons.push(dependency_diff_reason(model, current));
+    }
+    if current.version.source_state_hash != desired.source_state_hash {
+        reasons.extend(source_diff_reasons(model, current));
+    }
+    if current.version.target_hash != desired.target_hash {
+        reasons.push(PlanReason::simple(
+            ReasonKind::TargetChange,
+            format!(
+                "physical target changed (was {}, now {})",
+                current.target,
+                model.target.display()
+            ),
+        ));
+    }
+    if current.version.compiler_version != desired.compiler_version {
+        reasons.push(PlanReason::simple(
+            ReasonKind::CompilerSemanticsChange,
+            "compiler semantics changed",
+        ));
+    }
+    reasons
+}
+
+/// Explain a changed dependency hash in terms of which dependency's version
+/// input moved, using the detail recorded at materialisation time.
+fn dependency_diff_reason(model: &CompiledModel, current: &MaterializedRecord) -> PlanReason {
+    let desired = &model.version_detail.dependencies;
+    match &current.detail {
+        Some(detail) => {
+            let recorded = &detail.dependencies;
+            let mut changed: Vec<String> = Vec::new();
+            for name in desired.keys() {
+                match recorded.get(name) {
+                    Some(was) if *was != desired[name] => changed.push(name.clone()),
+                    None => changed.push(format!("{name} (new dependency)")),
+                    _ => {}
+                }
+            }
+            for name in recorded.keys() {
+                if !desired.contains_key(name) {
+                    changed.push(format!("{name} (removed)"));
+                }
+            }
+            if changed.is_empty() {
+                PlanReason::simple(
+                    ReasonKind::DependencyChange,
+                    "upstream version inputs changed",
+                )
+            } else {
+                let subject = changed
+                    .first()
+                    .map(|name| name.split(" (").next().unwrap_or(name).to_string());
+                let mut reason = PlanReason::simple(
+                    ReasonKind::DependencyChange,
+                    format!("upstream version changed: {}", changed.join(", ")),
+                );
+                reason.subject = subject;
+                reason
+            }
+        }
+        None => PlanReason::simple(
+            ReasonKind::DependencyChange,
+            "upstream version changed (recorded before dependency detail was tracked)",
+        ),
+    }
+}
+
+/// One reason per source whose observed state moved since materialisation.
+fn source_diff_reasons(model: &CompiledModel, current: &MaterializedRecord) -> Vec<PlanReason> {
+    let desired = &model.version_detail.sources;
+    match &current.detail {
+        Some(detail) => {
+            let recorded = &detail.sources;
+            let mut reasons = Vec::new();
+            for (name, now) in desired {
+                match recorded.get(name) {
+                    Some(was) if was != now => reasons.push(PlanReason::about(
+                        ReasonKind::SourceChange,
+                        format!(
+                            "source {name} changed ({} → {})",
+                            short_state(was),
+                            short_state(now)
+                        ),
+                        name.clone(),
+                    )),
+                    None => reasons.push(PlanReason::about(
+                        ReasonKind::SourceChange,
+                        format!("source {name} first observed ({})", short_state(now)),
+                        name.clone(),
+                    )),
+                    _ => {}
+                }
+            }
+            for name in recorded.keys() {
+                if !desired.contains_key(name) {
+                    reasons.push(PlanReason::about(
+                        ReasonKind::SourceChange,
+                        format!("source {name} removed"),
+                        name.clone(),
+                    ));
+                }
+            }
+            if reasons.is_empty() {
+                reasons.push(PlanReason::simple(
+                    ReasonKind::SourceChange,
+                    "source states changed",
+                ));
+            }
+            reasons
+        }
+        None => vec![PlanReason::simple(
+            ReasonKind::SourceChange,
+            "a source state changed (recorded before source detail was tracked)",
+        )],
+    }
+}
+
+/// A compact description of a classified schema change.
+fn schema_change_detail(
+    desired: &[SchemaColumn],
+    current: &[SchemaColumn],
+    safety: SchemaChangeSafety,
+) -> String {
+    let current_names: BTreeMap<&str, &SchemaColumn> = current
+        .iter()
+        .map(|column| (column.name.as_str(), column))
+        .collect();
+    let desired_names: BTreeSet<&str> = desired.iter().map(|column| column.name.as_str()).collect();
+    let mut pieces: Vec<String> = Vec::new();
+    for column in desired {
+        match current_names.get(column.name.as_str()) {
+            None => pieces.push(format!("added {}", column.name)),
+            Some(was) if was.data_type != column.data_type => pieces.push(format!(
+                "{}: {:?} → {:?}",
+                column.name, was.data_type, column.data_type
+            )),
+            _ => {}
+        }
+    }
+    for column in current {
+        if !desired_names.contains(column.name.as_str()) {
+            pieces.push(format!("removed {}", column.name));
+        }
+    }
+    let label = match safety {
+        SchemaChangeSafety::FullRebuildRequired => "schema change requires a full rebuild",
+        SchemaChangeSafety::Error => "incompatible schema change",
+        _ => "output schema changed",
+    };
+    if pieces.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label}: {}", pieces.join(", "))
+    }
 }
 
 /// Expand a selection to include every transitive model dependency.
 pub fn dependency_closure(compilation: &Compilation, selected: &[ModelId]) -> BTreeSet<ModelId> {
-    let mut included: BTreeSet<ModelId> = selected.iter().cloned().collect();
-    let mut frontier: Vec<ModelId> = selected.to_vec();
+    dependency_closure_excluding(
+        compilation,
+        &selected.iter().cloned().collect(),
+        &BTreeSet::new(),
+    )
+}
+
+/// Dependency closure that never pulls excluded models back in.
+fn dependency_closure_excluding(
+    compilation: &Compilation,
+    selected: &BTreeSet<ModelId>,
+    excluded: &BTreeSet<ModelId>,
+) -> BTreeSet<ModelId> {
+    let mut included: BTreeSet<ModelId> = selected.clone();
+    let mut frontier: Vec<ModelId> = selected.iter().cloned().collect();
     while let Some(id) = frontier.pop() {
         for dependency in compilation.dependencies(&id) {
             if let Dependency::Model(dependency_id) = dependency {
+                if excluded.contains(&dependency_id) {
+                    continue;
+                }
                 if included.insert(dependency_id.clone()) {
                     frontier.push(dependency_id);
                 }
@@ -532,4 +1081,49 @@ pub fn dependency_closure(compilation: &Compilation, selected: &[ModelId]) -> BT
         }
     }
     included
+}
+
+/// The selected model that pulls `id` into the plan — the nearest selected
+/// dependent, for "required by X" explanations.
+fn requiring_model(
+    compilation: &Compilation,
+    id: &ModelId,
+    selected: &BTreeSet<ModelId>,
+) -> Option<String> {
+    let mut seen: BTreeSet<ModelId> = BTreeSet::new();
+    let mut frontier: VecDeque<ModelId> = [id.clone()].into_iter().collect();
+    while let Some(current) = frontier.pop_front() {
+        for dependent in compilation.dependents(&current) {
+            if !seen.insert(dependent.clone()) {
+                continue;
+            }
+            if selected.contains(&dependent) {
+                return Some(dependent.logical_name());
+            }
+            frontier.push_back(dependent);
+        }
+    }
+    None
+}
+
+/// Abbreviate a hash/id for display: keep the recognisable prefix.
+fn short(value: &str, len: usize) -> String {
+    if value.len() <= len {
+        value.to_string()
+    } else {
+        format!("{}…", &value[..len])
+    }
+}
+
+/// Source states can be long hashes; show a recognisable prefix.
+fn short_state(state: &str) -> String {
+    if state.is_empty() {
+        "unobserved".to_string()
+    } else {
+        short(state, 20)
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
