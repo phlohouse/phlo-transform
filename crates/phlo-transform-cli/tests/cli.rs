@@ -361,6 +361,73 @@ fn translated_dbt_project_runs_on_duckdb() {
     assert!(stdout(&output).contains("status:   unchanged"));
 }
 
+/// Full pipeline on a real warehouse: a CSV seed read only through a nested
+/// ephemeral chain must be loaded, the ephemeral models must never
+/// materialise, the table must read the expanded subquery, and both the
+/// generated `-- @not-null` test and the explicit `tests/` query must run
+/// against the expansion — not against a relation that does not exist.
+#[test]
+fn seed_through_nested_ephemeral_runs_on_duckdb() {
+    fn copy_dir(src: &std::path::Path, dest: &std::path::Path) {
+        std::fs::create_dir_all(dest).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let target = dest.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("workspace");
+    copy_dir(&workspace_root().join("fixtures/ephemeral-seed"), &root);
+    let duckdb_path = dir.path().join("local.duckdb");
+
+    let duckdb_arg = duckdb_path.to_str().expect("utf-8").to_string();
+    let root_arg = root.to_str().expect("utf-8").to_string();
+    let output = run(&[
+        "--root",
+        root_arg.as_str(),
+        "--adapter",
+        "duckdb",
+        "--duckdb-path",
+        duckdb_arg.as_str(),
+        "run",
+    ]);
+    assert!(output.status.success(), "{}", stdout(&output));
+
+    let connection = duckdb::Connection::open(&duckdb_path).expect("open duckdb");
+    // The materialised model saw the seed rows through both ephemeral hops.
+    let mut stmt = connection
+        .prepare("select id, doubled from main.events order by id")
+        .expect("events table exists");
+    let rows: Vec<(i64, f64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query events")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(rows, vec![(1, 20.0), (3, 30.0)]);
+
+    // The seed table exists; the ephemeral relations never did.
+    let seeded: i64 = connection
+        .query_row("select count(*) from raw.raw_events", [], |row| row.get(0))
+        .expect("seed loaded");
+    assert_eq!(seeded, 3);
+    for phantom in ["main.stg_events", "main.stg_placed"] {
+        assert!(
+            connection
+                .query_row(&format!("select count(*) from {phantom}"), [], |row| {
+                    row.get::<usize, i64>(0)
+                })
+                .is_err(),
+            "{phantom} must not be materialised"
+        );
+    }
+}
+
 #[test]
 fn lineage_without_target_prints_the_whole_graph() {
     let output = run(&["--root", "fixtures/basic-multi-root", "lineage"]);

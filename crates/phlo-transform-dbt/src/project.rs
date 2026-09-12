@@ -155,6 +155,9 @@ pub struct DbtProject {
     pub analysis_paths: Vec<PathBuf>,
     /// Top-level `vars:` mapping (values kept as YAML).
     pub vars: Mapping,
+    /// `dispatch:` overrides: `macro_namespace` → `search_order`. Changes
+    /// which implementation `adapter.dispatch` selects for that namespace.
+    pub dispatch: BTreeMap<String, Vec<String>>,
     /// The `models:` hierarchy from `dbt_project.yml` (empty when absent).
     pub models_tree: Value,
     /// The `seeds:` hierarchy from `dbt_project.yml` (for `+schema` etc.).
@@ -218,6 +221,27 @@ pub fn load(root: &Path) -> Result<DbtProject, ProjectError> {
             vars.insert(key, value);
         }
     }
+    let mut dispatch: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for rule in project_yaml
+        .get("dispatch")
+        .and_then(Value::as_sequence)
+        .into_iter()
+        .flatten()
+    {
+        let namespace = get_str(rule, "macro_namespace");
+        let order = rule
+            .get("search_order")
+            .and_then(Value::as_sequence)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            });
+        if let (Some(namespace), Some(order)) = (namespace, order) {
+            dispatch.insert(namespace.to_string(), order);
+        }
+    }
     let models_tree = project_yaml.get("models").cloned().unwrap_or(Value::Null);
 
     let model_paths = paths(&project_yaml, "model-paths", &["models"]);
@@ -237,6 +261,7 @@ pub fn load(root: &Path) -> Result<DbtProject, ProjectError> {
         snapshot_paths: snapshot_paths.clone(),
         analysis_paths: analysis_paths.clone(),
         vars,
+        dispatch,
         models_tree,
         seeds_tree: project_yaml.get("seeds").cloned().unwrap_or(Value::Null),
         models: Vec::new(),

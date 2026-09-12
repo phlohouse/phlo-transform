@@ -13,3 +13,6 @@
 {% macro dynamic() %}
   {{ run_query('select 1') }}
 {% endmacro %}
+
+{% macro greet() %}{{ adapter.dispatch('greet', 'kit')() }}{% endmacro %}
+{% macro default__greet() %}'kit-default'{% endmacro %}

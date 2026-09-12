@@ -602,4 +602,17 @@ fn ephemeral_models_inline_into_dependents() {
         "{}",
         order_filters.compiled_sql
     );
+
+    // `-- @not-null order_id` on an ephemeral model generates a test against
+    // the expanded query as a derived table — the physical target is never
+    // materialised, so it must not appear in the test SQL.
+    let test = compilation
+        .tests
+        .iter()
+        .find(|test| test.id.name().contains("order_filters"))
+        .expect("generated not-null test for order_filters");
+    assert!(test.sql.contains("external.raw_orders"), "{}", test.sql);
+    assert!(test.sql.contains(") AS \"order_filters\""), "{}", test.sql);
+    assert!(!test.sql.contains("main.order_filters"), "{}", test.sql);
+    assert!(test.sql.contains("\"order_id\" is null"), "{}", test.sql);
 }

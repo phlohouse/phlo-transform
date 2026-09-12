@@ -2471,6 +2471,14 @@ fn lower_builtin(
     if !name.contains('.') && !ctx.has_package(provider) {
         return None;
     }
+    // Recognised fivetran helpers lower only against a verified upstream
+    // implementation: the installed package's macro body must fingerprint-
+    // match the source these rewrites were proven against. An uninstalled
+    // or modified package is an unknown implementation — REVIEW, not a
+    // guess (the `dbt_utils.surrogate_key` version-drift hazard).
+    if provider == "fivetran_utils" && !verified_fivetran_source(ctx, helper) {
+        return None;
+    }
     let rendered = lower_helper(provider, helper, args, ctx, scope);
     if let Some(rendered) = rendered {
         lowered
@@ -2836,6 +2844,46 @@ fn lower_helper(
     Some(rendered)
 }
 
+/// `true` when the installed `fivetran_utils` source defines `helper` with
+/// the exact body these lowerings were verified against (fivetran_utils
+/// 0.4.x — every corpus-pinned copy is byte-identical). The fingerprint is
+/// FNV-1a over the whitespace-collapsed body: stable across toolchains
+/// (unlike `DefaultHasher`) and insensitive only to blank space.
+fn verified_fivetran_source(ctx: &Context, helper: &str) -> bool {
+    let (key, expected) = match helper {
+        "partition_by_source_relation" => (
+            "fivetran_utils.default__partition_by_source_relation",
+            0xfc1e0e9d56099378u64,
+        ),
+        "fill_pass_through_columns" => (
+            "fivetran_utils.fill_pass_through_columns",
+            0xd08e588f12c110b2u64,
+        ),
+        _ => return false,
+    };
+    ctx.macro_defs
+        .get(key)
+        .map(|def| body_fingerprint(def) == expected)
+        .unwrap_or(false)
+}
+
+fn body_fingerprint(def: &macros::MacroDef) -> u64 {
+    let normalized = def
+        .body
+        .iter()
+        .map(Segment::raw)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in normalized.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 /// `len(var(name))` for the `|length` checks in fivetran helpers: the var
 /// defaults to `[]` upstream, so an unset var is length 0.
 fn var_len(ctx: &Context, name: &str) -> usize {
@@ -3118,6 +3166,22 @@ fn render_macro_body(
                     if search.is_empty() {
                         search.push(ctx.package_ns().unwrap_or_else(|| ctx.project.name.clone()));
                     }
+                    // `dispatch:` config replaces a namespace's search order
+                    // (e.g. `dbt_utils` → `['my_project', 'dbt_utils']`).
+                    // dbt's built-in default also puts the root project
+                    // first for the `dbt` namespace itself.
+                    let mut ordered = Vec::new();
+                    for ns in &search {
+                        if let Some(order) = ctx.project.dispatch.get(ns) {
+                            ordered.extend(order.iter().cloned());
+                        } else if ns == "dbt" {
+                            ordered.push(ctx.project.name.clone());
+                            ordered.push(ns.clone());
+                        } else {
+                            ordered.push(ns.clone());
+                        }
+                    }
+                    let search = ordered;
                     let mut found = None;
                     'search: for ns in &search {
                         let key = |prefix: &str| {

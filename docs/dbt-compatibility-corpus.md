@@ -71,7 +71,7 @@ Ranked by the number of affected *active* models.
 
 | Category | Active models | Issues |
 |---|---|---|
-| dynamic Jinja/runtime behaviour | 454 | 3530 |
+| dynamic Jinja/runtime behaviour | 453 | 3529 |
 | missing/static package translation | 273 | 488 |
 | unsupported dbt concept | 64 | 469 |
 | backend ambiguity | 27 | 89 |

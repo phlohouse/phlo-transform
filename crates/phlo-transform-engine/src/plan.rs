@@ -213,7 +213,10 @@ impl Planner {
             })
             .collect();
 
-        // Seeds are planned for the source relations the selected models read.
+        // Seeds are planned for the source relations the selected models
+        // read — including ephemeral models: they are filtered out of `order`
+        // but their source reads are inlined into dependents, so a seed used
+        // only inside an ephemeral chain still has to be loaded.
         let default_catalog = compilation.defaults.catalog.as_deref();
         let default_schema = compilation
             .defaults
@@ -223,7 +226,7 @@ impl Planner {
         let mut needed_seeds: BTreeMap<String, &phlo_transform_core::CompiledSeed> =
             BTreeMap::new();
         let mut seed_sources: Vec<&SourceId> = Vec::new();
-        for id in &order {
+        for id in &planned_ids {
             let Some(model) = compilation.model(id) else {
                 continue;
             };

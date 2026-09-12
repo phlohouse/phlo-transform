@@ -39,6 +39,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -352,6 +353,38 @@ def install_tarball(url: str, dest: Path) -> str | None:
     return None
 
 
+# Inside each installed package dir: records the resolution that produced
+# it, so a stale tree is reinstalled instead of trusted silently.
+INSTALL_MARKER = ".phlo-corpus-install.json"
+
+
+def install_is_current(dest: Path, descriptor: dict[str, Any]) -> bool:
+    """Whether `dest` was installed from exactly this resolution."""
+    marker = dest / INSTALL_MARKER
+    if not marker.is_file():
+        return False
+    try:
+        return json.loads(marker.read_text()) == descriptor
+    except (json.JSONDecodeError, OSError):
+        return False
+
+
+def ensure_installed(
+    dest: Path, descriptor: dict[str, Any], install: Callable[[Path], str | None]
+) -> str | None:
+    """Install into `dest` unless the recorded marker already matches."""
+    if install_is_current(dest, descriptor):
+        return None
+    # A stale or foreign tree is replaced wholesale — the directory only
+    # ever contains files this script installed.
+    shutil.rmtree(dest, ignore_errors=True)
+    problem = install(dest)
+    if problem is not None:
+        return problem
+    (dest / INSTALL_MARKER).write_text(json.dumps(descriptor) + "\n")
+    return None
+
+
 def write_package_lock(proj: Path, entries: list[dict[str, Any]]) -> None:
     """Write a `package-lock.yml` recording what was installed — the same
     record `dbt deps` produces."""
@@ -369,10 +402,48 @@ def write_package_lock(proj: Path, entries: list[dict[str, Any]]) -> None:
     (proj / "package-lock.yml").write_text("\n".join(lines) + "\n")
 
 
+def git_tracked(checkout: Path, path: Path) -> bool:
+    """True when `path` (inside `checkout`) holds files tracked by the
+    project's own git repository — i.e. vendored source the corpus runner
+    must never reinstall."""
+    try:
+        rel = path.relative_to(checkout)
+    except ValueError:
+        return False
+    proc = run(["git", "-C", str(checkout), "ls-files", "--", str(rel)])
+    return proc.returncode == 0 and bool(proc.stdout.strip())
+
+
+def resolved_root(proj: Path, pkg: dict[str, Any]) -> Path | None:
+    """The directory the translator read for a resolved package — the
+    report's `root` is relative to the project root; refuse anything that
+    would escape it."""
+    root = pkg.get("root")
+    if not root:
+        return None
+    rel = Path(root)
+    if rel.is_absolute() or ".." in rel.parts:
+        return None
+    return proj / rel
+
+
+def project_vendored(checkout: Path, proj: Path, pkg: dict[str, Any]) -> bool:
+    """True when a declared hub/git package's resolved source is vendored by
+    the project itself rather than installed by an earlier `--deps` run.
+    Script-installed trees carry `INSTALL_MARKER`; committed ones are
+    git-tracked."""
+    src = resolved_root(proj, pkg)
+    if src is None or (src / INSTALL_MARKER).is_file():
+        return False
+    return git_tracked(checkout, src)
+
+
 def deps(binary: str) -> None:
     """Install declared package dependencies under `dbt_packages/` so the
     translator can analyse their source. Reproducible via
-    `corpus/packages.lock` and any shipped `package-lock.yml`."""
+    `corpus/packages.lock` and any shipped `package-lock.yml`. Installed
+    trees are verified against the resolved pin on every run: a stale or
+    foreign `dbt_packages/` directory is replaced."""
     lock: dict[str, Any] = {}
     if PACKAGE_LOCK.exists():
         lock = json.loads(PACKAGE_LOCK.read_text())
@@ -398,15 +469,20 @@ def deps(binary: str) -> None:
             if report is None:
                 continue
             for pkg in report.get("packages", []):
-                if pkg["resolved"]:
-                    # Already resolved (vendored, local, or installed by an
-                    # earlier pass) — record its resolution for the report.
+                kind = pkg["kind"]
+                if pkg["resolved"] and (
+                    kind not in ("hub", "git")
+                    or project_vendored(checkout, proj, pkg)
+                ):
+                    # Source the project itself provides (vendored, local,
+                    # project) — record its resolution for the report and
+                    # leave it untouched.
                     installed.setdefault(
                         pkg["name"],
                         {
                             "kind": "local"
-                            if pkg["kind"] == "vendored"
-                            else pkg["kind"],
+                            if kind == "vendored"
+                            else kind,
                             "spec": pkg["spec"],
                             "name": pkg["name"],
                             "resolved": pkg.get("locked")
@@ -415,7 +491,6 @@ def deps(binary: str) -> None:
                         },
                     )
                     continue
-                kind = pkg["kind"]
                 if kind == "local":
                     failures.append(f"local package `{pkg['spec']}` is missing")
                     continue
@@ -426,7 +501,14 @@ def deps(binary: str) -> None:
                     continue
                 if pkg["name"] in installed:
                     continue
-                dest = proj / "dbt_packages" / pkg["name"]
+                # For a resolved package, verify/reinstall the directory the
+                # translator actually read (`root`); otherwise install under
+                # `dbt_packages/` where dbt would put it.
+                dest = (
+                    (resolved_root(proj, pkg) or proj / "dbt_packages" / pkg["name"])
+                    if pkg["resolved"]
+                    else proj / "dbt_packages" / pkg["name"]
+                )
                 if kind == "hub":
                     version, url, error = resolve_hub(
                         pkg["spec"], pkg.get("requested"), pkg.get("locked"), lock
@@ -434,11 +516,15 @@ def deps(binary: str) -> None:
                     if url is None:
                         failures.append(f"`{pkg['spec']}`: {error}")
                         continue
-                    if not dest.exists():
-                        problem = install_tarball(url, dest)
-                        if problem is not None:
-                            failures.append(f"`{pkg['spec']}`: {problem}")
-                            continue
+                    tarball = url
+                    problem = ensure_installed(
+                        dest,
+                        {"spec": pkg["spec"], "version": version, "tarball": tarball},
+                        lambda d, tarball=tarball: install_tarball(tarball, d),
+                    )
+                    if problem is not None:
+                        failures.append(f"`{pkg['spec']}`: {problem}")
+                        continue
                     # Only unpinned resolutions are written to the corpus
                     # lock; a shipped package-lock.yml pins itself.
                     lock_key = f"hub:{pkg['spec']}"
@@ -460,11 +546,17 @@ def deps(binary: str) -> None:
                     if clone is None:
                         failures.append(f"`{pkg['spec']}`: clone of {repo} failed")
                         continue
-                    if not dest.exists():
-                        problem = install_git(clone, sha, dest)
-                        if problem is not None:
-                            failures.append(f"`{pkg['spec']}`: {problem}")
-                            continue
+                    clone_dir, commit = clone, sha
+                    problem = ensure_installed(
+                        dest,
+                        {"spec": pkg["spec"], "commit": commit},
+                        lambda d, clone_dir=clone_dir, commit=commit: install_git(
+                            clone_dir, commit, d
+                        ),
+                    )
+                    if problem is not None:
+                        failures.append(f"`{pkg['spec']}`: {problem}")
+                        continue
                     lock_key = f"git:{repo}"
                     if lock.get(lock_key, {}).get("commit") != sha:
                         lock[lock_key] = {"commit": sha, "version": ref}
@@ -504,7 +596,7 @@ def analyse(binary: str, verify: bool) -> None:
     for name, slug, subdir in PROJECTS:
         checkout = REPOS_DIR / name
         result_path = RESULTS_DIR / f"{name}.json"
-        entry: dict[str, Any] = {"repo": slug}
+        entry: dict[str, Any] = {"name": name, "repo": slug}
         if not checkout.exists():
             entry["error"] = "not cloned"
         else:
@@ -595,14 +687,18 @@ def summarise(entry: dict[str, Any]) -> dict[str, Any] | None:
         return sum(1 for r in resources if r["classification"] == cls_name)
 
     reasons = Counter()
-    reason_models: dict[str, set[str]] = {}
+    reason_models: dict[str, set[tuple[str, str]]] = {}
     for resource in resources:
         for issue in resource.get("issues", []):
             reason = f"{issue['code']}: {issue['message']}"
             reasons[reason] += 1
             # Affected *active* models — the ranking unit for blockers.
+            # Keyed by (project, model) so same-named models in different
+            # projects do not collapse when aggregated across the corpus.
             if is_model(resource) and not is_disabled(resource):
-                reason_models.setdefault(reason, set()).add(resource["name"])
+                reason_models.setdefault(reason, set()).add(
+                    (entry["name"], resource["name"])
+                )
     return {
         "models": len(models),
         "active": len(active),

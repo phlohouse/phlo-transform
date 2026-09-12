@@ -81,8 +81,8 @@ existing files unless `--overwrite` is passed. The manifest lands at
 | `config(schema = 'literal')` differing from the derived namespace | model relocated under a `custom/` folder with `-- @id` preserving its logical name; dynamic schemas stay REVIEW |
 | `{{ pkg.macro(...) }}` where `pkg` is the project's own name | inlined like an unqualified project macro; `adapter.dispatch('m', '<project>')` resolves to `default__m`/adapter variants |
 | `{{ pkg.macro(...) }}` where `pkg` is a declared dependency | inlined from `dbt_packages/`/`local:` source under the same static rules as project macros; a unique unqualified name defined by exactly one installed package also resolves. Calls into a package that is not installed, or into `ref('pkg', 'm')` package models, stay REVIEW |
-| `{{ fivetran_utils.partition_by_source_relation(pkg, ...) }}` | `partition by <alias.>source_relation`, `, <alias.>source_relation`, or empty — driven by the statically-known `*_union_schemas`/`*_union_databases`/`*_sources` vars, matching the upstream `default__` body |
-| `{{ fivetran_utils.fill_pass_through_columns('var_name') }}` | `, field` per list entry; mapping entries honour `transform_sql`/`alias`/`name`. An unset var (which raises upstream) or non-list value stays REVIEW |
+| `{{ fivetran_utils.partition_by_source_relation(pkg, ...) }}` | `partition by <alias.>source_relation`, `, <alias.>source_relation`, or empty — driven by the statically-known `*_union_schemas`/`*_union_databases`/`*_sources` vars, matching the upstream `default__` body. Only applies when the installed package's macro body fingerprint-matches the verified upstream source; a modified or unknown implementation stays REVIEW |
+| `{{ fivetran_utils.fill_pass_through_columns('var_name') }}` | `, field` per list entry; mapping entries honour `transform_sql`/`alias`/`name`. An unset var (which raises upstream) or non-list value stays REVIEW. Fingerprint-guarded like `partition_by_source_relation` |
 | Jinja ternaries `x if cond else y`, `~` concatenation, `not/and/or`, `in`, `is [not] sameas/none`, `> >= < <=` comparisons | evaluated statically |
 | `{% for x in <literal list> %}…{% endfor %}` (incl. `loop.index/first/last`) | unrolled statically |
 | `{% if <statically-known condition> %}` / `{% if execute %}` | resolved at translation time / gate removed |
@@ -133,7 +133,11 @@ path) reports that distinctly: its macro bodies cannot even be inspected,
 so every call stays REVIEW. Installed source is inspected statically only —
 adapter-dispatching helpers fall back to recognised `default__`
 implementations; `run_query`, `adapter.get_relation` and other warehouse
-introspection never lower.
+introspection never lower. Project-level `dispatch:` configuration is
+honoured: a `macro_namespace` entry's `search_order` replaces the default
+search, so a root-project or earlier-package override wins — and when no
+ordered candidate exists the call stays REVIEW rather than falling back to
+an implementation dbt would not select.
 
 The report (`--check`) shows per-kind counts by classification, model
 conversion coverage, and deduplicated review reasons. `--json` returns the

@@ -1033,6 +1033,65 @@ async fn seed_loads_before_models_and_skips_when_unchanged() {
     assert_eq!(plan.seeds[0].action, PlanAction::Skip);
 }
 
+/// A seed read only through an ephemeral chain is still planned and loaded.
+/// Ephemeral models are filtered out of the execution order, but their
+/// source reads are inlined into dependents — seed discovery must look at
+/// `planned_ids`, not the filtered order.
+#[tokio::test]
+async fn seed_read_through_ephemeral_chain_is_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("seeds")).unwrap();
+    std::fs::write(
+        dir.path().join("seeds/raw_events.csv"),
+        "id,status\n1,placed\n",
+    )
+    .unwrap();
+
+    let mut staged = model(
+        "main.stg_seed_events",
+        "select * from raw.raw_events where status = 'placed'",
+    );
+    staged.config.materialization = Materialization::Ephemeral;
+    let mut named = model("main.stg_named", "select * from main.stg_seed_events");
+    named.config.materialization = Materialization::Ephemeral;
+    let events = model("main.events", "select * from main.stg_named");
+
+    let mut project = SemanticProject::in_memory(vec![staged, named, events]);
+    project.workspace_root = Some(dir.path().to_path_buf());
+    project.seeds = vec![SemanticSeed {
+        name: "raw_events".to_string(),
+        path: PathBuf::from("seeds/raw_events.csv"),
+        schema: Some("raw".to_string()),
+        content_hash: "hash-v1".to_string(),
+        columns: vec!["id".to_string(), "status".to_string()],
+    }];
+    let compilation = compile(&project);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+
+    let selected = select_models(&compilation, &SelectionOptions::default());
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(&compilation, &selected, Some("dev".to_string()))
+        .await
+        .unwrap();
+    // The ephemeral chain is inlined into `main.events`: only the
+    // materialised model is planned, and the seed it transitively reads
+    // is loaded.
+    assert_eq!(plan.model_count(), 1);
+    assert_eq!(plan.seeds.len(), 1, "{:?}", plan.seeds);
+    assert_eq!(plan.seeds[0].name, "raw_events");
+
+    let result = run_once(adapter.clone(), state, &compilation, "dev").await;
+    assert_eq!(result.status, ExecutionStatus::Passed);
+    let loaded = adapter.loaded_csvs.lock().unwrap().clone();
+    assert_eq!(loaded.len(), 1, "{loaded:?}");
+    assert!(loaded[0].starts_with("raw.raw_events <- "), "{loaded:?}");
+    let created = adapter.created.lock().unwrap().clone();
+    assert_eq!(created, vec!["main.events"], "{created:?}");
+}
+
 /// A changed CSV content hash re-plans the seed as a Build.
 #[tokio::test]
 async fn seed_content_change_replans_the_load() {

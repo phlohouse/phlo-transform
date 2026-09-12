@@ -321,8 +321,27 @@ pub fn compile_with_options(
                     &mut compilation.diagnostics,
                 );
             }
-            if let Some(model) = compilation.model(&id) {
-                generated_tests.extend(generate_tests(&id, &assertions, &model.target));
+            // Assertions on ephemeral models test the expanded query — the
+            // model is never materialised, so its physical target does not
+            // exist. Expansion failures already raised diagnostics above.
+            let (is_ephemeral, target_sql) = compilation
+                .model(&id)
+                .map(|model| {
+                    (
+                        model.config.materialization == Materialization::Ephemeral,
+                        model.target.sql(),
+                    )
+                })
+                .unwrap_or((false, String::new()));
+            let subject = if is_ephemeral {
+                expansion
+                    .expand(&id, &mut compilation.diagnostics)
+                    .map(|query| format!("({query}) AS {}", quote_ident(id.last_segment())))
+            } else {
+                Some(target_sql)
+            };
+            if let Some(subject) = subject {
+                generated_tests.extend(generate_tests(&id, &assertions, &subject));
             }
 
             // Compute the content-addressed version from upstream versions.
@@ -521,13 +540,15 @@ fn validate_contract(
     }
 }
 
-/// Generate logical runtime tests from assertions.
-fn generate_tests(id: &ModelId, assertions: &[Assertion], target: &Relation) -> Vec<CompiledTest> {
+/// Generate logical runtime tests from assertions. `subject` is the FROM
+/// target: the physical relation for materialised models, or the expanded
+/// derived table for ephemeral ones.
+fn generate_tests(id: &ModelId, assertions: &[Assertion], subject: &str) -> Vec<CompiledTest> {
     assertions
         .iter()
         .map(|assertion| {
             let slug = assertion_slug(assertion);
-            let compiled_sql = assertion_sql(assertion, target);
+            let compiled_sql = assertion_sql(assertion, subject);
             CompiledTest {
                 id: TestId::new(format!("{}.generated.{slug}", id.logical_name())),
                 origin: ModelOrigin {
@@ -551,11 +572,11 @@ fn assertion_slug(assertion: &Assertion) -> String {
     }
 }
 
-fn assertion_sql(assertion: &Assertion, target: &Relation) -> String {
+fn assertion_sql(assertion: &Assertion, subject: &str) -> String {
     match assertion {
         Assertion::NotNull { column } => format!(
             "select * from {} where {} is null",
-            target.sql(),
+            subject,
             quote_ident(column)
         ),
         Assertion::Unique { columns } => {
@@ -563,7 +584,7 @@ fn assertion_sql(assertion: &Assertion, target: &Relation) -> String {
             format!(
                 "select {}, count(*) as __phlo_count from {} group by {} having count(*) > 1",
                 quoted.join(", "),
-                target.sql(),
+                subject,
                 quoted.join(", ")
             )
         }

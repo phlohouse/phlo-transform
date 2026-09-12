@@ -17,3 +17,7 @@ vars:
         alias: renamed_b
       - name: raw_c
         transform_sql: upper(raw_c)
+
+dispatch:
+  - macro_namespace: kit
+    search_order: [pkg_consumer, kit]

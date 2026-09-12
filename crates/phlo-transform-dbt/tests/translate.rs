@@ -659,6 +659,22 @@ fn package_source_resolution() {
     // both stay REVIEW rather than guessing.
     let review = outcome(ResourceKind::Model, "fivetran_review");
     assert_eq!(review.classification, Classification::Review);
+
+    // `dispatch:` config is honoured: `adapter.dispatch('greet', 'kit')`
+    // searches `pkg_consumer` first, so the project's `default__greet`
+    // wins over the package's own variant.
+    let over = outcome(ResourceKind::Model, "dispatch_override");
+    assert_eq!(over.classification, Classification::Clean);
+    let sql = file("transforms/dispatch_override.sql");
+    assert!(sql.contains("'project-wins'"), "{sql}");
+    assert!(!sql.contains("kit-default"), "{sql}");
+
+    // Without a `dispatch:` entry the namespace's own `default__` variant
+    // is used — the local package's implementation.
+    let default = outcome(ResourceKind::Model, "dispatch_default");
+    assert_eq!(default.classification, Classification::Clean);
+    let sql = file("transforms/dispatch_default.sql");
+    assert!(sql.contains("'localpkg-default'"), "{sql}");
 }
 
 #[test]
@@ -680,4 +696,56 @@ fn clean_fixture_verifies_with_the_native_compiler() {
     // The generated test was discovered too.
     let list = compilation.list_report();
     assert!(list.tests.iter().any(|t| t.name.contains("not_null")));
+}
+
+/// A modified `fivetran_utils` implementation fails the fingerprint guard:
+/// the recognised-helper lowerings were proven against one exact upstream
+/// body, so an unknown implementation stays REVIEW rather than being
+/// rewritten by a lowering that no longer applies.
+#[test]
+fn tampered_fivetran_source_is_not_lowered() {
+    fn copy_dir(src: &std::path::Path, dest: &std::path::Path) {
+        std::fs::create_dir_all(dest).unwrap();
+        for entry in std::fs::read_dir(src).unwrap() {
+            let entry = entry.unwrap();
+            let target = dest.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    copy_dir(&fixture("dbt-packages"), dir.path());
+
+    // A semantic no-op upstream (dead comment inside the body) still defeats
+    // the fingerprint — the guard matches the exact verified source.
+    let macro_path = dir
+        .path()
+        .join("dbt_packages/fivetran_utils/macros/fill_pass_through_columns.sql");
+    let body = std::fs::read_to_string(&macro_path).unwrap();
+    std::fs::write(
+        &macro_path,
+        body.replace("{% endmacro %}", "-- tampered\n{% endmacro %}"),
+    )
+    .unwrap();
+
+    let translation = translate_project(dir.path()).expect("dbt project loads");
+    let report = &translation.report;
+    let outcome = |name: &str| {
+        report
+            .resources
+            .iter()
+            .find(|r| r.kind == ResourceKind::Model && r.name.ends_with(&format!(".{name}")))
+            .unwrap_or_else(|| panic!("no model named {name}"))
+            .classification
+    };
+    assert_eq!(outcome("fivetran_pass_through"), Classification::Review);
+    // `partition_by_source_relation`'s own verified body is untouched, so
+    // its lowering still applies.
+    assert_eq!(outcome("fivetran_partitioned"), Classification::Clean);
+    // Non-fivetran package inlining is unaffected by the guard.
+    assert_eq!(outcome("uses_package"), Classification::Clean);
 }
