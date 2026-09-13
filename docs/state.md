@@ -135,15 +135,18 @@ This is what `--resume` and `--retry-failed` rebuild from:
 
 - **`run --resume <run-id>`** continues an *interrupted* run — still
   `running` after a kill, or `cancelled` — under the same run id. It
-  reloads the stored plan and prior per-node records, then re-plans every
-  node that is not being reused. Reuse is verified, not trusted: a
-  previously-passed model is kept only if its desired version still
-  matches the fresh compile *and* its target relation still exists; a seed
-  is reused only when its recorded content hash matches the current file
-  and its target exists. Stored `skip`/`cached` decisions are never
-  trusted — the action is re-decided against current state, so a version
-  that moved since the interruption becomes a build. A finished run is not
-  resumable: `failed` redirects to `--retry-failed`, `passed` is a no-op.
+  reloads the stored plan's model set and prior per-node records, then
+  re-runs every model through the normal planner so the action, the
+  `full_rebuild` decision (incremental strategy/key changes and
+  schema-change classification) and the time-window watermark all reflect
+  current state. Reuse is verified, not trusted: a previously-passed model
+  is kept only if its desired version still matches the fresh compile
+  *and* its target relation still exists; a seed is reused only when its
+  recorded content hash matches the current file and its target exists.
+  Stored `skip`/`cached` decisions — and stored incremental decisions —
+  are never trusted: a version that moved since the interruption becomes a
+  build. A finished run is not resumable: `failed` redirects to
+  `--retry-failed`, `passed` is a no-op.
 - **`run --retry-failed <run-id>`** creates a new run (`continued_from`
   links back) over the failed/blocked/cancelled models of a finished run,
   the dependencies they still need, and any tests that failed — tests over

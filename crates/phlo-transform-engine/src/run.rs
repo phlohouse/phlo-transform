@@ -27,8 +27,8 @@ use crate::failure::{
     classify_adapter_error, timeout_failure, Attempt, Failure, FailureCategory, RetryPolicy,
 };
 use crate::plan::{
-    Membership, Plan, PlanAction, PlanOptions, PlanReason, PlanSelection, PlannedModel,
-    PlannedSeed, PlannedTest, Planner, ReasonKind,
+    Plan, PlanAction, PlanOptions, PlanReason, PlanSelection, PlannedModel, PlannedSeed, Planner,
+    ReasonKind,
 };
 use crate::source_state::{adapter_default_schema, relation_for_source, seed_relation};
 use crate::state::{
@@ -609,9 +609,14 @@ impl Runner {
         .await
     }
 
-    /// Rebuild the stored plan against the current compilation for a resume.
-    /// Desired versions come from the current compilation; `full_rebuild`/
-    /// `watermark` come from the stored plan.
+    /// Rebuild the stored plan against the current compilation for a
+    /// resume.
+    ///
+    /// Models and seeds go through the normal [`Planner`] so every
+    /// decision — action, incremental strategy/key changes, schema-change
+    /// rebuilds, time-window watermarks — is made against *current* state.
+    /// The stored plan's values are stale the moment the workspace moved;
+    /// only the reuse decision and resume provenance are overlaid on top.
     async fn resume_plan(
         &self,
         compilation: &Compilation,
@@ -620,120 +625,82 @@ impl Runner {
         prior: &PriorRun,
         options: &RunOptions,
     ) -> Result<Plan, EngineError> {
-        let mut models = Vec::with_capacity(manifest.models.len());
-        for stored_model in &manifest.models {
-            let id = ModelId::parse(&stored_model.id)
+        let ids = manifest
+            .models
+            .iter()
+            .map(|model| ModelId::parse(&model.id))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| EngineError::InvalidPlan(error.to_string()))?;
+        let selection = Selection::of(compilation, &ids);
+        let mut plan = Planner::new(self.adapter.clone(), self.state.clone())
+            .plan(
+                compilation,
+                &selection,
+                options.environment.clone(),
+                &PlanOptions::default(),
+            )
+            .await?;
+
+        // Overlay resume provenance and the reuse decision: only a
+        // verified earlier pass carries over — everything else executes
+        // exactly as the fresh plan decided.
+        let stored_desired: BTreeMap<&str, &str> = manifest
+            .models
+            .iter()
+            .map(|model| (model.id.as_str(), model.desired_version.as_str()))
+            .collect();
+        for model in &mut plan.models {
+            let id = ModelId::parse(&model.id)
                 .map_err(|error| EngineError::InvalidPlan(error.to_string()))?;
-            let compiled = compilation.model(&id).expect("checked compatible");
-            let desired = compiled.version.hash.clone();
-            let exists = self.adapter.relation_exists(&compiled.target).await?;
             // Reuse requires the earlier success *and* its relation still
             // present — a dropped target means the work has to run again.
-            let reused = exists && prior.reusable_model(&id, &desired).is_some();
-            let current_version = match &self.state {
-                Some(state) => state
-                    .materialized_version(&id.logical_name(), options.environment.as_deref())?
-                    .map(|record| record.version.hash),
-                None => None,
-            };
-            let mut reasons = Vec::new();
-            if reused {
-                reasons.push(PlanReason::simple(
-                    ReasonKind::ResumedRun,
-                    "passed earlier in this run at the same version — reused",
-                ));
+            let reused =
+                model.exists && prior.reusable_model(&id, &model.desired_version).is_some();
+            let provenance = if reused {
+                "passed earlier in this run at the same version — reused".to_string()
             } else {
-                let why = match prior.models.get(&stored_model.id).map(|r| r.status) {
+                match prior.models.get(&model.id).map(|record| record.status) {
                     Some(status) if status.is_terminal() => {
                         format!("resumed run; previous status was {}", status.label())
                     }
                     Some(_) => "resumed run; execution was interrupted".to_string(),
                     None => "resumed run; model never started".to_string(),
-                };
-                reasons.push(PlanReason::simple(ReasonKind::ResumedRun, why));
-                if stored_model.desired_version != desired {
-                    reasons.push(PlanReason::simple(
-                        ReasonKind::ResumedRun,
-                        "desired version changed since the original run",
-                    ));
-                }
-            }
-            // Re-decide the action against current state for everything not
-            // carried over: the stored action is stale once the desired
-            // version moved or the target relation changed underneath us.
-            // Mirrors the planner's rules — missing relation builds,
-            // matching materialised version skips, a version materialised
-            // in another environment is a cache candidate, otherwise build.
-            let action = if reused {
-                PlanAction::parse(&stored_model.action)
-            } else if !exists {
-                PlanAction::Build
-            } else if current_version.as_deref() == Some(desired.as_str()) {
-                PlanAction::Skip
-            } else {
-                match &self.state {
-                    Some(state) => {
-                        let elsewhere = state.materialized_by_hash(&desired)?;
-                        if elsewhere.iter().any(|record| {
-                            record.environment.as_deref() != options.environment.as_deref()
-                        }) {
-                            PlanAction::Cached
-                        } else {
-                            PlanAction::Build
-                        }
-                    }
-                    None => PlanAction::Build,
                 }
             };
-            models.push(PlannedModel {
-                id: stored_model.id.clone(),
-                target: compiled.target.display(),
-                materialization: compiled.config.materialization.to_string(),
-                action,
-                reasons,
-                membership: Membership::Selected,
-                exists,
-                incremental: compiled
-                    .config
-                    .incremental
-                    .as_ref()
-                    .map(|strategy| strategy.as_str().to_string()),
-                full_rebuild: stored_model.full_rebuild,
-                watermark: stored_model.watermark.clone(),
-                desired_version: desired,
-                current_version,
-                dependencies: compiled
-                    .model_dependencies()
-                    .map(|dep| dep.logical_name())
-                    .collect(),
-                sources: compiled
-                    .source_dependencies()
-                    .map(|source| source.logical_name())
-                    .collect(),
-                sql_hash: sha256_hex(&compiled.compiled_sql),
-                compiled_sql: compiled.compiled_sql.clone(),
-            });
+            model
+                .reasons
+                .insert(0, PlanReason::simple(ReasonKind::ResumedRun, provenance));
+            if reused {
+                model.action = PlanAction::Skip;
+            } else if stored_desired
+                .get(model.id.as_str())
+                .is_some_and(|version| *version != model.desired_version)
+            {
+                model.reasons.push(PlanReason::simple(
+                    ReasonKind::ResumedRun,
+                    "desired version changed since the original run",
+                ));
+            }
         }
 
+        // The planner re-decided each seed load against current state;
+        // only a verified earlier load is carried over as reused.
+        let stored_seed_versions: BTreeMap<&str, &str> = manifest
+            .seeds
+            .iter()
+            .map(|seed| (seed.name.as_str(), seed.desired_version.as_str()))
+            .collect();
         let seed_default_catalog = compilation.defaults.catalog.as_deref();
         let seed_default_schema = compilation
             .defaults
             .schema
             .as_deref()
             .or_else(|| adapter_default_schema(self.adapter.name()));
-        let mut seeds = Vec::with_capacity(manifest.seeds.len());
-        for stored_seed in &manifest.seeds {
-            let compiled = compilation
-                .seeds
-                .iter()
-                .find(|seed| seed.name == stored_seed.name);
-            let desired = compiled
-                .map(|seed| seed.content_hash.clone())
-                .unwrap_or_else(|| stored_seed.desired_version.clone());
-            let exists = match compiled {
-                Some(seed) => {
+        for seed in &mut plan.seeds {
+            let exists = match compilation.seeds.iter().find(|s| s.name == seed.name) {
+                Some(compiled) => {
                     let relation = seed_relation(
-                        seed,
+                        compiled,
                         seed_default_catalog,
                         seed_default_schema,
                         self.adapter.name(),
@@ -742,62 +709,30 @@ impl Runner {
                 }
                 None => false,
             };
-            let reused = exists
-                && prior.reusable_seed(&stored_seed.name, &stored_seed.desired_version, &desired);
-            seeds.push(PlannedSeed {
-                name: stored_seed.name.clone(),
-                target: stored_seed.target.clone(),
-                path: stored_seed.path.clone(),
-                // A seed reloads when its content changed or its target is
-                // gone, even if the stored plan had skipped it.
-                action: if reused {
-                    PlanAction::Skip
-                } else if stored_seed.desired_version != desired || !exists {
-                    PlanAction::Build
-                } else {
-                    PlanAction::parse(&stored_seed.action)
-                },
-                desired_version: desired,
-                reasons: if reused {
-                    vec![PlanReason::simple(
+            let stored_version = stored_seed_versions
+                .get(seed.name.as_str())
+                .copied()
+                .unwrap_or_default();
+            if exists && prior.reusable_seed(&seed.name, stored_version, &seed.desired_version) {
+                seed.action = PlanAction::Skip;
+                seed.reasons.insert(
+                    0,
+                    PlanReason::simple(
                         ReasonKind::ResumedRun,
                         "loaded earlier in this run — reused",
-                    )]
-                } else {
-                    Vec::new()
-                },
-            });
+                    ),
+                );
+            }
         }
 
-        let tests = manifest
-            .tests
-            .iter()
-            .map(|stored_test| PlannedTest {
-                id: stored_test.id.clone(),
-                generated: false,
-                targets: stored_test.targets.clone(),
-                sources: stored_test.sources.clone(),
-            })
-            .collect();
-
-        Ok(Plan {
-            id: stored.record.plan_id.clone(),
-            created_at: now_rfc3339(),
-            environment: stored.record.environment.clone(),
-            adapter: self.adapter.name().to_string(),
-            compiler_semantics_version: phlo_transform_core::COMPILER_SEMANTICS_VERSION.to_string(),
-            blocked: false,
-            selection: PlanSelection {
-                terms: vec![format!("--resume {}", short_id(&stored.record.run_id))],
-                ..Default::default()
-            },
-            git: None,
-            warnings: Vec::new(),
-            seeds,
-            models,
-            tests,
-            diagnostics: compilation.diagnostics.clone(),
-        })
+        plan.id = stored.record.plan_id.clone();
+        plan.environment = stored.record.environment.clone();
+        plan.selection = PlanSelection {
+            terms: vec![format!("--resume {}", short_id(&stored.record.run_id))],
+            ..Default::default()
+        };
+        plan.git = None;
+        Ok(plan)
     }
 
     /// Shared execution driver for fresh runs, resumes and retries.
@@ -1034,11 +969,14 @@ impl Runner {
         // Resume reuse: models that passed at their still-desired version are
         // carried over without re-executing. Their earlier run records stay
         // untouched — they already hold the attempts that produced them.
+        // The target must also still exist — the freshly planned `exists`
+        // carries that check so a dropped relation is rebuilt, not reused.
         for id in &planned {
             let Some(model) = compilation.model(id) else {
                 continue;
             };
-            if prior.reusable_model(id, &model.version.hash).is_some() {
+            let exists = plan_info.get(id).is_some_and(|planned| planned.exists);
+            if exists && prior.reusable_model(id, &model.version.hash).is_some() {
                 status.insert(id.clone(), ExecutionStatus::Cached);
                 events.push(EngineEvent::ModelFinished {
                     model: id.logical_name(),

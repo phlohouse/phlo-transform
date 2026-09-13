@@ -3320,3 +3320,308 @@ async fn a_state_write_failure_is_fatal_not_silent() {
         .expect_err("a failed state write must stop the run");
     assert!(matches!(error, EngineError::State(_)), "{error}");
 }
+
+#[tokio::test]
+async fn resume_full_rebuilds_when_incremental_strategy_changes() {
+    // run A completes: `assay.events` bootstraps as incremental key(id) and
+    // its materialisation record stores the strategy. run B changes the SQL
+    // and is killed while the unrelated `main.slow` builds. Before resume
+    // the strategy changes to append — the stored plan's `full_rebuild`
+    // flag is stale, so resume must re-plan and full-rebuild rather than
+    // merge.
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+    let dev = RunOptions {
+        environment: Some("dev".to_string()),
+        run_tests: false,
+        ..Default::default()
+    };
+    let provider = events_provider();
+    let build = |sql: &str, slow_sql: &str, strategy: IncrementalStrategy| {
+        let compilation = compile_with_options(
+            &SemanticProject::in_memory(vec![
+                incremental_with(sql, strategy),
+                model("main.slow", slow_sql),
+            ]),
+            &provider,
+            &EmptySourceStateProvider,
+        );
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+        compilation
+    };
+
+    let v1 = build(
+        "select id, updated_at from external.events",
+        "select 1 as id",
+        IncrementalStrategy::Key {
+            columns: vec!["id".to_string()],
+        },
+    );
+    run_once(adapter.clone(), state.clone(), &v1, "dev").await;
+    let created_for = |adapter: &FakeAdapter, target: &str| {
+        adapter
+            .created
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|created| created.as_str() == target)
+            .count()
+    };
+    assert_eq!(created_for(&adapter, "assay.events"), 1, "bootstrap");
+    assert!(adapter.merges.lock().unwrap().is_empty());
+
+    // run B: changed SQL → a merge is planned; the process dies while
+    // `main.slow` is still building.
+    // `main.slow` also changes so run B has real work to interrupt.
+    let v2 = build(
+        "select id, updated_at from external.events where id > 0",
+        "select 2 as id",
+        IncrementalStrategy::Key {
+            columns: vec!["id".to_string()],
+        },
+    );
+    adapter.slow_target("main.slow", 1500);
+    let plan2 =
+        plan_all_with_state(&v2, adapter.clone(), state.clone(), Some("dev".to_string())).await;
+    let run_id = interrupt_apply(
+        adapter.clone(),
+        state.clone(),
+        &v2,
+        &plan2,
+        dev.clone(),
+        Duration::from_millis(250),
+    )
+    .await;
+    adapter.delay_for.lock().unwrap().remove("main.slow");
+    assert_eq!(adapter.merges.lock().unwrap().len(), 1, "run B merged");
+
+    // merge(id) → append while the run was interrupted.
+    let v3 = build(
+        "select id, updated_at from external.events where id > 0",
+        "select 2 as id",
+        IncrementalStrategy::Append,
+    );
+    let resumed = runner.resume(&v3, &run_id[..8], &dev).await.unwrap();
+    assert_eq!(resumed.status, ExecutionStatus::Passed);
+    assert_eq!(
+        model_result(&resumed, "assay.events").status,
+        ExecutionStatus::Passed
+    );
+    assert_eq!(
+        adapter.merges.lock().unwrap().len(),
+        1,
+        "a strategy change must full-rebuild, not merge"
+    );
+    assert_eq!(
+        created_for(&adapter, "assay.events"),
+        2,
+        "bootstrap + resumed full rebuild"
+    );
+}
+
+#[tokio::test]
+async fn resume_uses_the_current_watermark_for_time_window_models() {
+    // run A completes and records watermark W1. run B changes the SQL and
+    // is killed with W1 baked into its stored plan. An external process
+    // advances the watermark to W2 before resume — the resumed append must
+    // filter on W2, not the stored W1.
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_max_value("2026-09-10 00:00:00.000");
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+    let dev = RunOptions {
+        environment: Some("dev".to_string()),
+        run_tests: false,
+        ..Default::default()
+    };
+    let provider = events_provider();
+    let build = |sql: &str, slow_sql: &str| {
+        let compilation = compile_with_options(
+            &SemanticProject::in_memory(vec![
+                incremental_with(
+                    sql,
+                    IncrementalStrategy::TimeWindow {
+                        column: "updated_at".to_string(),
+                        overlap_seconds: None,
+                    },
+                ),
+                model("main.slow", slow_sql),
+            ]),
+            &provider,
+            &EmptySourceStateProvider,
+        );
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+        compilation
+    };
+
+    let v1 = build(
+        "select id, updated_at from external.events",
+        "select 1 as id",
+    );
+    run_once(adapter.clone(), state.clone(), &v1, "dev").await;
+    assert_eq!(
+        state.watermark("assay.events", Some("dev")).unwrap(),
+        Some("2026-09-10 00:00:00.000".to_string())
+    );
+
+    // run B: both models change → a time-window append is planned against
+    // W1 and `main.slow` builds; the process dies mid-`main.slow`.
+    let v2 = build(
+        "select id, updated_at from external.events where id > 0",
+        "select 2 as id",
+    );
+    adapter.slow_target("main.slow", 1500);
+    let plan2 =
+        plan_all_with_state(&v2, adapter.clone(), state.clone(), Some("dev".to_string())).await;
+    assert_eq!(
+        plan2
+            .models
+            .iter()
+            .find(|model| model.id == "assay.events")
+            .unwrap()
+            .watermark
+            .as_deref(),
+        Some("2026-09-10 00:00:00.000"),
+        "the interrupted plan stored W1"
+    );
+    let run_id = interrupt_apply(
+        adapter.clone(),
+        state.clone(),
+        &v2,
+        &plan2,
+        dev.clone(),
+        Duration::from_millis(250),
+    )
+    .await;
+    adapter.delay_for.lock().unwrap().remove("main.slow");
+
+    // The watermark moved on between the interruption and the resume, and
+    // the model's SQL moved again so the earlier pass cannot be reused.
+    state
+        .set_watermark(
+            "assay.events",
+            Some("dev"),
+            "2026-09-12 00:00:00.000",
+            "external-process",
+        )
+        .unwrap();
+    let v3 = build(
+        "select id, updated_at from external.events where id > 1",
+        "select 2 as id",
+    );
+    let resumed = runner.resume(&v3, &run_id[..8], &dev).await.unwrap();
+    assert_eq!(resumed.status, ExecutionStatus::Passed);
+    let appends = adapter.append_sqls.lock().unwrap().clone();
+    let last = appends.last().expect("the resumed run appended");
+    assert!(
+        last.contains("2026-09-12"),
+        "resume must read the current watermark, got: {last}"
+    );
+    assert!(
+        !last.contains("2026-09-10"),
+        "stale watermark leaked: {last}"
+    );
+}
+
+#[tokio::test]
+async fn resume_full_rebuilds_when_schema_change_requires_it() {
+    // run A completes: `assay.events` is incremental append. run B changes
+    // the SQL and is killed mid-`main.slow`. While interrupted the target
+    // gains a column the desired schema drops — normal planning classifies
+    // that as full-rebuild-required, and resume must reach the same verdict
+    // instead of keeping the stored plan's append.
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+    let dev = RunOptions {
+        environment: Some("dev".to_string()),
+        run_tests: false,
+        ..Default::default()
+    };
+    let provider = events_provider();
+    let build = |sql: &str, slow_sql: &str| {
+        let compilation = compile_with_options(
+            &SemanticProject::in_memory(vec![
+                incremental_with(sql, IncrementalStrategy::Append),
+                model("main.slow", slow_sql),
+            ]),
+            &provider,
+            &EmptySourceStateProvider,
+        );
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+        compilation
+    };
+
+    let v1 = build(
+        "select id, updated_at from external.events",
+        "select 1 as id",
+    );
+    run_once(adapter.clone(), state.clone(), &v1, "dev").await;
+    let created_for = |adapter: &FakeAdapter, target: &str| {
+        adapter
+            .created
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|created| created.as_str() == target)
+            .count()
+    };
+    assert_eq!(created_for(&adapter, "assay.events"), 1, "bootstrap");
+
+    // run B: both models change → an append is planned and `main.slow`
+    // rebuilds; killed mid-`main.slow`.
+    let v2 = build(
+        "select id, updated_at from external.events where id > 0",
+        "select 2 as id",
+    );
+    adapter.slow_target("main.slow", 1500);
+    let plan2 =
+        plan_all_with_state(&v2, adapter.clone(), state.clone(), Some("dev".to_string())).await;
+    let run_id = interrupt_apply(
+        adapter.clone(),
+        state.clone(),
+        &v2,
+        &plan2,
+        dev.clone(),
+        Duration::from_millis(250),
+    )
+    .await;
+    adapter.delay_for.lock().unwrap().remove("main.slow");
+
+    // The target gained a legacy column the desired schema drops — an
+    // unsafe append that normal planning turns into a full rebuild.
+    adapter.set_columns(vec![
+        ColumnInfo {
+            name: "id".to_string(),
+            data_type: "bigint".to_string(),
+            nullable: false,
+        },
+        ColumnInfo {
+            name: "legacy".to_string(),
+            data_type: "varchar".to_string(),
+            nullable: true,
+        },
+    ]);
+    let v3 = build(
+        "select id, updated_at from external.events where id > 1",
+        "select 2 as id",
+    );
+    let appends_before = adapter.appends.lock().unwrap().len();
+    let resumed = runner.resume(&v3, &run_id[..8], &dev).await.unwrap();
+    assert_eq!(resumed.status, ExecutionStatus::Passed);
+    assert_eq!(
+        model_result(&resumed, "assay.events").status,
+        ExecutionStatus::Passed
+    );
+    assert_eq!(
+        adapter.appends.lock().unwrap().len(),
+        appends_before,
+        "a full-rebuild-required schema change must not append"
+    );
+    assert_eq!(
+        created_for(&adapter, "assay.events"),
+        2,
+        "bootstrap + resumed full rebuild"
+    );
+}
