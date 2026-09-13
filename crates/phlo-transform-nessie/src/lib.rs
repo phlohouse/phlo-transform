@@ -448,7 +448,8 @@ impl NessieClient for NessieRestClient {
     async fn can_merge(&self, from_ref: &str, to_ref: &str) -> Result<MergeOutcome, NessieError> {
         // Nessie's `dryRun` merge runs the real conflict detection without
         // committing — the `conflicts` promotion gate sees actual conflicts,
-        // not just that the source ref resolves.
+        // not just that the source ref resolves. `post_merge` pins the
+        // source's current head when no hash is given.
         self.post_merge(from_ref, None, to_ref, None, true).await
     }
 
@@ -490,6 +491,17 @@ impl NessieRestClient {
         if dry_run {
             path.push_str("&dryRun=true");
         }
+        // Nessie requires the source hash; resolve the head when the caller
+        // did not pin one.
+        let from_hash = match from_hash {
+            Some(hash) => hash.to_string(),
+            None => {
+                self.get_reference(from_ref)
+                    .await?
+                    .ok_or_else(|| NessieError::NotFound(from_ref.to_string()))?
+                    .hash
+            }
+        };
         let body = serde_json::json!({
             "fromRefName": from_ref,
             "fromHash": from_hash,
