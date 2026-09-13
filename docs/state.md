@@ -111,6 +111,55 @@ A plan records the desired version of every planned model. At apply time the
 runner recomputes against the freshly compiled workspace and rejects a plan
 whose desired versions no longer match (`EngineError::StalePlan`).
 
+## Run progress
+
+Runs are persisted while they execute, not just at the end. `start_run`
+writes the run row — id, plan id, environment, started timestamp — together
+with the stored `plan` itself *before* the scheduler dispatches anything,
+and each model/seed/test record is written as it transitions
+(`model_runs`, `seed_runs`, `test_runs`; per-attempt detail lives in
+`attempts_json`). Every failed attempt is persisted before its retry
+backoff begins — a process killed mid-retry still shows the attempts it
+made. State-store write failures are fatal to the run rather than silently
+dropped: an execution record that cannot be written cannot be trusted for
+resume. A killed process therefore leaves an accurate partial record:
+passed work is marked passed, everything else stays unfinished.
+
+Each execution record carries the fields needed to reconstruct what
+happened: status (`passed`/`failed`/`skipped`/`cached`/`blocked`/
+`cancelled`), attempt count, per-attempt failure detail (`category`,
+message, adapter error code, retryable flag), timestamps, desired version
+and query id. `finish_run` stamps the run's final status and failed count.
+
+This is what `--resume` and `--retry-failed` rebuild from:
+
+- **`run --resume <run-id>`** continues an *interrupted* run — still
+  `running` after a kill, or `cancelled` — under the same run id. It
+  reloads the stored plan's model set and prior per-node records, then
+  re-runs every model through the normal planner so the action, the
+  `full_rebuild` decision (incremental strategy/key changes and
+  schema-change classification) and the time-window watermark all reflect
+  current state. Reuse is verified, not trusted: a previously-passed model
+  is kept only if its desired version still matches the fresh compile
+  *and* its target relation still exists; a seed is reused only when its
+  recorded content hash matches the current file and its target exists.
+  Stored `skip`/`cached` decisions — and stored incremental decisions —
+  are never trusted: a version that moved since the interruption becomes a
+  build. A finished run is not resumable: `failed` redirects to
+  `--retry-failed`, `passed` is a no-op.
+- **`run --retry-failed <run-id>`** creates a new run (`continued_from`
+  links back) over the failed/blocked/cancelled models of a finished run,
+  the dependencies they still need, and any tests that failed — tests over
+  rebuilt models re-verify as well. If nothing failed there is nothing to
+  retry and the command says so.
+
+Safe to reuse: `passed` model records whose desired version still matches
+and whose target still exists, and `passed` seed records with matching
+hashes and existing targets. Never trusted: `failed`/`blocked`/`cancelled`
+records, unfinished records from a killed run, stored `skip`/`cached`
+actions whose underlying version moved, and any record whose desired
+version differs from the current compile.
+
 ## Inspect
 
 `inspect` shows desired/current versions and `status` (`new`/`changed`/

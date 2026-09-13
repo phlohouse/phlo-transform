@@ -110,7 +110,7 @@ async fn executes_models_and_tests_against_trino() {
                 environment: Some("ci".to_string()),
                 concurrency: 2,
                 run_tests: true,
-                cancel: Default::default(),
+                ..Default::default()
             },
         )
         .await

@@ -1405,7 +1405,7 @@ cancelled
 cached
 ```
 
-`blocked` indicates an upstream dependency prevented execution.
+`blocked` indicates an upstream dependency prevented execution — the model's own SQL never ran, and it is not reported as a model failure. `skipped` and `cached` satisfy dependents; `failed`, `blocked` and `cancelled` do not.
 
 ## 64. Partial failure
 
@@ -1427,9 +1427,24 @@ D PASS
 E PASS
 ```
 
+With `--fail-fast`, the first unrecoverable failure instead stops new scheduling: dependents of the failure are `blocked`, unrelated not-started work is `cancelled`, and in-flight tasks are aborted. Each attempt runs through a tracked adapter view that reports its in-flight query ids, so abort and per-attempt `--model-timeout` cancel the underlying warehouse query where the adapter supports it (Trino: `DELETE /v1/query/{id}`); adapters that cannot report in-flight queries degrade to dropping the attempt's future.
+
 ## 65. Retry behaviour
 
 Retry applies only to recognised transient execution failures by default. Compilation errors and deterministic test failures must not be retried automatically.
+
+Every failure carries a stable machine-readable category (`adapter`, `sql`, `test`, `timeout`, `cancelled`, `dependency`, `state`, `internal`) plus the adapter error code, attempt number, timestamp and a `retryable` flag. `--retries N` allows extra attempts with bounded exponential backoff; only adapter failures the adapter marked retryable are retried — SQL-semantic errors are never retried, and test/timeout/dependency/cancellation failures are scheduler or assertion outcomes, not transient faults. Every attempt is recorded.
+
+## 65a. Interrupted runs
+
+Execution progress is persisted incrementally: the run row and stored plan are written before scheduling, each node record lands as it transitions, and every failed attempt is persisted before its retry backoff begins. A state-store write failure is fatal to the run — progress that cannot be recorded cannot be trusted for resume. A killed process therefore leaves an accurate partial record rather than a misleadingly successful one.
+
+Two continuations rebuild from that state:
+
+- `run --resume <run-id>` — continue an *interrupted* run (still `running`, or `cancelled`) under the same run id. Verified `passed` work is reused (a model's earlier `passed` counts only when its desired version still matches and its target relation still exists; a seed's only when its content hash matches and its target exists); every other node is re-planned through the normal planner against current state — stored `skip`/`cached` decisions, `full_rebuild` flags and watermarks are never trusted once the workspace moved, so an incremental strategy/key change or a schema change classified as full-rebuild-required rebuilds fully, and time-window models read the current watermark. A finished run is refused: `failed` redirects to `--retry-failed`.
+- `run --retry-failed <run-id>` — start a new run (linked by `continued_from`) over the failed/blocked/cancelled models of a finished run, the dependencies they still need, and any tests that failed; tests over rebuilt models re-verify too.
+
+Only `passed` materialisations update materialised-version state; a model version is never recorded as successful before execution genuinely completes.
 
 ---
 
@@ -1529,7 +1544,7 @@ These files are interfaces, not incidental logs.
 
 ## 75. Run artifact
 
-`run.json` includes run ID, plan ID, environment, timestamps, model results, compiled SQL hashes, query IDs, test results, model versions, source versions, timings and errors.
+`run.json` includes run ID, plan ID, `continued_from`, environment, timestamps, model/seed/test results, compiled SQL hashes, query IDs, per-status counts, model versions, source versions, timings, per-attempt records and structured failures (category, adapter code, retryable flag).
 
 ---
 
@@ -1577,6 +1592,19 @@ It should be fast enough for frequent local use.
 ## 79. `run`
 
 Convenience command, broadly `plan + apply`, intended for development environments. Production use should favour explicit plan/apply.
+
+Execution flags apply to `run`/`apply` alike:
+
+```bash
+phlo transform run --jobs 4              # bounded concurrency
+phlo transform run --retries 2           # transient-failure retries
+phlo transform run --fail-fast           # stop scheduling on first failure
+phlo transform run --model-timeout 30m   # per-attempt timeout
+phlo transform run --resume <run-id>     # continue an interrupted run
+phlo transform run --retry-failed <run-id>  # new run over the failed portion
+```
+
+`--resume`/`--retry-failed` take a full run id or a unique prefix; selection flags do not apply to them — the prior run defines the work.
 
 ## 80. `inspect`
 

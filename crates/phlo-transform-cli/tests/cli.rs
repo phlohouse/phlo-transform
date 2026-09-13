@@ -1179,3 +1179,301 @@ fn plan_since_deleted_dependency_marks_dependents() {
     );
     assert!(body.contains("BUILD  assay.results"), "{body}");
 }
+
+// ---------------------------------------------------------------------
+// Execution resilience: resume, retry-failed, fail-fast, summary output.
+// ---------------------------------------------------------------------
+
+/// A workspace with one healthy model, one model whose external source is
+/// missing at run time, and a dependent of the failing model.
+fn resilience_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let transforms = dir.path().join("workflows/main/transforms");
+    std::fs::create_dir_all(&transforms).unwrap();
+    std::fs::write(transforms.join("ok.sql"), "select 1 as id\n").unwrap();
+    std::fs::write(
+        transforms.join("broken.sql"),
+        "select * from external.missing_table\n",
+    )
+    .unwrap();
+    std::fs::write(transforms.join("child.sql"), "select * from main.broken\n").unwrap();
+    dir
+}
+
+/// Args shared by every invocation of a resilience test.
+fn resilience_args(dir: &tempfile::TempDir) -> Vec<String> {
+    let duckdb = dir.path().join("run.duckdb");
+    vec![
+        "--root".into(),
+        dir.path().to_str().expect("utf-8").into(),
+        "--adapter".into(),
+        "duckdb".into(),
+        "--duckdb-path".into(),
+        duckdb.to_str().expect("utf-8").into(),
+    ]
+}
+
+/// The run id of the last run, read from the `run.json` artifact.
+fn last_run_id(dir: &tempfile::TempDir) -> String {
+    let path = dir.path().join(".phlo/transform/run.json");
+    let artifact: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("run.json")).unwrap();
+    artifact["run"]["run_id"]
+        .as_str()
+        .expect("run_id")
+        .to_string()
+}
+
+/// Materialise the missing source so the broken model can succeed.
+fn heal_workspace(dir: &tempfile::TempDir) {
+    let connection = duckdb::Connection::open(dir.path().join("run.duckdb")).expect("open duckdb");
+    connection
+        .execute_batch(
+            "create schema if not exists external;
+             create or replace table external.missing_table as
+                 select * from (values (1,'x')) t(id,label);",
+        )
+        .expect("create source");
+}
+
+#[test]
+fn run_fails_cleanly_and_reports_the_summary() {
+    let dir = resilience_workspace();
+    let base = resilience_args(&dir);
+    let mut args = base.clone();
+    args.push("run".into());
+    let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(!output.status.success());
+    let body = stdout(&output);
+    // The run summary names counts and per-node outcomes.
+    assert!(body.contains("FAILED"), "{body}");
+    assert!(body.contains("1 failed"), "{body}");
+    assert!(body.contains("1 blocked"), "{body}");
+    assert!(body.contains("passed"), "{body}");
+    assert!(body.contains("main.broken"), "{body}");
+    assert!(body.contains("main.child"), "{body}");
+    assert!(body.contains("--retry-failed"), "{body}");
+    assert!(body.contains("--resume"), "{body}");
+
+    // The JSON run result carries the same information structurally.
+    let mut json_args = base.clone();
+    json_args.extend(["--json".into(), "run".into()]);
+    let output = run_unchecked(&json_args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("json run");
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["counts"]["failed"], 1);
+    assert_eq!(result["counts"]["blocked"], 1);
+    let broken = result["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["model"] == "main.broken")
+        .expect("broken result");
+    assert_eq!(broken["status"], "failed");
+    assert!(broken["failure"]["category"].is_string(), "{broken}");
+    let child = result["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["model"] == "main.child")
+        .expect("child result");
+    assert_eq!(child["status"], "blocked");
+    assert_eq!(child["failure"]["category"], "dependency");
+}
+
+/// The id of the still-`running` run — waits until the run has actually
+/// started, so a test can kill the process mid-flight.
+fn running_run_id(dir: &tempfile::TempDir) -> String {
+    let db = dir.path().join(".phlo/transform/state.db");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if db.exists() {
+            if let Ok(connection) = rusqlite::Connection::open(&db) {
+                // Read-only while the run holds the writer — retry on busy.
+                if let Ok(id) = connection.query_row(
+                    "select run_id from runs where status = 'running' order by started_at desc limit 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    return id;
+                }
+            }
+        }
+        assert!(std::time::Instant::now() < deadline, "run never started");
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn resume_continues_an_interrupted_run() {
+    let dir = resilience_workspace();
+    // Make `main.broken` heavy rather than broken so the run is reliably
+    // in-flight when we kill it — `@table` materialisation forces the query
+    // to execute (~3s); `main.child` queues behind it.
+    std::fs::write(
+        dir.path()
+            .join("workflows/main/transforms/broken.sql"),
+        "-- @table\nselect sum(t1.x * t2.y) as total from range(0,300000) t1(x), range(0,3000) t2(y)\n",
+    )
+    .unwrap();
+    let base = resilience_args(&dir);
+    let mut args = base.clone();
+    args.push("run".into());
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_phlo-transform"))
+        .current_dir(workspace_root())
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn run");
+
+    // Kill the process mid-run — the state store keeps an honest partial
+    // record: `main.ok` passed, `main.broken` still `running`.
+    let run_id = running_run_id(&dir);
+    // Give the run a moment to record the in-flight model.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    child.kill().expect("kill mid-run");
+    child.wait().unwrap();
+    let short = &run_id[..8];
+
+    // Resume recompiles the workspace — make the heavy model trivial so the
+    // resumed build is fast. `main.ok` is reused; `main.broken` and
+    // `main.child` run, all under the same run id.
+    std::fs::write(
+        dir.path().join("workflows/main/transforms/broken.sql"),
+        "select 1 as id\n",
+    )
+    .unwrap();
+    let mut args = base.clone();
+    args.extend(["run".into(), "--resume".into(), short.into()]);
+    let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains(&format!("Run {short}  PASSED")), "{body}");
+    assert!(body.contains("cached"), "{body}");
+    assert_eq!(last_run_id(&dir), run_id, "resume keeps the run id");
+}
+
+#[test]
+fn resume_redirects_a_finished_run_to_retry_failed() {
+    let dir = resilience_workspace();
+    let base = resilience_args(&dir);
+    let mut args = base.clone();
+    args.push("run".into());
+    let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(!output.status.success());
+    let run_id = last_run_id(&dir);
+
+    // A finished run's history is immutable — resume refuses and points at
+    // --retry-failed.
+    let mut args = base.clone();
+    args.extend(["run".into(), "--resume".into(), run_id[..8].into()]);
+    let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr.clone()).expect("utf-8 stderr");
+    assert!(stderr.contains("--retry-failed"), "{stderr}");
+}
+
+#[test]
+fn retry_failed_reruns_the_failed_portion_as_a_new_run() {
+    let dir = resilience_workspace();
+    let base = resilience_args(&dir);
+    let mut args = base.clone();
+    args.push("run".into());
+    let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(!output.status.success());
+    let run_id = last_run_id(&dir);
+    let short = &run_id[..8];
+
+    heal_workspace(&dir);
+    let mut args = base.clone();
+    args.extend(["run".into(), "--retry-failed".into(), short.into()]);
+    let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains(&format!("continues run {short}")), "{body}");
+    // A new run id was recorded.
+    assert_ne!(last_run_id(&dir), run_id);
+    // The healthy model was not part of the retry.
+    assert!(!body.contains("main.ok"), "{body}");
+}
+
+#[test]
+fn fail_fast_cancels_queued_work() {
+    let dir = resilience_workspace();
+    let base = resilience_args(&dir);
+    // --jobs 1 makes the outcome deterministic: `main.broken` is first in
+    // plan order, fails, and fail-fast then leaves `main.ok` unscheduled.
+    let mut json_args = base.clone();
+    json_args.extend([
+        "--json".into(),
+        "run".into(),
+        "--fail-fast".into(),
+        "--jobs".into(),
+        "1".into(),
+    ]);
+    let output = run_unchecked(&json_args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("json run");
+    assert_eq!(result["counts"]["failed"], 1);
+    assert_eq!(result["counts"]["blocked"], 1);
+    assert_eq!(result["counts"]["cancelled"], 1);
+    let child = result["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["model"] == "main.child")
+        .expect("child result");
+    assert_eq!(child["status"], "blocked");
+    let ok = result["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["model"] == "main.ok")
+        .expect("ok result");
+    assert_eq!(ok["status"], "cancelled");
+}
+
+#[test]
+fn retries_and_timeout_flags_are_accepted() {
+    let dir = resilience_workspace();
+    let base = resilience_args(&dir);
+    let mut args = base.clone();
+    args.extend([
+        "run".into(),
+        "--retries".into(),
+        "2".into(),
+        "--jobs".into(),
+        "2".into(),
+        "--model-timeout".into(),
+        "30s".into(),
+    ]);
+    let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    // The flags wire through; the run itself still fails on the missing
+    // source.
+    assert!(!output.status.success());
+    assert!(stdout(&output).contains("FAILED"), "{}", stdout(&output));
+}
+
+#[test]
+fn resume_and_retry_failed_reject_selector_flags() {
+    let dir = resilience_workspace();
+    let base = resilience_args(&dir);
+    let mut args = base.clone();
+    args.push("run".into());
+    run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    let run_id = last_run_id(&dir);
+    let short = &run_id[..8];
+
+    let mut args = base.clone();
+    args.extend([
+        "run".into(),
+        "--resume".into(),
+        short.into(),
+        "--select".into(),
+        "main.ok".into(),
+    ]);
+    let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(!output.status.success());
+}

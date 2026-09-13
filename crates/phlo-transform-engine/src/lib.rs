@@ -14,6 +14,7 @@ pub mod diff;
 pub mod environment;
 pub mod error;
 pub mod events;
+pub mod failure;
 pub mod plan;
 pub mod promotion;
 pub mod run;
@@ -35,17 +36,18 @@ pub use diff::{
 pub use environment::{ensure_environment, EnvironmentSetup, EnvironmentSpec};
 pub use error::{AdapterError, EngineError};
 pub use events::{EngineEvent, ExecutionStatus};
+pub use failure::{Attempt, Failure, FailureCategory, RetryPolicy};
 pub use plan::{
     dependency_closure, diff_reasons, Membership, Plan, PlanAction, PlanOptions, PlanReason,
     PlanSelection, PlannedModel, PlannedSeed, PlannedTest, Planner, ReasonKind,
 };
 pub use promotion::{promote, PromotionRecord, PromotionRequest};
-pub use run::{ModelResult, RunOptions, RunResult, Runner, SeedResult, TestResult};
+pub use run::{ModelResult, RunCounts, RunOptions, RunResult, Runner, SeedResult, TestResult};
 pub use source_state::{
     adapter_default_schema, collect_source_states, relation_for_source, seed_for_relation,
     seed_relation,
 };
 pub use state::{
-    MaterializedRecord, ModelRunRecord, RunRecord, RunSummary, SeedRecord, SqliteStateStore,
-    StateStore, TestRunRecord,
+    MaterializedRecord, ModelRunRecord, RunRecord, RunSummary, SeedRecord, SeedRunRecord,
+    SqliteStateStore, StateStore, StoredPlan, StoredRun, TestRunRecord,
 };

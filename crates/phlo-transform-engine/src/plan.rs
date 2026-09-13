@@ -36,7 +36,7 @@ use crate::state::{MaterializedRecord, StateStore};
 use crate::util::{now_rfc3339, sha256_hex};
 
 /// What the planner intends to do to a model's physical relation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanAction {
     /// Build or rebuild the physical relation.
@@ -46,7 +46,31 @@ pub enum PlanAction {
     /// The desired version can be reused from a compatible materialisation.
     Cached,
     /// Compilation errors block a decision.
+    #[default]
     Unknown,
+}
+
+impl PlanAction {
+    /// Stable machine-readable code.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlanAction::Build => "build",
+            PlanAction::Skip => "skip",
+            PlanAction::Cached => "cached",
+            PlanAction::Unknown => "unknown",
+        }
+    }
+
+    /// Parse a code produced by `as_str` (used when reconstructing a stored
+    /// plan for resume). Unknown values map to `Unknown`.
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "build" => PlanAction::Build,
+            "skip" => PlanAction::Skip,
+            "cached" => PlanAction::Cached,
+            _ => PlanAction::Unknown,
+        }
+    }
 }
 
 /// The kind of a [`PlanReason`] — stable for programmatic consumers.
@@ -93,6 +117,8 @@ pub enum ReasonKind {
     /// Selected because a Git-aware change provider marked it changed
     /// (selection provenance — not a rebuild decision).
     GitChange,
+    /// Re-executed (or reused) as part of a resumed or retried run.
+    ResumedRun,
 }
 
 impl ReasonKind {
@@ -118,6 +144,7 @@ impl ReasonKind {
             ReasonKind::SelectionExpansion => "selection_expansion",
             ReasonKind::StateUnavailable => "state_unavailable",
             ReasonKind::GitChange => "git_change",
+            ReasonKind::ResumedRun => "resumed_run",
         }
     }
 }
@@ -136,7 +163,7 @@ pub struct PlanReason {
 }
 
 impl PlanReason {
-    fn simple(kind: ReasonKind, detail: impl Into<String>) -> Self {
+    pub(crate) fn simple(kind: ReasonKind, detail: impl Into<String>) -> Self {
         Self {
             kind,
             detail: detail.into(),

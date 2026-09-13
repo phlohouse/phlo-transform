@@ -25,7 +25,7 @@ use phlo_transform_engine::{
     ensure_environment, promote, relation_for_source, Adapter, ArtifactWriter, CancelHandle,
     DiffPolicy, DiffRequest, DiffStrategy, EnvironmentSetup, EnvironmentSpec, ExecutionStatus,
     Membership, Plan, PlanAction, PlanOptions, PlanReason, Planner, PromotionRequest, ReasonKind,
-    RunOptions, RunResult, Runner, SqliteStateStore, StateStore,
+    RetryPolicy, RunOptions, RunResult, Runner, SqliteStateStore, StateStore,
 };
 use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -111,9 +111,32 @@ struct Cli {
     #[arg(long, global = true)]
     trino_schema: Option<String>,
 
-    /// Maximum concurrent model builds.
-    #[arg(long, global = true, default_value_t = 4)]
-    concurrency: usize,
+    /// Maximum concurrent model builds (run/apply).
+    #[arg(long, alias = "concurrency", global = true, default_value_t = 4)]
+    jobs: usize,
+
+    /// Extra attempts for transient adapter failures (run/apply).
+    #[arg(long, global = true)]
+    retries: Option<u32>,
+
+    /// Stop scheduling new work on the first unrecoverable failure
+    /// (run/apply).
+    #[arg(long, global = true)]
+    fail_fast: bool,
+
+    /// Per-attempt execution timeout, e.g. `30m`, `90s`, `1h` (run/apply).
+    #[arg(long, global = true, value_parser = parse_duration)]
+    model_timeout: Option<Duration>,
+
+    /// Continue an interrupted run, keeping its id and reusing successful
+    /// work (run/apply). Selector flags do not apply to a resumed run.
+    #[arg(long, global = true)]
+    resume: Option<String>,
+
+    /// Re-execute the failed/blocked portion of a finished run as a new run
+    /// (run/apply). Selector flags do not apply.
+    #[arg(long, global = true)]
+    retry_failed: Option<String>,
 
     /// Environment label recorded in plans and run history.
     #[arg(long, global = true)]
@@ -794,6 +817,40 @@ fn environment(cli: &Cli) -> Option<String> {
     cli.environment.clone().or_else(|| cli.reference.clone())
 }
 
+/// Parse `--model-timeout` values: `30s`, `5m`, `1h`, or bare seconds.
+fn parse_duration(value: &str) -> Result<Duration, String> {
+    let value = value.trim();
+    let (digits, unit_seconds) = if let Some(number) = value.strip_suffix('s') {
+        (number, 1)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3600)
+    } else {
+        (value, 1)
+    };
+    let seconds: u64 = digits
+        .parse()
+        .map_err(|_| format!("invalid duration `{value}` — try `30s`, `5m` or `1h`"))?;
+    Ok(Duration::from_secs(seconds.saturating_mul(unit_seconds)))
+}
+
+/// Run/apply execution options from the CLI flags.
+fn run_options(cli: &Cli, cancel: CancelHandle) -> RunOptions {
+    RunOptions {
+        environment: environment(cli),
+        concurrency: cli.jobs,
+        run_tests: true,
+        fail_fast: cli.fail_fast,
+        retry: RetryPolicy {
+            retries: cli.retries.unwrap_or(0),
+            ..Default::default()
+        },
+        model_timeout: cli.model_timeout,
+        cancel,
+    }
+}
+
 fn nessie_endpoint(cli: &Cli) -> Option<String> {
     cli.nessie_endpoint
         .clone()
@@ -1144,6 +1201,50 @@ async fn run_apply(
     convenience_run: bool,
 ) -> Result<ExitCode, String> {
     let state = open_state(cli);
+
+    // `--resume` / `--retry-failed` continue a prior run: their work comes
+    // from the stored run, not from CLI selection.
+    if cli.resume.is_some() || cli.retry_failed.is_some() {
+        if !set.is_unrestricted() || cli.force || cli.since.is_some() {
+            return Err(
+                "--resume/--retry-failed derive their work from the prior run; \
+                 selection flags do not apply"
+                    .to_string(),
+            );
+        }
+        let adapter = build_adapter(cli)?;
+        let cancel = CancelHandle::default();
+        spawn_ctrl_c_listener(cancel.clone());
+        let runner = Runner::new(adapter, state);
+        let options = run_options(cli, cancel);
+        let result = match (&cli.resume, &cli.retry_failed) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "--resume and --retry-failed are different continuations; use one".to_string(),
+                )
+            }
+            (Some(id), None) => runner.resume(compilation, id, &options).await,
+            (None, Some(id)) => runner.retry_failed(compilation, id, &options).await,
+            _ => unreachable!(),
+        }
+        .map_err(|error| error.to_string())?;
+        let writer = ArtifactWriter::for_workspace(&cli.root);
+        writer
+            .write_project(compilation)
+            .and_then(|_| writer.write_run(&result))
+            .map_err(|error| error.to_string())?;
+        if cli.json {
+            print_json(&result)?;
+        } else {
+            print_run_human(&result);
+        }
+        return Ok(if result.status == ExecutionStatus::Passed {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
+    }
+
     let (plan, writer) = build_plan(cli, compilation, set, state.clone(), git).await?;
     writer
         .write_project(compilation)
@@ -1163,12 +1264,7 @@ async fn run_apply(
     let cancel = CancelHandle::default();
     spawn_ctrl_c_listener(cancel.clone());
     let runner = Runner::new(adapter, state);
-    let options = RunOptions {
-        environment: environment(cli),
-        concurrency: cli.concurrency,
-        run_tests: true,
-        cancel,
-    };
+    let options = run_options(cli, cancel);
     let result = runner
         .apply(compilation, &plan, &options)
         .await
@@ -2136,8 +2232,22 @@ fn print_plan_human(plan: &Plan) {
 }
 
 fn print_run_human(result: &RunResult) {
-    println!("Run:    {}", result.run_id);
-    println!("Status: {}", result.status.label());
+    println!(
+        "Run {}  {}",
+        &result.run_id[..result.run_id.len().min(8)],
+        result.status.label().to_uppercase()
+    );
+    if let Some(from) = &result.continued_from {
+        println!("  continues run {}", &from[..from.len().min(8)]);
+    }
+    println!();
+    let counts = &result.counts;
+    println!("{} passed", counts.passed);
+    println!("{} skipped", counts.skipped);
+    println!("{} cached", counts.cached);
+    println!("{} failed", counts.failed);
+    println!("{} blocked", counts.blocked);
+    println!("{} cancelled", counts.cancelled);
     println!();
     for seed in &result.seeds {
         println!(
@@ -2146,8 +2256,12 @@ fn print_run_human(result: &RunResult) {
             seed.seed,
             seed.target
         );
-        if let Some(error) = &seed.error {
-            println!("           {error}");
+        if let Some(failure) = &seed.failure {
+            println!(
+                "           {}: {}",
+                failure.category.code(),
+                failure.message
+            );
         }
     }
     if !result.seeds.is_empty() {
@@ -2170,8 +2284,15 @@ fn print_run_human(result: &RunResult) {
                 println!("           {reason}");
             }
         }
-        if let Some(error) = &model.error {
-            println!("           {error}");
+        if let Some(failure) = &model.failure {
+            println!(
+                "           {}: {}",
+                failure.category.code(),
+                failure.message
+            );
+        }
+        if model.attempts.len() > 1 {
+            println!("           {} attempts", model.attempts.len());
         }
     }
     if !result.tests.is_empty() {
@@ -2183,10 +2304,25 @@ fn print_run_human(result: &RunResult) {
                 test.test,
                 test.row_count
             );
-            if let Some(error) = &test.error {
-                println!("           {error}");
+            if let Some(failure) = &test.failure {
+                println!(
+                    "           {}: {}",
+                    failure.category.code(),
+                    failure.message
+                );
             }
         }
+    }
+    if matches!(result.status, ExecutionStatus::Failed) {
+        println!();
+        println!(
+            "  retry:  phlo-transform run --retry-failed {}",
+            &result.run_id[..result.run_id.len().min(8)]
+        );
+        println!(
+            "  resume: phlo-transform run --resume {}",
+            &result.run_id[..result.run_id.len().min(8)]
+        );
     }
     println!();
 }
