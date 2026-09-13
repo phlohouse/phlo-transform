@@ -355,8 +355,10 @@ struct MergeResponse {
 struct MergeDetail {
     #[serde(default)]
     key: Option<MergeKey>,
-    #[serde(rename = "conflictType", default)]
-    conflict: Option<String>,
+    /// Nessie reports a conflict object (`conflictType`, `message`, `key`);
+    /// tolerate a bare string for older shapes.
+    #[serde(default)]
+    conflict: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -503,16 +505,19 @@ impl NessieRestClient {
                     .hash
             }
         };
-        let mut path = format!(
-            "/trees/{}@{expected_target_hash}/history/merge?returnConflictDetailsAsResult=true",
+        let path = format!(
+            "/trees/{}@{expected_target_hash}/history/merge",
             encode(to_ref)
         );
-        if dry_run {
-            path.push_str("&dryRun=true");
-        }
+        // The merge flags live in the request body as `is*` fields — the
+        // documented `dryRun`/`returnConflictDetailsAsResult` query params
+        // are silently ignored by the server (projectnessie/nessie#12130),
+        // which would turn a merge *check* into a real merge.
         let body = serde_json::json!({
             "fromRefName": from_ref,
             "fromHash": from_hash,
+            "isDryRun": dry_run,
+            "isReturnConflictAsResult": true,
         });
         let response = self
             .send(self.request(reqwest::Method::POST, &path).json(&body))
@@ -549,15 +554,22 @@ fn merge_outcome(merge: MergeResponse, raw: &str) -> MergeOutcome {
         .details
         .into_iter()
         .filter_map(|detail| {
-            let kind = detail.conflict?;
+            let conflict = detail.conflict?;
             let path = detail
                 .key
                 .map(|key| key.elements.join("."))
                 .unwrap_or_default();
-            Some(Conflict {
-                path,
-                message: kind,
-            })
+            let message = match &conflict {
+                serde_json::Value::String(kind) => kind.clone(),
+                serde_json::Value::Object(fields) => fields
+                    .get("message")
+                    .and_then(|message| message.as_str())
+                    .or_else(|| fields.get("conflictType").and_then(|kind| kind.as_str()))
+                    .unwrap_or("merge conflict")
+                    .to_string(),
+                _ => "merge conflict".to_string(),
+            };
+            Some(Conflict { path, message })
         })
         .collect();
     if !merge.was_successful && conflicts.is_empty() {
