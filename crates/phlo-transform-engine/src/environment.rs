@@ -105,3 +105,21 @@ pub async fn ensure_environment(
         catalog: spec.catalog.clone(),
     })
 }
+
+/// The conventional catalog name for a candidate environment: `phlo_<ref>`
+/// with characters unsafe in a catalog name folded to `_`. Provisioning and
+/// diff/promotion evidence resolution share this convention.
+pub fn catalog_name(reference: &str) -> String {
+    let mut name = String::from("phlo_");
+    let mut previous_underscore = false;
+    for character in reference.chars() {
+        if character.is_ascii_alphanumeric() {
+            name.push(character.to_ascii_lowercase());
+            previous_underscore = false;
+        } else if !previous_underscore {
+            name.push('_');
+            previous_underscore = true;
+        }
+    }
+    name.trim_end_matches('_').to_string()
+}

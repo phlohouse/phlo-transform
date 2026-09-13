@@ -8,6 +8,7 @@
 
 pub mod adapter;
 pub mod artifacts;
+pub mod audit;
 pub mod branch_diff;
 pub mod cancel;
 pub mod changed;
@@ -32,6 +33,11 @@ pub use artifacts::{
     LineageArtifact, LineageDiffArtifact, LineageEnvironment, ManifestArtifact,
     OpenLineageArtifact, PlanArtifact, PromotionArtifact, RunArtifact, SCHEMA_VERSION,
 };
+pub use audit::{
+    audited_diff, audited_lineage, compiled_catalog, contract_breaking_changes,
+    environment_artifact_name, read_branch_diff, read_diff, read_environment, read_environment_for,
+    remove_environment_artifacts, write_environment_artifacts, AuditEvidence, LineageEvidence,
+};
 pub use branch_diff::{
     branch_diff, materialized_for_environment, model_keys, retarget, seeds_for_environment,
     BranchDiffReport, BranchDiffRequest, DatasetDiff, DatasetKind, DatasetStatus,
@@ -46,7 +52,7 @@ pub use contracts::{
 pub use diff::{
     diff, DiffPolicy, DiffReport, DiffRequest, DiffStrategy, PolicyResult, RowSummary, SchemaChange,
 };
-pub use environment::{ensure_environment, EnvironmentSetup, EnvironmentSpec};
+pub use environment::{catalog_name, ensure_environment, EnvironmentSetup, EnvironmentSpec};
 pub use error::{AdapterError, EngineError};
 pub use events::{EngineEvent, ExecutionStatus};
 pub use failure::{Attempt, Failure, FailureCategory, RetryPolicy};

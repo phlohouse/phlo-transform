@@ -1832,13 +1832,20 @@ without manually parsing source files.
 
 ## 85. Transform daemon
 
-A later phase should introduce:
-
 ```bash
 phlo transform daemon
 ```
 
-The daemon maintains an incremental in-memory workspace representation containing parsed ASTs, typed ASTs, dependency graph, catalogue schemas, lineage, hashes, filesystem state and compiled plans.
+The daemon maintains an in-memory workspace representation containing parsed ASTs, typed ASTs, dependency graph, catalogue schemas, lineage, hashes, filesystem state and compiled plans, published as an immutable `Arc<Compilation>` snapshot so readers never observe partial updates.
+
+It serves a versioned local HTTP API (see `docs/daemon.md`) with two planes:
+
+- **Reads** (`GET /v1/...`): check, models, inspect, lineage (document, model, column), impact, graph, plan, branch/lineage diffs, and state inspection (runs, run detail, materialisations, promotions) — the same report DTOs as `--json` output.
+- **Operations** (`POST /v1/operations`): `run`, `test`, `promote`, `reload` with a stable `queued → running → succeeded|failed|cancelled` lifecycle, live progress read back from the state store, cooperative cancellation via `CancelHandle`, per-key idempotent replay (`idempotency_key` / `Idempotency-Key` header), and a single-mutating-operation gate (`API008`).
+
+Promotion through the API uses the same audited evidence path as the CLI (`phlo_transform_engine::audit`): the gate reads the diff artifacts (`branch_diff.json` preferred, bound to both refs' resolved heads), the recorded provisioning environment (`created_from` provenance), live contract diffs against the target's recorded contracts, and the Nessie merge check — so CLI and API cannot drift apart on what counts as evidence. A `run` op records the environment reference's current head when it resolves to a Nessie reference; an unbound run cannot promote a commit-bound candidate.
+
+Errors are `{"error": {"code", "message"}}` with stable `API0xx` codes.
 
 ## 86. Daemon consumers
 
