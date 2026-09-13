@@ -24,6 +24,7 @@ pub mod git;
 pub mod graph;
 pub mod identity;
 pub mod lineage;
+pub mod lineage_diff;
 pub mod model;
 pub mod report;
 pub mod resolve;
@@ -42,14 +43,18 @@ pub use consumers::{ConsumerRegistry, EmptyConsumerRegistry, StaticConsumerRegis
 pub use diagnostics::{codes, Diagnostic, Severity};
 pub use discovery::{load_project, model_id_for_path};
 pub use git::{
-    changes as git_changes, ChangedModel, ChangedPath, ChangedSeed, ChangedTest, DeletedModel,
-    GitChanges, GitError, PathStatus,
+    changes as git_changes, checkout_tree, comparison_base, resolve_commit, ChangedModel,
+    ChangedPath, ChangedSeed, ChangedTest, CheckedTree, ComparisonBase, DeletedModel, GitChanges,
+    GitError, PathStatus,
 };
 pub use graph::{Dependency, EdgeKind, GraphNode, TransformGraph};
 pub use identity::{IdentityError, ModelId, Namespace, SourceId};
 pub use lineage::{
     DatasetColumn, DatasetId, DatasetKind, LineageDocument, LineageEdge, LineageEdgeKind,
     LineageGraph, LineageNode, NodeMeta,
+};
+pub use lineage_diff::{
+    lineage_diff, DiffEdge, DiffNode, EdgeChange, LineageDiff, LineageDiffImpact, NodeChange,
 };
 pub use model::{
     FrontendKind, ModelConfig, ModelOrigin, Relation, RootKind, RootNamespaceStrategy, RootRef,

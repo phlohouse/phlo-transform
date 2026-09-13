@@ -24,11 +24,12 @@ use phlo_transform_engine::{
     adapter_default_schema, branch_diff, changed_models, collect_source_states, diff, diff_reasons,
     ensure_environment, evaluate_gates, materialized_for_environment, model_keys, promote,
     relation_for_source, retarget, seeds_for_environment, Adapter, ArtifactWriter,
-    BranchDiffReport, BranchDiffRequest, CancelHandle, ContractSafety, DatasetKind, DiffPolicy,
-    DiffRequest, DiffStrategy, EnvironmentArtifact, EnvironmentSetup, EnvironmentSpec,
-    ExecutionStatus, GateInput, Membership, Plan, PlanAction, PlanOptions, PlanReason, Planner,
-    PostgresStateStore, PromotionRequest, ReasonKind, RetryPolicy, RunOptions, RunResult, Runner,
-    SqliteStateStore, StateStore, SCHEMA_VERSION,
+    BranchDiffReport, BranchDiffRequest, CancelHandle, CandidateProvenance, ContractSafety,
+    DatasetKind, DiffPolicy, DiffRequest, DiffStrategy, EnvironmentArtifact, EnvironmentSetup,
+    EnvironmentSpec, ExecutionStatus, GateInput, LineageDiffArtifact, LineageEnvironment,
+    Membership, Plan, PlanAction, PlanOptions, PlanReason, Planner, PostgresStateStore,
+    PromotionRequest, ReasonKind, RetryPolicy, RunOptions, RunResult, Runner, SqliteStateStore,
+    StateStore, SCHEMA_VERSION,
 };
 use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -283,6 +284,15 @@ enum Command {
         /// JSON array of OpenLineage JobEvents and DatasetEvents.
         #[arg(long, value_enum)]
         format: Option<LineageFormat>,
+        /// Diff lineage against the lineage compiled at a Git baseline.
+        /// One ref — `lineage --diff main` — uses the same merge-base
+        /// semantics as `--since`: the workspace is compared against
+        /// `merge-base(ref, HEAD)`, so a feature branch diffs against where
+        /// it diverged. Two refs — `lineage --diff main feature/foo` —
+        /// compare the exact refs, no worktree involved. Writes
+        /// `lineage_diff.json` alongside the other artifacts.
+        #[arg(long, value_name = "BASE_REF [CANDIDATE_REF]", num_args = 1..=2, conflicts_with_all = ["target", "format"])]
+        diff: Vec<String>,
     },
     /// Show downstream impact of a column or a selection.
     Impact {
@@ -510,14 +520,22 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
         Command::Apply { .. } => run_apply(cli, &compilation, &set, git.as_ref(), false).await,
         Command::Run { .. } => run_apply(cli, &compilation, &set, git.as_ref(), true).await,
         Command::Test { .. } => run_test(cli, &compilation, &set, git.as_ref()).await,
-        Command::Lineage { target, format } => run_lineage(
-            cli,
-            &compilation,
-            target.as_deref(),
-            &set,
-            git.as_ref(),
-            *format,
-        ),
+        Command::Lineage {
+            target,
+            format,
+            diff,
+        } => {
+            run_lineage(
+                cli,
+                &compilation,
+                target.as_deref(),
+                &set,
+                git.as_ref(),
+                *format,
+                diff.as_slice(),
+            )
+            .await
+        }
         Command::Impact { column } => {
             run_impact(cli, &compilation, column.as_deref(), &set, git.as_ref())
         }
@@ -1209,6 +1227,19 @@ async fn run_promote(
             to,
         )?);
     let merge_check = nessie.can_merge(candidate, to).await.ok();
+    // Lineage evidence: the artifact only speaks for this promotion when
+    // the identities it was produced against still hold — including the
+    // candidate's compiled lineage fingerprint — stale or unbound reports
+    // are surfaced as such, never silently as "no changes".
+    let current_lineage_hash = compilation.lineage.fingerprint();
+    let lineage = audited_lineage(
+        cli,
+        candidate,
+        to,
+        &candidate_reference.hash,
+        &target.hash,
+        Some(&current_lineage_hash),
+    );
 
     // The `base` gate needs a target commit the evidence was established
     // against. Two sources, freshest first: a hash-bound diff artifact that
@@ -1250,9 +1281,11 @@ async fn run_promote(
                 "target_ref": to,
                 "check_only": check,
                 "gates": report.results,
+                "lineage": lineage,
             }))?;
         } else {
             print_gates_human(&report);
+            print_lineage_evidence(&lineage);
             if check && report.passed {
                 println!("Candidate `{candidate}` can be promoted to `{to}` (check only).");
             }
@@ -1307,11 +1340,13 @@ async fn run_promote(
                 print_json(&serde_json::json!({
                     "ok": cleanup_error.is_none(),
                     "gates": report.results,
+                    "lineage": lineage,
                     "promotion": record,
                     "cleanup_error": cleanup_error,
                 }))?;
             } else {
                 print_gates_human(&report);
+                print_lineage_evidence(&lineage);
                 print_promotion_human(&record);
                 if let Some(error) = &cleanup_error {
                     eprintln!(
@@ -1408,6 +1443,177 @@ fn contract_breaking_changes(
         }
     }
     Ok(breaking)
+}
+
+/// The lineage-diff artifact's standing as evidence for this promotion.
+#[derive(Clone, Debug, serde::Serialize)]
+struct LineageEvidence {
+    /// `current` — the artifact audited this Nessie pair at these commits;
+    /// `advisory` — only Git-bound, so no environment identity to check;
+    /// `stale` — the identity it was produced for has moved and it cannot
+    /// be treated as describing the candidate being promoted.
+    status: &'static str,
+    /// Why the artifact is not current evidence, when stale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// The base the diff was produced against (`ref (commit)`).
+    base: String,
+    /// Total lineage changes the artifact reports.
+    changes: usize,
+}
+
+/// Read `lineage_diff.json` and audit its provenance against the pair
+/// being promoted. The artifact only counts when it was produced for this
+/// candidate against this target — bound to the Nessie commits when it
+/// carries an environment binding, else to the Git identity it recorded —
+/// and only while its candidate fingerprint still matches the compiled
+/// workspace. Anything stale, unreadable, or about another pair is
+/// rejected with a reason naming the rerun rather than silently treated
+/// as current.
+fn audited_lineage(
+    cli: &Cli,
+    candidate: &str,
+    to: &str,
+    candidate_hash: &str,
+    target_hash: &str,
+    current_lineage_hash: Option<&str>,
+) -> Option<LineageEvidence> {
+    let text = std::fs::read_to_string(artifact_path(cli, "lineage_diff.json")).ok()?;
+    let artifact = match serde_json::from_str::<LineageDiffArtifact>(&text) {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            return Some(LineageEvidence {
+                status: "stale",
+                reason: Some(format!("unreadable lineage artifact: {error}")),
+                base: "unknown".to_string(),
+                changes: 0,
+            });
+        }
+    };
+    let base = format!(
+        "{} ({})",
+        artifact.base_ref,
+        short(&artifact.base_commit, 12)
+    );
+    let changes = artifact.diff.change_count();
+    let stale = |reason: String| LineageEvidence {
+        status: "stale",
+        reason: Some(reason),
+        base: base.clone(),
+        changes,
+    };
+    let evidence = |status: &'static str| LineageEvidence {
+        status,
+        reason: None,
+        base: base.clone(),
+        changes,
+    };
+    let rerun = format!("rerun `lineage --diff {to} --ref {candidate}`");
+    let verdict = match &artifact.environment {
+        // Nessie-bound: the pair and both commits must match the promotion.
+        Some(binding) => {
+            if binding.candidate_ref != candidate || binding.target_ref != to {
+                stale(format!(
+                    "lineage diff covers `{}` -> `{}`, not `{candidate}` -> `{to}`; {rerun}",
+                    binding.candidate_ref, binding.target_ref
+                ))
+            } else if binding.candidate_hash != candidate_hash {
+                stale(format!(
+                    "candidate `{candidate}` moved since the lineage diff; {rerun}"
+                ))
+            } else if binding.target_hash != target_hash {
+                stale(format!(
+                    "target `{to}` moved since the lineage diff; {rerun}"
+                ))
+            } else {
+                evidence("current")
+            }
+        }
+        // Git-bound only: the recorded candidate identity must still hold.
+        None => match artifact.base_kind.as_str() {
+            "merge-base" => {
+                match phlo_transform_core::comparison_base(&cli.root, &artifact.base_ref) {
+                    Ok(current)
+                        if current.commit == artifact.base_commit
+                            && current.head == artifact.candidate.head
+                            && current.dirty == artifact.candidate.dirty =>
+                    {
+                        evidence("advisory")
+                    }
+                    Ok(_) => stale(format!(
+                        "the worktree or `{}` moved since the lineage diff; {rerun}",
+                        artifact.base_ref
+                    )),
+                    Err(_) => stale(format!(
+                        "base ref `{}` no longer resolves; {rerun}",
+                        artifact.base_ref
+                    )),
+                }
+            }
+            // Exact ref -> ref: both refs must still resolve to the commits
+            // the diff was produced from — a deleted or unrecorded ref is
+            // unverifiable, not "unchanged".
+            _ => {
+                let base_now =
+                    match phlo_transform_core::resolve_commit(&cli.root, &artifact.base_ref) {
+                        Ok(commit) => commit,
+                        Err(_) => {
+                            return Some(stale(format!(
+                                "base ref `{}` no longer resolves; {rerun}",
+                                artifact.base_ref
+                            )))
+                        }
+                    };
+                let candidate_now = match artifact.candidate.git_ref.as_deref() {
+                    Some(git_ref) => {
+                        match phlo_transform_core::resolve_commit(&cli.root, git_ref) {
+                            Ok(commit) => Some(commit),
+                            Err(_) => {
+                                return Some(stale(format!(
+                                    "candidate ref `{git_ref}` no longer resolves; {rerun}"
+                                )))
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                match (candidate_now, artifact.candidate.head.as_deref()) {
+                    (Some(now), Some(recorded))
+                        if now == recorded && base_now == artifact.base_commit =>
+                    {
+                        evidence("advisory")
+                    }
+                    (Some(_), Some(_)) => stale(format!(
+                        "a diffed ref moved since the lineage diff; {rerun}"
+                    )),
+                    _ => stale(format!(
+                        "the artifact does not record a resolvable candidate ref; {rerun}"
+                    )),
+                }
+            }
+        },
+    };
+    // Whichever identity check passed, the artifact must also describe the
+    // candidate's current definitions: refs can sit still while edited
+    // code waits unpromoted, and a dirty worktree stays "dirty" as its
+    // contents change.
+    if verdict.status == "stale" {
+        return Some(verdict);
+    }
+    Some(
+        match (&artifact.candidate.lineage_hash, current_lineage_hash) {
+            (Some(recorded), Some(now)) if recorded == now => verdict,
+            (Some(_), Some(_)) => stale(format!(
+                "the candidate's lineage changed since the diff; {rerun}"
+            )),
+            (Some(_), None) => stale(format!(
+                "the candidate's lineage could not be fingerprinted; {rerun}"
+            )),
+            (None, _) => stale(format!(
+                "the lineage artifact predates candidate fingerprinting; {rerun}"
+            )),
+        },
+    )
 }
 
 /// Read the audited `branch_diff.json` artifact and derive the evidence it
@@ -1638,6 +1844,26 @@ fn print_gates_human(report: &phlo_transform_engine::GateReport) {
         println!("{status} {:<10} {}", result.name, result.detail);
     }
     println!();
+}
+
+/// The lineage artifact's standing under the gates — advisory context, not
+/// a gate itself: `stale` means the report's provenance no longer matches
+/// what is being promoted.
+fn print_lineage_evidence(lineage: &Option<LineageEvidence>) {
+    let Some(lineage) = lineage else {
+        return;
+    };
+    match (lineage.status, &lineage.reason) {
+        ("stale", Some(reason)) => println!("Lineage: stale — {reason}\n"),
+        ("current", _) => println!(
+            "Lineage: {} change(s) vs {} — current\n",
+            lineage.changes, lineage.base
+        ),
+        _ => println!(
+            "Lineage: {} change(s) vs {} (advisory — not bound to this environment)\n",
+            lineage.changes, lineage.base
+        ),
+    }
 }
 
 /// Removal of a promoted candidate's catalog and branch. Every failure is
@@ -2274,14 +2500,18 @@ async fn run_test(
     })
 }
 
-fn run_lineage(
+async fn run_lineage(
     cli: &Cli,
     compilation: &Compilation,
     target: Option<&str>,
     set: &SelectorSet,
     git: Option<&GitChanges>,
     format: Option<LineageFormat>,
+    diff: &[String],
 ) -> Result<ExitCode, String> {
+    if !diff.is_empty() {
+        return run_lineage_diff(cli, compilation, diff).await;
+    }
     // `--format` exports the canonical lineage graph: scoped to a model
     // target or a selection when given, the whole workspace otherwise.
     if let Some(format) = format {
@@ -2380,6 +2610,284 @@ fn run_lineage(
             }
             Ok(ExitCode::FAILURE)
         }
+    }
+}
+
+/// `lineage --diff <base>` / `lineage --diff <base> <candidate>`: compile
+/// the base workspace and diff its lineage graph against the candidate's.
+///
+/// One ref uses the same merge-base semantics as `--since` — the workspace
+/// is compared against `merge-base(base, HEAD)`, so a feature branch diffs
+/// against where it diverged rather than against the other ref's current
+/// head. Two refs compare the exact refs with no worktree involved. Both
+/// trees are materialised read-only — the checkout is never touched.
+async fn run_lineage_diff(
+    cli: &Cli,
+    compilation: &Compilation,
+    refs: &[String],
+) -> Result<ExitCode, String> {
+    let (base_kind, base_ref, base_tree, candidate_tree, candidate) = match refs {
+        [base_ref] => {
+            // merge-base(ref, HEAD) -> worktree: the branch-change
+            // workflow, identical to `--since`.
+            let comparison = phlo_transform_core::comparison_base(&cli.root, base_ref)
+                .map_err(|error| error.to_string())?;
+            let tree = phlo_transform_core::checkout_tree(&cli.root, &comparison.commit)
+                .map_err(|error| error.to_string())?;
+            (
+                "merge-base",
+                base_ref.clone(),
+                tree,
+                None,
+                CandidateProvenance {
+                    git_ref: environment(cli).or_else(|| cli.from.clone()),
+                    head: comparison.head,
+                    dirty: comparison.dirty,
+                    lineage_hash: None,
+                    model_versions: BTreeMap::new(),
+                },
+            )
+        }
+        [base_ref, candidate_ref] => {
+            // Exact ref -> exact ref: the candidate is a checked-out tree,
+            // not the working tree.
+            let base_tree = phlo_transform_core::checkout_tree(&cli.root, base_ref)
+                .map_err(|error| error.to_string())?;
+            let candidate_tree = phlo_transform_core::checkout_tree(&cli.root, candidate_ref)
+                .map_err(|error| error.to_string())?;
+            (
+                "ref",
+                base_ref.clone(),
+                base_tree,
+                Some(candidate_tree),
+                CandidateProvenance {
+                    git_ref: Some(candidate_ref.clone()),
+                    head: None,
+                    dirty: false,
+                    lineage_hash: None,
+                    model_versions: BTreeMap::new(),
+                },
+            )
+        }
+        _ => return Err("`--diff` takes one or two Git refs".to_string()),
+    };
+    let base_commit = base_tree.commit.clone();
+    let candidate = CandidateProvenance {
+        head: candidate_tree
+            .as_ref()
+            .map(|tree| tree.commit.clone())
+            .or(candidate.head),
+        ..candidate
+    };
+
+    let base = match compile_tree(cli, &base_tree.workspace, &base_ref).await {
+        Ok(base) => base,
+        Err(code) => return Ok(code),
+    };
+    let base_graph = phlo_transform_core::LineageGraph::build(&base);
+    let candidate_compilation = match &candidate_tree {
+        Some(tree) => match compile_tree(cli, &tree.workspace, &refs[1]).await {
+            Ok(candidate) => Some(candidate),
+            Err(code) => return Ok(code),
+        },
+        None => None,
+    };
+    let candidate_graph = candidate_compilation
+        .as_ref()
+        .map(|candidate| candidate.lineage.clone())
+        .unwrap_or_else(|| compilation.lineage.clone());
+    // The candidate's definitional identity: the canonical graph's
+    // fingerprint — the stale-artifact check promotion can trust — plus
+    // each model's content-addressed version as diagnostic context.
+    let candidate = CandidateProvenance {
+        lineage_hash: Some(candidate_graph.fingerprint()),
+        model_versions: candidate_compilation
+            .as_ref()
+            .unwrap_or(compilation)
+            .models
+            .iter()
+            .map(|model| (model.id.logical_name(), model.version.hash.clone()))
+            .collect(),
+        ..candidate
+    };
+    let mut diff = phlo_transform_core::lineage_diff(&base_graph, &candidate_graph);
+    diff.base_ref = Some(match base_kind {
+        "merge-base" => format!("{base_ref} (merge-base {})", short(&base_commit, 12)),
+        _ => format!("{base_ref} ({})", short(&base_commit, 12)),
+    });
+
+    // Bind the diff to the Nessie pair it describes, when both resolve:
+    // the environment names the candidate branch, the base ref names the
+    // target. Unconfigured or unresolved leaves the artifact unbound —
+    // promotion then treats it as advisory rather than current evidence.
+    let environment_binding = match (candidate.git_ref.clone(), nessie_endpoint(cli)) {
+        (Some(candidate_ref), Some(_)) => match build_nessie(cli) {
+            Ok(nessie) => {
+                let candidate_nessie = nessie.get_reference(&candidate_ref).await.ok().flatten();
+                let target_nessie = nessie.get_reference(&base_ref).await.ok().flatten();
+                match (candidate_nessie, target_nessie) {
+                    (Some(candidate), Some(target)) => Some(LineageEnvironment {
+                        candidate_ref,
+                        candidate_hash: candidate.hash,
+                        target_ref: base_ref.clone(),
+                        target_hash: target.hash,
+                    }),
+                    _ => None,
+                }
+            }
+            Err(_) => None,
+        },
+        _ => None,
+    };
+
+    ArtifactWriter::for_workspace(&cli.root)
+        .write_lineage_diff(&LineageDiffArtifact {
+            schema_version: SCHEMA_VERSION,
+            base_kind: base_kind.to_string(),
+            base_ref: base_ref.clone(),
+            base_commit,
+            candidate,
+            environment: environment_binding,
+            diff: diff.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+
+    if cli.json {
+        return print_json(&diff).map(|_| ExitCode::SUCCESS);
+    }
+    if diff.is_empty() {
+        println!(
+            "No lineage changes since {}",
+            diff.base_ref.as_deref().unwrap_or(&base_ref)
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!(
+        "Lineage diff vs {}",
+        diff.base_ref.as_deref().unwrap_or(&base_ref)
+    );
+    let section = |title: &str, count: usize| {
+        if count > 0 {
+            println!();
+            println!("{title}");
+        }
+    };
+    section("Added", diff.nodes_added.len());
+    for node in &diff.nodes_added {
+        println!("  + {} ({})", node.name, node.kind);
+    }
+    section("Removed", diff.nodes_removed.len());
+    for node in &diff.nodes_removed {
+        println!("  - {} ({})", node.name, node.kind);
+    }
+    section("Changed", diff.nodes_changed.len());
+    for node in &diff.nodes_changed {
+        println!("  ~ {} ({})", node.name, node.kind);
+        for change in &node.changes {
+            println!("      {change}");
+        }
+    }
+    if !diff.edges_added.is_empty()
+        || !diff.edges_removed.is_empty()
+        || !diff.edges_changed.is_empty()
+    {
+        println!();
+        println!("Edges");
+        for edge in &diff.edges_added {
+            let detail = edge
+                .detail
+                .as_ref()
+                .map(|detail| format!(" ({detail})"))
+                .unwrap_or_default();
+            println!("  + {} --{}-> {}{detail}", edge.from, edge.kind, edge.to);
+        }
+        for edge in &diff.edges_removed {
+            let detail = edge
+                .detail
+                .as_ref()
+                .map(|detail| format!(" ({detail})"))
+                .unwrap_or_default();
+            println!("  - {} --{}-> {}{detail}", edge.from, edge.kind, edge.to);
+        }
+        for edge in &diff.edges_changed {
+            println!("  ~ {} --{}-> {}", edge.from, edge.kind, edge.to);
+            for change in &edge.changes {
+                println!("      {change}");
+            }
+        }
+    }
+    section("Impacts", diff.impacts.len() + diff.edge_impacts.len());
+    for impact in &diff.impacts {
+        println!("  {} orphans: {}", impact.node, impact.orphans.join(", "));
+    }
+    for impact in &diff.edge_impacts {
+        println!(
+            "  {} --{}-> {} {}: affects {}",
+            impact.from,
+            impact.kind,
+            impact.to,
+            impact.change,
+            impact.downstream.join(", ")
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Compile the workspace inside a materialised Git tree: load it, apply
+/// the same `--catalog` override, and enrich it against the same adapter —
+/// the live compile's twin, or every target would diff as moved. `label`
+/// is the ref name diagnostics are reported under.
+async fn compile_tree(
+    cli: &Cli,
+    workspace: &std::path::Path,
+    label: &str,
+) -> Result<Compilation, ExitCode> {
+    let mut project = match load_project(workspace) {
+        Ok(project) => project,
+        Err(diagnostics) => {
+            report_diff_diagnostics(cli, label, "cannot load", &diagnostics);
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    let base_catalog = project.defaults.catalog.clone();
+    let base_schema = project.defaults.schema.clone();
+    if let Some(catalog) = &cli.catalog {
+        project.defaults.catalog = Some(catalog.clone());
+    }
+    let compiled = {
+        let plain = compile(&project);
+        enrich(
+            cli,
+            &project,
+            base_catalog.as_deref(),
+            base_schema.as_deref(),
+            &plain,
+        )
+        .await
+        .unwrap_or(plain)
+    };
+    if !compiled.is_ok() {
+        report_diff_diagnostics(
+            cli,
+            label,
+            "does not compile cleanly",
+            &compiled.diagnostics,
+        );
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(compiled)
+}
+
+fn report_diff_diagnostics(cli: &Cli, label: &str, problem: &str, diagnostics: &[Diagnostic]) {
+    if cli.json {
+        let _ = print_json(&serde_json::json!({
+            "ok": false,
+            "base_ref": label,
+            "diagnostics": diagnostics,
+        }));
+    } else {
+        eprintln!("`{label}` {problem}:");
+        render_diagnostics(diagnostics);
     }
 }
 
@@ -5031,6 +5539,358 @@ mod tests {
                 .iter()
                 .any(|change| change.contains("key") && change.contains("cannot be verified")),
             "unverifiable record must block even against a keyless model: {breaks:?}"
+        );
+    }
+
+    fn lineage_artifact(
+        base_kind: &str,
+        base_ref: &str,
+        base_commit: &str,
+        candidate_head: Option<&str>,
+        dirty: bool,
+        environment: Option<LineageEnvironment>,
+    ) -> LineageDiffArtifact {
+        LineageDiffArtifact {
+            schema_version: SCHEMA_VERSION,
+            base_kind: base_kind.to_string(),
+            base_ref: base_ref.to_string(),
+            base_commit: base_commit.to_string(),
+            candidate: CandidateProvenance {
+                git_ref: Some("ci/x".to_string()),
+                head: candidate_head.map(str::to_string),
+                dirty,
+                lineage_hash: Some("fingerprint".to_string()),
+                model_versions: BTreeMap::new(),
+            },
+            environment,
+            diff: phlo_transform_core::LineageDiff::default(),
+        }
+    }
+
+    fn write_lineage_diff(cli: &Cli, artifact: &LineageDiffArtifact) {
+        ArtifactWriter::for_workspace(&cli.root)
+            .write_lineage_diff(artifact)
+            .expect("lineage artifact writes");
+    }
+
+    #[test]
+    fn audited_lineage_accepts_the_bound_pair() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        write_lineage_diff(
+            &cli,
+            &lineage_artifact(
+                "merge-base",
+                "main",
+                "abc",
+                Some("def"),
+                false,
+                Some(LineageEnvironment {
+                    candidate_ref: "ci/x".to_string(),
+                    candidate_hash: "h1".to_string(),
+                    target_ref: "main".to_string(),
+                    target_hash: "h2".to_string(),
+                }),
+            ),
+        );
+
+        let evidence = audited_lineage(&cli, "ci/x", "main", "h1", "h2", Some("fingerprint"))
+            .expect("evidence");
+        assert_eq!(evidence.status, "current");
+    }
+
+    /// The Nessie hashes matching is not enough: code edited after the
+    /// diff — or a dirty worktree edited again — changes the candidate's
+    /// lineage fingerprint, and the artifact stops being current.
+    #[test]
+    fn audited_lineage_rejects_a_changed_candidate_fingerprint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        write_lineage_diff(
+            &cli,
+            &lineage_artifact(
+                "merge-base",
+                "main",
+                "abc",
+                Some("def"),
+                false,
+                Some(LineageEnvironment {
+                    candidate_ref: "ci/x".to_string(),
+                    candidate_hash: "h1".to_string(),
+                    target_ref: "main".to_string(),
+                    target_hash: "h2".to_string(),
+                }),
+            ),
+        );
+
+        let evidence =
+            audited_lineage(&cli, "ci/x", "main", "h1", "h2", Some("edited")).expect("evidence");
+        assert_eq!(evidence.status, "stale");
+        assert!(
+            evidence
+                .reason
+                .as_deref()
+                .expect("reason")
+                .contains("lineage changed"),
+            "{:?}",
+            evidence.reason
+        );
+    }
+
+    /// An artifact written before candidate fingerprinting cannot prove it
+    /// describes this candidate — even when every other identity matches.
+    #[test]
+    fn audited_lineage_rejects_an_artifact_without_a_fingerprint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        let mut artifact = lineage_artifact(
+            "merge-base",
+            "main",
+            "abc",
+            Some("def"),
+            false,
+            Some(LineageEnvironment {
+                candidate_ref: "ci/x".to_string(),
+                candidate_hash: "h1".to_string(),
+                target_ref: "main".to_string(),
+                target_hash: "h2".to_string(),
+            }),
+        );
+        artifact.candidate.lineage_hash = None;
+        write_lineage_diff(&cli, &artifact);
+
+        let evidence = audited_lineage(&cli, "ci/x", "main", "h1", "h2", Some("fingerprint"))
+            .expect("evidence");
+        assert_eq!(evidence.status, "stale");
+        assert!(
+            evidence
+                .reason
+                .as_deref()
+                .expect("reason")
+                .contains("fingerprinting"),
+            "{:?}",
+            evidence.reason
+        );
+    }
+
+    #[test]
+    fn audited_lineage_rejects_an_artifact_for_other_refs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        write_lineage_diff(
+            &cli,
+            &lineage_artifact(
+                "merge-base",
+                "main",
+                "abc",
+                Some("def"),
+                false,
+                Some(LineageEnvironment {
+                    candidate_ref: "ci/other".to_string(),
+                    candidate_hash: "h1".to_string(),
+                    target_ref: "main".to_string(),
+                    target_hash: "h2".to_string(),
+                }),
+            ),
+        );
+
+        let evidence = audited_lineage(&cli, "ci/x", "main", "h1", "h2", Some("fingerprint"))
+            .expect("evidence");
+        assert_eq!(evidence.status, "stale");
+        assert!(
+            evidence
+                .reason
+                .as_deref()
+                .expect("reason")
+                .contains("ci/other"),
+            "{:?}",
+            evidence.reason
+        );
+    }
+
+    #[test]
+    fn audited_lineage_rejects_a_moved_candidate_hash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        write_lineage_diff(
+            &cli,
+            &lineage_artifact(
+                "merge-base",
+                "main",
+                "abc",
+                Some("def"),
+                false,
+                Some(LineageEnvironment {
+                    candidate_ref: "ci/x".to_string(),
+                    candidate_hash: "old".to_string(),
+                    target_ref: "main".to_string(),
+                    target_hash: "h2".to_string(),
+                }),
+            ),
+        );
+
+        let evidence = audited_lineage(&cli, "ci/x", "main", "new", "h2", Some("fingerprint"))
+            .expect("evidence");
+        assert_eq!(evidence.status, "stale");
+        assert!(
+            evidence
+                .reason
+                .as_deref()
+                .expect("reason")
+                .contains("moved"),
+            "{:?}",
+            evidence.reason
+        );
+    }
+
+    #[test]
+    fn audited_lineage_rejects_an_unreadable_artifact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        let directory = dir.path().join(".phlo").join("transform");
+        std::fs::create_dir_all(&directory).expect("artifact dir");
+        std::fs::write(directory.join("lineage_diff.json"), "not json").expect("write");
+
+        let evidence = audited_lineage(&cli, "ci/x", "main", "h1", "h2", Some("fingerprint"))
+            .expect("evidence");
+        assert_eq!(evidence.status, "stale");
+        assert!(
+            evidence
+                .reason
+                .as_deref()
+                .expect("reason")
+                .contains("unreadable"),
+            "{:?}",
+            evidence.reason
+        );
+    }
+
+    #[test]
+    fn audited_lineage_absent_artifact_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        assert!(audited_lineage(&cli, "ci/x", "main", "h1", "h2", Some("fingerprint")).is_none());
+    }
+
+    /// A git-bound (no Nessie binding) merge-base artifact is advisory while
+    /// HEAD and the merge-base still match, and stale once the worktree or
+    /// base moved. A repo the artifact never knew cannot prove currentness.
+    #[test]
+    fn audited_lineage_git_bound_tracks_the_worktree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(output.status.success(), "{args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@phlo.dev"]);
+        git(&["config", "user.name", "Phlo Test"]);
+        std::fs::write(root.join("phlo.toml"), "[transform]\nroots = []\n").expect("toml");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        let head = git(&["rev-parse", "HEAD"]);
+
+        let cli = cli_at(root);
+        // Current merge-base, current head, clean — advisory.
+        write_lineage_diff(
+            &cli,
+            &lineage_artifact("merge-base", "main", &head, Some(&head), false, None),
+        );
+        let evidence = audited_lineage(&cli, "ci/x", "main", "h1", "h2", Some("fingerprint"))
+            .expect("evidence");
+        assert_eq!(evidence.status, "advisory");
+
+        // HEAD recorded differently — the worktree moved on.
+        write_lineage_diff(
+            &cli,
+            &lineage_artifact("merge-base", "main", &head, Some("stale"), false, None),
+        );
+        let evidence = audited_lineage(&cli, "ci/x", "main", "h1", "h2", Some("fingerprint"))
+            .expect("evidence");
+        assert_eq!(evidence.status, "stale");
+
+        // The same artifact in a non-repository cannot resolve its base.
+        let bare = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(bare.path());
+        write_lineage_diff(
+            &cli,
+            &lineage_artifact("merge-base", "main", &head, Some(&head), false, None),
+        );
+        let evidence = audited_lineage(&cli, "ci/x", "main", "h1", "h2", Some("fingerprint"))
+            .expect("evidence");
+        assert_eq!(evidence.status, "stale");
+    }
+
+    /// An exact ref→ref artifact is only evidence while both refs still
+    /// resolve to the commits it recorded — deleting either ref is
+    /// unverifiable, not "unchanged".
+    #[test]
+    fn audited_lineage_rejects_deleted_refs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(output.status.success(), "{args:?}");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "test@phlo.dev"]);
+        git(&["config", "user.name", "Phlo Test"]);
+        std::fs::write(root.join("phlo.toml"), "[transform]\nroots = []\n").expect("toml");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        git(&["branch", "base"]);
+        git(&["branch", "feature"]);
+
+        let cli = cli_at(root);
+        let mut artifact = lineage_artifact("ref", "base", &head, Some(&head), false, None);
+        artifact.candidate.git_ref = Some("feature".to_string());
+        write_lineage_diff(&cli, &artifact);
+
+        // Both refs resolve to the recorded commits — advisory.
+        let evidence = audited_lineage(&cli, "ci/x", "main", "h1", "h2", Some("fingerprint"))
+            .expect("evidence");
+        assert_eq!(evidence.status, "advisory");
+
+        // The candidate ref is gone — the artifact can no longer prove it
+        // describes `feature`.
+        git(&["branch", "-D", "feature"]);
+        let evidence = audited_lineage(&cli, "ci/x", "main", "h1", "h2", Some("fingerprint"))
+            .expect("evidence");
+        assert_eq!(evidence.status, "stale");
+        assert!(
+            evidence
+                .reason
+                .as_deref()
+                .expect("reason")
+                .contains("feature"),
+            "{:?}",
+            evidence.reason
+        );
+
+        // Restore the candidate; deleting the base ref must go stale too.
+        git(&["branch", "feature"]);
+        git(&["branch", "-D", "base"]);
+        let evidence = audited_lineage(&cli, "ci/x", "main", "h1", "h2", Some("fingerprint"))
+            .expect("evidence");
+        assert_eq!(evidence.status, "stale");
+        assert!(
+            evidence.reason.as_deref().expect("reason").contains("base"),
+            "{:?}",
+            evidence.reason
         );
     }
 }

@@ -81,6 +81,19 @@ A failed run or audit leaves the candidate isolated and does not advance
 diff, gate evaluation, promotion, stale-promotion rejection and branch cleanup
 against Nessie + Trino/Iceberg.
 
+Two reviews precede promotion, one per axis:
+
+- `lineage --diff <git-ref>` — the **code-side** delta: models, datasets,
+  columns, tests and dependency edges added, removed or changed relative
+  to the merge-base the work branched from, plus the consumers each
+  removal orphans and the downstream each lost lineage path affects.
+  Persisted to `lineage_diff.json` and bound to the candidate; `promote`
+  surfaces it as `current`, `advisory` or `stale`. See `docs/lineage.md`.
+- `diff --from <candidate> --to <target>` — the **data-side** delta:
+  dataset classification, schema and contract changes, row counts and
+  keyed value diffs between the two Nessie references. Persisted to
+  `branch_diff.json`. See below.
+
 ## Branch diff
 
 ```bash

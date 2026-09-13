@@ -193,6 +193,227 @@ pub enum GitError {
     Command(String),
 }
 
+/// A workspace tree materialised at one commit — every file under the
+/// workspace prefix at `commit`, extracted into a temporary directory so
+/// the base side can be discovered and compiled exactly as a checkout
+/// would be.
+pub struct CheckedTree {
+    /// The extraction — kept alive so `workspace` stays valid; dropped
+    /// (and deleted) with the value.
+    pub dir: tempfile::TempDir,
+    /// The extracted workspace root: `<dir>/<workspace-prefix>`.
+    pub workspace: std::path::PathBuf,
+    /// The commit the tree was extracted from.
+    pub commit: String,
+}
+
+/// What a workspace diff compares against: the merge-base `git_ref` shares
+/// with HEAD — the same baseline `--since` uses — plus the candidate side's
+/// identity.
+#[derive(Clone, Debug)]
+pub struct ComparisonBase {
+    /// The merge-base commit (the empty tree when HEAD has no commits).
+    pub commit: String,
+    /// HEAD's commit at resolution time, when the checkout has one.
+    pub head: Option<String>,
+    /// Whether the worktree carries uncommitted or untracked changes under
+    /// the workspace root — the candidate side of a workspace diff is the
+    /// working tree, so dirt is part of its identity.
+    pub dirty: bool,
+}
+
+/// Resolve the branch-diff baseline for `git_ref`: `merge-base(git_ref,
+/// HEAD)`, so a feature branch is compared against where it diverged —
+/// not against the other ref's current head, which may have moved on.
+pub fn comparison_base(workspace_root: &Path, git_ref: &str) -> Result<ComparisonBase, GitError> {
+    let workspace = std::fs::canonicalize(workspace_root).map_err(|error| {
+        GitError::Command(format!(
+            "could not resolve workspace root `{}`: {error}",
+            workspace_root.display()
+        ))
+    })?;
+    let repo_text = git_stdout(&workspace, &["rev-parse", "--show-toplevel"])
+        .ok_or_else(|| GitError::NotARepository(workspace.display().to_string()))?;
+    let repo = std::fs::canonicalize(repo_text.trim())
+        .map_err(|error| GitError::Command(format!("could not resolve repo root: {error}")))?;
+    let prefix = workspace
+        .strip_prefix(&repo)
+        .unwrap_or(&workspace)
+        .to_path_buf();
+
+    let reference = git_stdout(
+        &repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{git_ref}^{{commit}}"),
+        ],
+    )
+    .ok_or_else(|| GitError::UnknownRef(git_ref.to_string()))?;
+    let head = git_stdout(&repo, &["rev-parse", "--verify", "--quiet", "HEAD"])
+        .map(|head| head.trim().to_string());
+    let commit = match &head {
+        Some(head) => git_stdout(&repo, &["merge-base", reference.trim(), head.trim()])
+            .map(|base| base.trim().to_string())
+            .ok_or_else(|| GitError::NoMergeBase {
+                since: git_ref.to_string(),
+            })?,
+        None => EMPTY_TREE.to_string(),
+    };
+    let spec = if prefix.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        prefix.to_string_lossy().replace('\\', "/")
+    };
+    // `.phlo/` holds artifacts — writing `lineage_diff.json` must not make
+    // the worktree it describes "dirty".
+    let exclude = if prefix.as_os_str().is_empty() {
+        ":(exclude).phlo".to_string()
+    } else {
+        format!(":(exclude){}/.phlo", spec)
+    };
+    let dirty = git_stdout(&repo, &["status", "--porcelain", "--", &spec, &exclude])
+        .map(|status| !status.trim().is_empty())
+        .unwrap_or(false);
+    Ok(ComparisonBase {
+        commit,
+        head,
+        dirty,
+    })
+}
+
+/// The commit `git_ref` currently resolves to in the workspace's
+/// repository.
+pub fn resolve_commit(workspace_root: &Path, git_ref: &str) -> Result<String, GitError> {
+    let workspace = std::fs::canonicalize(workspace_root).map_err(|error| {
+        GitError::Command(format!(
+            "could not resolve workspace root `{}`: {error}",
+            workspace_root.display()
+        ))
+    })?;
+    let repo_text = git_stdout(&workspace, &["rev-parse", "--show-toplevel"])
+        .ok_or_else(|| GitError::NotARepository(workspace.display().to_string()))?;
+    git_stdout(
+        Path::new(repo_text.trim()),
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{git_ref}^{{commit}}"),
+        ],
+    )
+    .map(|commit| commit.trim().to_string())
+    .ok_or_else(|| GitError::UnknownRef(git_ref.to_string()))
+}
+
+/// Materialise the workspace at `git_ref` into a temporary directory.
+///
+/// `git ls-tree` lists the workspace subtree at the resolved commit and one
+/// `cat-file --batch` round fetches every blob — the repository is never
+/// mutated (no worktree, no checkout), so this is safe to run alongside an
+/// in-progress rebase or a dirty working tree.
+pub fn checkout_tree(workspace_root: &Path, git_ref: &str) -> Result<CheckedTree, GitError> {
+    let workspace = std::fs::canonicalize(workspace_root).map_err(|error| {
+        GitError::Command(format!(
+            "could not resolve workspace root `{}`: {error}",
+            workspace_root.display()
+        ))
+    })?;
+    let repo_text = git_stdout(&workspace, &["rev-parse", "--show-toplevel"])
+        .ok_or_else(|| GitError::NotARepository(workspace.display().to_string()))?;
+    let repo = std::fs::canonicalize(repo_text.trim())
+        .map_err(|error| GitError::Command(format!("could not resolve repo root: {error}")))?;
+    let prefix = workspace
+        .strip_prefix(&repo)
+        .unwrap_or(&workspace)
+        .to_path_buf();
+
+    let commit = git_stdout(
+        &repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{git_ref}^{{commit}}"),
+        ],
+    )
+    .ok_or_else(|| GitError::UnknownRef(git_ref.to_string()))?;
+    let commit = commit.trim().to_string();
+
+    // `ls-tree -r -z <commit> -- <prefix>`: `<mode> <type> <sha>\t<path>`
+    // entries, NUL-separated. Only blobs become files — gitlinks
+    // (submodule commit entries) are skipped.
+    let spec = if prefix.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        prefix.to_string_lossy().replace('\\', "/")
+    };
+    let listing = git_bytes(&repo, &["ls-tree", "-r", "-z", &commit, "--", &spec])?;
+    let mut blobs = Vec::new();
+    let mut symlinks = Vec::new();
+    for entry in listing.split(|byte| *byte == 0).filter(|e| !e.is_empty()) {
+        let entry = String::from_utf8_lossy(entry);
+        let Some((meta, path)) = entry.split_once('\t') else {
+            continue;
+        };
+        let mut parts = meta.split_whitespace();
+        let (mode, kind) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        if kind != "blob" {
+            continue;
+        }
+        if mode == "120000" {
+            symlinks.push(path.to_string());
+        } else {
+            blobs.push(path.to_string());
+        }
+    }
+
+    let dir = tempfile::tempdir()
+        .map_err(|error| GitError::Command(format!("could not create tempdir: {error}")))?;
+    let contents = blob_contents(&repo, &commit, &blobs)?;
+    for (path, content) in &contents {
+        let Some(content) = content else {
+            continue;
+        };
+        let target = dir.path().join(path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| GitError::Command(format!("could not extract {path}: {error}")))?;
+        }
+        std::fs::write(&target, content)
+            .map_err(|error| GitError::Command(format!("could not extract {path}: {error}")))?;
+    }
+    // Symlinked files: recreate the link so the extraction reads what the
+    // checkout would. On platforms without symlink support the target
+    // path text is written instead — the file still exists for discovery.
+    let links = blob_contents(&repo, &commit, &symlinks)?;
+    for (path, link_target) in &links {
+        let Some(link_target) = link_target else {
+            continue;
+        };
+        let link = dir.path().join(path);
+        if let Some(parent) = link.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(link_target.trim_end(), &link);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::write(&link, link_target);
+        }
+    }
+
+    let workspace = dir.path().join(&prefix);
+    Ok(CheckedTree {
+        dir,
+        workspace,
+        commit,
+    })
+}
+
 /// What a workspace-relative path is to the project.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PathKind {

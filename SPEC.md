@@ -1271,6 +1271,20 @@ a bare JSON array of spec-valid `JobEvent`s and `DatasetEvent`s, each with
 `eventTime`/`producer`/`schemaURL`, usable directly as a batch-endpoint
 payload. Both accept a model target or selector terms for scoping.
 
+`lineage --diff <git-ref>` is the semantic complement to the data-side
+`branch_diff`: the workspace subtree at `merge-base(ref, HEAD)` is
+materialised read-only (`ls-tree`/`cat-file`, no worktree or checkout
+mutation), compiled with the same options, and the two graphs are compared
+— nodes and edges added, removed or field-changed, plus the consumers each
+removed node orphans and the downstream each removed or moved edge affects.
+Edges compare as multisets: parallel edges between the same nodes keep
+their metadata distinct. `lineage --diff <base> <candidate>` compares two
+exact refs instead. The report persists to `lineage_diff.json` with the
+resolved base commit, the candidate's git head and worktree state, and the
+Nessie branch-pair binding when `--ref`/`--from` resolves — `promote`
+audits that provenance and reports the delta as `current`, `advisory`, or
+`stale` with the reason rather than treating a moved report as evidence.
+
 ## 56. Column lineage
 
 ```bash

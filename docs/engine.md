@@ -361,6 +361,7 @@ Written under `.phlo/transform/` with `schema_version = 3`:
 | `run.json` | run id, plan id, `continued_from`, status, per-status counts, model/seed/test results with structured failures and attempts, events |
 | `environment.json` | provisioned base/candidate references and candidate catalog |
 | `diff.json` | data/schema diff report (strategy, rows, columns, partitions, policies) |
+| `lineage_diff.json` | semantic lineage diff vs a Git baseline (nodes/edges added, removed, changed; orphaned consumers and affected downstream paths) bound to `base_kind`/`base_commit`, the candidate's git head + worktree state, and the Nessie pair when resolved |
 | `promotion.json` | promotion id, references/hashes, gates, conflicts, timestamp |
 
 `schema_version` makes the interface explicit and versionable.

@@ -175,7 +175,7 @@ impl LineageNode {
 }
 
 /// Optional metadata carried by a node.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct NodeMeta {
     /// Workspace-relative source path, when the node is file-backed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -724,6 +724,38 @@ impl LineageGraph {
             .collect();
         edges.sort_by(|left, right| (&left.from, &left.to).cmp(&(&right.from, &right.to)));
         LineageDocument { nodes, edges }
+    }
+
+    /// A content fingerprint of the whole graph — nodes, edges and their
+    /// metadata in canonical order, so two compilations that produce the
+    /// same lineage hash identically. Promotion uses it to prove a lineage
+    /// diff artifact still describes the candidate being promoted.
+    pub fn fingerprint(&self) -> String {
+        let mut document = self.document();
+        // The document's edge order is only (from, to)-canonical; parallel
+        // edges need their metadata in the sort key for a total order.
+        document.edges.sort_by(|left, right| {
+            (
+                &left.from,
+                &left.to,
+                &left.edge.kind,
+                &left.edge.directness,
+                &left.edge.transformation,
+                &left.edge.confidence,
+                &left.edge.expression,
+            )
+                .cmp(&(
+                    &right.from,
+                    &right.to,
+                    &right.edge.kind,
+                    &right.edge.directness,
+                    &right.edge.transformation,
+                    &right.edge.confidence,
+                    &right.edge.expression,
+                ))
+        });
+        let canonical = serde_json::to_string(&document).expect("a lineage document serialises");
+        crate::version::sha256_hex(&canonical)
     }
 
     /// A document restricted to a selection of models: the models, their
