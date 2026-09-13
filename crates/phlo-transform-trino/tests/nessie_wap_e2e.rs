@@ -301,12 +301,21 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
     assert!(names.contains(&"main"), "{names:?}");
 
     // Promote the audited candidate against the base it was planned from.
+    // `candidate_hash` pins the head the gates were evaluated against —
+    // `setup.candidate.hash` is the provisioning-time hash, which the run's
+    // commits have already advanced.
+    let audited_candidate = nessie_client
+        .get_reference("ci/pr-1")
+        .await
+        .expect("candidate")
+        .expect("candidate exists")
+        .hash;
     let record = promote(
         &nessie_client,
         &PromotionRequest {
             candidate_ref: "ci/pr-1".to_string(),
             target_ref: "main".to_string(),
-            candidate_hash: Some(setup.candidate.hash.clone()),
+            candidate_hash: Some(audited_candidate.clone()),
             expected_target_hash: Some(setup.base.hash.clone()),
             plan_id: None,
             run_id: None,
@@ -332,13 +341,15 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
     assert_eq!(promoted.rows[0][0], "25");
 
     // Re-promoting the same candidate against the now-advanced target is
-    // rejected: the audited base is no longer current.
+    // rejected: the audited base is no longer current. The candidate hash
+    // still matches (the merge did not move it), so the stale-target check
+    // is what fires.
     let stale = promote(
         &nessie_client,
         &PromotionRequest {
             candidate_ref: "ci/pr-1".to_string(),
             target_ref: "main".to_string(),
-            candidate_hash: Some(setup.candidate.hash.clone()),
+            candidate_hash: Some(audited_candidate),
             expected_target_hash: Some(setup.base.hash.clone()),
             plan_id: None,
             run_id: None,

@@ -624,4 +624,54 @@ mod tests {
             "aaa"
         );
     }
+
+    #[test]
+    fn merge_outcome_parses_object_and_string_conflicts() {
+        // Current Nessie reports conflicts as objects; older shapes sent a
+        // bare string. Both must surface as conflicts, not a clean merge.
+        let object_shape: MergeResponse = serde_json::from_str(
+            r#"{
+                "wasSuccessful": false,
+                "details": [
+                    {
+                        "key": {"elements": ["assay", "results"]},
+                        "conflict": {
+                            "conflictType": "KEY_DIFFERS",
+                            "message": "key differs between source and target",
+                            "key": "assay.results"
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let outcome = merge_outcome(object_shape, "{}");
+        assert!(!outcome.is_clean());
+        assert_eq!(outcome.conflicts[0].path, "assay.results");
+        assert_eq!(
+            outcome.conflicts[0].message,
+            "key differs between source and target"
+        );
+
+        let string_shape: MergeResponse = serde_json::from_str(
+            r#"{
+                "wasSuccessful": false,
+                "details": [{"conflict": "VALUE_DIFFERS"}]
+            }"#,
+        )
+        .unwrap();
+        let outcome = merge_outcome(string_shape, "{}");
+        assert!(!outcome.is_clean());
+        assert_eq!(outcome.conflicts[0].message, "VALUE_DIFFERS");
+
+        // A failure with no parseable conflict still fails, generically.
+        let bare: MergeResponse =
+            serde_json::from_str(r#"{"wasSuccessful": false, "details": []}"#).unwrap();
+        let outcome = merge_outcome(bare, "server said no");
+        assert!(!outcome.is_clean());
+        assert_eq!(
+            outcome.conflicts[0].message,
+            "merge was not applied: server said no"
+        );
+    }
 }

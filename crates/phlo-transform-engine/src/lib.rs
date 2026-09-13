@@ -31,8 +31,9 @@ pub use artifacts::{
     SCHEMA_VERSION,
 };
 pub use branch_diff::{
-    branch_diff, model_keys, BranchDiffReport, BranchDiffRequest, DatasetDiff, DatasetKind,
-    DatasetStatus, ModelRowDiff, ModelSchemaDiff,
+    branch_diff, materialized_for_environment, model_keys, retarget, seeds_for_environment,
+    BranchDiffReport, BranchDiffRequest, DatasetDiff, DatasetKind, DatasetStatus, ModelRowDiff,
+    ModelSchemaDiff,
 };
 pub use cancel::CancelHandle;
 pub use changed::changed_models;

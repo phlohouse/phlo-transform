@@ -1714,3 +1714,40 @@ fn promote_rejects_disagreeing_candidates() {
         stderr(&output)
     );
 }
+
+#[test]
+fn diff_rejects_disagreeing_candidates() {
+    // `--from` and `--ref` naming different candidates is an error, matching
+    // `promote` — never a silent pick.
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "diff",
+        "--from",
+        "ci/a",
+        "--ref",
+        "ci/b",
+    ]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("candidate given twice"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn ref_delete_refuses_main() {
+    // `main` is every environment's default base — it must not go under the
+    // same verb as a scratch branch. The guard fires before Nessie is even
+    // consulted.
+    let output = Command::cargo_bin("phlo-transform")
+        .expect("binary builds")
+        .current_dir(workspace_root())
+        .env_remove("PHLO_NESSIE_ENDPOINT")
+        .args(["ref", "delete", "main"])
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("main"), "{}", stderr(&output));
+}

@@ -16,7 +16,9 @@ use crate::util::now_rfc3339;
 pub struct PromotionRequest {
     pub candidate_ref: String,
     pub target_ref: String,
-    /// Candidate hash that was audited, when known.
+    /// The candidate hash the gates were evaluated against. When given, the
+    /// candidate must still be at this hash at merge time — a branch that
+    /// advanced since the audit is refused rather than merged unaudited.
     pub candidate_hash: Option<String>,
     /// Target hash observed when the candidate was planned.
     pub expected_target_hash: Option<String>,
@@ -106,6 +108,19 @@ pub async fn promote(
                 request.target_ref
             ))
         })?;
+
+    // The candidate must still be the commit that was audited: a branch that
+    // advanced between gate evaluation and promotion carries unaudited work,
+    // and merging it would make this record's `candidate_hash` a lie.
+    if let Some(expected) = &request.candidate_hash {
+        if expected != &candidate.hash {
+            return Err(EngineError::Promotion(format!(
+                "candidate `{}` advanced since the audit (expected {}, found {}); \
+                 re-run the audit and gates",
+                request.candidate_ref, expected, candidate.hash
+            )));
+        }
+    }
 
     let mut record = PromotionRecord {
         promotion_id: uuid::Uuid::new_v4().to_string(),
@@ -244,6 +259,46 @@ mod tests {
         nessie.assign_reference("ci/pr-1", "bbb").await.unwrap();
         let error = promote(&nessie, &request(false)).await.unwrap_err();
         assert!(error.to_string().contains("advanced"));
+    }
+
+    #[tokio::test]
+    async fn blocks_when_candidate_advanced_since_audit() {
+        // The audit pinned the candidate at `bbb`; a racing commit moved the
+        // branch to `ccc` before the merge — promotion must refuse rather
+        // than merge unaudited work.
+        let nessie = InMemoryNessie::new();
+        nessie.seed("main", "aaa");
+        nessie
+            .create_branch("ci/pr-1", &ReferenceInfo::branch("main", "aaa"))
+            .await
+            .unwrap();
+        nessie.assign_reference("ci/pr-1", "bbb").await.unwrap();
+        let mut request = request(false);
+        request.candidate_hash = Some("bbb".to_string());
+        nessie.assign_reference("ci/pr-1", "ccc").await.unwrap();
+        let error = promote(&nessie, &request).await.unwrap_err();
+        assert!(error.to_string().contains("advanced"), "{error}");
+        // The target must not have been merged.
+        assert_eq!(
+            nessie.get_reference("main").await.unwrap().unwrap().hash,
+            "aaa"
+        );
+    }
+
+    #[tokio::test]
+    async fn promotes_when_candidate_hash_still_matches() {
+        let nessie = InMemoryNessie::new();
+        nessie.seed("main", "aaa");
+        nessie
+            .create_branch("ci/pr-1", &ReferenceInfo::branch("main", "aaa"))
+            .await
+            .unwrap();
+        nessie.assign_reference("ci/pr-1", "bbb").await.unwrap();
+        let mut request = request(false);
+        request.candidate_hash = Some("bbb".to_string());
+        let record = promote(&nessie, &request).await.unwrap();
+        assert!(record.merged);
+        assert_eq!(record.candidate_hash.as_deref(), Some("bbb"));
     }
 
     #[tokio::test]

@@ -495,6 +495,8 @@ pub(crate) fn compare_column_lists(
                 safety: "full_rebuild_required".to_string(),
             }),
             Some((candidate_type, candidate_nullable)) => {
+                // Type and nullability are independent changes — a column
+                // that moved on both reports both.
                 if candidate_type != base_type {
                     changes.push(SchemaChange {
                         column: name.clone(),
@@ -506,7 +508,8 @@ pub(crate) fn compare_column_lists(
                             "error".to_string()
                         },
                     });
-                } else if candidate_nullable != base_nullable {
+                }
+                if candidate_nullable != base_nullable {
                     changes.push(SchemaChange {
                         column: name.clone(),
                         kind: "nullability".to_string(),
@@ -545,47 +548,66 @@ fn evaluate_policy(
     summary: &RowSummary,
 ) -> Vec<PolicyResult> {
     let mut results = Vec::new();
+    // Row-level counts only exist when the keyed path ran — aggregate or
+    // partition coverage leaves added/removed/modified unmeasured, and a
+    // threshold that was never measured must fail rather than pass on a
+    // vacuous zero.
+    let measured = !request.key_columns.is_empty()
+        && !matches!(request.strategy, DiffStrategy::Partition { .. });
+    let row_policy =
+        |name: &'static str, metric: &'static str, value: i64, max: i64| PolicyResult {
+            policy: name.to_string(),
+            passed: measured && value <= max,
+            detail: if measured {
+                format!("{metric} {value} (max {max})")
+            } else {
+                format!("{metric} cannot be measured without keyed row counts")
+            },
+        };
     if let Some(max) = policy.max_added_rows {
-        results.push(PolicyResult {
-            policy: "max_added_rows".to_string(),
-            passed: summary.added <= max,
-            detail: format!("added {} (max {max})", summary.added),
-        });
+        results.push(row_policy("max_added_rows", "added", summary.added, max));
     }
     if let Some(max) = policy.max_removed_rows {
-        results.push(PolicyResult {
-            policy: "max_removed_rows".to_string(),
-            passed: summary.removed <= max,
-            detail: format!("removed {} (max {max})", summary.removed),
-        });
+        results.push(row_policy(
+            "max_removed_rows",
+            "removed",
+            summary.removed,
+            max,
+        ));
     }
     if let Some(max) = policy.max_modified_rows {
-        results.push(PolicyResult {
-            policy: "max_modified_rows".to_string(),
-            passed: summary.modified <= max,
-            detail: format!("modified {} (max {max})", summary.modified),
-        });
+        results.push(row_policy(
+            "max_modified_rows",
+            "modified",
+            summary.modified,
+            max,
+        ));
     }
     if let Some(max_fraction) = policy.max_changed_fraction {
         let base = summary.base_rows.max(1) as f64;
         let fraction = (summary.added + summary.removed + summary.modified) as f64 / base;
         results.push(PolicyResult {
             policy: "max_changed_fraction".to_string(),
-            passed: fraction <= max_fraction,
-            detail: format!("changed fraction {fraction:.4} (max {max_fraction})"),
+            passed: measured && fraction <= max_fraction,
+            detail: if measured {
+                format!("changed fraction {fraction:.4} (max {max_fraction})")
+            } else {
+                "changed fraction cannot be measured without keyed row counts".to_string()
+            },
         });
     }
     if policy.require_keyed_diff {
         results.push(PolicyResult {
             policy: "require_keyed_diff".to_string(),
-            passed: !request.key_columns.is_empty(),
+            passed: measured,
             detail: "a stable key is required for keyed diffing".to_string(),
         });
     }
     if policy.require_full_diff {
         results.push(PolicyResult {
             policy: "require_full_diff".to_string(),
-            passed: matches!(request.strategy, DiffStrategy::Keyed | DiffStrategy::Full),
+            passed: !request.key_columns.is_empty()
+                && matches!(request.strategy, DiffStrategy::Keyed | DiffStrategy::Full),
             detail: "full/keyed coverage is required".to_string(),
         });
     }
@@ -698,6 +720,68 @@ mod tests {
         assert!(evaluate_policy(&policy, &request(false), &summary)
             .iter()
             .any(|result| !result.passed));
+    }
+
+    #[test]
+    fn keyless_policies_fail_closed() {
+        // Without a stable key, added/removed/modified are never measured —
+        // a threshold evaluated against unmeasured zeros must fail, not
+        // pass vacuously.
+        let policy = DiffPolicy {
+            max_added_rows: Some(10),
+            max_changed_fraction: Some(0.5),
+            require_full_diff: true,
+            ..Default::default()
+        };
+        let summary = RowSummary::default();
+        let mut keyless = request(false);
+        keyless.strategy = DiffStrategy::Full;
+        let results = evaluate_policy(&policy, &keyless, &summary);
+        assert_eq!(results.len(), 3);
+        for result in &results {
+            assert!(!result.passed, "{} should fail", result.policy);
+        }
+        // With keys and a keyed/full strategy the same policies measure.
+        let keyed = request(true);
+        let results = evaluate_policy(&policy, &keyed, &summary);
+        assert!(results.iter().all(|result| result.passed));
+    }
+
+    #[test]
+    fn partition_coverage_cannot_satisfy_row_thresholds() {
+        // A partition diff reports changed partitions, not row counts — the
+        // same fail-closed rule applies.
+        let policy = DiffPolicy {
+            max_added_rows: Some(0),
+            ..Default::default()
+        };
+        let mut partitioned = request(true);
+        partitioned.strategy = DiffStrategy::Partition {
+            columns: vec!["d".to_string()],
+        };
+        let results = evaluate_policy(&policy, &partitioned, &RowSummary::default());
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].passed);
+    }
+
+    #[test]
+    fn column_compare_reports_type_and_nullability_together() {
+        // A column that changed type AND nullability reports both changes.
+        let candidate = [crate::adapter::ColumnInfo {
+            name: "id".to_string(),
+            data_type: "bigint".to_string(),
+            nullable: true,
+        }];
+        let base = [crate::adapter::ColumnInfo {
+            name: "id".to_string(),
+            data_type: "varchar".to_string(),
+            nullable: false,
+        }];
+        let changes = compare_column_lists(&candidate, &base);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].kind, "changed");
+        assert_eq!(changes[1].kind, "nullability");
+        assert_eq!(changes[1].detail, "not null -> nullable");
     }
 
     #[test]

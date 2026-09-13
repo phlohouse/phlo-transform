@@ -43,7 +43,8 @@ phlo-transform ref delete ci/pr-1
 mutate Nessie references directly, and they do exactly what they say — nothing
 creates or deletes a branch as a side effect of another operation except the
 explicit provisioning on `plan`/`apply`/`run --ref` and `--cleanup` on
-`promote`.
+`promote`. `ref delete main` is refused outright: `main` is every
+environment's default base, not a scratch branch.
 
 ## WAP
 
@@ -63,7 +64,11 @@ PLAN → WRITE candidate branch → AUDIT (tests) → PUBLISH (promote)
 The provisioned catalog name defaults to `phlo_<sanitized ref>` and can be
 overridden with `--catalog`; `--warehouse` sets the Iceberg warehouse (for
 example `local:///tmp/phlo-warehouse` or `s3://bucket/wh`). Provisioning is
-recorded in `.phlo/transform/environment.json`.
+recorded in `.phlo/transform/environment.json` — the workspace's current
+environment — plus a per-candidate copy at
+`.phlo/transform/environment_<ref>.json`, so one candidate's evidence
+survives another being provisioned. Both are removed when the branch is
+deleted.
 
 A failed run or audit leaves the candidate isolated and does not advance
 `main`. The live `nessie_wap_e2e` test exercises candidate isolation, branch
@@ -108,21 +113,25 @@ PASS conflicts  — candidate merges cleanly
 
 - `run` — the candidate's latest recorded run finished fully passed.
 - `tests` — no test in that run failed.
-- `blocked` — no model or seed was left blocked or cancelled.
+- `blocked` — no model, seed or test was left blocked or cancelled.
 - `schema` — the audited diff found no breaking schema changes, or they were
   waived with `--allow-breaking-schema`.
 - `data_diff` — only evaluated with `--require-diff`; the audited diff
   (`branch_diff.json` from a `--full` branch diff, or `diff.json` for a
   single model) must exist, pass its policies, cover this exact
-  candidate→target pair, and still be fresh (its recorded candidate versions
-  match the candidate's current materialisations). A shallow branch diff —
-  schema and row counts only, no value-level policies — does not satisfy it.
+  candidate→target pair, and still be fresh (its recorded versions match
+  both sides' current materialisations). A shallow branch diff — schema and
+  row counts only, no value-level policies — or a diff that compared a
+  relation to itself does not satisfy it.
 - `base` — the target's hash still equals the hash recorded when the
-  candidate was provisioned. A target that advanced fails this gate; the
-  merge itself asserts the hash the gates were evaluated against (the
-  recorded base hash, or the hash resolved at promotion time when none was
-  recorded) so a racing commit is rejected by Nessie rather than silently
-  merged.
+  candidate was provisioned from that same target (a candidate provisioned
+  off a different ref has no recorded view of this target's freshness). A
+  target that advanced fails this gate; the merge itself asserts the hash
+  the gates were evaluated against (the recorded base hash, or the hash
+  resolved at promotion time when none was recorded) so a racing commit is
+  rejected by Nessie rather than silently merged. The same holds on the
+  candidate side: a branch that advanced between gate evaluation and merge
+  is refused rather than promoted unaudited.
 - `conflicts` — a non-destructive merge check reported no conflicts. Against
   a real Nessie this is the server's `dryRun` merge: the same conflict
   detection the merge performs, without committing anything.

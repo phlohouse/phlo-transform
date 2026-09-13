@@ -19,12 +19,13 @@ use phlo_transform_core::{
     StaticSchemaProvider, StaticSourceStateProvider, TestId,
 };
 use phlo_transform_engine::{
-    branch_diff, changed_models, collect_source_states, Adapter, AdapterError, ArtifactWriter,
-    BranchDiffRequest, CancelHandle, CatalogRequest, ColumnInfo, DatasetStatus, EngineError,
-    EngineEvent, ExecutionStatus, FailureCategory, MaterializedRecord, Membership, ModelResult,
-    ModelRunRecord, Plan, PlanAction, PlanOptions, Planner, PromotionRecord, QueryResult,
-    ReasonKind, RetryPolicy, RunOptions, RunRecord, RunResult, RunSummary, Runner, SeedRecord,
-    SeedRunRecord, SqliteStateStore, StateStore, StoredPlan, StoredRun, TestRunRecord,
+    branch_diff, changed_models, collect_source_states, materialized_for_environment, Adapter,
+    AdapterError, ArtifactWriter, BranchDiffRequest, CancelHandle, CatalogRequest, ColumnInfo,
+    DatasetStatus, EngineError, EngineEvent, ExecutionStatus, FailureCategory, MaterializedRecord,
+    Membership, ModelResult, ModelRunRecord, Plan, PlanAction, PlanOptions, Planner,
+    PromotionRecord, QueryResult, ReasonKind, RetryPolicy, RunOptions, RunRecord, RunResult,
+    RunSummary, Runner, SeedRecord, SeedRunRecord, SqliteStateStore, StateStore, StoredPlan,
+    StoredRun, TestRunRecord,
 };
 
 /// How a target should fail: the error to return, and how many attempts it
@@ -3721,16 +3722,26 @@ fn version(hash: &str) -> phlo_transform_core::ModelVersion {
 }
 
 fn materialized(model_id: &str, env: &str, hash: &str, target: &Relation) -> MaterializedRecord {
+    materialized_at(model_id, Some(env), hash, target, "t")
+}
+
+fn materialized_at(
+    model_id: &str,
+    env: Option<&str>,
+    hash: &str,
+    target: &Relation,
+    at: &str,
+) -> MaterializedRecord {
     MaterializedRecord {
         model_id: model_id.to_string(),
-        environment: Some(env.to_string()),
+        environment: env.map(|e| e.to_string()),
         version: version(hash),
         detail: None,
         target: target.display(),
         incremental_strategy: None,
         incremental_key: None,
         run_id: "run-1".to_string(),
-        materialized_at: "t".to_string(),
+        materialized_at: at.to_string(),
     }
 }
 
@@ -4034,6 +4045,99 @@ async fn branch_diff_deep_evaluates_declared_policies_on_keyless_models() {
     assert!(!report.passed);
 }
 
+#[tokio::test]
+async fn branch_diff_folds_default_environment_into_main() {
+    // Runs on `main` with no `--ref` record under the default (unlabeled)
+    // environment — `diff --to main` must still see them, or dropped models
+    // never classify `removed` and `unchanged` degrades to `changed`.
+    let compilation = branch_compilation();
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = SqliteStateStore::in_memory().unwrap();
+    let model = |name: &str| compilation.model_by_name(name).unwrap();
+
+    // same: recorded on candidate "ci/x" and on base via a default-env run.
+    let same_cand = ref_relation("phlo_ci_x", model("main.same"));
+    let same_base = ref_relation("phlo_main", model("main.same"));
+    state
+        .record_materialized(&materialized("main.same", "ci/x", "v1", &same_cand))
+        .unwrap();
+    state
+        .record_materialized(&materialized_at("main.same", None, "v1", &same_base, "t"))
+        .unwrap();
+    adapter.existing.lock().unwrap().insert(same_cand.display());
+    adapter.existing.lock().unwrap().insert(same_base.display());
+
+    // dropped: only a default-env record on base — surfaces as removed.
+    let dropped_base = Relation {
+        catalog: Some("phlo_main".to_string()),
+        schema: "main".to_string(),
+        table: "dropped".to_string(),
+    };
+    state
+        .record_materialized(&materialized_at(
+            "main.dropped",
+            None,
+            "v1",
+            &dropped_base,
+            "t",
+        ))
+        .unwrap();
+    adapter
+        .existing
+        .lock()
+        .unwrap()
+        .insert(dropped_base.display());
+
+    let report = branch_diff(adapter, Some(&state), &compilation, &branch_diff_request())
+        .await
+        .unwrap();
+    let status = |name: &str| {
+        report
+            .datasets
+            .iter()
+            .find(|dataset| dataset.dataset == name)
+            .map(|dataset| dataset.status)
+    };
+    assert_eq!(status("main.same"), Some(DatasetStatus::Unchanged));
+    assert_eq!(status("main.dropped"), Some(DatasetStatus::Removed));
+}
+
+#[test]
+fn materialized_for_environment_merges_default_env_by_latest() {
+    let state = SqliteStateStore::in_memory().unwrap();
+    let target = Relation {
+        catalog: Some("iceberg".to_string()),
+        schema: "main".to_string(),
+        table: "t".to_string(),
+    };
+    // An older explicit-"main" record and a newer default-env record: the
+    // latest materialisation describes the physical table.
+    state
+        .record_materialized(&materialized_at(
+            "main.t",
+            Some("main"),
+            "v1",
+            &target,
+            "2024-01-01T00:00:00Z",
+        ))
+        .unwrap();
+    state
+        .record_materialized(&materialized_at(
+            "main.t",
+            None,
+            "v2",
+            &target,
+            "2024-06-01T00:00:00Z",
+        ))
+        .unwrap();
+    let records = materialized_for_environment(&state, "main").unwrap();
+    assert_eq!(records["main.t"].version.hash, "v2");
+
+    // A different env does not fold in the default environment.
+    let dev = materialized_for_environment(&state, "dev").unwrap();
+    assert!(dev.is_empty());
+}
+
 #[test]
 fn promotion_records_persist_in_state() {
     let state = SqliteStateStore::in_memory().unwrap();
@@ -4217,6 +4321,22 @@ fn blocked_seed_blocks_promotion() {
     let blocked = gate(&report, "blocked");
     assert!(!blocked.passed);
     assert!(blocked.detail.contains("countries"), "{}", blocked.detail);
+}
+
+#[test]
+fn blocked_test_blocks_promotion() {
+    // A test that never ran — blocked upstream or cancelled — is unverified
+    // work, same as a blocked model.
+    let mut input = green_input();
+    input.test_runs = vec![
+        test_run("t.ok", ExecutionStatus::Passed),
+        test_run("t.skipped", ExecutionStatus::Blocked),
+    ];
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    let blocked = gate(&report, "blocked");
+    assert!(!blocked.passed);
+    assert!(blocked.detail.contains("t.skipped"), "{}", blocked.detail);
 }
 
 #[test]

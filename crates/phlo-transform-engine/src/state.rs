@@ -615,7 +615,7 @@ impl StateStore for SqliteStateStore {
         let mut statement = connection
             .prepare(
                 "SELECT run_id, plan_id, started_at, finished_at, status, model_count, failed_count
-                 FROM runs ORDER BY started_at DESC",
+                 FROM runs ORDER BY started_at DESC, rowid DESC",
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
         let rows = statement
@@ -641,7 +641,7 @@ impl StateStore for SqliteStateStore {
         let mut statement = connection
             .prepare(
                 "SELECT run_id, plan_id, started_at, finished_at, status, model_count, failed_count
-                 FROM runs WHERE environment = ?1 ORDER BY started_at DESC LIMIT 1",
+                 FROM runs WHERE environment = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1",
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
         let mut rows = statement
@@ -709,7 +709,7 @@ impl StateStore for SqliteStateStore {
         let mut statement = connection
             .prepare(
                 "SELECT run_id, plan_id, started_at, finished_at, status, model_count, failed_count
-                 FROM runs WHERE run_id LIKE ?1 || '%' ORDER BY started_at DESC",
+                 FROM runs WHERE run_id LIKE ?1 || '%' ORDER BY started_at DESC, rowid DESC",
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
         let rows = statement
@@ -932,7 +932,7 @@ impl StateStore for SqliteStateStore {
     fn promotions(&self) -> Result<Vec<crate::promotion::PromotionRecord>, EngineError> {
         let connection = self.lock()?;
         let mut statement = connection
-            .prepare("SELECT record_json FROM promotions ORDER BY created_at DESC")
+            .prepare("SELECT record_json FROM promotions ORDER BY created_at DESC, rowid DESC")
             .map_err(|error| EngineError::State(error.to_string()))?;
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))

@@ -140,7 +140,7 @@ pub fn evaluate_gates(input: &GateInput) -> GateReport {
         ));
     }
 
-    // blocked: no blocked or cancelled model or seed work may remain.
+    // blocked: no blocked or cancelled model, seed or test work may remain.
     let blocked: Vec<String> = input
         .model_runs
         .iter()
@@ -162,6 +162,18 @@ pub fn evaluate_gates(input: &GateInput) -> GateReport {
                     )
                 })
                 .map(|record| record.name.clone()),
+        )
+        .chain(
+            input
+                .test_runs
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.status,
+                        ExecutionStatus::Blocked | ExecutionStatus::Cancelled
+                    )
+                })
+                .map(|record| record.test_id.clone()),
         )
         .collect();
     if input.run.is_none() {

@@ -37,7 +37,7 @@ use crate::state::{MaterializedRecord, SeedRecord, StateStore};
 use crate::util::now_rfc3339;
 
 /// What a dataset is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DatasetKind {
     Model,
@@ -155,35 +155,19 @@ pub async fn branch_diff(
     let started_at = now_rfc3339();
 
     let candidate_records: BTreeMap<String, MaterializedRecord> = match state {
-        Some(state) => state
-            .materialized_in(Some(&request.candidate_ref))?
-            .into_iter()
-            .map(|record| (record.model_id.clone(), record))
-            .collect(),
+        Some(state) => materialized_for_environment(state, &request.candidate_ref)?,
         None => BTreeMap::new(),
     };
     let base_records: BTreeMap<String, MaterializedRecord> = match state {
-        Some(state) => state
-            .materialized_in(Some(&request.base_ref))?
-            .into_iter()
-            .map(|record| (record.model_id.clone(), record))
-            .collect(),
+        Some(state) => materialized_for_environment(state, &request.base_ref)?,
         None => BTreeMap::new(),
     };
     let candidate_seeds: BTreeMap<String, SeedRecord> = match state {
-        Some(state) => state
-            .seeds_in(Some(&request.candidate_ref))?
-            .into_iter()
-            .map(|record| (record.name.clone(), record))
-            .collect(),
+        Some(state) => seeds_for_environment(state, &request.candidate_ref)?,
         None => BTreeMap::new(),
     };
     let base_seeds: BTreeMap<String, SeedRecord> = match state {
-        Some(state) => state
-            .seeds_in(Some(&request.base_ref))?
-            .into_iter()
-            .map(|record| (record.name.clone(), record))
-            .collect(),
+        Some(state) => seeds_for_environment(state, &request.base_ref)?,
         None => BTreeMap::new(),
     };
 
@@ -500,7 +484,7 @@ fn diff_policy(spec: Option<&phlo_transform_core::DiffPolicySpec>) -> crate::dif
 }
 
 /// Re-point a compiled target at a reference's catalog.
-fn retarget(target: &Relation, catalog: Option<&str>) -> Relation {
+pub fn retarget(target: &Relation, catalog: Option<&str>) -> Relation {
     match catalog {
         Some(catalog) => Relation {
             catalog: Some(catalog.to_string()),
@@ -526,6 +510,65 @@ async fn snapshot(adapter: &dyn Adapter, relation: Option<&Relation>) -> Option<
         Some(relation) => adapter.source_state(relation).await.ok().flatten(),
         None => None,
     }
+}
+
+/// The default (unlabeled) environment — `apply`/`run` with no `--ref`
+/// records under it while physically writing the default catalog, which is
+/// `main`'s view. When `main` is asked for, its records count too.
+fn includes_default_environment(environment: &str) -> bool {
+    environment == "main"
+}
+
+/// Every materialised model recorded for an environment label, keyed by
+/// model id. `main` also folds in the default environment — a run on `main`
+/// with no `--ref` records there — so a dropped model's record is found
+/// regardless of which label the run carried. When a model has records in
+/// both, the latest `materialized_at` wins: both describe the same physical
+/// table, and the last write is what is actually there.
+pub fn materialized_for_environment(
+    state: &dyn StateStore,
+    environment: &str,
+) -> Result<BTreeMap<String, MaterializedRecord>, EngineError> {
+    let mut records: BTreeMap<String, MaterializedRecord> = state
+        .materialized_in(Some(environment))?
+        .into_iter()
+        .map(|record| (record.model_id.clone(), record))
+        .collect();
+    if includes_default_environment(environment) {
+        for record in state.materialized_in(None)? {
+            match records.get(&record.model_id) {
+                Some(existing) if existing.materialized_at >= record.materialized_at => {}
+                _ => {
+                    records.insert(record.model_id.clone(), record);
+                }
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// Every seed load recorded for an environment label — same `main`
+/// convention as [`materialized_for_environment`], latest `loaded_at` wins.
+pub fn seeds_for_environment(
+    state: &dyn StateStore,
+    environment: &str,
+) -> Result<BTreeMap<String, SeedRecord>, EngineError> {
+    let mut records: BTreeMap<String, SeedRecord> = state
+        .seeds_in(Some(environment))?
+        .into_iter()
+        .map(|record| (record.name.clone(), record))
+        .collect();
+    if includes_default_environment(environment) {
+        for record in state.seeds_in(None)? {
+            match records.get(&record.name) {
+                Some(existing) if existing.loaded_at >= record.loaded_at => {}
+                _ => {
+                    records.insert(record.name.clone(), record);
+                }
+            }
+        }
+    }
+    Ok(records)
 }
 
 async fn row_count(adapter: &dyn Adapter, relation: &Relation) -> Result<i64, EngineError> {
