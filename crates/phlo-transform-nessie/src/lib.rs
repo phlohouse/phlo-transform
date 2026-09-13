@@ -483,16 +483,17 @@ impl NessieRestClient {
         expected_target_hash: Option<&str>,
         dry_run: bool,
     ) -> Result<MergeOutcome, NessieError> {
-        let target = match expected_target_hash {
-            Some(hash) => format!("{}@{hash}", encode(to_ref)),
-            None => encode(to_ref),
+        // Nessie requires both hashes on a merge; resolve each ref's head
+        // when the caller did not pin one.
+        let expected_target_hash = match expected_target_hash {
+            Some(hash) => hash.to_string(),
+            None => {
+                self.get_reference(to_ref)
+                    .await?
+                    .ok_or_else(|| NessieError::NotFound(to_ref.to_string()))?
+                    .hash
+            }
         };
-        let mut path = format!("/trees/{target}/history/merge?returnConflictDetailsAsResult=true");
-        if dry_run {
-            path.push_str("&dryRun=true");
-        }
-        // Nessie requires the source hash; resolve the head when the caller
-        // did not pin one.
         let from_hash = match from_hash {
             Some(hash) => hash.to_string(),
             None => {
@@ -502,6 +503,13 @@ impl NessieRestClient {
                     .hash
             }
         };
+        let mut path = format!(
+            "/trees/{}@{expected_target_hash}/history/merge?returnConflictDetailsAsResult=true",
+            encode(to_ref)
+        );
+        if dry_run {
+            path.push_str("&dryRun=true");
+        }
         let body = serde_json::json!({
             "fromRefName": from_ref,
             "fromHash": from_hash,
