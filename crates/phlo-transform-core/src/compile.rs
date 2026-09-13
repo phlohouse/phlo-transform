@@ -420,10 +420,16 @@ fn version_inputs(
                     )
                 })
                 .collect();
+            let renames: Vec<String> = contract
+                .renames
+                .iter()
+                .map(|(new, old)| format!("{new}={old}"))
+                .collect();
             format!(
-                "enforced={};columns={}",
+                "enforced={};columns={};renames={}",
                 contract.enforced,
-                columns.join(",")
+                columns.join(","),
+                renames.join(",")
             )
         })
         .unwrap_or_default();

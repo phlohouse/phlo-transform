@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use phlo_transform_core::semantic::ModelContract;
 use phlo_transform_core::{ModelVersion, VersionDetail};
 
 use crate::error::EngineError;
@@ -182,8 +183,69 @@ pub struct MaterializedRecord {
     /// cross-environment cache hit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_identity: Option<String>,
+    /// The model's contract at materialisation time — lets promotion diff
+    /// the candidate's contract against what the base environment recorded
+    /// instead of comparing opaque contract hashes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract: Option<ModelContract>,
+    /// The effective row-identity key at materialisation time — the union
+    /// of the `key` incremental strategy's columns and each unique
+    /// assertion's columns, one set per claim. `Some(vec![])` means the
+    /// record proves the model had no key; `None` means nothing about the
+    /// key was persisted (rows written before the column existed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_key: Option<Vec<Vec<String>>>,
     pub run_id: String,
     pub materialized_at: String,
+}
+
+impl MaterializedRecord {
+    /// What this record proves about the row-identity key it was
+    /// materialised with.
+    ///
+    /// - a persisted `effective_key` (including an empty set — recorded
+    ///   keyless) is known evidence;
+    /// - a legacy row with an incremental `key` strategy reconstructs its
+    ///   columns: before `effective_key` existed that strategy was the only
+    ///   key concept state recorded;
+    /// - anything else is `Unknown` — its historical key cannot be told
+    ///   from "no key", and promotion evidence must not treat it as
+    ///   keyless.
+    pub fn recorded_key(&self) -> crate::contracts::RecordedKey {
+        use crate::contracts::RecordedKey;
+        if let Some(key) = &self.effective_key {
+            let mut key = key.clone();
+            for claim in &mut key {
+                claim.sort();
+            }
+            key.sort();
+            return RecordedKey::Known((!key.is_empty()).then_some(key));
+        }
+        if self.incremental_strategy.as_deref() == Some("key") {
+            if let Some(claim) = self
+                .incremental_key
+                .as_deref()
+                .and_then(incremental_key_claim)
+            {
+                return RecordedKey::Known(Some(claim));
+            }
+        }
+        RecordedKey::Unknown
+    }
+}
+
+/// The canonical key claim a persisted `incremental_key` string encodes —
+/// the comma-joined columns, sorted as `effective_key` claims are. `None`
+/// for an empty column list.
+pub(crate) fn incremental_key_claim(raw: &str) -> Option<Vec<Vec<String>>> {
+    let mut columns: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|column| !column.is_empty())
+        .map(str::to_string)
+        .collect();
+    columns.sort();
+    (!columns.is_empty()).then_some(vec![columns])
 }
 
 /// A seed load recorded against an environment.
@@ -411,6 +473,8 @@ impl SqliteStateStore {
                     version_detail TEXT,
                     adapter TEXT,
                     output_identity TEXT,
+                    contract_json TEXT,
+                    effective_key_json TEXT,
                     PRIMARY KEY (model_id, environment)
                 );
                 CREATE TABLE IF NOT EXISTS incremental_state (
@@ -460,6 +524,14 @@ impl SqliteStateStore {
             "ALTER TABLE model_versions ADD COLUMN output_identity TEXT",
             [],
         );
+        let _ = connection.execute(
+            "ALTER TABLE model_versions ADD COLUMN contract_json TEXT",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE model_versions ADD COLUMN effective_key_json TEXT",
+            [],
+        );
         // Run-progress columns added for resumable runs.
         let _ = connection.execute("ALTER TABLE runs ADD COLUMN plan_json TEXT", []);
         // The Nessie commit a run validated — added for promotion provenance.
@@ -472,6 +544,46 @@ impl SqliteStateStore {
             "ALTER TABLE test_runs ADD COLUMN error_category TEXT",
         ] {
             let _ = connection.execute(column, []);
+        }
+        // Backfill `effective_key_json` for rows written before the column
+        // existed: an incremental `key` strategy's columns were the era's
+        // effective key — the only key concept state then recorded. Rows
+        // without one stay NULL: their key is unknown, not absent.
+        let legacy_keys = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT model_id, environment, incremental_key FROM model_versions
+                     WHERE effective_key_json IS NULL
+                       AND incremental_strategy = 'key'
+                       AND incremental_key IS NOT NULL",
+                )
+                .map_err(|error| EngineError::State(error.to_string()))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| EngineError::State(error.to_string()))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| EngineError::State(error.to_string()))?;
+            rows
+        };
+        for (model_id, environment, raw) in legacy_keys {
+            let Some(claim) = incremental_key_claim(&raw) else {
+                continue;
+            };
+            let json = serde_json::to_string(&claim)
+                .map_err(|error| EngineError::State(error.to_string()))?;
+            connection
+                .execute(
+                    "UPDATE model_versions SET effective_key_json = ?1
+                     WHERE model_id = ?2 AND environment = ?3",
+                    rusqlite::params![json, model_id, environment],
+                )
+                .map_err(|error| EngineError::State(error.to_string()))?;
         }
         Ok(Self {
             connection: Mutex::new(connection),
@@ -899,6 +1011,14 @@ impl StateStore for SqliteStateStore {
             .detail
             .as_ref()
             .map(|detail| serde_json::to_string(detail).unwrap_or_default());
+        let contract = record
+            .contract
+            .as_ref()
+            .map(|contract| serde_json::to_string(contract).unwrap_or_default());
+        let effective_key = record
+            .effective_key
+            .as_ref()
+            .map(|key| serde_json::to_string(key).unwrap_or_default());
         // Ordered upsert: a record is only applied when it is not older than
         // what is already stored. Two concurrent runs can finish out of
         // order — the run that materialised later physically overwrote the
@@ -910,8 +1030,8 @@ impl StateStore for SqliteStateStore {
                  (model_id, environment, version_hash, sql_hash, config_hash, contract_hash,
                   dependency_hash, source_state_hash, compiler_version, target_hash, target,
                   run_id, materialized_at, incremental_strategy, incremental_key, version_detail,
-                  adapter, output_identity)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                  adapter, output_identity, contract_json, effective_key_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
                  ON CONFLICT (model_id, environment) DO UPDATE SET
                     version_hash = excluded.version_hash,
                     sql_hash = excluded.sql_hash,
@@ -928,7 +1048,9 @@ impl StateStore for SqliteStateStore {
                     incremental_key = excluded.incremental_key,
                     version_detail = excluded.version_detail,
                     adapter = excluded.adapter,
-                    output_identity = excluded.output_identity
+                    output_identity = excluded.output_identity,
+                    contract_json = excluded.contract_json,
+                    effective_key_json = excluded.effective_key_json
                  WHERE excluded.materialized_at >= model_versions.materialized_at",
                 rusqlite::params![
                     record.model_id,
@@ -949,6 +1071,8 @@ impl StateStore for SqliteStateStore {
                     detail,
                     record.adapter,
                     record.output_identity,
+                    contract,
+                    effective_key,
                 ],
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
@@ -1227,7 +1351,7 @@ impl StateStore for SqliteStateStore {
 const MATERIALIZED_COLUMNS: &str = "model_id, environment, version_hash, sql_hash, config_hash, \
      contract_hash, dependency_hash, source_state_hash, compiler_version, target_hash, target, \
      run_id, materialized_at, incremental_strategy, incremental_key, version_detail, adapter, \
-     output_identity";
+     output_identity, contract_json, effective_key_json";
 
 fn materialized_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MaterializedRecord> {
     let environment: String = row.get(1)?;
@@ -1256,6 +1380,12 @@ fn materialized_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Materializ
         incremental_key: row.get(14)?,
         adapter: row.get(16)?,
         output_identity: row.get(17)?,
+        contract: row
+            .get::<_, Option<String>>(18)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
+        effective_key: row
+            .get::<_, Option<String>>(19)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
         run_id: row.get(11)?,
         materialized_at: row.get(12)?,
     })
@@ -1351,6 +1481,8 @@ mod tests {
             incremental_key: None,
             adapter: Some("trino".to_string()),
             output_identity: Some(format!("snap:{hash}")),
+            contract: None,
+            effective_key: Some(Vec::new()),
             run_id: run_id.to_string(),
             materialized_at: at.to_string(),
         }
@@ -1366,14 +1498,9 @@ mod tests {
         let writer_a = SqliteStateStore::open(&path).unwrap();
         let writer_b = SqliteStateStore::open(&path).unwrap();
 
-        writer_b
-            .record_materialized(&materialized(
-                "assay.results",
-                "v2",
-                "2026-01-01T00:00:02Z",
-                "run-b",
-            ))
-            .unwrap();
+        let mut winning = materialized("assay.results", "v2", "2026-01-01T00:00:02Z", "run-b");
+        winning.effective_key = Some(vec![vec!["sample_id".to_string()]]);
+        writer_b.record_materialized(&winning).unwrap();
         writer_a
             .record_materialized(&materialized(
                 "assay.results",
@@ -1388,6 +1515,11 @@ mod tests {
             .expect("record");
         assert_eq!(record.version.hash, "v2", "the stale write must lose");
         assert_eq!(record.run_id, "run-b");
+        // The persisted effective key survives the write and the read.
+        assert_eq!(
+            record.effective_key.as_deref(),
+            Some(&[vec!["sample_id".to_string()]][..])
+        );
 
         // An equal or later timestamp still applies — same-run re-records
         // and genuinely newer writes are unaffected.
@@ -1404,6 +1536,54 @@ mod tests {
             .unwrap()
             .expect("record");
         assert_eq!(record.version.hash, "v3");
+    }
+
+    /// Reopening a database backfills `effective_key_json` for legacy rows
+    /// that recorded an incremental `key` strategy — the era's only key
+    /// concept — and leaves rows with no key evidence NULL (unknown, not
+    /// keyless).
+    #[test]
+    fn reopening_backfills_legacy_incremental_keys() {
+        use crate::contracts::RecordedKey;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+
+        {
+            let store = SqliteStateStore::open(&path).unwrap();
+            // A legacy incremental-key row: nothing in `effective_key`,
+            // the incremental fields carry the era's key.
+            let mut keyed = materialized("assay.keyed", "v1", "2026-01-01T00:00:01Z", "run-1");
+            keyed.incremental_strategy = Some("key".to_string());
+            keyed.incremental_key = Some("b, a".to_string());
+            keyed.effective_key = None;
+            store.record_materialized(&keyed).unwrap();
+            // A legacy row with no key evidence at all stays NULL.
+            let mut bare = materialized("assay.bare", "v1", "2026-01-01T00:00:01Z", "run-1");
+            bare.effective_key = None;
+            store.record_materialized(&bare).unwrap();
+        }
+
+        let store = SqliteStateStore::open(&path).unwrap();
+        let keyed = store
+            .materialized_version("assay.keyed", Some("prod"))
+            .unwrap()
+            .expect("keyed record");
+        assert_eq!(
+            keyed.effective_key.as_deref(),
+            Some(&[vec!["a".to_string(), "b".to_string()]][..]),
+            "the backfill writes the canonical sorted claim"
+        );
+        assert_eq!(
+            keyed.recorded_key().as_deref(),
+            Some(&[vec!["a".to_string(), "b".to_string()]][..])
+        );
+
+        let bare = store
+            .materialized_version("assay.bare", Some("prod"))
+            .unwrap()
+            .expect("bare record");
+        assert_eq!(bare.effective_key, None, "no evidence to backfill from");
+        assert_eq!(bare.recorded_key(), RecordedKey::Unknown);
     }
 
     #[test]

@@ -223,6 +223,7 @@ async fn computes_keyed_data_diff_against_trino() {
         strategy: DiffStrategy::Keyed,
         policy: DiffPolicy::default(),
         sample_fraction: None,
+        renames: Default::default(),
     };
 
     let report = diff(adapter, &request).await.expect("diff runs");
@@ -284,6 +285,7 @@ async fn diff_supports_partitions_tolerances_schema_and_sampling() {
         strategy,
         policy,
         sample_fraction: None,
+        renames: Default::default(),
     };
 
     // Tolerance: the tiny difference is within bounds.

@@ -66,6 +66,9 @@ pub struct DiffRequest {
     pub strategy: DiffStrategy,
     pub policy: DiffPolicy,
     pub sample_fraction: Option<f64>,
+    /// Declared column renames (`candidate name` → `base name`) — turns a
+    /// removed+added schema pair into a reviewable rename.
+    pub renames: std::collections::BTreeMap<String, String>,
 }
 
 /// Row-level summary.
@@ -436,7 +439,13 @@ fn partition_delta(
 }
 
 async fn schema_changes(adapter: &dyn Adapter, request: &DiffRequest) -> Vec<SchemaChange> {
-    compare_columns(adapter, &request.candidate_relation, &request.base_relation).await
+    compare_columns(
+        adapter,
+        &request.candidate_relation,
+        &request.base_relation,
+        &request.renames,
+    )
+    .await
 }
 
 /// Column-level comparison of two relations: added/removed columns, type
@@ -446,6 +455,7 @@ pub(crate) async fn compare_columns(
     adapter: &dyn Adapter,
     candidate: &phlo_transform_core::Relation,
     base: &phlo_transform_core::Relation,
+    renames: &BTreeMap<String, String>,
 ) -> Vec<SchemaChange> {
     let Ok(candidate_columns) = adapter.relation_columns(candidate).await else {
         return Vec::new();
@@ -453,14 +463,18 @@ pub(crate) async fn compare_columns(
     let Ok(base_columns) = adapter.relation_columns(base).await else {
         return Vec::new();
     };
-    compare_column_lists(&candidate_columns, &base_columns)
+    compare_column_lists(&candidate_columns, &base_columns, renames)
 }
 
 /// Column-level comparison of two column lists — usable when only one side
-/// exists (pass an empty list for the absent side).
+/// exists (pass an empty list for the absent side). `renames` maps a
+/// candidate column name to the base column it was renamed from, so a
+/// remove+add pair that is a declared rename reports as `renamed` instead of
+/// a breaking removal.
 pub(crate) fn compare_column_lists(
     candidate_columns: &[crate::adapter::ColumnInfo],
     base_columns: &[crate::adapter::ColumnInfo],
+    renames: &BTreeMap<String, String>,
 ) -> Vec<SchemaChange> {
     if candidate_columns.is_empty() && base_columns.is_empty() {
         return Vec::new();
@@ -486,14 +500,79 @@ pub(crate) fn compare_column_lists(
         .collect();
 
     let mut changes = Vec::new();
+    // Renames that actually resolve: the new name exists only on the
+    // candidate side and the old name exists on the base side. A stale
+    // declaration (`new` absent, `old` absent, or `new` already a base
+    // column) explains nothing and must not suppress a real addition or
+    // removal. Renames are one-to-one: an `old` name claimed by two new
+    // columns is ambiguous — resolve none of them so the removal and both
+    // additions report normally.
+    let mut claims: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (new, old) in renames {
+        claims.entry(old.as_str()).or_default().push(new.as_str());
+    }
+    let ambiguous: std::collections::BTreeSet<&str> = claims
+        .iter()
+        .filter(|(_, news)| news.len() > 1)
+        .map(|(old, _)| *old)
+        .collect();
+    let resolved: std::collections::BTreeSet<&str> = renames
+        .iter()
+        .filter(|(new, old)| {
+            !ambiguous.contains(old.as_str())
+                && candidate_types.contains_key(new.as_str())
+                && !base_types.contains_key(new.as_str())
+                && base_types.contains_key(old.as_str())
+        })
+        .map(|(new, _)| new.as_str())
+        .collect();
+    for (old, news) in &claims {
+        if ambiguous.contains(old) && base_types.contains_key(*old) {
+            changes.push(SchemaChange {
+                column: (*old).to_string(),
+                kind: "rename_ambiguous".to_string(),
+                detail: format!(
+                    "declared renames for `{old}` are ambiguous: {}",
+                    news.join(", ")
+                ),
+                safety: "review".to_string(),
+            });
+        }
+    }
+    // Base columns renamed to a new candidate name — `old -> new`.
+    let renamed_away: BTreeMap<&str, &str> = renames
+        .iter()
+        .filter(|(new, _)| resolved.contains(new.as_str()))
+        .map(|(new, old)| (old.as_str(), new.as_str()))
+        .collect();
     for (name, (base_type, base_nullable)) in &base_types {
         match candidate_types.get(name) {
-            None => changes.push(SchemaChange {
-                column: name.clone(),
-                kind: "removed".to_string(),
-                detail: format!("{base_type} removed"),
-                safety: "full_rebuild_required".to_string(),
-            }),
+            None => {
+                if let Some(new_name) = renamed_away.get(name.as_str()) {
+                    let (new_type, _) = &candidate_types[*new_name];
+                    let type_note = if new_type != base_type {
+                        format!(" (type {base_type} -> {new_type})")
+                    } else {
+                        String::new()
+                    };
+                    changes.push(SchemaChange {
+                        column: (*new_name).to_string(),
+                        kind: "renamed".to_string(),
+                        detail: format!("`{name}` renamed to `{new_name}`{type_note}"),
+                        // Declaring a rename proves intent, not
+                        // compatibility — consumers selecting the old name
+                        // break, so it gates like a removal.
+                        safety: "full_rebuild_required".to_string(),
+                    });
+                } else {
+                    changes.push(SchemaChange {
+                        column: name.clone(),
+                        kind: "removed".to_string(),
+                        detail: format!("{base_type} removed"),
+                        safety: "full_rebuild_required".to_string(),
+                    });
+                }
+            }
             Some((candidate_type, candidate_nullable)) => {
                 // Type and nullability are independent changes — a column
                 // that moved on both reports both.
@@ -518,8 +597,11 @@ pub(crate) fn compare_column_lists(
                         } else {
                             "nullable -> not null".to_string()
                         },
+                        // Downstream direction: losing the NOT NULL
+                        // guarantee breaks consumers that relied on it;
+                        // gaining it can only reject producer data.
                         safety: if *candidate_nullable {
-                            "safe".to_string()
+                            "error".to_string()
                         } else {
                             "review".to_string()
                         },
@@ -529,7 +611,7 @@ pub(crate) fn compare_column_lists(
         }
     }
     for (name, (candidate_type, _)) in &candidate_types {
-        if !base_types.contains_key(name) {
+        if !base_types.contains_key(name) && !resolved.contains(name.as_str()) {
             changes.push(SchemaChange {
                 column: name.clone(),
                 kind: "added".to_string(),
@@ -691,6 +773,7 @@ mod tests {
             strategy: DiffStrategy::Keyed,
             policy: DiffPolicy::default(),
             sample_fraction: None,
+            renames: Default::default(),
         }
     }
 
@@ -777,11 +860,99 @@ mod tests {
             data_type: "varchar".to_string(),
             nullable: false,
         }];
-        let changes = compare_column_lists(&candidate, &base);
+        let changes = compare_column_lists(&candidate, &base, &BTreeMap::new());
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0].kind, "changed");
         assert_eq!(changes[1].kind, "nullability");
         assert_eq!(changes[1].detail, "not null -> nullable");
+        // Losing a NOT NULL guarantee breaks downstream consumers.
+        assert_eq!(changes[1].safety, "error");
+    }
+
+    #[test]
+    fn declared_rename_reports_renamed_not_removed_and_added() {
+        let info = |name: &str| crate::adapter::ColumnInfo {
+            name: name.to_string(),
+            data_type: "bigint".to_string(),
+            nullable: true,
+        };
+        let candidate = [info("id"), info("new_col")];
+        let base = [info("id"), info("old_col")];
+        let mut renames = BTreeMap::new();
+        renames.insert("new_col".to_string(), "old_col".to_string());
+        let changes = compare_column_lists(&candidate, &base, &renames);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, "renamed");
+        assert_eq!(changes[0].column, "new_col");
+        // A declared rename proves intent, not compatibility — consumers
+        // selecting the old name break, so it is a breaking change.
+        assert_eq!(changes[0].safety, "full_rebuild_required");
+
+        // Without the declaration the same pair is a breaking removal.
+        let changes = compare_column_lists(&candidate, &base, &BTreeMap::new());
+        assert!(changes.iter().any(|change| change.kind == "removed"));
+        assert!(changes.iter().any(|change| change.kind == "added"));
+    }
+
+    #[test]
+    fn ambiguous_rename_resolves_nothing() {
+        // Two new columns claiming the same old name: resolve neither — the
+        // removal stays breaking and both additions report, plus an
+        // ambiguity diagnostic explains why.
+        let info = |name: &str| crate::adapter::ColumnInfo {
+            name: name.to_string(),
+            data_type: "bigint".to_string(),
+            nullable: true,
+        };
+        let candidate = [info("id"), info("new_a"), info("new_b")];
+        let base = [info("id"), info("old_col")];
+        let mut renames = BTreeMap::new();
+        renames.insert("new_a".to_string(), "old_col".to_string());
+        renames.insert("new_b".to_string(), "old_col".to_string());
+        let changes = compare_column_lists(&candidate, &base, &renames);
+        let removed = changes
+            .iter()
+            .find(|change| change.column == "old_col" && change.kind == "removed")
+            .expect("old_col removal");
+        assert_eq!(removed.safety, "full_rebuild_required");
+        for new in ["new_a", "new_b"] {
+            let added = changes
+                .iter()
+                .find(|change| change.column == new && change.kind == "added")
+                .unwrap_or_else(|| panic!("{new} must report added"));
+            assert_eq!(added.safety, "safe");
+        }
+        assert!(changes
+            .iter()
+            .any(|change| change.kind == "rename_ambiguous" && change.column == "old_col"));
+    }
+
+    #[test]
+    fn stale_rename_neither_hides_addition_nor_removal() {
+        let info = |name: &str| crate::adapter::ColumnInfo {
+            name: name.to_string(),
+            data_type: "bigint".to_string(),
+            nullable: true,
+        };
+        // `old_col` was never a base column — the declaration explains
+        // nothing, and the genuinely-new `new_col` still reports added.
+        let candidate = [info("id"), info("new_col")];
+        let base = [info("id")];
+        let mut renames = BTreeMap::new();
+        renames.insert("new_col".to_string(), "old_col".to_string());
+        let changes = compare_column_lists(&candidate, &base, &renames);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, "added");
+        assert_eq!(changes[0].column, "new_col");
+
+        // `new_col` already existed on the base side — the declaration is
+        // ambiguous, so `old_col`'s disappearance stays a breaking removal.
+        let candidate = [info("id"), info("new_col")];
+        let base = [info("id"), info("new_col"), info("old_col")];
+        let changes = compare_column_lists(&candidate, &base, &renames);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, "removed");
+        assert_eq!(changes[0].column, "old_col");
     }
 
     #[test]

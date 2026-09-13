@@ -1090,10 +1090,7 @@ pub fn diff_reasons(model: &CompiledModel, current: &MaterializedRecord) -> Vec<
         ));
     }
     if current.version.contract_hash != desired.contract_hash {
-        reasons.push(PlanReason::simple(
-            ReasonKind::ContractChange,
-            "contract or assertions changed",
-        ));
+        reasons.push(contract_diff_reason(model, current));
     }
     if current.version.dependency_hash != desired.dependency_hash {
         reasons.push(dependency_diff_reason(model, current));
@@ -1118,6 +1115,65 @@ pub fn diff_reasons(model: &CompiledModel, current: &MaterializedRecord) -> Vec<
         ));
     }
     reasons
+}
+
+/// Explain a contract-hash change with the structured contract diff when
+/// both sides' contracts are available — names the breaking changes instead
+/// of reporting an opaque hash change.
+fn contract_diff_reason(model: &CompiledModel, current: &MaterializedRecord) -> PlanReason {
+    let Some(changes) = model
+        .contract
+        .as_ref()
+        .map(|desired| crate::contracts::contract_diff(current.contract.as_ref(), Some(desired)))
+    else {
+        // The model dropped its contract — report what the base recorded.
+        if let Some(previous) = &current.contract {
+            let changes = crate::contracts::contract_diff(Some(previous), None);
+            return contract_reason_from_changes(changes);
+        }
+        return PlanReason::simple(ReasonKind::ContractChange, "contract or assertions changed");
+    };
+    if changes.is_empty() {
+        // Assertions changed, or the recorded contract is missing — the hash
+        // moved but no column-level diff is derivable.
+        return PlanReason::simple(ReasonKind::ContractChange, "contract or assertions changed");
+    }
+    contract_reason_from_changes(changes)
+}
+
+fn contract_reason_from_changes(changes: Vec<crate::contracts::ContractChange>) -> PlanReason {
+    let breaking = changes
+        .iter()
+        .filter(|change| change.safety == crate::contracts::ContractSafety::Breaking)
+        .count();
+    let summary = changes
+        .iter()
+        .take(3)
+        .map(|change| {
+            if change.column.is_empty() {
+                change.detail.clone()
+            } else {
+                format!("{}: {}", change.column, change.detail)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let more = if changes.len() > 3 {
+        format!(" (+{} more)", changes.len() - 3)
+    } else {
+        String::new()
+    };
+    PlanReason::simple(
+        ReasonKind::ContractChange,
+        format!(
+            "contract changed: {summary}{more}{}",
+            if breaking > 0 {
+                format!(" — {breaking} breaking")
+            } else {
+                String::new()
+            }
+        ),
+    )
 }
 
 /// Explain a changed dependency hash in terms of which dependency's version

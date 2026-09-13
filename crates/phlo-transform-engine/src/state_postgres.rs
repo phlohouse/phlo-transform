@@ -26,8 +26,8 @@ use phlo_transform_core::{ModelVersion, VersionDetail};
 use crate::error::EngineError;
 use crate::events::ExecutionStatus;
 use crate::state::{
-    status_str, MaterializedRecord, ModelRunRecord, RunRecord, RunSummary, SeedRecord,
-    SeedRunRecord, StateStore, StoredPlan, StoredRun, TestRunRecord,
+    incremental_key_claim, status_str, MaterializedRecord, ModelRunRecord, RunRecord, RunSummary,
+    SeedRecord, SeedRunRecord, StateStore, StoredPlan, StoredRun, TestRunRecord,
 };
 use crate::util::now_rfc3339;
 
@@ -40,7 +40,7 @@ const MODEL_RUN_COLUMNS: &str = "run_id, model_id, materialization, status, star
 const MATERIALIZED_COLUMNS: &str = "model_id, environment, version_hash, sql_hash, config_hash, \
      contract_hash, dependency_hash, source_state_hash, compiler_version, target_hash, target, \
      run_id, materialized_at, incremental_strategy, incremental_key, version_detail, adapter, \
-     output_identity";
+     output_identity, contract_json, effective_key_json";
 
 fn parse_status(value: &str) -> ExecutionStatus {
     match value {
@@ -106,6 +106,8 @@ fn model_run_from_row(row: &Row) -> ModelRunRecord {
 fn materialized_from_row(row: &Row) -> MaterializedRecord {
     let environment: String = row.get(1);
     let detail: Option<String> = row.get(15);
+    let contract: Option<String> = row.get(18);
+    let effective_key: Option<String> = row.get(19);
     MaterializedRecord {
         model_id: row.get(0),
         environment: if environment.is_empty() {
@@ -129,6 +131,8 @@ fn materialized_from_row(row: &Row) -> MaterializedRecord {
         incremental_key: row.get(14),
         adapter: row.get(16),
         output_identity: row.get(17),
+        contract: contract.and_then(|json| serde_json::from_str(&json).ok()),
+        effective_key: effective_key.and_then(|json| serde_json::from_str(&json).ok()),
         run_id: row.get(11),
         materialized_at: row.get(12),
     }
@@ -317,6 +321,8 @@ fn ensure_schema(client: &mut Client) -> Result<(), String> {
                 version_detail TEXT,
                 adapter TEXT,
                 output_identity TEXT,
+                contract_json TEXT,
+                effective_key_json TEXT,
                 PRIMARY KEY (model_id, environment)
             );
             CREATE TABLE IF NOT EXISTS incremental_state (
@@ -357,6 +363,8 @@ fn ensure_schema(client: &mut Client) -> Result<(), String> {
         "ALTER TABLE model_versions ADD COLUMN version_detail TEXT",
         "ALTER TABLE model_versions ADD COLUMN adapter TEXT",
         "ALTER TABLE model_versions ADD COLUMN output_identity TEXT",
+        "ALTER TABLE model_versions ADD COLUMN contract_json TEXT",
+        "ALTER TABLE model_versions ADD COLUMN effective_key_json TEXT",
         "ALTER TABLE runs ADD COLUMN plan_json TEXT",
         "ALTER TABLE runs ADD COLUMN reference_hash TEXT",
         "ALTER TABLE runs ADD COLUMN seq BIGINT GENERATED ALWAYS AS IDENTITY",
@@ -369,6 +377,33 @@ fn ensure_schema(client: &mut Client) -> Result<(), String> {
         "ALTER TABLE seed_runs ADD COLUMN error_category TEXT",
     ] {
         let _ = client.execute(column, &[]);
+    }
+    // Backfill `effective_key_json` for rows written before the column
+    // existed: an incremental `key` strategy's columns were the era's
+    // effective key — the only key concept state then recorded. Rows
+    // without one stay NULL: their key is unknown, not absent.
+    let legacy_keys = client
+        .query(
+            "SELECT model_id, environment, incremental_key FROM model_versions
+             WHERE effective_key_json IS NULL
+               AND incremental_strategy = 'key'
+               AND incremental_key IS NOT NULL",
+            &[],
+        )
+        .map_err(|error| error.to_string())?;
+    for row in legacy_keys {
+        let raw: String = row.get(2);
+        let Some(claim) = incremental_key_claim(&raw) else {
+            continue;
+        };
+        let json = serde_json::to_string(&claim).map_err(|error| error.to_string())?;
+        client
+            .execute(
+                "UPDATE model_versions SET effective_key_json = $1
+                 WHERE model_id = $2 AND environment = $3",
+                &[&json, &row.get::<_, String>(0), &row.get::<_, String>(1)],
+            )
+            .map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -734,6 +769,14 @@ impl StateStore for PostgresStateStore {
                 .detail
                 .as_ref()
                 .map(|detail| serde_json::to_string(detail).unwrap_or_default());
+            let contract = record
+                .contract
+                .as_ref()
+                .map(|contract| serde_json::to_string(contract).unwrap_or_default());
+            let effective_key = record
+                .effective_key
+                .as_ref()
+                .map(|key| serde_json::to_string(key).unwrap_or_default());
             let environment = record.environment.clone().unwrap_or_default();
             // Ordered upsert: only applied when the incoming record is not
             // older than what is stored — a later-materialised run physically
@@ -746,8 +789,8 @@ impl StateStore for PostgresStateStore {
                      (model_id, environment, version_hash, sql_hash, config_hash, contract_hash,
                       dependency_hash, source_state_hash, compiler_version, target_hash, target,
                       run_id, materialized_at, incremental_strategy, incremental_key, version_detail,
-                      adapter, output_identity)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                      adapter, output_identity, contract_json, effective_key_json)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
                      ON CONFLICT (model_id, environment) DO UPDATE SET
                         version_hash = EXCLUDED.version_hash,
                         sql_hash = EXCLUDED.sql_hash,
@@ -764,7 +807,9 @@ impl StateStore for PostgresStateStore {
                         incremental_key = EXCLUDED.incremental_key,
                         version_detail = EXCLUDED.version_detail,
                         adapter = EXCLUDED.adapter,
-                        output_identity = EXCLUDED.output_identity
+                        output_identity = EXCLUDED.output_identity,
+                        contract_json = EXCLUDED.contract_json,
+                        effective_key_json = EXCLUDED.effective_key_json
                      WHERE EXCLUDED.materialized_at >= model_versions.materialized_at",
                     &[
                         &record.model_id,
@@ -785,6 +830,8 @@ impl StateStore for PostgresStateStore {
                         &detail,
                         &record.adapter,
                         &record.output_identity,
+                        &contract,
+                        &effective_key,
                     ],
                 )
                 .map_err(map_error)?;
@@ -1128,6 +1175,8 @@ mod tests {
                 incremental_key: None,
                 adapter: Some("trino".to_string()),
                 output_identity: Some("snap:1".to_string()),
+                contract: None,
+                effective_key: Some(vec![vec!["sample_id".to_string()]]),
                 run_id: "run-pg-1".to_string(),
                 materialized_at: "2026-01-01T00:00:01Z".to_string(),
             })
@@ -1139,6 +1188,10 @@ mod tests {
         assert_eq!(record.version.hash, "v1");
         assert_eq!(record.adapter.as_deref(), Some("trino"));
         assert_eq!(record.output_identity.as_deref(), Some("snap:1"));
+        assert_eq!(
+            record.effective_key.as_deref(),
+            Some(&[vec!["sample_id".to_string()]][..])
+        );
         assert_eq!(store.materialized_by_hash("v1").expect("by hash").len(), 1);
 
         // Same-key writes are ordered by materialisation time: a later

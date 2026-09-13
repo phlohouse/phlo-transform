@@ -70,6 +70,9 @@ pub struct ModelContractConfig {
     pub incremental: IncrementalModelConfig,
     /// `[model.<name>.diff]`.
     pub diff: DiffConfig,
+    /// `[model.<name>.renames]` — column renames the model declares
+    /// (`new name = "old name"`).
+    pub renames: BTreeMap<String, String>,
 }
 
 /// The `[model.<name>.diff]` settings.

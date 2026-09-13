@@ -24,11 +24,11 @@ use phlo_transform_engine::{
     adapter_default_schema, branch_diff, changed_models, collect_source_states, diff, diff_reasons,
     ensure_environment, evaluate_gates, materialized_for_environment, model_keys, promote,
     relation_for_source, retarget, seeds_for_environment, Adapter, ArtifactWriter,
-    BranchDiffReport, BranchDiffRequest, CancelHandle, DatasetKind, DiffPolicy, DiffRequest,
-    DiffStrategy, EnvironmentArtifact, EnvironmentSetup, EnvironmentSpec, ExecutionStatus,
-    GateInput, Membership, Plan, PlanAction, PlanOptions, PlanReason, Planner, PostgresStateStore,
-    PromotionRequest, ReasonKind, RetryPolicy, RunOptions, RunResult, Runner, SqliteStateStore,
-    StateStore, SCHEMA_VERSION,
+    BranchDiffReport, BranchDiffRequest, CancelHandle, ContractSafety, DatasetKind, DiffPolicy,
+    DiffRequest, DiffStrategy, EnvironmentArtifact, EnvironmentSetup, EnvironmentSpec,
+    ExecutionStatus, GateInput, Membership, Plan, PlanAction, PlanOptions, PlanReason, Planner,
+    PostgresStateStore, PromotionRequest, ReasonKind, RetryPolicy, RunOptions, RunResult, Runner,
+    SqliteStateStore, StateStore, SCHEMA_VERSION,
 };
 use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -538,6 +538,7 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
         } => {
             run_promote(
                 cli,
+                &compilation,
                 candidate.as_deref(),
                 to,
                 *check,
@@ -1128,8 +1129,10 @@ fn build_nessie(cli: &Cli) -> Result<Arc<dyn NessieClient>, String> {
     Ok(Arc::new(client))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_promote(
     cli: &Cli,
+    compilation: &Compilation,
     candidate: Option<&str>,
     to: &str,
     check: bool,
@@ -1186,7 +1189,7 @@ async fn run_promote(
     };
 
     let environment = read_environment_for(cli, candidate);
-    let audit = audited_diff(
+    let mut audit = audited_diff(
         cli,
         state.as_deref(),
         candidate,
@@ -1194,6 +1197,17 @@ async fn run_promote(
         Some(&candidate_reference.hash),
         Some(&target.hash),
     );
+    // Contract breaks are computed live — the workspace's desired contracts
+    // against what the target environment last recorded — so a contract
+    // edited after `diff` cannot sneak a break past the gate on a stale
+    // artifact's analysis.
+    audit
+        .breaking_schema_changes
+        .extend(contract_breaking_changes(
+            state.as_deref(),
+            compilation,
+            to,
+        )?);
     let merge_check = nessie.can_merge(candidate, to).await.ok();
 
     // The `base` gate needs a target commit the evidence was established
@@ -1346,8 +1360,58 @@ struct AuditEvidence {
     schema_audited: bool,
 }
 
-/// Read the audited diff artifact (`branch_diff.json` preferred, single-model
-/// `diff.json` as fallback) and derive the evidence it carries for this
+/// Live contract analysis for the promotion gate: the workspace's desired
+/// contracts against the contracts the target environment last recorded.
+/// Returns the breaking subset in the same `model.column: detail` shape as
+/// physical schema breaks.
+fn contract_breaking_changes(
+    state: Option<&dyn StateStore>,
+    compilation: &Compilation,
+    to: &str,
+) -> Result<Vec<String>, String> {
+    let Some(state) = state else {
+        return Ok(Vec::new());
+    };
+    // The recorded base contracts are promotion evidence — a store error
+    // must fail promotion, never read as "no contracts recorded".
+    let base = materialized_for_environment(state, to).map_err(|error| error.to_string())?;
+    let mut breaking = Vec::new();
+    for model in &compilation.models {
+        let name = model.id.logical_name();
+        let record = base.get(&name);
+        let mut changes = phlo_transform_engine::contract_diff(
+            record.and_then(|record| record.contract.as_ref()),
+            model.contract.as_ref(),
+        );
+        // The effective key — incremental `key` columns and unique-assertion
+        // columns collapse onto the same identity concept — is compared
+        // against the key the target's materialisation persisted. Changing
+        // or dropping it is breaking; a record that cannot prove its
+        // historical key fails closed.
+        if let Some(change) = phlo_transform_engine::key_change(
+            &record
+                .map(|record| record.recorded_key())
+                .unwrap_or(phlo_transform_engine::RecordedKey::Known(None)),
+            phlo_transform_engine::effective_key(model).as_deref(),
+        ) {
+            changes.push(change);
+        }
+        for change in changes {
+            if change.safety == ContractSafety::Breaking {
+                let subject = if change.column.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{name}.{}", change.column)
+                };
+                breaking.push(format!("{subject}: contract {}", change.detail));
+            }
+        }
+    }
+    Ok(breaking)
+}
+
+/// Read the audited `branch_diff.json` artifact and derive the evidence it
+/// carries for this
 /// promotion: the diff verdict, why the artifact cannot be used, the breaking
 /// schema changes it recorded, and whether a schema audit genuinely ran.
 ///
@@ -1428,10 +1492,29 @@ fn audited_diff(
         // dataset that had no materialisation at diff time has one now (it
         // stopped being `removed`/`absent` since the audit). `main` folds in
         // the default environment, matching how the diff was produced.
-        let candidate_models = materialized_for_environment(state, candidate).unwrap_or_default();
-        let candidate_seeds = seeds_for_environment(state, candidate).unwrap_or_default();
-        let base_models = materialized_for_environment(state, to).unwrap_or_default();
-        let base_seeds = seeds_for_environment(state, to).unwrap_or_default();
+        // State reads are promotion evidence: a store error cannot masquerade
+        // as "nothing recorded" — the artifact is rejected rather than
+        // trusted against an empty map.
+        let (candidate_models, candidate_seeds) = match (
+            materialized_for_environment(state, candidate),
+            seeds_for_environment(state, candidate),
+        ) {
+            (Ok(models), Ok(seeds)) => (models, seeds),
+            (Err(error), _) | (_, Err(error)) => {
+                stale(format!("cannot confirm the diff is current: {error}"));
+                (BTreeMap::new(), BTreeMap::new())
+            }
+        };
+        let (base_models, base_seeds) = match (
+            materialized_for_environment(state, to),
+            seeds_for_environment(state, to),
+        ) {
+            (Ok(models), Ok(seeds)) => (models, seeds),
+            (Err(error), _) | (_, Err(error)) => {
+                stale(format!("cannot confirm the diff is current: {error}"));
+                (BTreeMap::new(), BTreeMap::new())
+            }
+        };
         for dataset in &report.datasets {
             let (current_candidate, current_base) = match dataset.kind {
                 DatasetKind::Model => (
@@ -1849,6 +1932,28 @@ fn run_state(cli: &Cli, action: &StateAction) -> Result<ExitCode, String> {
                         println!("  sources:  {}", record.version.source_state_hash);
                         println!("  compiler: {}", record.version.compiler_version);
                         println!("  target:   {}", record.version.target_hash);
+                        if let Some(contract) = &record.contract {
+                            let columns = contract
+                                .columns
+                                .iter()
+                                .map(|column| column.name.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            println!(
+                                "Contract:      {} ({} columns{})",
+                                if contract.enforced {
+                                    "enforced"
+                                } else {
+                                    "advisory"
+                                },
+                                contract.columns.len(),
+                                if columns.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(": {columns}")
+                                }
+                            );
+                        }
                     }
                 }
             }
@@ -3295,6 +3400,11 @@ async fn run_diff(
         strategy,
         policy: diff_policy(compiled.config.diff.as_ref()),
         sample_fraction: sample,
+        renames: compiled
+            .contract
+            .as_ref()
+            .map(|contract| contract.renames.clone())
+            .unwrap_or_default(),
     };
 
     match diff(adapter, &request).await {
@@ -3476,6 +3586,24 @@ fn print_branch_diff_human(report: &BranchDiffReport) {
                 println!(
                     "  {}.{}: {} [{}]",
                     diff.model, change.column, change.detail, change.safety
+                );
+            }
+        }
+    }
+    if !report.contract_changes.is_empty() {
+        println!();
+        println!("Contracts");
+        for diff in &report.contract_changes {
+            for change in &diff.changes {
+                let subject = if change.column.is_empty() {
+                    diff.model.clone()
+                } else {
+                    format!("{}.{}", diff.model, change.column)
+                };
+                println!(
+                    "  {subject}: {} [{}]",
+                    change.detail,
+                    change.safety.as_str()
                 );
             }
         }
@@ -4115,7 +4243,7 @@ async fn run_explain(
 mod tests {
     use super::*;
     use phlo_transform_engine::{
-        BranchDiffReport, DatasetDiff, DatasetKind, DatasetStatus, MaterializedRecord,
+        BranchDiffReport, DatasetDiff, DatasetKind, DatasetStatus, EngineError, MaterializedRecord,
         ModelSchemaDiff, SchemaChange, SqliteStateStore,
     };
 
@@ -4137,6 +4265,8 @@ mod tests {
             base_hash: None,
             datasets: Vec::new(),
             schema_changes: Vec::new(),
+            contract_changes: Vec::new(),
+            impacts: Vec::new(),
             rows: Vec::new(),
             diffs: Vec::new(),
             deep,
@@ -4287,6 +4417,8 @@ mod tests {
                 incremental_key: None,
                 adapter: None,
                 output_identity: None,
+                contract: None,
+                effective_key: None,
                 run_id: "run-1".to_string(),
                 materialized_at: "t".to_string(),
             })
@@ -4332,6 +4464,9 @@ mod tests {
             incremental_key: None,
             adapter: None,
             output_identity: None,
+            contract: None,
+            // A current-era record: recorded keyless, not legacy-unknown.
+            effective_key: Some(Vec::new()),
             run_id: "run-1".to_string(),
             materialized_at: "t".to_string(),
         }
@@ -4535,5 +4670,367 @@ mod tests {
         );
         // Nor may a degenerate ref collapse onto the single-slot artifact.
         assert_ne!(environment_artifact_name("///"), "environment.json");
+    }
+
+    fn contract(names: &[&str]) -> phlo_transform_core::ModelContract {
+        phlo_transform_core::ModelContract {
+            enforced: true,
+            columns: names
+                .iter()
+                .map(|name| phlo_transform_core::ColumnContract {
+                    name: (*name).to_string(),
+                    data_type: None,
+                    nullable: None,
+                })
+                .collect(),
+            renames: Default::default(),
+        }
+    }
+
+    #[test]
+    fn contract_breaking_changes_reads_recorded_contracts() {
+        let state = SqliteStateStore::in_memory().expect("state");
+        let mut main_record = record("main.base", Some("main"), "v1");
+        main_record.contract = Some(contract(&["id", "legacy"]));
+        state.record_materialized(&main_record).expect("record");
+
+        // The workspace now declares a contract without `legacy` — removing
+        // it is a breaking change against the recorded base contract.
+        let mut base = phlo_transform_core::SemanticModel::in_memory(
+            ModelId::parse("main.base").expect("model id"),
+            "select 1 as id, 2 as legacy",
+        );
+        base.contract = Some(contract(&["id"]));
+        let compilation = compile(&phlo_transform_core::SemanticProject::in_memory(vec![base]));
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+        let breaks = contract_breaking_changes(Some(&state), &compilation, "main").expect("breaks");
+        assert_eq!(breaks.len(), 1, "{breaks:?}");
+        assert!(breaks[0].contains("legacy"), "{breaks:?}");
+
+        // The default environment folds into `main`, so a default-env
+        // record feeds the same gate.
+        let state = SqliteStateStore::in_memory().expect("state");
+        let mut default_record = record("main.base", None, "v1");
+        default_record.contract = Some(contract(&["id", "legacy"]));
+        state.record_materialized(&default_record).expect("record");
+        let breaks = contract_breaking_changes(Some(&state), &compilation, "main").expect("breaks");
+        assert_eq!(breaks.len(), 1, "{breaks:?}");
+    }
+
+    struct FailingStore;
+    impl StateStore for FailingStore {
+        fn start_run(
+            &self,
+            _run: &phlo_transform_engine::RunRecord,
+            _plan: &phlo_transform_engine::StoredPlan,
+        ) -> Result<(), EngineError> {
+            unimplemented!()
+        }
+        fn reopen_run(&self, _run_id: &str) -> Result<(), EngineError> {
+            unimplemented!()
+        }
+        fn bind_run_reference_hash(
+            &self,
+            _run_id: &str,
+            _reference_hash: &str,
+        ) -> Result<(), EngineError> {
+            unimplemented!()
+        }
+        fn finish_run(
+            &self,
+            _run_id: &str,
+            _status: phlo_transform_engine::ExecutionStatus,
+            _finished_at: &str,
+            _failed_count: usize,
+        ) -> Result<(), EngineError> {
+            unimplemented!()
+        }
+        fn record_model(
+            &self,
+            _record: &phlo_transform_engine::ModelRunRecord,
+        ) -> Result<(), EngineError> {
+            unimplemented!()
+        }
+        fn record_seed_run(
+            &self,
+            _record: &phlo_transform_engine::SeedRunRecord,
+        ) -> Result<(), EngineError> {
+            unimplemented!()
+        }
+        fn record_test(
+            &self,
+            _record: &phlo_transform_engine::TestRunRecord,
+        ) -> Result<(), EngineError> {
+            unimplemented!()
+        }
+        fn runs(&self) -> Result<Vec<phlo_transform_engine::RunSummary>, EngineError> {
+            unimplemented!()
+        }
+        fn latest_run(
+            &self,
+            _environment: Option<&str>,
+        ) -> Result<Option<phlo_transform_engine::RunSummary>, EngineError> {
+            unimplemented!()
+        }
+        fn run(
+            &self,
+            _run_id: &str,
+        ) -> Result<Option<phlo_transform_engine::StoredRun>, EngineError> {
+            unimplemented!()
+        }
+        fn find_runs(
+            &self,
+            _prefix: &str,
+        ) -> Result<Vec<phlo_transform_engine::RunSummary>, EngineError> {
+            unimplemented!()
+        }
+        fn model_runs(
+            &self,
+            _run_id: &str,
+        ) -> Result<Vec<phlo_transform_engine::ModelRunRecord>, EngineError> {
+            unimplemented!()
+        }
+        fn seed_runs(
+            &self,
+            _run_id: &str,
+        ) -> Result<Vec<phlo_transform_engine::SeedRunRecord>, EngineError> {
+            unimplemented!()
+        }
+        fn test_runs(
+            &self,
+            _run_id: &str,
+        ) -> Result<Vec<phlo_transform_engine::TestRunRecord>, EngineError> {
+            unimplemented!()
+        }
+        fn record_materialized(&self, _record: &MaterializedRecord) -> Result<(), EngineError> {
+            unimplemented!()
+        }
+        fn materialized_version(
+            &self,
+            _model_id: &str,
+            _environment: Option<&str>,
+        ) -> Result<Option<MaterializedRecord>, EngineError> {
+            unimplemented!()
+        }
+        fn materialized_by_hash(
+            &self,
+            _version_hash: &str,
+        ) -> Result<Vec<MaterializedRecord>, EngineError> {
+            unimplemented!()
+        }
+        // The one method the promotion evidence path exercises — it fails.
+        fn materialized_in(
+            &self,
+            _environment: Option<&str>,
+        ) -> Result<Vec<MaterializedRecord>, EngineError> {
+            Err(EngineError::State("state store unreachable".to_string()))
+        }
+        fn record_promotion(
+            &self,
+            _record: &phlo_transform_engine::PromotionRecord,
+        ) -> Result<(), EngineError> {
+            unimplemented!()
+        }
+        fn promotions(&self) -> Result<Vec<phlo_transform_engine::PromotionRecord>, EngineError> {
+            unimplemented!()
+        }
+        fn set_watermark(
+            &self,
+            _model_id: &str,
+            _environment: Option<&str>,
+            _value: &str,
+            _run_id: &str,
+        ) -> Result<(), EngineError> {
+            unimplemented!()
+        }
+        fn watermark(
+            &self,
+            _model_id: &str,
+            _environment: Option<&str>,
+        ) -> Result<Option<String>, EngineError> {
+            unimplemented!()
+        }
+        fn record_seed(
+            &self,
+            _record: &phlo_transform_engine::SeedRecord,
+        ) -> Result<(), EngineError> {
+            unimplemented!()
+        }
+        fn seed_state(
+            &self,
+            _name: &str,
+            _environment: Option<&str>,
+        ) -> Result<Option<phlo_transform_engine::SeedRecord>, EngineError> {
+            unimplemented!()
+        }
+        fn seeds_in(
+            &self,
+            _environment: Option<&str>,
+        ) -> Result<Vec<phlo_transform_engine::SeedRecord>, EngineError> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn contract_breaking_changes_fails_closed_on_state_error() {
+        // A store whose read fails must fail promotion — never read as
+        // "no contracts recorded".
+        let model = phlo_transform_core::SemanticModel::in_memory(
+            ModelId::parse("main.base").expect("model id"),
+            "select 1 as id",
+        );
+        let compilation = compile(&phlo_transform_core::SemanticProject::in_memory(vec![
+            model,
+        ]));
+        let result = contract_breaking_changes(Some(&FailingStore), &compilation, "main");
+        let error = result.expect_err("a state error must fail promotion");
+        assert!(error.contains("unreachable"), "{error}");
+    }
+
+    #[test]
+    fn contract_breaking_changes_reports_key_changes() {
+        // A legacy record — written before effective keys were persisted —
+        // still proves its incremental key: `batch_id` recorded → `id`
+        // desired is a breaking key change, not a keyless base.
+        let state = SqliteStateStore::in_memory().expect("state");
+        let mut main_record = record("main.base", Some("main"), "v1");
+        main_record.incremental_strategy = Some("key".to_string());
+        main_record.incremental_key = Some("batch_id".to_string());
+        main_record.effective_key = None; // predates the column
+        state.record_materialized(&main_record).expect("record");
+
+        let mut base = phlo_transform_core::SemanticModel::in_memory(
+            ModelId::parse("main.base").expect("model id"),
+            "select 1 as id",
+        );
+        base.config.incremental = Some(phlo_transform_core::IncrementalStrategy::Key {
+            columns: vec!["id".to_string()],
+        });
+        let compilation = compile(&phlo_transform_core::SemanticProject::in_memory(vec![base]));
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+        let breaks = contract_breaking_changes(Some(&state), &compilation, "main").expect("breaks");
+        assert!(
+            breaks.iter().any(|change| change.contains("key changed")),
+            "{breaks:?}"
+        );
+    }
+
+    #[test]
+    fn contract_breaking_changes_reports_persisted_key_changes() {
+        // The persisted effective key — not the incremental fields — is the
+        // historical key: a `unique(sample_id)` assertion alone materialised
+        // with `effective_key = [[sample_id]]`, no incremental strategy.
+        let mut keyed = phlo_transform_core::SemanticModel::in_memory(
+            ModelId::parse("main.base").expect("model id"),
+            "select 1 as id",
+        );
+        keyed.directives.keys.push("batch_id".to_string());
+        let compilation = compile(&phlo_transform_core::SemanticProject::in_memory(vec![
+            keyed,
+        ]));
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+        // Changed: recorded [[sample_id]] vs desired [[batch_id]].
+        let state = SqliteStateStore::in_memory().expect("state");
+        let mut main_record = record("main.base", Some("main"), "v1");
+        main_record.effective_key = Some(vec![vec!["sample_id".to_string()]]);
+        state.record_materialized(&main_record).expect("record");
+        let breaks = contract_breaking_changes(Some(&state), &compilation, "main").expect("breaks");
+        assert!(
+            breaks.iter().any(|change| change.contains("key changed")),
+            "{breaks:?}"
+        );
+
+        // Removed: the workspace model declares no key at all.
+        let keyless = phlo_transform_core::SemanticModel::in_memory(
+            ModelId::parse("main.base").expect("model id"),
+            "select 1 as id",
+        );
+        let compilation = compile(&phlo_transform_core::SemanticProject::in_memory(vec![
+            keyless,
+        ]));
+        let breaks = contract_breaking_changes(Some(&state), &compilation, "main").expect("breaks");
+        assert!(
+            breaks
+                .iter()
+                .any(|change| change.contains("key") && change.contains("dropped")),
+            "{breaks:?}"
+        );
+    }
+
+    #[test]
+    fn contract_breaking_changes_treats_incremental_and_unique_keys_equally() {
+        // The base materialised with `key = "id"` — a legacy record whose
+        // only key evidence is the incremental fields; the workspace now
+        // claims the same identity through a `unique(id)` assertion —
+        // same effective key, no change.
+        let state = SqliteStateStore::in_memory().expect("state");
+        let mut main_record = record("main.base", Some("main"), "v1");
+        main_record.incremental_strategy = Some("key".to_string());
+        main_record.incremental_key = Some("id".to_string());
+        main_record.effective_key = None; // predates the column
+        state.record_materialized(&main_record).expect("record");
+
+        let mut asserted = phlo_transform_core::SemanticModel::in_memory(
+            ModelId::parse("main.base").expect("model id"),
+            "select 1 as id",
+        );
+        asserted.directives.keys.push("id".to_string());
+        let compilation = compile(&phlo_transform_core::SemanticProject::in_memory(vec![
+            asserted,
+        ]));
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+        let breaks = contract_breaking_changes(Some(&state), &compilation, "main").expect("breaks");
+        assert!(
+            !breaks.iter().any(|change| change.contains("key")),
+            "equivalent key declared differently must not report: {breaks:?}"
+        );
+    }
+
+    #[test]
+    fn contract_breaking_changes_fails_closed_on_unverifiable_key() {
+        // A legacy record with neither a persisted effective key nor an
+        // incremental key cannot prove the base had no key — an unknown
+        // historical key must fail closed, not read as keyless.
+        let state = SqliteStateStore::in_memory().expect("state");
+        let mut main_record = record("main.base", Some("main"), "v1");
+        main_record.effective_key = None; // predates the column
+        state.record_materialized(&main_record).expect("record");
+
+        // Desired has a key: the record might be hiding a change.
+        let mut keyed = phlo_transform_core::SemanticModel::in_memory(
+            ModelId::parse("main.base").expect("model id"),
+            "select 1 as id",
+        );
+        keyed.directives.keys.push("id".to_string());
+        let compilation = compile(&phlo_transform_core::SemanticProject::in_memory(vec![
+            keyed,
+        ]));
+        let breaks = contract_breaking_changes(Some(&state), &compilation, "main").expect("breaks");
+        assert!(
+            breaks
+                .iter()
+                .any(|change| change.contains("key") && change.contains("cannot be verified")),
+            "unverifiable record must block, got: {breaks:?}"
+        );
+
+        // Desired has no key either: the record might be hiding a removal.
+        let keyless = phlo_transform_core::SemanticModel::in_memory(
+            ModelId::parse("main.base").expect("model id"),
+            "select 1 as id",
+        );
+        let compilation = compile(&phlo_transform_core::SemanticProject::in_memory(vec![
+            keyless,
+        ]));
+        let breaks = contract_breaking_changes(Some(&state), &compilation, "main").expect("breaks");
+        assert!(
+            breaks
+                .iter()
+                .any(|change| change.contains("key") && change.contains("cannot be verified")),
+            "unverifiable record must block even against a keyless model: {breaks:?}"
+        );
     }
 }

@@ -248,6 +248,7 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
             strategy: DiffStrategy::Keyed,
             policy: DiffPolicy::default(),
             sample_fraction: None,
+            renames: Default::default(),
         },
     )
     .await

@@ -330,6 +330,7 @@ fn enforced_contract_violation_is_an_error() {
             data_type: None,
             nullable: None,
         }],
+        renames: Default::default(),
     });
     let compilation = compile(vec![model]);
     assert!(!compilation.is_ok());
@@ -349,6 +350,7 @@ fn contract_type_mismatch_is_reported() {
             data_type: Some(DataType::Varchar),
             nullable: Some(false),
         }],
+        renames: Default::default(),
     });
     let compilation = compile(vec![model]);
     assert!(!compilation.is_ok());

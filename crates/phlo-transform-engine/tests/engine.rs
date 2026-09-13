@@ -12,20 +12,21 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use phlo_transform_core::{
-    compile, compile_with_options, resolve_selection, Compilation, DataType, DiffPolicySpec,
-    EmptySchemaProvider, EmptySourceStateProvider, IncrementalStrategy, Materialization, ModelId,
-    ModelOrigin, Nullability, Relation, RelationSchema, SchemaColumn, Selection, SelectorSet,
-    SemanticModel, SemanticProject, SemanticSeed, SemanticTest, SourceId, SourceStateProvider,
-    StaticSchemaProvider, StaticSourceStateProvider, TestId,
+    compile, compile_with_options, resolve_selection, ColumnContract, Compilation, DataType,
+    DiffPolicySpec, EmptySchemaProvider, EmptySourceStateProvider, IncrementalStrategy,
+    Materialization, ModelContract, ModelId, ModelOrigin, Nullability, Relation, RelationSchema,
+    SchemaColumn, Selection, SelectorSet, SemanticModel, SemanticProject, SemanticSeed,
+    SemanticTest, SourceId, SourceStateProvider, StaticSchemaProvider, StaticSourceStateProvider,
+    TestId,
 };
 use phlo_transform_engine::{
     branch_diff, changed_models, collect_source_states, ensure_environment,
     materialized_for_environment, Adapter, AdapterError, ArtifactWriter, BranchDiffRequest,
-    CancelHandle, CatalogRequest, ColumnInfo, DatasetStatus, EngineError, EngineEvent,
-    EnvironmentSpec, ExecutionStatus, FailureCategory, MaterializedRecord, Membership, ModelResult,
-    ModelRunRecord, Plan, PlanAction, PlanOptions, Planner, PromotionRecord, QueryResult,
-    ReasonKind, RetryPolicy, RunOptions, RunRecord, RunResult, RunSummary, Runner, SeedRecord,
-    SeedRunRecord, SqliteStateStore, StateStore, StoredPlan, StoredRun, TestRunRecord,
+    CancelHandle, CatalogRequest, ColumnInfo, ContractSafety, DatasetStatus, EngineError,
+    EngineEvent, EnvironmentSpec, ExecutionStatus, FailureCategory, MaterializedRecord, Membership,
+    ModelResult, ModelRunRecord, Plan, PlanAction, PlanOptions, Planner, PromotionRecord,
+    QueryResult, ReasonKind, RetryPolicy, RunOptions, RunRecord, RunResult, RunSummary, Runner,
+    SeedRecord, SeedRunRecord, SqliteStateStore, StateStore, StoredPlan, StoredRun, TestRunRecord,
 };
 
 /// How a target should fail: the error to return, and how many attempts it
@@ -1122,6 +1123,8 @@ async fn plan_prod_after(
             incremental_key: None,
             adapter: record_adapter.map(str::to_string),
             output_identity: output_identity.map(str::to_string),
+            contract: None,
+            effective_key: None,
             run_id: "run-dev".to_string(),
             materialized_at: "t".to_string(),
         })
@@ -1223,6 +1226,8 @@ async fn materialisation_by_another_adapter_rebuilds() {
             incremental_key: None,
             adapter: Some("trino".to_string()),
             output_identity: None,
+            contract: None,
+            effective_key: None,
             run_id: "run-prod".to_string(),
             materialized_at: "t".to_string(),
         })
@@ -1255,6 +1260,8 @@ async fn materialisation_by_an_unrecorded_adapter_rebuilds() {
             incremental_key: None,
             adapter: None,
             output_identity: Some("snap:dev".to_string()),
+            contract: None,
+            effective_key: None,
             run_id: "run-prod".to_string(),
             materialized_at: "t".to_string(),
         })
@@ -1502,6 +1509,8 @@ fn concurrent_sqlite_writers_complete() {
                         incremental_key: None,
                         adapter: Some("fake".to_string()),
                         output_identity: None,
+                        contract: None,
+                        effective_key: None,
                         run_id: format!("{prefix}-run"),
                         materialized_at: "t".to_string(),
                     })
@@ -4289,6 +4298,10 @@ fn materialized_at(
         incremental_key: None,
         adapter: Some("fake".to_string()),
         output_identity: None,
+        contract: None,
+        // A materialisation today records its key evidence even when the
+        // model has no key: an empty set, never an ambiguous NULL.
+        effective_key: Some(Vec::new()),
         run_id: "run-1".to_string(),
         materialized_at: at.to_string(),
     }
@@ -4651,6 +4664,222 @@ async fn branch_diff_folds_default_environment_into_main() {
     };
     assert_eq!(status("main.same"), Some(DatasetStatus::Unchanged));
     assert_eq!(status("main.dropped"), Some(DatasetStatus::Removed));
+}
+
+fn contract(names: &[&str]) -> ModelContract {
+    ModelContract {
+        enforced: true,
+        columns: names
+            .iter()
+            .map(|name| ColumnContract {
+                name: (*name).to_string(),
+                data_type: None,
+                nullable: None,
+            })
+            .collect(),
+        renames: BTreeMap::new(),
+    }
+}
+
+/// A contract change reports structurally — the removed column is breaking
+/// and its lineage impact names the downstream consumer.
+#[tokio::test]
+async fn branch_diff_reports_contract_changes_and_impacts() {
+    let mut base = model("main.base", "select 1 as id, 2 as legacy");
+    base.contract = Some(contract(&["id"]));
+    let downstream = model("main.down", "select id, legacy from main.base");
+    let compilation = compile(&SemanticProject::in_memory(vec![base, downstream]));
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    // The base environment recorded the contract while `legacy` was still
+    // part of it.
+    let state = SqliteStateStore::in_memory().unwrap();
+    let relation = ref_relation("phlo_main", compilation.model_by_name("main.base").unwrap());
+    let mut record = materialized("main.base", "main", "v1", &relation);
+    record.contract = Some(contract(&["id", "legacy"]));
+    state.record_materialized(&record).unwrap();
+
+    let report = branch_diff(
+        Arc::new(FakeAdapter::default()),
+        Some(&state),
+        &compilation,
+        &branch_diff_request(),
+    )
+    .await
+    .unwrap();
+
+    let contract = report
+        .contract_changes
+        .iter()
+        .find(|diff| diff.model == "main.base")
+        .expect("contract diff for main.base");
+    let removed = contract
+        .changes
+        .iter()
+        .find(|change| change.column == "legacy")
+        .expect("legacy change");
+    assert_eq!(removed.kind, "removed");
+    assert_eq!(removed.safety, ContractSafety::Breaking);
+
+    let impact = report
+        .impacts
+        .iter()
+        .find(|impact| impact.model == "main.base" && impact.column.as_deref() == Some("legacy"))
+        .expect("impact for the breaking column");
+    assert_eq!(impact.source, "contract");
+    assert!(
+        impact
+            .downstream_models
+            .iter()
+            .any(|model| model == "main.down"),
+        "expected main.down downstream of the broken column: {:?}",
+        impact.downstream_models
+    );
+}
+
+/// A rename declared through `[model.<name>.renames]` classifies as a
+/// breaking change — it proves intent, not compatibility — and produces
+/// a lineage impact.
+#[tokio::test]
+async fn branch_diff_declared_contract_rename_is_breaking() {
+    let mut base = model("main.base", "select 1 as id, 2 as new_col");
+    let mut desired = contract(&["id", "new_col"]);
+    desired
+        .renames
+        .insert("new_col".to_string(), "legacy".to_string());
+    base.contract = Some(desired);
+    let compilation = compile(&SemanticProject::in_memory(vec![base]));
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let state = SqliteStateStore::in_memory().unwrap();
+    let relation = ref_relation("phlo_main", compilation.model_by_name("main.base").unwrap());
+    let mut record = materialized("main.base", "main", "v1", &relation);
+    record.contract = Some(contract(&["id", "legacy"]));
+    state.record_materialized(&record).unwrap();
+
+    let report = branch_diff(
+        Arc::new(FakeAdapter::default()),
+        Some(&state),
+        &compilation,
+        &branch_diff_request(),
+    )
+    .await
+    .unwrap();
+
+    let contract = report
+        .contract_changes
+        .iter()
+        .find(|diff| diff.model == "main.base")
+        .expect("contract diff");
+    let renamed = contract
+        .changes
+        .iter()
+        .find(|change| change.column == "new_col")
+        .expect("new_col change");
+    assert_eq!(renamed.kind, "renamed");
+    // A declared rename proves intent, not compatibility: consumers
+    // selecting `legacy` break, so promotion must gate on it.
+    assert_eq!(renamed.safety, ContractSafety::Breaking);
+    assert!(
+        !report.impacts.is_empty(),
+        "a breaking rename produces lineage impact"
+    );
+}
+
+/// The historical key comes from the persisted `effective_key`, not the
+/// incremental fields: a base materialised with only `unique(sample_id)`
+/// remembers `[[sample_id]]`, so dropping the assertion reports a breaking
+/// key removal and changing it reports a breaking key change.
+#[tokio::test]
+async fn branch_diff_reports_persisted_effective_key_changes() {
+    // Base has no key in the workspace; the recorded materialisation had a
+    // unique-only key — no incremental strategy at all.
+    let keyless = model("main.base", "select 1 as id");
+    let compilation = compile(&SemanticProject::in_memory(vec![keyless]));
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let state = SqliteStateStore::in_memory().unwrap();
+    let relation = ref_relation("phlo_main", compilation.model_by_name("main.base").unwrap());
+    let mut record = materialized("main.base", "main", "v1", &relation);
+    record.effective_key = Some(vec![vec!["sample_id".to_string()]]);
+    state.record_materialized(&record).unwrap();
+
+    let report = branch_diff(
+        Arc::new(FakeAdapter::default()),
+        Some(&state),
+        &compilation,
+        &branch_diff_request(),
+    )
+    .await
+    .unwrap();
+    let contract = report
+        .contract_changes
+        .iter()
+        .find(|diff| diff.model == "main.base")
+        .expect("key removal reports a contract diff");
+    let removed = contract
+        .changes
+        .iter()
+        .find(|change| change.kind == "key_removed")
+        .expect("key_removed change");
+    assert_eq!(removed.safety, ContractSafety::Breaking);
+
+    // Changed: the workspace claims `unique(batch_id)` against the recorded
+    // `unique(sample_id)` — breaking, not a fresh declaration.
+    let mut keyed = model("main.base", "select 1 as id");
+    keyed.directives.keys.push("batch_id".to_string());
+    let compilation = compile(&SemanticProject::in_memory(vec![keyed]));
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let report = branch_diff(
+        Arc::new(FakeAdapter::default()),
+        Some(&state),
+        &compilation,
+        &branch_diff_request(),
+    )
+    .await
+    .unwrap();
+    let contract = report
+        .contract_changes
+        .iter()
+        .find(|diff| diff.model == "main.base")
+        .expect("key change reports a contract diff");
+    let changed = contract
+        .changes
+        .iter()
+        .find(|change| change.kind == "key_changed")
+        .expect("key_changed change");
+    assert_eq!(changed.safety, ContractSafety::Breaking);
+}
+
+/// The plan-level contract-change reason names the breaking columns rather
+/// than reporting an opaque hash change.
+#[test]
+fn diff_reasons_describes_breaking_contract_changes() {
+    let mut base = model("main.base", "select 1 as id, 2 as legacy");
+    base.contract = Some(contract(&["id"]));
+    let compilation = compile(&SemanticProject::in_memory(vec![base]));
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+    let compiled = compilation.model_by_name("main.base").unwrap();
+
+    let relation = Relation {
+        catalog: Some("phlo_main".to_string()),
+        schema: "main".to_string(),
+        table: "base".to_string(),
+    };
+    let mut record = materialized("main.base", "main", "v9", &relation);
+    record.contract = Some(contract(&["id", "legacy"]));
+
+    let reasons = phlo_transform_engine::diff_reasons(compiled, &record);
+    let reason = reasons
+        .iter()
+        .find(|reason| reason.kind == ReasonKind::ContractChange)
+        .expect("contract change reason");
+    assert!(
+        reason.detail.contains("legacy") && reason.detail.contains("breaking"),
+        "expected the breaking column named: {}",
+        reason.detail
+    );
 }
 
 #[test]
