@@ -101,6 +101,9 @@ pub enum NessieError {
 pub trait NessieClient: Send + Sync {
     async fn get_reference(&self, name: &str) -> Result<Option<ReferenceInfo>, NessieError>;
 
+    /// Every reference (branches and tags), sorted by name.
+    async fn list_references(&self) -> Result<Vec<ReferenceInfo>, NessieError>;
+
     /// Create `name` from an existing reference (its name and hash).
     async fn create_branch(
         &self,
@@ -155,6 +158,13 @@ impl InMemoryNessie {
 impl NessieClient for InMemoryNessie {
     async fn get_reference(&self, name: &str) -> Result<Option<ReferenceInfo>, NessieError> {
         Ok(self.references.lock().unwrap().get(name).cloned())
+    }
+
+    async fn list_references(&self) -> Result<Vec<ReferenceInfo>, NessieError> {
+        let mut references: Vec<ReferenceInfo> =
+            self.references.lock().unwrap().values().cloned().collect();
+        references.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(references)
     }
 
     async fn create_branch(
@@ -323,6 +333,12 @@ struct SingleReferenceResponse {
 }
 
 #[derive(Deserialize)]
+struct ReferencesResponse {
+    #[serde(default)]
+    references: Vec<ReferenceInfo>,
+}
+
+#[derive(Deserialize)]
 struct MergeResponse {
     #[serde(rename = "wasSuccessful", default)]
     was_successful: bool,
@@ -361,6 +377,15 @@ impl NessieClient for NessieRestClient {
         }
     }
 
+    async fn list_references(&self) -> Result<Vec<ReferenceInfo>, NessieError> {
+        let response: ReferencesResponse = self
+            .json(self.request(reqwest::Method::GET, "/trees"))
+            .await?;
+        let mut references = response.references;
+        references.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(references)
+    }
+
     async fn create_branch(
         &self,
         name: &str,
@@ -384,10 +409,16 @@ impl NessieClient for NessieRestClient {
     }
 
     async fn delete_branch(&self, name: &str) -> Result<(), NessieError> {
+        // Nessie v2 deletes `name@hash`: resolve first so we delete exactly
+        // the observed hash rather than whatever the name has moved to.
+        let reference = self
+            .get_reference(name)
+            .await?
+            .ok_or_else(|| NessieError::NotFound(name.to_string()))?;
         let response = self
             .send(self.request(
                 reqwest::Method::DELETE,
-                &format!("/trees/{}?type=BRANCH", encode(name)),
+                &format!("/trees/{}@{}?type=BRANCH", encode(name), reference.hash),
             ))
             .await?;
         if response.status().is_success() {

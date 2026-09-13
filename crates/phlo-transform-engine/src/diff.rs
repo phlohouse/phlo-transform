@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use phlo_transform_core::{ColumnTolerance, DataType, Relation};
 
@@ -16,7 +16,7 @@ use crate::error::EngineError;
 use crate::util::now_rfc3339;
 
 /// How a diff compares data.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffStrategy {
     Keyed,
@@ -42,7 +42,7 @@ pub struct DiffPolicy {
 }
 
 /// A single policy evaluation result.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PolicyResult {
     pub policy: String,
     pub passed: bool,
@@ -69,7 +69,7 @@ pub struct DiffRequest {
 }
 
 /// Row-level summary.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RowSummary {
     pub base_rows: i64,
     pub candidate_rows: i64,
@@ -81,7 +81,7 @@ pub struct RowSummary {
 }
 
 /// A schema change included in the diff.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SchemaChange {
     pub column: String,
     pub kind: String,
@@ -90,7 +90,7 @@ pub struct SchemaChange {
 }
 
 /// A structured diff report.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiffReport {
     pub diff_id: String,
     pub model: String,
@@ -431,37 +431,57 @@ fn partition_delta(
 }
 
 async fn schema_changes(adapter: &dyn Adapter, request: &DiffRequest) -> Vec<SchemaChange> {
-    let Ok(candidate) = adapter.relation_columns(&request.candidate_relation).await else {
+    compare_columns(adapter, &request.candidate_relation, &request.base_relation).await
+}
+
+/// Column-level comparison of two relations: added/removed columns, type
+/// changes and nullability changes. Empty when either side's columns cannot
+/// be read.
+pub(crate) async fn compare_columns(
+    adapter: &dyn Adapter,
+    candidate: &phlo_transform_core::Relation,
+    base: &phlo_transform_core::Relation,
+) -> Vec<SchemaChange> {
+    let Ok(candidate_columns) = adapter.relation_columns(candidate).await else {
         return Vec::new();
     };
-    let Ok(base) = adapter.relation_columns(&request.base_relation).await else {
+    let Ok(base_columns) = adapter.relation_columns(base).await else {
         return Vec::new();
     };
-    if candidate.is_empty() && base.is_empty() {
+    compare_column_lists(&candidate_columns, &base_columns)
+}
+
+/// Column-level comparison of two column lists — usable when only one side
+/// exists (pass an empty list for the absent side).
+pub(crate) fn compare_column_lists(
+    candidate_columns: &[crate::adapter::ColumnInfo],
+    base_columns: &[crate::adapter::ColumnInfo],
+) -> Vec<SchemaChange> {
+    if candidate_columns.is_empty() && base_columns.is_empty() {
         return Vec::new();
     }
 
-    let candidate_types: BTreeMap<String, DataType> = candidate
+    let candidate_types: BTreeMap<String, (DataType, bool)> = candidate_columns
         .iter()
         .map(|column| {
             (
                 column.name.clone(),
-                DataType::parse_trino(&column.data_type),
+                (DataType::parse_trino(&column.data_type), column.nullable),
             )
         })
         .collect();
-    let base_types: BTreeMap<String, DataType> = base
+    let base_types: BTreeMap<String, (DataType, bool)> = base_columns
         .iter()
         .map(|column| {
             (
                 column.name.clone(),
-                DataType::parse_trino(&column.data_type),
+                (DataType::parse_trino(&column.data_type), column.nullable),
             )
         })
         .collect();
 
     let mut changes = Vec::new();
-    for (name, base_type) in &base_types {
+    for (name, (base_type, base_nullable)) in &base_types {
         match candidate_types.get(name) {
             None => changes.push(SchemaChange {
                 column: name.clone(),
@@ -469,20 +489,38 @@ async fn schema_changes(adapter: &dyn Adapter, request: &DiffRequest) -> Vec<Sch
                 detail: format!("{base_type} removed"),
                 safety: "full_rebuild_required".to_string(),
             }),
-            Some(candidate_type) if candidate_type != base_type => changes.push(SchemaChange {
-                column: name.clone(),
-                kind: "changed".to_string(),
-                detail: format!("{base_type} -> {candidate_type}"),
-                safety: if candidate_type.is_numeric() && base_type.is_numeric() {
-                    "review".to_string()
-                } else {
-                    "error".to_string()
-                },
-            }),
-            Some(_) => {}
+            Some((candidate_type, candidate_nullable)) => {
+                if candidate_type != base_type {
+                    changes.push(SchemaChange {
+                        column: name.clone(),
+                        kind: "changed".to_string(),
+                        detail: format!("{base_type} -> {candidate_type}"),
+                        safety: if candidate_type.is_numeric() && base_type.is_numeric() {
+                            "review".to_string()
+                        } else {
+                            "error".to_string()
+                        },
+                    });
+                } else if candidate_nullable != base_nullable {
+                    changes.push(SchemaChange {
+                        column: name.clone(),
+                        kind: "nullability".to_string(),
+                        detail: if *candidate_nullable {
+                            "not null -> nullable".to_string()
+                        } else {
+                            "nullable -> not null".to_string()
+                        },
+                        safety: if *candidate_nullable {
+                            "safe".to_string()
+                        } else {
+                            "review".to_string()
+                        },
+                    });
+                }
+            }
         }
     }
-    for (name, candidate_type) in &candidate_types {
+    for (name, (candidate_type, _)) in &candidate_types {
         if !base_types.contains_key(name) {
             changes.push(SchemaChange {
                 column: name.clone(),

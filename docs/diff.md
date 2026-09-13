@@ -1,9 +1,57 @@
 # Phase 6 native data diff
 
 Data diff compares candidate and base model outputs at the data level, driven
-by warehouse-side SQL rather than downloading tables.
+by warehouse-side SQL rather than downloading tables. It operates at two
+scopes: a single model, or a whole branch.
 
-## CLI
+## Branch diff
+
+```bash
+phlo-transform diff --from ci/pr-1 --to main
+phlo-transform diff --from ci/pr-1 --to main --full   # deep keyed diffs
+phlo-transform diff --from ci/pr-1                    # --to defaults to main
+```
+
+With no model argument, `diff` compares the materialised datasets of two
+Nessie references. Candidate relations resolve through the provisioned
+catalog recorded in `environment.json` (falling back to the `phlo_<ref>`
+convention); the base resolves through the workspace catalog for `main` or
+the same convention for other refs. Recorded materialisation targets take
+precedence over both.
+
+Every dataset in the union of the workspace and recorded materialisations is
+classified:
+
+```text
+added      materialised on the candidate only
+removed    materialised on the base only
+changed    present on both, recorded versions (or snapshot ids) differ
+unchanged  present on both, versions equal or table inherited unchanged
+absent     in the workspace but materialised on neither side
+```
+
+A Nessie branch inherits the base's physical tables, so a dataset visible on
+both sides with no candidate record is `unchanged` — its data literally is
+the base's. When no state records exist on either side, the adapter's
+snapshot/source state (the Iceberg snapshot id) decides instead.
+
+The report also carries:
+
+- **schema** — per-model added/removed columns, type changes and nullability
+  changes, each with a safety classification;
+- **rows** — `count(*)` per side plus the delta;
+- **diffs** — with `--full`, a keyed value diff per changed model that
+  declares keys (the same `diff` engine as single-model diffs);
+- **upstream** — each dataset's model dependencies, the lineage hook for
+  branch-aware graph diffs.
+
+Output is deterministic (datasets sorted by name) and identical in content
+between human and `--json` output. The report is written to
+`.phlo/transform/branch_diff.json`, which `promote --require-diff` consumes:
+a report whose recorded candidate versions no longer match the candidate's
+current materialisations is rejected as stale.
+
+## Model diff
 
 ```bash
 phlo-transform diff assay.results
@@ -54,8 +102,10 @@ relative_tolerance = 1e-6
 ## Schema diff
 
 `schema_changes` is populated from the candidate and base relation schemas:
-added, removed (`full_rebuild_required`) and changed (`review` for numeric
-widening, `error` otherwise) columns appear alongside the row-level result.
+added, removed (`full_rebuild_required`), changed (`review` for numeric
+widening, `error` otherwise) and nullability (`safe` when widening to
+nullable, `review` when narrowing to not-null) columns appear alongside the
+row-level result.
 
 ## Policies
 
@@ -77,9 +127,10 @@ policy fails the command and blocks promotion.
 ## WAP integration
 
 `PromotionRequest` accepts `diff_passed` and `require_diff`. `phlo-transform
-promote --require-diff` reads `diff.json`, requires a passing diff, and rejects
-a diff whose recorded candidate model version no longer matches the candidate's
-materialised version (stale-diff invalidation).
+promote --require-diff` reads `branch_diff.json` first (falling back to the
+single-model `diff.json`), requires a passing diff, and rejects a diff whose
+recorded candidate versions no longer match the candidate's materialised
+state — a stale artifact fails the `data_diff` promotion gate.
 
 ## Execution and coverage
 

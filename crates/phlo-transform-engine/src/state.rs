@@ -225,6 +225,21 @@ pub trait StateStore: Send + Sync {
         &self,
         version_hash: &str,
     ) -> Result<Vec<MaterializedRecord>, EngineError>;
+    /// Every materialised model in an environment — used by branch diffs to
+    /// find datasets that exist on a ref but are no longer in the workspace.
+    fn materialized_in(
+        &self,
+        environment: Option<&str>,
+    ) -> Result<Vec<MaterializedRecord>, EngineError>;
+
+    /// Record a promotion (or a `--check` evaluation) for audit and later
+    /// APIs.
+    fn record_promotion(
+        &self,
+        record: &crate::promotion::PromotionRecord,
+    ) -> Result<(), EngineError>;
+    /// Recorded promotions, newest first.
+    fn promotions(&self) -> Result<Vec<crate::promotion::PromotionRecord>, EngineError>;
 
     /// Record a successful time-window watermark. Only called on success.
     fn set_watermark(
@@ -251,6 +266,8 @@ pub trait StateStore: Send + Sync {
         name: &str,
         environment: Option<&str>,
     ) -> Result<Option<SeedRecord>, EngineError>;
+    /// Every seed load recorded for an environment.
+    fn seeds_in(&self, environment: Option<&str>) -> Result<Vec<SeedRecord>, EngineError>;
 }
 
 /// SQLite-backed local state store.
@@ -368,6 +385,15 @@ impl SqliteStateStore {
                     run_id TEXT NOT NULL,
                     loaded_at TEXT NOT NULL,
                     PRIMARY KEY (name, environment)
+                );
+                CREATE TABLE IF NOT EXISTS promotions (
+                    promotion_id TEXT PRIMARY KEY,
+                    candidate_ref TEXT NOT NULL,
+                    target_ref TEXT NOT NULL,
+                    merged INTEGER NOT NULL,
+                    dry_run INTEGER NOT NULL,
+                    record_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
                 ",
             )
@@ -857,6 +883,68 @@ impl StateStore for SqliteStateStore {
             .map_err(|error| EngineError::State(error.to_string()))
     }
 
+    fn materialized_in(
+        &self,
+        environment: Option<&str>,
+    ) -> Result<Vec<MaterializedRecord>, EngineError> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT {MATERIALIZED_COLUMNS} FROM model_versions WHERE environment = ?1 \
+                 ORDER BY model_id"
+            ))
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![environment.unwrap_or("")],
+                materialized_from_row,
+            )
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| EngineError::State(error.to_string()))
+    }
+
+    fn record_promotion(
+        &self,
+        record: &crate::promotion::PromotionRecord,
+    ) -> Result<(), EngineError> {
+        let json =
+            serde_json::to_string(record).map_err(|error| EngineError::State(error.to_string()))?;
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO promotions
+                 (promotion_id, candidate_ref, target_ref, merged, dry_run, record_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    record.promotion_id,
+                    record.candidate_ref,
+                    record.target_ref,
+                    record.merged as i64,
+                    record.dry_run as i64,
+                    json,
+                    record.timestamp,
+                ],
+            )
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        Ok(())
+    }
+
+    fn promotions(&self) -> Result<Vec<crate::promotion::PromotionRecord>, EngineError> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare("SELECT record_json FROM promotions ORDER BY created_at DESC")
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        rows.map(|row| {
+            let json = row.map_err(|error| EngineError::State(error.to_string()))?;
+            serde_json::from_str(&json).map_err(|error| EngineError::State(error.to_string()))
+        })
+        .collect()
+    }
+
     fn set_watermark(
         &self,
         model_id: &str,
@@ -971,6 +1059,31 @@ impl StateStore for SqliteStateStore {
             }
             None => Ok(None),
         }
+    }
+
+    fn seeds_in(&self, environment: Option<&str>) -> Result<Vec<SeedRecord>, EngineError> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT name, environment, content_hash, target, run_id, loaded_at
+                 FROM seed_loads WHERE environment = ?1 ORDER BY name",
+            )
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        let rows = statement
+            .query_map(rusqlite::params![environment.unwrap_or("")], |row| {
+                let env: String = row.get(1)?;
+                Ok(SeedRecord {
+                    name: row.get(0)?,
+                    environment: if env.is_empty() { None } else { Some(env) },
+                    content_hash: row.get(2)?,
+                    target: row.get(3)?,
+                    run_id: row.get(4)?,
+                    loaded_at: row.get(5)?,
+                })
+            })
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| EngineError::State(error.to_string()))
     }
 }
 

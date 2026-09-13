@@ -14,18 +14,19 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use phlo_transform_core::{
     compile, compile_with_options, git_changes, load_project, parse_selector, resolve_selection,
-    Assertion, CheckReport, Compilation, DataType, Diagnostic, GitChanges, IncrementalStrategy,
-    InspectReport, ListReport, ModelId, Nullability, Relation, RelationSchema, SchemaColumn,
-    Selection, SelectorKind, SelectorSet, StaticSchemaProvider,
+    CheckReport, Compilation, DataType, Diagnostic, GitChanges, InspectReport, ListReport, ModelId,
+    Nullability, Relation, RelationSchema, SchemaColumn, Selection, SelectorKind, SelectorSet,
+    StaticSchemaProvider,
 };
 use phlo_transform_daemon::{serve, spawn_watcher, WorkspaceService};
 use phlo_transform_duckdb::DuckDbAdapter;
 use phlo_transform_engine::{
-    adapter_default_schema, changed_models, collect_source_states, diff, diff_reasons,
-    ensure_environment, promote, relation_for_source, Adapter, ArtifactWriter, CancelHandle,
-    DiffPolicy, DiffRequest, DiffStrategy, EnvironmentSetup, EnvironmentSpec, ExecutionStatus,
-    Membership, Plan, PlanAction, PlanOptions, PlanReason, Planner, PromotionRequest, ReasonKind,
-    RetryPolicy, RunOptions, RunResult, Runner, SqliteStateStore, StateStore,
+    adapter_default_schema, branch_diff, changed_models, collect_source_states, diff, diff_reasons,
+    ensure_environment, evaluate_gates, model_keys, promote, relation_for_source, Adapter,
+    ArtifactWriter, BranchDiffReport, BranchDiffRequest, CancelHandle, DiffPolicy, DiffRequest,
+    DiffStrategy, EnvironmentSetup, EnvironmentSpec, ExecutionStatus, GateInput, Membership, Plan,
+    PlanAction, PlanOptions, PlanReason, Planner, PromotionRequest, ReasonKind, RetryPolicy,
+    RunOptions, RunResult, Runner, SqliteStateStore, StateStore,
 };
 use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -143,7 +144,7 @@ struct Cli {
     environment: Option<String>,
 
     /// Nessie reference (environment) for plan/apply.
-    #[arg(long = "ref", global = true)]
+    #[arg(long = "ref", visible_alias = "reference", global = true)]
     reference: Option<String>,
 
     /// Base Nessie reference to create a candidate from (default `main`);
@@ -183,6 +184,29 @@ enum LineageFormat {
     /// An OpenLineage document: a JSON array of spec-valid JobEvents and
     /// DatasetEvents — a valid batch-endpoint payload.
     Openlineage,
+}
+
+/// Nessie reference management (`phlo-transform ref ...`).
+#[derive(Debug, Subcommand)]
+enum RefAction {
+    /// List every reference with its current hash.
+    List,
+    /// Resolve a reference to its current hash.
+    Show {
+        /// Reference name, e.g. `ci/pr-1`.
+        name: String,
+    },
+    /// Create a branch from another reference (`--from`, default `main`).
+    /// Mutates Nessie.
+    Create {
+        /// New branch name, e.g. `ci/pr-1`.
+        name: String,
+    },
+    /// Delete a branch. Mutates Nessie.
+    Delete {
+        /// Branch name to delete.
+        name: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -237,10 +261,16 @@ enum Command {
         /// selection.
         column: Option<String>,
     },
+    /// Manage Nessie references: list, show, create and delete branches.
+    /// `create` and `delete` mutate Nessie; `list` and `show` are read-only.
+    Ref {
+        #[command(subcommand)]
+        action: RefAction,
+    },
     /// Promote an audited candidate Nessie reference to a target.
     Promote {
-        /// Candidate reference, e.g. `ci/pr-1`.
-        candidate: String,
+        /// Candidate reference, e.g. `ci/pr-1`. May also be given as `--from`.
+        candidate: Option<String>,
         /// Target reference, e.g. `main`.
         #[arg(long)]
         to: String,
@@ -263,17 +293,21 @@ enum Command {
         #[arg(long)]
         to: String,
     },
-    /// Compare a model's candidate and base data.
+    /// Compare a model's candidate and base data, or — with no model —
+    /// compare two references: `diff --from ci/pr-1 --to main`.
     Diff {
-        /// Model name (`assay.results`).
-        model: String,
-        /// Base reference label (defaults to the candidate reference).
+        /// Model name (`assay.results`). Omit for a branch-level diff.
+        model: Option<String>,
+        /// Base reference label (model diffs; defaults to the candidate).
         #[arg(long)]
         base: Option<String>,
-        /// Base physical relation (`catalog.schema.table`).
+        /// Base Nessie reference for a branch diff (`--to main`).
+        #[arg(long)]
+        to: Option<String>,
+        /// Base physical relation (`catalog.schema.table`; model diffs).
         #[arg(long)]
         base_relation: Option<String>,
-        /// Force a full keyed comparison.
+        /// Full comparison: keyed diff (model) / deep value diffs (branch).
         #[arg(long)]
         full: bool,
         /// Compare at partition granularity (comma-separated columns).
@@ -363,6 +397,7 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
         Command::Init => return run_init(cli),
         Command::Doctor => return run_doctor(cli).await,
         Command::Manifest => return run_manifest(cli),
+        Command::Ref { action } => return run_ref(cli, action).await,
         _ => {}
     }
 
@@ -452,9 +487,11 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
             run_impact(cli, &compilation, column.as_deref(), &set, git.as_ref())
         }
         Command::Explain { model } => run_explain(cli, &compilation, model).await,
-        Command::Translate { .. } | Command::Doctor | Command::Init | Command::Manifest => {
-            unreachable!("handled before workspace load")
-        }
+        Command::Translate { .. }
+        | Command::Doctor
+        | Command::Init
+        | Command::Manifest
+        | Command::Ref { .. } => unreachable!("handled before workspace load"),
         Command::Promote {
             candidate,
             to,
@@ -465,7 +502,7 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
         } => {
             run_promote(
                 cli,
-                candidate,
+                candidate.as_deref(),
                 to,
                 *check,
                 *require_diff,
@@ -478,6 +515,7 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
         Command::Diff {
             model,
             base,
+            to,
             base_relation,
             full,
             partition,
@@ -486,8 +524,9 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
             run_diff(
                 cli,
                 &compilation,
-                model,
+                model.as_deref(),
                 base,
+                to,
                 base_relation,
                 *full,
                 partition.as_deref(),
@@ -921,28 +960,6 @@ fn read_diff(cli: &Cli) -> Option<serde_json::Value> {
     serde_json::from_str(&text).ok()
 }
 
-/// A diff is stale once the candidate model version it recorded is no longer
-/// the candidate's materialised version.
-fn diff_is_stale(cli: &Cli, candidate: &str, diff: &serde_json::Value) -> Option<String> {
-    let state = open_state(cli)?;
-    let diff = diff.get("diff")?;
-    let model = diff.get("model")?.as_str()?;
-    let version = diff.get("candidate_version")?.as_str()?;
-    match state
-        .materialized_version(model, Some(candidate))
-        .ok()
-        .flatten()
-    {
-        Some(record) if record.version.hash == version => None,
-        Some(_) => Some(format!(
-            "diff artifact for `{model}` is stale: candidate data changed since the diff"
-        )),
-        None => Some(format!(
-            "diff artifact for `{model}` is stale: candidate is not materialised"
-        )),
-    }
-}
-
 fn build_nessie(cli: &Cli) -> Result<Arc<dyn NessieClient>, String> {
     let endpoint = cli
         .nessie_endpoint
@@ -962,66 +979,217 @@ fn build_nessie(cli: &Cli) -> Result<Arc<dyn NessieClient>, String> {
 
 async fn run_promote(
     cli: &Cli,
-    candidate: &str,
+    candidate: Option<&str>,
     to: &str,
     check: bool,
     require_diff: bool,
     allow_breaking_schema: bool,
     cleanup: bool,
 ) -> Result<ExitCode, String> {
+    let candidate = candidate.or(cli.from.as_deref()).ok_or_else(|| {
+        "promote requires a candidate: `promote <ref> --to <target>` or `promote --from <ref> --to <target>`".to_string()
+    })?;
     let nessie = build_nessie(cli)?;
     let state = open_state(cli);
-    let gates_passed = match &state {
+
+    // Resolve both references up front: promotion needs both to exist.
+    let candidate_reference = nessie
+        .get_reference(candidate)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("candidate reference `{candidate}` was not found"))?;
+    let target = nessie
+        .get_reference(to)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("target reference `{to}` was not found"))?;
+
+    // Gather gate evidence: run history, the audited diff artifact, the
+    // recorded provisioning base and a non-destructive merge check.
+    let run = match &state {
         Some(state) => state
             .latest_run(Some(candidate))
-            .map_err(|error| error.to_string())?
-            .map(|run| run.status == ExecutionStatus::Passed && run.failed_count == 0)
-            .unwrap_or(false),
-        None => false,
+            .map_err(|error| error.to_string())?,
+        None => None,
     };
-    if !gates_passed {
-        let message = format!("candidate `{candidate}` has no successful run; apply it first");
-        if cli.json {
-            print_json(&serde_json::json!({ "ok": false, "error": message }))?;
-        } else {
-            eprintln!("error: {message}");
-        }
-        return Ok(ExitCode::FAILURE);
-    }
+    let (model_runs, test_runs) = match (&state, &run) {
+        (Some(state), Some(run)) => (
+            state
+                .model_runs(&run.run_id)
+                .map_err(|error| error.to_string())?,
+            state
+                .test_runs(&run.run_id)
+                .map_err(|error| error.to_string())?,
+        ),
+        _ => (Vec::new(), Vec::new()),
+    };
 
     let environment = read_environment(cli);
-    let diff = read_diff(cli);
-    let diff_passed = diff
-        .as_ref()
-        .and_then(|value| value.get("diff")?.get("passed")?.as_bool());
+    let (diff_passed, diff_rejected, breaking_schema_changes) =
+        audited_diff(cli, state.as_deref(), candidate);
+    let merge_check = nessie.can_merge(candidate, to).await.ok();
 
-    if require_diff {
-        if diff_passed != Some(true) {
-            let message = "a passing data diff is required before promotion".to_string();
-            if cli.json {
-                print_json(&serde_json::json!({ "ok": false, "error": message }))?;
-            } else {
-                eprintln!("error: {message}");
+    // The recorded provisioning base pins the target state the candidate was
+    // planned and audited against — only when it describes this candidate.
+    let expected_target_hash = environment
+        .as_ref()
+        .filter(|setup| setup.candidate.name == candidate)
+        .map(|setup| setup.base.hash.clone());
+
+    let input = GateInput {
+        run: run.clone(),
+        model_runs,
+        test_runs,
+        require_diff,
+        diff_passed,
+        diff_rejected,
+        breaking_schema_changes,
+        allow_breaking_schema,
+        expected_target_hash: expected_target_hash.clone(),
+        actual_target_hash: Some(target.hash.clone()),
+        merge_check,
+    };
+    let report = evaluate_gates(&input);
+
+    if !report.passed || check {
+        if cli.json {
+            print_json(&serde_json::json!({
+                "ok": report.passed,
+                "candidate_ref": candidate,
+                "target_ref": to,
+                "check_only": check,
+                "gates": report.results,
+            }))?;
+        } else {
+            print_gates_human(&report);
+            if check && report.passed {
+                println!("Candidate `{candidate}` can be promoted to `{to}` (check only).");
             }
-            return Ok(ExitCode::FAILURE);
         }
-        if let Some(value) = &diff {
-            if let Some(reason) = diff_is_stale(cli, candidate, value) {
-                if cli.json {
-                    print_json(&serde_json::json!({ "ok": false, "error": reason }))?;
-                } else {
-                    eprintln!("error: {reason}");
-                }
-                return Ok(ExitCode::FAILURE);
-            }
-        }
+        return Ok(if report.passed {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
     }
 
-    // Breaking schema changes from the audited diff block promotion unless
-    // explicitly allowed (enforced by the engine).
-    let breaking_schema_changes: Vec<String> = diff
-        .as_ref()
-        .and_then(|value| value.get("diff"))
+    let request = PromotionRequest {
+        candidate_ref: candidate.to_string(),
+        target_ref: to.to_string(),
+        candidate_hash: Some(candidate_reference.hash.clone()),
+        expected_target_hash,
+        plan_id: run.as_ref().map(|run| run.plan_id.clone()),
+        run_id: run.as_ref().map(|run| run.run_id.clone()),
+        quality_gates_passed: true,
+        diff_passed,
+        require_diff,
+        breaking_schema_changes: input.breaking_schema_changes,
+        allow_breaking_schema,
+        dry_run: false,
+        actor: None,
+        gates: report.results.clone(),
+    };
+    match promote(nessie.as_ref(), &request).await {
+        Ok(record) => {
+            ArtifactWriter::for_workspace(&cli.root)
+                .write_promotion(&record)
+                .map_err(|error| error.to_string())?;
+            if let Some(state) = &state {
+                state
+                    .record_promotion(&record)
+                    .map_err(|error| error.to_string())?;
+            }
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "ok": true,
+                    "gates": report.results,
+                    "promotion": record,
+                }))?;
+            } else {
+                print_gates_human(&report);
+                print_promotion_human(&record);
+            }
+            if cleanup && record.merged {
+                cleanup_candidate(cli, &nessie, candidate, environment.as_ref()).await;
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) => {
+            let message = error.to_string();
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "ok": false,
+                    "gates": report.results,
+                    "error": message,
+                }))?;
+            } else {
+                print_gates_human(&report);
+                eprintln!("error: {message}");
+            }
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// Read the audited diff artifact (`branch_diff.json` preferred, single-model
+/// `diff.json` as fallback) and derive: the diff verdict, why the artifact
+/// was rejected as stale, and the breaking schema changes it recorded.
+fn audited_diff(
+    cli: &Cli,
+    state: Option<&dyn StateStore>,
+    candidate: &str,
+) -> (Option<bool>, Option<String>, Vec<String>) {
+    let Some(state) = state else {
+        return (None, None, Vec::new());
+    };
+    if let Some(report) = read_branch_diff(cli) {
+        let mut rejected = None;
+        let mut breaking = Vec::new();
+        for change in &report.schema_changes {
+            for item in &change.changes {
+                if matches!(item.safety.as_str(), "error" | "full_rebuild_required") {
+                    breaking.push(format!("{}.{}: {}", change.model, item.column, item.detail));
+                }
+            }
+        }
+        // The artifact is stale when a dataset's recorded candidate version
+        // no longer matches the candidate's current materialisation.
+        for dataset in &report.datasets {
+            let Some(version) = &dataset.candidate_version else {
+                continue;
+            };
+            let current = match dataset.kind {
+                phlo_transform_engine::DatasetKind::Model => state
+                    .materialized_version(&dataset.dataset, Some(candidate))
+                    .ok()
+                    .flatten()
+                    .map(|record| record.version.hash),
+                phlo_transform_engine::DatasetKind::Seed => state
+                    .seed_state(&dataset.dataset, Some(candidate))
+                    .ok()
+                    .flatten()
+                    .map(|record| record.content_hash),
+            };
+            if current.as_deref() != Some(version.as_str()) {
+                rejected = Some(format!(
+                    "branch diff is stale: `{}` changed on the candidate since the diff",
+                    dataset.dataset
+                ));
+            }
+        }
+        return (Some(report.passed), rejected, breaking);
+    }
+
+    let Some(value) = read_diff(cli) else {
+        return (None, None, Vec::new());
+    };
+    let passed = value
+        .get("diff")
+        .and_then(|diff| diff.get("passed"))
+        .and_then(|passed| passed.as_bool());
+    let rejected = diff_is_stale_with(state, candidate, &value);
+    let breaking: Vec<String> = value
+        .get("diff")
         .and_then(|diff| diff.get("schema_changes"))
         .and_then(|changes| changes.as_array())
         .map(|changes| {
@@ -1049,51 +1217,46 @@ async fn run_promote(
                 .collect()
         })
         .unwrap_or_default();
+    (passed, rejected, breaking)
+}
 
-    let request = PromotionRequest {
-        candidate_ref: candidate.to_string(),
-        target_ref: to.to_string(),
-        candidate_hash: environment
-            .as_ref()
-            .map(|setup| setup.candidate.hash.clone()),
-        // The base hash recorded when the candidate was provisioned pins the
-        // target state the audit was performed against.
-        expected_target_hash: environment.as_ref().map(|setup| setup.base.hash.clone()),
-        plan_id: None,
-        run_id: None,
-        quality_gates_passed: true,
-        diff_passed,
-        require_diff,
-        breaking_schema_changes,
-        allow_breaking_schema,
-        dry_run: check,
-        actor: None,
-    };
-    match promote(nessie.as_ref(), &request).await {
-        Ok(record) => {
-            ArtifactWriter::for_workspace(&cli.root)
-                .write_promotion(&record)
-                .map_err(|error| error.to_string())?;
-            if cli.json {
-                print_json(&record)?;
-            } else {
-                print_promotion_human(&record);
-            }
-            if cleanup && record.merged {
-                cleanup_candidate(cli, &nessie, candidate, environment.as_ref()).await;
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Err(error) => {
-            let message = error.to_string();
-            if cli.json {
-                print_json(&serde_json::json!({ "ok": false, "error": message }))?;
-            } else {
-                eprintln!("error: {message}");
-            }
-            Ok(ExitCode::FAILURE)
-        }
+fn read_branch_diff(cli: &Cli) -> Option<BranchDiffReport> {
+    let text = std::fs::read_to_string(artifact_path(cli, "branch_diff.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    serde_json::from_value(value.get("diff")?.clone()).ok()
+}
+
+/// A model diff is stale once the candidate model version it recorded is no
+/// longer the candidate's materialised version.
+fn diff_is_stale_with(
+    state: &dyn StateStore,
+    candidate: &str,
+    diff: &serde_json::Value,
+) -> Option<String> {
+    let diff = diff.get("diff")?;
+    let model = diff.get("model")?.as_str()?;
+    let version = diff.get("candidate_version")?.as_str()?;
+    match state
+        .materialized_version(model, Some(candidate))
+        .ok()
+        .flatten()
+    {
+        Some(record) if record.version.hash == version => None,
+        Some(_) => Some(format!(
+            "diff artifact for `{model}` is stale: candidate data changed since the diff"
+        )),
+        None => Some(format!(
+            "diff artifact for `{model}` is stale: candidate is not materialised"
+        )),
     }
+}
+
+fn print_gates_human(report: &phlo_transform_engine::GateReport) {
+    for result in &report.results {
+        let status = if result.passed { "PASS" } else { "FAIL" };
+        println!("{status} {:<10} {}", result.name, result.detail);
+    }
+    println!();
 }
 
 /// Best-effort removal of a promoted candidate's branch and catalog.
@@ -1112,6 +1275,74 @@ async fn cleanup_candidate(
             .await;
     }
     let _ = nessie.delete_branch(candidate).await;
+}
+
+/// `phlo-transform ref ...` — Nessie reference management. `create` and
+/// `delete` mutate Nessie; `list` and `show` are read-only.
+async fn run_ref(cli: &Cli, action: &RefAction) -> Result<ExitCode, String> {
+    let nessie = build_nessie(cli)?;
+    match action {
+        RefAction::List => {
+            let references = nessie
+                .list_references()
+                .await
+                .map_err(|error| error.to_string())?;
+            if cli.json {
+                print_json(&references)?;
+            } else {
+                for reference in &references {
+                    println!(
+                        "{:<32} {} {}",
+                        reference.name, reference.kind, reference.hash
+                    );
+                }
+            }
+        }
+        RefAction::Show { name } => {
+            let reference = nessie
+                .get_reference(name)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("reference `{name}` was not found"))?;
+            if cli.json {
+                print_json(&reference)?;
+            } else {
+                println!("{} {} {}", reference.name, reference.kind, reference.hash);
+            }
+        }
+        RefAction::Create { name } => {
+            let base_name = cli.from.clone().unwrap_or_else(|| "main".to_string());
+            let base = nessie
+                .get_reference(&base_name)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("base reference `{base_name}` was not found"))?;
+            let reference = nessie
+                .create_branch(name, &base)
+                .await
+                .map_err(|error| error.to_string())?;
+            if cli.json {
+                print_json(&reference)?;
+            } else {
+                println!(
+                    "Created branch {} at {} (from {} @ {})",
+                    reference.name, reference.hash, base.name, base.hash
+                );
+            }
+        }
+        RefAction::Delete { name } => {
+            nessie
+                .delete_branch(name)
+                .await
+                .map_err(|error| error.to_string())?;
+            if cli.json {
+                print_json(&serde_json::json!({ "deleted": name }))?;
+            } else {
+                println!("Deleted branch {name}");
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn run_rollback(cli: &Cli, to: &str) -> Result<ExitCode, String> {
@@ -2343,13 +2574,20 @@ fn print_section(title: &str, values: &[String]) {
 async fn run_diff(
     cli: &Cli,
     compilation: &Compilation,
-    model: &str,
+    model: Option<&str>,
     base: &Option<String>,
+    to: &Option<String>,
     base_relation: &Option<String>,
     full: bool,
     partition: Option<&str>,
     sample: Option<f64>,
 ) -> Result<ExitCode, String> {
+    let Some(model) = model else {
+        return run_branch_diff(cli, compilation, to, full).await;
+    };
+    if to.is_some() {
+        return Err("--to applies to branch diffs; a model diff uses --base".to_string());
+    }
     let id = ModelId::parse(model).map_err(|error| format!("invalid model `{model}`: {error}"))?;
     let compiled = compilation
         .model(&id)
@@ -2371,7 +2609,8 @@ async fn run_diff(
 
     let candidate_relation = compiled.target.clone();
     let base_relation = match base_relation {
-        Some(spec) => parse_relation(spec),
+        Some(spec) => Relation::parse(spec)
+            .map_err(|error| format!("invalid --base-relation `{spec}`: {error}"))?,
         None => candidate_relation.clone(),
     };
     let partition_columns: Vec<String> = partition
@@ -2456,37 +2695,152 @@ fn diff_policy(spec: Option<&phlo_transform_core::DiffPolicySpec>) -> DiffPolicy
     }
 }
 
-fn model_keys(model: &phlo_transform_core::CompiledModel) -> Vec<String> {
-    if let Some(IncrementalStrategy::Key { columns }) = &model.config.incremental {
-        return columns.clone();
+/// Branch-level diff: `phlo-transform diff --from <candidate> --to <base>`.
+///
+/// Candidate relations resolve through the reference's provisioned catalog
+/// (`environment.json` when it names this candidate, else the `phlo_<ref>`
+/// convention); base relations resolve through the workspace/default catalog
+/// for `main` or the `phlo_<ref>` convention for other refs. Recorded
+/// materialisation targets take precedence over both.
+async fn run_branch_diff(
+    cli: &Cli,
+    compilation: &Compilation,
+    to: &Option<String>,
+    full: bool,
+) -> Result<ExitCode, String> {
+    let candidate_ref = cli
+        .from
+        .clone()
+        .or_else(|| cli.reference.clone())
+        .ok_or_else(|| {
+            "branch diff needs a candidate: `diff --from <ref> --to <ref>`".to_string()
+        })?;
+    let base_ref = to.clone().unwrap_or_else(|| "main".to_string());
+
+    let environment = read_environment(cli);
+    let candidate_catalog = environment
+        .as_ref()
+        .filter(|setup| setup.candidate.name == candidate_ref)
+        .map(|setup| setup.catalog.clone())
+        .unwrap_or_else(|| catalog_name(&candidate_ref));
+    // `main` (and any ref that was never provisioned as a candidate) resolves
+    // through the configured catalog; other refs use the per-ref convention.
+    let base_catalog = if base_ref == "main" {
+        cli.catalog
+            .clone()
+            .or_else(|| compilation_model_catalog(compilation))
+    } else {
+        Some(catalog_name(&base_ref))
+    };
+
+    let adapter = build_adapter(cli)?;
+    let state = open_state(cli);
+    let report = branch_diff(
+        adapter,
+        state.as_deref(),
+        compilation,
+        &BranchDiffRequest {
+            candidate_ref: candidate_ref.clone(),
+            base_ref: base_ref.clone(),
+            candidate_catalog: Some(candidate_catalog),
+            base_catalog,
+            deep: full,
+            default_schema: cli.trino_schema.clone(),
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+
+    ArtifactWriter::for_workspace(&cli.root)
+        .write_branch_diff(&report)
+        .map_err(|error| error.to_string())?;
+    if cli.json {
+        print_json(&report)?;
+    } else {
+        print_branch_diff_human(&report);
     }
-    for assertion in &model.assertions {
-        if let Assertion::Unique { columns } = assertion {
-            return columns.clone();
-        }
-    }
-    Vec::new()
+    Ok(if report.passed {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
-fn parse_relation(spec: &str) -> Relation {
-    let parts: Vec<&str> = spec.split('.').collect();
-    match parts.as_slice() {
-        [schema, table] => Relation {
-            catalog: None,
-            schema: (*schema).to_string(),
-            table: (*table).to_string(),
-        },
-        [catalog, schema, table] => Relation {
-            catalog: Some((*catalog).to_string()),
-            schema: (*schema).to_string(),
-            table: (*table).to_string(),
-        },
-        _ => Relation {
-            catalog: None,
-            schema: "default".to_string(),
-            table: spec.to_string(),
-        },
+/// The catalog the workspace's compiled targets resolve through (the project
+/// default the current compilation was built with).
+fn compilation_model_catalog(compilation: &Compilation) -> Option<String> {
+    compilation
+        .models
+        .iter()
+        .find_map(|model| model.target.catalog.clone())
+}
+
+fn print_branch_diff_human(report: &BranchDiffReport) {
+    println!(
+        "Branch diff: {} -> {}",
+        report.candidate_ref, report.base_ref
+    );
+    println!();
+    println!("Datasets");
+    for dataset in &report.datasets {
+        let status = match dataset.status {
+            phlo_transform_engine::DatasetStatus::Added => "added",
+            phlo_transform_engine::DatasetStatus::Removed => "removed",
+            phlo_transform_engine::DatasetStatus::Changed => "changed",
+            phlo_transform_engine::DatasetStatus::Unchanged => "unchanged",
+            phlo_transform_engine::DatasetStatus::Absent => "absent",
+        };
+        println!("  {:<10} {}", status, dataset.dataset);
     }
+    if !report.schema_changes.is_empty() {
+        println!();
+        println!("Schema");
+        for diff in &report.schema_changes {
+            for change in &diff.changes {
+                println!(
+                    "  {}.{}: {} [{}]",
+                    diff.model, change.column, change.detail, change.safety
+                );
+            }
+        }
+    }
+    if !report.rows.is_empty() {
+        println!();
+        println!("Rows");
+        for row in &report.rows {
+            let base = row
+                .base_rows
+                .map(|rows| rows.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let candidate = row
+                .candidate_rows
+                .map(|rows| rows.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let delta = row
+                .delta
+                .map(|delta| format!(" ({delta:+})"))
+                .unwrap_or_default();
+            println!(
+                "  {:<32} base {base}  candidate {candidate}{delta}",
+                row.dataset
+            );
+        }
+    }
+    if !report.diffs.is_empty() {
+        println!();
+        println!("Data diffs");
+        for diff in &report.diffs {
+            let verdict = if diff.passed { "PASS" } else { "FAIL" };
+            println!(
+                "  {verdict} {} ({} added, {} removed, {} modified)",
+                diff.model,
+                diff.row_summary.added,
+                diff.row_summary.removed,
+                diff.row_summary.modified
+            );
+        }
+    }
+    println!();
 }
 
 fn print_diff_human(report: &phlo_transform_engine::DiffReport) {

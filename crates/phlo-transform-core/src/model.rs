@@ -192,6 +192,27 @@ impl Relation {
             None => format!("{}.{}", self.schema, self.table),
         }
     }
+
+    /// Parse the `display`/`sql` dotted form back: `catalog.schema.table` or
+    /// `schema.table`.
+    pub fn parse(spec: &str) -> Result<Relation, String> {
+        let parts: Vec<&str> = spec.split('.').collect();
+        match parts.as_slice() {
+            [schema, table] => Ok(Relation {
+                catalog: None,
+                schema: (*schema).to_string(),
+                table: (*table).to_string(),
+            }),
+            [catalog, schema, table] => Ok(Relation {
+                catalog: Some((*catalog).to_string()),
+                schema: (*schema).to_string(),
+                table: (*table).to_string(),
+            }),
+            _ => Err(format!(
+                "invalid relation `{spec}` — expected `schema.table` or `catalog.schema.table`"
+            )),
+        }
+    }
 }
 
 fn quote_identifier(value: &str) -> String {

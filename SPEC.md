@@ -1026,6 +1026,8 @@ A Git branch may map automatically or explicitly to a Nessie reference. Explicit
 phlo transform --ref feature/new-assay plan
 ```
 
+References are managed explicitly — `ref list`, `ref show`, `ref create --from <base>` and `ref delete` — and no command creates or deletes a branch as a side effect, except explicit candidate provisioning on `plan`/`apply`/`run --ref` and `--cleanup` on `promote`.
+
 ## 46. Write-Audit-Publish
 
 Production-oriented execution follows:
@@ -1064,7 +1066,10 @@ Example:
 
 ```bash
 phlo transform promote feature/new-assay --to main
+phlo transform promote --from feature/new-assay --to main
 ```
+
+Promotion is authorised by named gates, reported identically in human and JSON output: `run` (latest candidate run passed), `tests` (no failed tests), `blocked` (no blocked/cancelled work), `schema` (no unwaived breaking changes), `data_diff` (a fresh, passing audited diff when `--require-diff` is set), `base` (target unchanged since provisioning) and `conflicts` (the merge check is clean). `--check` evaluates gates without merging; a passing promotion merges and persists a `PromotionRecord` (refs, hashes, plan/run ids, gate results, timestamp) in the state store.
 
 Preconditions may include successful plan, successful execution, required tests passing, no blocking schema changes, no stale state and optional approval.
 
@@ -1142,7 +1147,10 @@ Native command:
 
 ```bash
 phlo transform diff assay.results
+phlo transform diff --from feature/new-assay --to main
 ```
+
+With no model argument, `diff` compares two Nessie references: every dataset known to the workspace or recorded in state is classified `added`/`removed`/`changed`/`unchanged`/`absent`, schema and nullability changes are listed per model, row counts come from the catalogs, and `--full` runs keyed value diffs on changed models. The report is the audit artifact promotion consumes.
 
 Example:
 

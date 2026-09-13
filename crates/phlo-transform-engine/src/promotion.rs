@@ -4,7 +4,7 @@
 //! promoted to a target reference. Promotion validates quality gates and
 //! target staleness before merging, and records a reproducible artifact.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use phlo_transform_nessie::{Conflict, NessieClient};
 
@@ -34,10 +34,12 @@ pub struct PromotionRequest {
     /// Only check preconditions; do not merge.
     pub dry_run: bool,
     pub actor: Option<String>,
+    /// Gate results computed by the caller, carried into the record.
+    pub gates: Vec<crate::gates::GateResult>,
 }
 
 /// A reproducible promotion record.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PromotionRecord {
     pub promotion_id: String,
     pub candidate_ref: String,
@@ -51,8 +53,11 @@ pub struct PromotionRecord {
     pub run_id: Option<String>,
     pub dry_run: bool,
     pub merged: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts: Vec<Conflict>,
+    /// The gate evaluation that authorised (or refused) this promotion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gates: Vec<crate::gates::GateResult>,
     pub timestamp: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
@@ -117,6 +122,7 @@ pub async fn promote(
         dry_run: request.dry_run,
         merged: false,
         conflicts: Vec::new(),
+        gates: request.gates.clone(),
         timestamp: now_rfc3339(),
         actor: request.actor.clone(),
     };
@@ -191,6 +197,7 @@ mod tests {
             allow_breaking_schema: false,
             dry_run,
             actor: None,
+            gates: Vec::new(),
         }
     }
 
@@ -288,6 +295,7 @@ mod schema_gate_tests {
             allow_breaking_schema: allow,
             dry_run: true,
             actor: None,
+            gates: Vec::new(),
         };
 
         assert!(promote(&nessie, &make(false)).await.is_err());

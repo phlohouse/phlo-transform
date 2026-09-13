@@ -17,11 +17,11 @@ use phlo_transform_core::{
     SemanticModel, SemanticProject, SemanticTest, TestId, WorkspaceDefaults,
 };
 use phlo_transform_engine::{
-    diff, ensure_environment, promote, Adapter, CatalogRequest, DiffPolicy, DiffRequest,
-    DiffStrategy, EnvironmentSpec, ExecutionStatus, PlanOptions, Planner, PromotionRequest,
-    RunOptions, Runner,
+    branch_diff, diff, ensure_environment, evaluate_gates, promote, Adapter, BranchDiffRequest,
+    CatalogRequest, DatasetStatus, DiffPolicy, DiffRequest, DiffStrategy, EnvironmentSpec,
+    ExecutionStatus, GateInput, PlanOptions, Planner, PromotionRequest, RunOptions, Runner,
 };
-use phlo_transform_nessie::{NessieConfig, NessieRestClient};
+use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
 
 const TRINO_CONFIG: &str = "\
@@ -222,6 +222,84 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
     assert_eq!(report.row_summary.modified, 1);
     assert!(report.passed);
 
+    // Branch-level diff: the candidate rewrote both models — snapshot ids
+    // differ from the base's even without shared state records.
+    let branch = branch_diff(
+        adapter.clone(),
+        None,
+        &candidate,
+        &BranchDiffRequest {
+            candidate_ref: "ci/pr-1".to_string(),
+            base_ref: "main".to_string(),
+            candidate_catalog: Some("phlo_ci_pr_1".to_string()),
+            base_catalog: Some("phlo_main".to_string()),
+            deep: false,
+            default_schema: None,
+        },
+    )
+    .await
+    .expect("branch diff");
+    let status = |name: &str| {
+        branch
+            .datasets
+            .iter()
+            .find(|dataset| dataset.dataset == name)
+            .map(|dataset| dataset.status)
+            .unwrap_or_else(|| panic!("dataset {name} missing from branch diff"))
+    };
+    assert_eq!(status("assay.raw"), DatasetStatus::Changed);
+    assert_eq!(status("assay.results"), DatasetStatus::Changed);
+    // Row counts come straight from the catalogs.
+    let rows = branch
+        .rows
+        .iter()
+        .find(|row| row.dataset == "assay.results")
+        .expect("assay.results row diff");
+    assert_eq!(rows.base_rows, Some(1));
+    assert_eq!(rows.candidate_rows, Some(1));
+
+    // Gate evaluation against real Nessie state: the base hash matches the
+    // provisioned target and the merge check is clean — every gate that has
+    // evidence passes; run/tests/blocked fail for lack of a state store.
+    let target_now = nessie_client
+        .get_reference("main")
+        .await
+        .expect("target")
+        .expect("main exists");
+    let gates = evaluate_gates(&GateInput {
+        require_diff: true,
+        diff_passed: Some(report.passed),
+        expected_target_hash: Some(setup.base.hash.clone()),
+        actual_target_hash: Some(target_now.hash.clone()),
+        merge_check: Some(
+            nessie_client
+                .can_merge("ci/pr-1", "main")
+                .await
+                .expect("merge check"),
+        ),
+        ..Default::default()
+    });
+    let gate = |name: &str| {
+        gates
+            .results
+            .iter()
+            .find(|result| result.name == name)
+            .unwrap_or_else(|| panic!("gate {name} missing"))
+    };
+    assert!(gate("base").passed, "{}", gate("base").detail);
+    assert!(gate("data_diff").passed);
+    assert!(gate("conflicts").passed, "{}", gate("conflicts").detail);
+    assert!(!gates.passed, "no recorded run must fail the gates");
+
+    // Reference management: both refs resolve, sorted by name.
+    let refs = nessie_client.list_references().await.expect("list refs");
+    let names: Vec<&str> = refs
+        .iter()
+        .map(|reference| reference.name.as_str())
+        .collect();
+    assert!(names.contains(&"ci/pr-1"), "{names:?}");
+    assert!(names.contains(&"main"), "{names:?}");
+
     // Promote the audited candidate against the base it was planned from.
     let record = promote(
         &nessie_client,
@@ -239,6 +317,7 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
             allow_breaking_schema: false,
             dry_run: false,
             actor: None,
+            gates: Vec::new(),
         },
     )
     .await
@@ -270,6 +349,7 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
             allow_breaking_schema: false,
             dry_run: false,
             actor: None,
+            gates: Vec::new(),
         },
     )
     .await;
@@ -291,4 +371,12 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
         .expect("source state")
         .expect("snapshot id");
     assert_ne!(state_before, state_after);
+
+    // Cleanup: deleting the promoted branch removes it from the ref list.
+    nessie_client
+        .delete_branch("ci/pr-1")
+        .await
+        .expect("delete candidate");
+    let refs = nessie_client.list_references().await.expect("list refs");
+    assert!(!refs.iter().any(|reference| reference.name == "ci/pr-1"));
 }

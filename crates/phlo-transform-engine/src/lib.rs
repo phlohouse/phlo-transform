@@ -8,6 +8,7 @@
 
 pub mod adapter;
 pub mod artifacts;
+pub mod branch_diff;
 pub mod cancel;
 pub mod changed;
 pub mod diff;
@@ -15,6 +16,7 @@ pub mod environment;
 pub mod error;
 pub mod events;
 pub mod failure;
+pub mod gates;
 pub mod plan;
 pub mod promotion;
 pub mod run;
@@ -28,6 +30,10 @@ pub use artifacts::{
     ManifestArtifact, OpenLineageArtifact, PlanArtifact, PromotionArtifact, RunArtifact,
     SCHEMA_VERSION,
 };
+pub use branch_diff::{
+    branch_diff, model_keys, BranchDiffReport, BranchDiffRequest, DatasetDiff, DatasetKind,
+    DatasetStatus, ModelRowDiff, ModelSchemaDiff,
+};
 pub use cancel::CancelHandle;
 pub use changed::changed_models;
 pub use diff::{
@@ -37,6 +43,7 @@ pub use environment::{ensure_environment, EnvironmentSetup, EnvironmentSpec};
 pub use error::{AdapterError, EngineError};
 pub use events::{EngineEvent, ExecutionStatus};
 pub use failure::{Attempt, Failure, FailureCategory, RetryPolicy};
+pub use gates::{evaluate_gates, GateInput, GateReport, GateResult};
 pub use plan::{
     dependency_closure, diff_reasons, Membership, Plan, PlanAction, PlanOptions, PlanReason,
     PlanSelection, PlannedModel, PlannedSeed, PlannedTest, Planner, ReasonKind,

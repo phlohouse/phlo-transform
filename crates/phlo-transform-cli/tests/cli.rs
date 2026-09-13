@@ -1477,3 +1477,181 @@ fn resume_and_retry_failed_reject_selector_flags() {
     let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
     assert!(!output.status.success());
 }
+
+// ---------------------------------------------------------------------------
+// Bundle 5: refs, branch diff, promotion gates
+// ---------------------------------------------------------------------------
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8(output.stderr.clone()).expect("utf-8 stderr")
+}
+
+#[test]
+fn ref_commands_require_nessie() {
+    // `ref` is dispatched before workspace load — no --root needed.
+    for args in [
+        vec!["ref", "list"],
+        vec!["ref", "show", "ci/x"],
+        vec!["ref", "create", "ci/x"],
+        vec!["ref", "delete", "ci/x"],
+    ] {
+        let output = Command::cargo_bin("phlo-transform")
+            .expect("binary builds")
+            .current_dir(workspace_root())
+            .env_remove("PHLO_NESSIE_ENDPOINT")
+            .args(&args)
+            .output()
+            .expect("command runs");
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            stderr(&output).contains("Nessie"),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn promote_requires_a_candidate() {
+    let output = Command::cargo_bin("phlo-transform")
+        .expect("binary builds")
+        .current_dir(workspace_root())
+        .env_remove("PHLO_NESSIE_ENDPOINT")
+        .args(["promote", "--to", "main"])
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("candidate"), "{}", stderr(&output));
+}
+
+#[test]
+fn promote_from_alias_reaches_nessie() {
+    // `promote --from <ref>` resolves the candidate before touching Nessie —
+    // with no endpoint configured it fails on the endpoint, proving `--from`
+    // was accepted as the candidate.
+    let output = Command::cargo_bin("phlo-transform")
+        .expect("binary builds")
+        .current_dir(workspace_root())
+        .env_remove("PHLO_NESSIE_ENDPOINT")
+        .args(["promote", "--from", "ci/x", "--to", "main"])
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("Nessie"), "{}", stderr(&output));
+}
+
+#[test]
+fn branch_diff_needs_a_candidate() {
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "--adapter",
+        "duckdb",
+        "--duckdb-path",
+        ":memory:",
+        "diff",
+    ]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("--from"), "{}", stderr(&output));
+}
+
+/// A full branch-diff pass on DuckDB: run the workspace under `--ref main`,
+/// then diff a candidate that has no records — every materialised dataset is
+/// missing on the candidate, so it reports `removed`. Deterministic and
+/// Docker-free; the Nessie e2e covers the real branch topology.
+#[test]
+fn branch_diff_reports_datasets_missing_on_candidate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("generated");
+    let duckdb_path = dir.path().join("shop.duckdb");
+
+    let output = run(&[
+        "--root",
+        "fixtures/dbt-shop",
+        "translate",
+        "--from",
+        "dbt",
+        "--out",
+        out.to_str().expect("utf-8"),
+    ]);
+    assert!(output.status.success(), "{}", stdout(&output));
+
+    {
+        let connection = duckdb::Connection::open(&duckdb_path).expect("open duckdb");
+        connection
+            .execute_batch(
+                "create schema raw;
+                 create table raw.customers as
+                     select * from (values (1,'Ada','eu'),(2,'Grace',null)) t(id,name,region);
+                 create table raw.orders as
+                     select * from (values
+                         (10,1,50.0,'placed',timestamp '2024-01-01 10:00:00'),
+                         (11,2,25.0,'shipped',timestamp '2024-01-02 11:00:00'))
+                     t(id,customer_id,amount,status,ordered_at);",
+            )
+            .expect("seed sources");
+    }
+
+    let duckdb_arg = duckdb_path.to_str().expect("utf-8").to_string();
+    let out_arg = out.to_str().expect("utf-8").to_string();
+    let run_args = |extra: &[&'static str]| {
+        let mut args = vec![
+            "--root",
+            out_arg.as_str(),
+            "--adapter",
+            "duckdb",
+            "--duckdb-path",
+            duckdb_arg.as_str(),
+        ];
+        args.extend_from_slice(extra);
+        args
+    };
+
+    // Materialise under the `main` environment label.
+    let output = run_unchecked(&run_args(&["run", "--ref", "main"]));
+    assert!(output.status.success(), "{}", stdout(&output));
+
+    // The candidate never ran: every base dataset reports `removed`.
+    let output = run_unchecked(&run_args(&[
+        "--json", "diff", "--from", "ci/x", "--to", "main",
+    ]));
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout(&output)).expect("branch diff json");
+    assert_eq!(report["candidate_ref"], "ci/x");
+    assert_eq!(report["base_ref"], "main");
+    let datasets = report["datasets"].as_array().expect("datasets array");
+    assert!(!datasets.is_empty());
+    for dataset in datasets {
+        assert_eq!(
+            dataset["status"],
+            "removed",
+            "{}",
+            dataset["dataset"].as_str().unwrap_or("?")
+        );
+        assert_eq!(dataset["kind"], "model");
+    }
+    // Deterministic: sorted by dataset name, and a second run is identical
+    // modulo timestamps.
+    let names: Vec<&str> = datasets
+        .iter()
+        .map(|dataset| dataset["dataset"].as_str().unwrap())
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted);
+
+    let again = run_unchecked(&run_args(&[
+        "--json", "diff", "--from", "ci/x", "--to", "main",
+    ]));
+    assert!(again.status.success());
+    let report2: serde_json::Value =
+        serde_json::from_str(&stdout(&again)).expect("branch diff json");
+    assert_eq!(report["datasets"], report2["datasets"]);
+    assert_eq!(report["rows"], report2["rows"]);
+}
