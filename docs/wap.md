@@ -65,10 +65,10 @@ The provisioned catalog name defaults to `phlo_<sanitized ref>` and can be
 overridden with `--catalog`; `--warehouse` sets the Iceberg warehouse (for
 example `local:///tmp/phlo-warehouse` or `s3://bucket/wh`). Provisioning is
 recorded in `.phlo/transform/environment.json` — the workspace's current
-environment — plus a per-candidate copy at
-`.phlo/transform/environment_<ref>.json`, so one candidate's evidence
-survives another being provisioned. Both are removed when the branch is
-deleted.
+environment — plus a per-candidate copy named
+`environment_<sanitised ref>_<hash>.json`, so one candidate's evidence
+survives another being provisioned and similarly-named refs never share a
+file. Both are removed when the branch is deleted.
 
 A failed run or audit leaves the candidate isolated and does not advance
 `main`. The live `nessie_wap_e2e` test exercises candidate isolation, branch

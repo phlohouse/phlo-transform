@@ -956,8 +956,11 @@ fn read_environment(cli: &Cli) -> Option<EnvironmentSetup> {
     serde_json::from_value(value.get("environment")?.clone()).ok()
 }
 
-/// The per-candidate environment artifact file: `environment_<ref>.json`
-/// with characters unsafe in a filename folded to `_`.
+/// The per-candidate environment artifact file: `environment_<ref>_<hash>.json`
+/// with characters unsafe in a filename folded to `_`. Folding can collide
+/// (`ci/pr-1` vs `ci_pr_1`) and a ref of nothing but unsafe characters
+/// collapses to `environment` — the FNV-1a suffix keeps every ref's evidence
+/// its own file, and stays stable across builds (unlike `DefaultHasher`).
 fn environment_artifact_name(reference: &str) -> String {
     let mut name = String::from("environment_");
     let mut previous_underscore = true;
@@ -970,7 +973,12 @@ fn environment_artifact_name(reference: &str) -> String {
             previous_underscore = true;
         }
     }
-    format!("{}.json", name.trim_end_matches('_'))
+    let sanitized = name.trim_end_matches('_');
+    let mut hash: u32 = 0x811c9dc5;
+    for byte in reference.bytes() {
+        hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+    }
+    format!("{sanitized}_{hash:08x}.json")
 }
 
 /// Persist the provisioning record: the conventional `environment.json` for
@@ -4103,7 +4111,7 @@ mod tests {
 
         // Both files exist: the single-slot record and the per-candidate one.
         assert!(artifact_path(&cli, "environment.json").exists());
-        assert!(artifact_path(&cli, "environment_ci_x.json").exists());
+        assert!(artifact_path(&cli, &environment_artifact_name("ci/x")).exists());
 
         // Provisioning a different candidate overwrites the single-slot
         // record but not ci/x's evidence.
@@ -4125,13 +4133,18 @@ mod tests {
 
     #[test]
     fn environment_artifact_name_sanitizes() {
-        assert_eq!(
+        let name = environment_artifact_name("ci/pr-1");
+        assert!(name.starts_with("environment_ci_pr_1_"), "{name}");
+        assert!(name.ends_with(".json"), "{name}");
+        let name = environment_artifact_name("feature/ABC-123");
+        assert!(name.starts_with("environment_feature_abc_123_"), "{name}");
+
+        // Refs that fold to the same readable name must not share a file.
+        assert_ne!(
             environment_artifact_name("ci/pr-1"),
-            "environment_ci_pr_1.json"
+            environment_artifact_name("ci_pr_1")
         );
-        assert_eq!(
-            environment_artifact_name("feature/ABC-123"),
-            "environment_feature_abc_123.json"
-        );
+        // Nor may a degenerate ref collapse onto the single-slot artifact.
+        assert_ne!(environment_artifact_name("///"), "environment.json");
     }
 }
