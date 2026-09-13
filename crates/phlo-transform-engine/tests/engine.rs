@@ -12,10 +12,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use phlo_transform_core::{
-    compile, compile_with_options, resolve_selection, Compilation, DataType, EmptySchemaProvider,
-    EmptySourceStateProvider, IncrementalStrategy, Materialization, ModelId, ModelOrigin,
-    Nullability, Relation, RelationSchema, SchemaColumn, Selection, SelectorSet, SemanticModel,
-    SemanticProject, SemanticSeed, SemanticTest, SourceId, SourceStateProvider,
+    compile, compile_with_options, resolve_selection, Compilation, DataType, DiffPolicySpec,
+    EmptySchemaProvider, EmptySourceStateProvider, IncrementalStrategy, Materialization, ModelId,
+    ModelOrigin, Nullability, Relation, RelationSchema, SchemaColumn, Selection, SelectorSet,
+    SemanticModel, SemanticProject, SemanticSeed, SemanticTest, SourceId, SourceStateProvider,
     StaticSchemaProvider, StaticSourceStateProvider, TestId,
 };
 use phlo_transform_engine::{
@@ -289,6 +289,17 @@ impl Adapter for FakeAdapter {
                 query_id: Some("count-query".to_string()),
                 columns: vec!["count".to_string()],
                 rows: vec![vec![rows.to_string()]],
+                row_count: 1,
+            });
+        }
+        // Other count queries (keyed diffs' added/removed/modified/unchanged)
+        // answer one zero per `count(*)` — the fake models empty tables.
+        if sql.contains("count(*)") {
+            let columns = sql.matches("count(*)").count().max(1);
+            return Ok(QueryResult {
+                query_id: Some("count-query".to_string()),
+                columns: vec!["count".to_string(); columns],
+                rows: vec![vec!["0".to_string(); columns]],
                 row_count: 1,
             });
         }
@@ -3837,6 +3848,7 @@ async fn branch_diff_classifies_datasets() {
     let report = branch_diff(adapter, Some(&state), &compilation, &branch_diff_request())
         .await
         .unwrap();
+    assert!(!report.deep);
 
     let status = |name: &str| {
         report
@@ -3970,7 +3982,56 @@ async fn branch_diff_deep_runs_keyed_diffs_for_changed_models() {
     assert_eq!(report.diffs.len(), 1);
     assert_eq!(report.diffs[0].model, "main.changed");
     assert_eq!(report.diffs[0].key_columns, vec!["id".to_string()]);
+    assert!(report.deep);
     assert!(report.passed);
+}
+
+#[tokio::test]
+async fn branch_diff_deep_evaluates_declared_policies_on_keyless_models() {
+    // A changed model with no stable key is normally skipped in deep mode —
+    // but when it declares a diff policy, that policy must still be
+    // evaluated. `require_keyed_diff` on a keyless model must fail the
+    // report, not pass silently.
+    let mut keyless = model("main.changed", "select * from main.same");
+    keyless.config.diff = Some(DiffPolicySpec {
+        require_keyed_diff: true,
+        ..Default::default()
+    });
+    let project = SemanticProject::in_memory(vec![model("main.same", "select 1 as id"), keyless]);
+    let compilation = compile(&project);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = SqliteStateStore::in_memory().unwrap();
+    let changed = compilation.model_by_name("main.changed").unwrap();
+    let cand = ref_relation("phlo_ci_x", changed);
+    let base = ref_relation("phlo_main", changed);
+    state
+        .record_materialized(&materialized("main.changed", "ci/x", "v2", &cand))
+        .unwrap();
+    state
+        .record_materialized(&materialized("main.changed", "main", "v1", &base))
+        .unwrap();
+    adapter.existing.lock().unwrap().insert(cand.display());
+    adapter.existing.lock().unwrap().insert(base.display());
+
+    let mut request = branch_diff_request();
+    request.deep = true;
+    let report = branch_diff(adapter, Some(&state), &compilation, &request)
+        .await
+        .unwrap();
+    assert_eq!(report.diffs.len(), 1);
+    let diff = &report.diffs[0];
+    assert!(diff.key_columns.is_empty());
+    assert_eq!(diff.coverage, "aggregate (row counts only)");
+    assert!(
+        diff.policy_results
+            .iter()
+            .any(|result| result.policy == "require_keyed_diff" && !result.passed),
+        "{:?}",
+        diff.policy_results
+    );
+    assert!(!report.passed);
 }
 
 #[test]
@@ -4056,12 +4117,27 @@ fn test_run(test_id: &str, status: ExecutionStatus) -> TestRunRecord {
     }
 }
 
+fn seed_run(name: &str, status: ExecutionStatus) -> SeedRunRecord {
+    SeedRunRecord {
+        run_id: "run-1".to_string(),
+        name: name.to_string(),
+        status,
+        target: format!("cat.seeds.{name}"),
+        attempts: Vec::new(),
+        error: None,
+        error_category: None,
+        started_at: "t".to_string(),
+        finished_at: "t".to_string(),
+    }
+}
+
 /// A fully-green gate input: passed run, tests green, nothing blocked,
 /// passing diff, stable target, clean merge check.
 fn green_input() -> GateInput {
     GateInput {
         run: Some(passed_run()),
         model_runs: vec![model_run("m.a", ExecutionStatus::Passed)],
+        seed_runs: vec![seed_run("countries", ExecutionStatus::Passed)],
         test_runs: vec![test_run("t.a", ExecutionStatus::Passed)],
         require_diff: true,
         diff_passed: Some(true),
@@ -4130,6 +4206,17 @@ fn blocked_work_blocks_promotion() {
     assert!(!blocked.passed);
     assert!(blocked.detail.contains("m.b"), "{}", blocked.detail);
     assert!(blocked.detail.contains("m.c"), "{}", blocked.detail);
+}
+
+#[test]
+fn blocked_seed_blocks_promotion() {
+    let mut input = green_input();
+    input.seed_runs = vec![seed_run("countries", ExecutionStatus::Blocked)];
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    let blocked = gate(&report, "blocked");
+    assert!(!blocked.passed);
+    assert!(blocked.detail.contains("countries"), "{}", blocked.detail);
 }
 
 #[test]

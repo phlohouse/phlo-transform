@@ -13,11 +13,15 @@ phlo-transform diff --from ci/pr-1                    # --to defaults to main
 ```
 
 With no model argument, `diff` compares the materialised datasets of two
-Nessie references. Candidate relations resolve through the provisioned
-catalog recorded in `environment.json` (falling back to the `phlo_<ref>`
-convention); the base resolves through the workspace catalog for `main` or
-the same convention for other refs. Recorded materialisation targets take
-precedence over both.
+Nessie references — `--from`/`--ref` names the candidate and `--to` the base
+(the model-diff flags `--base`, `--base-relation`, `--partition` and
+`--sample` do not apply). When a Nessie endpoint is configured both
+references must exist; a typo errors rather than producing a misleading
+report. Candidate relations resolve through the provisioned catalog recorded
+in `environment.json` (falling back to the `phlo_<ref>` convention); the
+base resolves through the workspace catalog for `main` or the same
+convention for other refs. Recorded materialisation targets take precedence
+over both.
 
 Every dataset in the union of the workspace and recorded materialisations is
 classified:
@@ -41,15 +45,21 @@ The report also carries:
   changes, each with a safety classification;
 - **rows** — `count(*)` per side plus the delta;
 - **diffs** — with `--full`, a keyed value diff per changed model that
-  declares keys (the same `diff` engine as single-model diffs);
+  declares keys, plus an aggregate diff for any changed model that declares
+  a diff policy but no key — so a declared `require_keyed_diff` or row
+  threshold is evaluated rather than skipped (the same `diff` engine as
+  single-model diffs);
 - **upstream** — each dataset's model dependencies, the lineage hook for
   branch-aware graph diffs.
 
 Output is deterministic (datasets sorted by name) and identical in content
 between human and `--json` output. The report is written to
-`.phlo/transform/branch_diff.json`, which `promote --require-diff` consumes:
-a report whose recorded candidate versions no longer match the candidate's
-current materialisations is rejected as stale.
+`.phlo/transform/branch_diff.json` (including `deep`, whether `--full`
+value-level diffs ran), which `promote --require-diff` consumes. The
+artifact only authorises the candidate→target pair it names; it is rejected
+when its recorded candidate versions no longer match the candidate's current
+materialisations (stale) or when it was produced without `--full` — a
+required data-diff audit must evaluate value-level policies.
 
 ## Model diff
 
@@ -128,9 +138,11 @@ policy fails the command and blocks promotion.
 
 `PromotionRequest` accepts `diff_passed` and `require_diff`. `phlo-transform
 promote --require-diff` reads `branch_diff.json` first (falling back to the
-single-model `diff.json`), requires a passing diff, and rejects a diff whose
-recorded candidate versions no longer match the candidate's materialised
-state — a stale artifact fails the `data_diff` promotion gate.
+single-model `diff.json`) and requires a passing value-level diff that
+covers the exact candidate→target pair being promoted: an artifact naming
+different refs, one produced without `--full`, or one whose recorded
+candidate versions no longer match the candidate's materialised state is
+rejected, failing the `data_diff` promotion gate.
 
 ## Execution and coverage
 

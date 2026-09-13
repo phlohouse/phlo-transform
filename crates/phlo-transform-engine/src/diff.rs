@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use phlo_transform_core::{ColumnTolerance, DataType, Relation};
 
 use crate::adapter::Adapter;
-use crate::error::EngineError;
+use crate::error::{AdapterError, EngineError};
 use crate::util::now_rfc3339;
 
 /// How a diff compares data.
@@ -104,15 +104,15 @@ pub struct DiffReport {
     pub coverage: String,
     pub key_columns: Vec<String>,
     pub row_summary: RowSummary,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub column_changes: BTreeMap<String, i64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schema_changes: Vec<SchemaChange>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partitions_added: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partitions_removed: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partitions_changed: Vec<String>,
     pub policy_results: Vec<PolicyResult>,
     pub passed: bool,
@@ -263,7 +263,7 @@ async fn row_count(adapter: &dyn Adapter, relation_sql: &str) -> Result<i64, Eng
         .execute(&format!("SELECT count(*) FROM {relation_sql}"))
         .await
         .map_err(EngineError::Adapter)?;
-    Ok(first_cell_i64(&result.rows))
+    first_cell_i64(&result.rows)
 }
 
 fn change_predicate(column: &str, tolerance: Option<&ColumnTolerance>) -> String {
@@ -322,8 +322,13 @@ async fn keyed_counts(
         join.join(" AND "),
     );
     let result = adapter.execute(&sql).await.map_err(EngineError::Adapter)?;
-    let row = result.rows.first().cloned().unwrap_or_default();
-    Ok((cell(&row, 0), cell(&row, 1), cell(&row, 2), cell(&row, 3)))
+    let row = result.rows.first().ok_or_else(|| {
+        EngineError::Adapter(AdapterError::new(
+            "MALFORMED_RESULT",
+            "count query returned no rows",
+        ))
+    })?;
+    Ok((cell(row, 0)?, cell(row, 1)?, cell(row, 2)?, cell(row, 3)?))
 }
 
 async fn column_changed(
@@ -344,7 +349,7 @@ async fn column_changed(
         join.join(" AND "),
     );
     let result = adapter.execute(&sql).await.map_err(EngineError::Adapter)?;
-    Ok(first_cell_i64(&result.rows))
+    first_cell_i64(&result.rows)
 }
 
 async fn partition_summary(
@@ -591,17 +596,34 @@ fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-fn first_cell_i64(rows: &[Vec<String>]) -> i64 {
-    rows.first()
-        .and_then(|row| row.first())
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0)
+fn first_cell_i64(rows: &[Vec<String>]) -> Result<i64, EngineError> {
+    let value = rows.first().and_then(|row| row.first()).ok_or_else(|| {
+        EngineError::Adapter(AdapterError::new(
+            "MALFORMED_RESULT",
+            "count query returned no rows",
+        ))
+    })?;
+    value.parse().map_err(|_| {
+        EngineError::Adapter(AdapterError::new(
+            "MALFORMED_RESULT",
+            format!("count query returned non-numeric value `{value}`"),
+        ))
+    })
 }
 
-fn cell(row: &[String], index: usize) -> i64 {
-    row.get(index)
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0)
+fn cell(row: &[String], index: usize) -> Result<i64, EngineError> {
+    let value = row.get(index).ok_or_else(|| {
+        EngineError::Adapter(AdapterError::new(
+            "MALFORMED_RESULT",
+            format!("count query returned no column {index}"),
+        ))
+    })?;
+    value.parse().map_err(|_| {
+        EngineError::Adapter(AdapterError::new(
+            "MALFORMED_RESULT",
+            format!("count query returned non-numeric value `{value}`"),
+        ))
+    })
 }
 
 /// Attach a schema-safety classification (kept for compatibility).

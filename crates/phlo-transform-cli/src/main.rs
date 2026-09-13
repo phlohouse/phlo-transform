@@ -147,8 +147,9 @@ struct Cli {
     #[arg(long = "ref", visible_alias = "reference", global = true)]
     reference: Option<String>,
 
-    /// Base Nessie reference to create a candidate from (default `main`);
-    /// for `translate`, the source format (e.g. `--from dbt`).
+    /// Base Nessie reference a candidate is created from (default `main`);
+    /// the candidate reference for `diff`/`promote`; the source format for
+    /// `translate` (e.g. `--from dbt`).
     #[arg(long, global = true)]
     from: Option<String>,
 
@@ -986,9 +987,16 @@ async fn run_promote(
     allow_breaking_schema: bool,
     cleanup: bool,
 ) -> Result<ExitCode, String> {
-    let candidate = candidate.or(cli.from.as_deref()).ok_or_else(|| {
-        "promote requires a candidate: `promote <ref> --to <target>` or `promote --from <ref> --to <target>`".to_string()
-    })?;
+    let candidate = match (candidate, cli.from.as_deref()) {
+        (Some(positional), Some(from)) if positional != from => {
+            return Err(format!(
+                "candidate given twice and disagreeing: `{positional}` vs `--from {from}`"
+            ));
+        }
+        (positional, from) => positional.or(from).ok_or_else(|| {
+            "promote requires a candidate: `promote <ref> --to <target>` or `promote --from <ref> --to <target>`".to_string()
+        })?,
+    };
     let nessie = build_nessie(cli)?;
     let state = open_state(cli);
 
@@ -1012,21 +1020,24 @@ async fn run_promote(
             .map_err(|error| error.to_string())?,
         None => None,
     };
-    let (model_runs, test_runs) = match (&state, &run) {
+    let (model_runs, seed_runs, test_runs) = match (&state, &run) {
         (Some(state), Some(run)) => (
             state
                 .model_runs(&run.run_id)
                 .map_err(|error| error.to_string())?,
             state
+                .seed_runs(&run.run_id)
+                .map_err(|error| error.to_string())?,
+            state
                 .test_runs(&run.run_id)
                 .map_err(|error| error.to_string())?,
         ),
-        _ => (Vec::new(), Vec::new()),
+        _ => (Vec::new(), Vec::new(), Vec::new()),
     };
 
     let environment = read_environment(cli);
     let (diff_passed, diff_rejected, breaking_schema_changes) =
-        audited_diff(cli, state.as_deref(), candidate);
+        audited_diff(cli, state.as_deref(), candidate, to);
     let merge_check = nessie.can_merge(candidate, to).await.ok();
 
     // The recorded provisioning base pins the target state the candidate was
@@ -1039,6 +1050,7 @@ async fn run_promote(
     let input = GateInput {
         run: run.clone(),
         model_runs,
+        seed_runs,
         test_runs,
         require_diff,
         diff_passed,
@@ -1077,7 +1089,10 @@ async fn run_promote(
         candidate_ref: candidate.to_string(),
         target_ref: to.to_string(),
         candidate_hash: Some(candidate_reference.hash.clone()),
-        expected_target_hash,
+        // Assert the target hash the gates were evaluated against: when no
+        // provisioning base was recorded, pin the just-resolved hash so a
+        // commit racing this promotion is rejected rather than merged over.
+        expected_target_hash: expected_target_hash.or_else(|| Some(target.hash.clone())),
         plan_id: run.as_ref().map(|run| run.plan_id.clone()),
         run_id: run.as_ref().map(|run| run.run_id.clone()),
         quality_gates_passed: true,
@@ -1099,20 +1114,38 @@ async fn run_promote(
                     .record_promotion(&record)
                     .map_err(|error| error.to_string())?;
             }
+            // Cleanup is part of what the caller asked for; a failure is
+            // reported and fails the command — the merge record already
+            // persisted shows the promotion itself succeeded.
+            let cleanup_error = if cleanup && record.merged {
+                cleanup_candidate(cli, &nessie, candidate, environment.as_ref())
+                    .await
+                    .err()
+            } else {
+                None
+            };
             if cli.json {
                 print_json(&serde_json::json!({
-                    "ok": true,
+                    "ok": cleanup_error.is_none(),
                     "gates": report.results,
                     "promotion": record,
+                    "cleanup_error": cleanup_error,
                 }))?;
             } else {
                 print_gates_human(&report);
                 print_promotion_human(&record);
+                if let Some(error) = &cleanup_error {
+                    eprintln!(
+                        "error: promotion merged but cleanup failed: {error}; \
+                         remove the branch with `phlo-transform ref delete {candidate}`"
+                    );
+                }
             }
-            if cleanup && record.merged {
-                cleanup_candidate(cli, &nessie, candidate, environment.as_ref()).await;
-            }
-            Ok(ExitCode::SUCCESS)
+            Ok(if cleanup_error.is_some() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            })
         }
         Err(error) => {
             let message = error.to_string();
@@ -1133,16 +1166,34 @@ async fn run_promote(
 
 /// Read the audited diff artifact (`branch_diff.json` preferred, single-model
 /// `diff.json` as fallback) and derive: the diff verdict, why the artifact
-/// was rejected as stale, and the breaking schema changes it recorded.
+/// was rejected, and the breaking schema changes it recorded.
+///
+/// The artifact only authorises the pair it was produced for: it must name
+/// this candidate and target, still be fresh, and — for the `data_diff`
+/// gate — carry value-level diffs (`diff --full`).
 fn audited_diff(
     cli: &Cli,
     state: Option<&dyn StateStore>,
     candidate: &str,
+    to: &str,
 ) -> (Option<bool>, Option<String>, Vec<String>) {
     let Some(state) = state else {
         return (None, None, Vec::new());
     };
     if let Some(report) = read_branch_diff(cli) {
+        // An audit of another candidate, or against another target, is not
+        // evidence for this promotion.
+        if report.candidate_ref != candidate || report.base_ref != to {
+            return (
+                None,
+                Some(format!(
+                    "branch diff covers `{}` -> `{}`, not `{candidate}` -> `{to}`; \
+                     rerun `diff --from {candidate} --to {to} --full`",
+                    report.candidate_ref, report.base_ref
+                )),
+                Vec::new(),
+            );
+        }
         let mut rejected = None;
         let mut breaking = Vec::new();
         for change in &report.schema_changes {
@@ -1176,12 +1227,60 @@ fn audited_diff(
                 ));
             }
         }
+        // A shallow diff compared schema and row counts only — no data-diff
+        // policies were evaluated, so it cannot satisfy a required audit.
+        // (`diffs` non-empty also proves `--full`, for pre-`deep`-field
+        // artifacts.)
+        if !report.deep && report.diffs.is_empty() {
+            return (
+                None,
+                Some(rejected.unwrap_or_else(|| {
+                    format!(
+                        "branch diff ran without `--full`; rerun \
+                         `diff --from {candidate} --to {to} --full` for a value-level audit"
+                    )
+                })),
+                breaking,
+            );
+        }
         return (Some(report.passed), rejected, breaking);
     }
 
     let Some(value) = read_diff(cli) else {
         return (None, None, Vec::new());
     };
+    // Same binding for the single-model artifact: the diff must have run on
+    // this candidate and, when a base label was recorded, against this target.
+    let audited_candidate = value
+        .get("diff")
+        .and_then(|diff| diff.get("candidate_ref"))
+        .and_then(|reference| reference.as_str());
+    if audited_candidate != Some(candidate) {
+        return (
+            None,
+            Some(format!(
+                "model diff covers candidate `{}`, not `{candidate}`; \
+                 rerun the diff under `--ref {candidate}`",
+                audited_candidate.unwrap_or("<unlabeled>")
+            )),
+            Vec::new(),
+        );
+    }
+    if let Some(audited_base) = value
+        .get("diff")
+        .and_then(|diff| diff.get("base_ref"))
+        .and_then(|reference| reference.as_str())
+    {
+        if audited_base != to {
+            return (
+                None,
+                Some(format!(
+                    "model diff was audited against `{audited_base}`, not `{to}`"
+                )),
+                Vec::new(),
+            );
+        }
+    }
     let passed = value
         .get("diff")
         .and_then(|diff| diff.get("passed"))
@@ -1258,22 +1357,42 @@ fn print_gates_human(report: &phlo_transform_engine::GateReport) {
     println!();
 }
 
-/// Best-effort removal of a promoted candidate's branch and catalog.
+/// Removal of a promoted candidate's catalog and branch. Every failure is
+/// reported — the merge already happened, so a leftover catalog or branch
+/// must never be silent.
 async fn cleanup_candidate(
     cli: &Cli,
     nessie: &Arc<dyn NessieClient>,
     candidate: &str,
     environment: Option<&EnvironmentSetup>,
-) {
+) -> Result<(), String> {
     let catalog = environment
         .map(|setup| setup.catalog.clone())
         .unwrap_or_else(|| catalog_name(candidate));
-    if let Ok(adapter) = build_adapter(cli) {
-        let _ = adapter
-            .execute(&format!("DROP CATALOG IF EXISTS {}", catalog))
-            .await;
+    let mut failures = Vec::new();
+    match build_adapter(cli) {
+        Ok(adapter) => {
+            if let Err(error) = adapter
+                .execute(&format!("DROP CATALOG IF EXISTS {}", catalog))
+                .await
+            {
+                failures.push(format!("drop catalog `{catalog}`: {error}"));
+            }
+        }
+        Err(error) => {
+            failures.push(format!(
+                "open the adapter to drop catalog `{catalog}`: {error}"
+            ));
+        }
     }
-    let _ = nessie.delete_branch(candidate).await;
+    if let Err(error) = nessie.delete_branch(candidate).await {
+        failures.push(format!("delete branch `{candidate}`: {error}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 /// `phlo-transform ref ...` — Nessie reference management. `create` and
@@ -2582,10 +2701,29 @@ async fn run_diff(
     sample: Option<f64>,
 ) -> Result<ExitCode, String> {
     let Some(model) = model else {
+        let model_only = [
+            (base.is_some(), "--base"),
+            (base_relation.is_some(), "--base-relation"),
+            (partition.is_some(), "--partition"),
+            (sample.is_some(), "--sample"),
+        ]
+        .into_iter()
+        .find_map(|(present, flag)| present.then_some(flag));
+        if let Some(flag) = model_only {
+            return Err(format!(
+                "`{flag}` applies to model diffs; a branch diff compares two references"
+            ));
+        }
         return run_branch_diff(cli, compilation, to, full).await;
     };
     if to.is_some() {
-        return Err("--to applies to branch diffs; a model diff uses --base".to_string());
+        return Err("`--to` applies to branch diffs; a model diff uses `--base`".to_string());
+    }
+    if cli.from.is_some() {
+        return Err(
+            "`--from` selects a branch-diff candidate; a model diff takes its candidate from `--ref`"
+                .to_string(),
+        );
     }
     let id = ModelId::parse(model).map_err(|error| format!("invalid model `{model}`: {error}"))?;
     let compiled = compilation
@@ -2715,6 +2853,21 @@ async fn run_branch_diff(
             "branch diff needs a candidate: `diff --from <ref> --to <ref>`".to_string()
         })?;
     let base_ref = to.clone().unwrap_or_else(|| "main".to_string());
+
+    // When Nessie is configured both sides must be real references — a
+    // typo'd ref should error, not produce a plausible all-`removed` report.
+    if nessie_endpoint(cli).is_some() {
+        let nessie = build_nessie(cli)?;
+        for name in [&candidate_ref, &base_ref] {
+            nessie
+                .get_reference(name)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!("reference `{name}` was not found — see `phlo-transform ref list`")
+                })?;
+        }
+    }
 
     let environment = read_environment(cli);
     let candidate_catalog = environment
@@ -3416,4 +3569,206 @@ async fn run_explain(
         println!();
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phlo_transform_engine::{
+        BranchDiffReport, DatasetDiff, DatasetKind, DatasetStatus, MaterializedRecord,
+        ModelSchemaDiff, SchemaChange, SqliteStateStore,
+    };
+
+    fn cli_at(root: &std::path::Path) -> Cli {
+        Cli::try_parse_from([
+            "phlo-transform",
+            "--root",
+            root.to_str().expect("utf-8 root"),
+            "check",
+        ])
+        .expect("cli parses")
+    }
+
+    fn branch_report(candidate: &str, base: &str, deep: bool) -> BranchDiffReport {
+        BranchDiffReport {
+            candidate_ref: candidate.to_string(),
+            base_ref: base.to_string(),
+            datasets: Vec::new(),
+            schema_changes: Vec::new(),
+            rows: Vec::new(),
+            diffs: Vec::new(),
+            deep,
+            passed: true,
+            started_at: "t".to_string(),
+            finished_at: "t".to_string(),
+        }
+    }
+
+    fn dataset(name: &str, candidate_version: Option<&str>) -> DatasetDiff {
+        DatasetDiff {
+            dataset: name.to_string(),
+            kind: DatasetKind::Model,
+            status: DatasetStatus::Changed,
+            candidate_version: candidate_version.map(str::to_string),
+            base_version: Some("v1".to_string()),
+            candidate_relation: None,
+            base_relation: None,
+            upstream: Vec::new(),
+        }
+    }
+
+    fn write_branch_diff(cli: &Cli, report: &BranchDiffReport) {
+        ArtifactWriter::for_workspace(&cli.root)
+            .write_branch_diff(report)
+            .expect("artifact writes");
+    }
+
+    fn write_diff_json(cli: &Cli, candidate_ref: Option<&str>, base_ref: Option<&str>) {
+        let directory = cli.root.join(".phlo").join("transform");
+        std::fs::create_dir_all(&directory).expect("artifact dir");
+        std::fs::write(
+            directory.join("diff.json"),
+            serde_json::json!({
+                "schema_version": 1,
+                "diff": {
+                    "model": "m.a",
+                    "candidate_ref": candidate_ref,
+                    "base_ref": base_ref,
+                    "candidate_version": "v1",
+                    "passed": true,
+                }
+            })
+            .to_string(),
+        )
+        .expect("diff.json writes");
+    }
+
+    #[test]
+    fn audited_diff_rejects_an_artifact_for_other_refs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        let state = SqliteStateStore::in_memory().expect("state");
+
+        // A deep, passing diff — for the wrong pair — must not authorise this
+        // promotion, and its breaking changes must not leak in either.
+        let mut report = branch_report("ci/other", "main", true);
+        report.schema_changes.push(ModelSchemaDiff {
+            model: "m.a".to_string(),
+            changes: vec![SchemaChange {
+                column: "id".to_string(),
+                kind: "changed".to_string(),
+                detail: "removed".to_string(),
+                safety: "full_rebuild_required".to_string(),
+            }],
+        });
+        write_branch_diff(&cli, &report);
+
+        let (passed, rejected, breaking) = audited_diff(&cli, Some(&state), "ci/x", "main");
+        assert_eq!(passed, None);
+        let reason = rejected.expect("other-ref artifact must be rejected");
+        assert!(reason.contains("ci/other"), "{reason}");
+        assert!(breaking.is_empty());
+    }
+
+    #[test]
+    fn audited_diff_rejects_an_audit_against_another_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        let state = SqliteStateStore::in_memory().expect("state");
+
+        // Audited against `dev`; promoting to `main` must not consume it.
+        write_branch_diff(&cli, &branch_report("ci/x", "dev", true));
+
+        let (passed, rejected, _) = audited_diff(&cli, Some(&state), "ci/x", "main");
+        assert_eq!(passed, None);
+        let reason = rejected.expect("wrong-target artifact must be rejected");
+        assert!(reason.contains("dev"), "{reason}");
+    }
+
+    #[test]
+    fn audited_diff_requires_a_value_level_branch_diff() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        let state = SqliteStateStore::in_memory().expect("state");
+
+        // A shallow (schema + row-count) diff passes no data-diff verdict.
+        write_branch_diff(&cli, &branch_report("ci/x", "main", false));
+
+        let (passed, rejected, _) = audited_diff(&cli, Some(&state), "ci/x", "main");
+        assert_eq!(passed, None);
+        let reason = rejected.expect("shallow diff must not satisfy require-diff");
+        assert!(reason.contains("--full"), "{reason}");
+    }
+
+    #[test]
+    fn audited_diff_accepts_a_deep_diff_for_these_refs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        let state = SqliteStateStore::in_memory().expect("state");
+
+        write_branch_diff(&cli, &branch_report("ci/x", "main", true));
+
+        let (passed, rejected, _) = audited_diff(&cli, Some(&state), "ci/x", "main");
+        assert_eq!(passed, Some(true));
+        assert_eq!(rejected, None);
+    }
+
+    #[test]
+    fn audited_diff_rejects_a_stale_candidate_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        let state = SqliteStateStore::in_memory().expect("state");
+
+        let mut report = branch_report("ci/x", "main", true);
+        report.datasets.push(dataset("m.a", Some("v1")));
+        write_branch_diff(&cli, &report);
+
+        state
+            .record_materialized(&MaterializedRecord {
+                model_id: "m.a".to_string(),
+                environment: Some("ci/x".to_string()),
+                version: phlo_transform_core::ModelVersion {
+                    hash: "v2".to_string(),
+                    ..Default::default()
+                },
+                detail: None,
+                target: "cat.m.a".to_string(),
+                incremental_strategy: None,
+                incremental_key: None,
+                run_id: "run-1".to_string(),
+                materialized_at: "t".to_string(),
+            })
+            .expect("record materialised");
+
+        let (passed, rejected, _) = audited_diff(&cli, Some(&state), "ci/x", "main");
+        assert_eq!(passed, Some(true));
+        let reason = rejected.expect("stale artifact must be rejected");
+        assert!(reason.contains("stale"), "{reason}");
+    }
+
+    #[test]
+    fn audited_diff_rejects_a_model_diff_for_another_candidate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        let state = SqliteStateStore::in_memory().expect("state");
+
+        write_diff_json(&cli, Some("ci/old"), Some("main"));
+
+        let (_, rejected, _) = audited_diff(&cli, Some(&state), "ci/x", "main");
+        let reason = rejected.expect("other-candidate artifact must be rejected");
+        assert!(reason.contains("ci/old"), "{reason}");
+    }
+
+    #[test]
+    fn audited_diff_rejects_a_model_diff_for_another_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        let state = SqliteStateStore::in_memory().expect("state");
+
+        write_diff_json(&cli, Some("ci/x"), Some("dev"));
+
+        let (_, rejected, _) = audited_diff(&cli, Some(&state), "ci/x", "main");
+        let reason = rejected.expect("other-target artifact must be rejected");
+        assert!(reason.contains("dev"), "{reason}");
+    }
 }

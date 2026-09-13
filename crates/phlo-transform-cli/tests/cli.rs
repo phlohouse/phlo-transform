@@ -1655,3 +1655,62 @@ fn branch_diff_reports_datasets_missing_on_candidate() {
     assert_eq!(report["datasets"], report2["datasets"]);
     assert_eq!(report["rows"], report2["rows"]);
 }
+
+#[test]
+fn model_diff_rejects_from_flag() {
+    // `--from` means the branch-diff candidate; a model diff's candidate comes
+    // from `--ref`.
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "diff",
+        "assay.results",
+        "--from",
+        "ci/x",
+    ]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("--ref"), "{}", stderr(&output));
+}
+
+#[test]
+fn branch_diff_rejects_model_only_flags() {
+    for (flag, value) in [
+        ("--base", "dev"),
+        ("--base-relation", "cat.sch.tbl"),
+        ("--partition", "dt"),
+        ("--sample", "0.5"),
+    ] {
+        let output = run(&[
+            "--root",
+            "fixtures/basic-multi-root",
+            "diff",
+            "--from",
+            "ci/x",
+            flag,
+            value,
+        ]);
+        assert!(!output.status.success(), "{flag}");
+        assert!(
+            stderr(&output).contains("model diffs"),
+            "{flag}: {}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn promote_rejects_disagreeing_candidates() {
+    let output = Command::cargo_bin("phlo-transform")
+        .expect("binary builds")
+        .current_dir(workspace_root())
+        .env_remove("PHLO_NESSIE_ENDPOINT")
+        .args(["promote", "ci/a", "--from", "ci/b", "--to", "main"])
+        .output()
+        .expect("command runs");
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("candidate given twice"),
+        "{}",
+        stderr(&output)
+    );
+}

@@ -1069,7 +1069,7 @@ phlo transform promote feature/new-assay --to main
 phlo transform promote --from feature/new-assay --to main
 ```
 
-Promotion is authorised by named gates, reported identically in human and JSON output: `run` (latest candidate run passed), `tests` (no failed tests), `blocked` (no blocked/cancelled work), `schema` (no unwaived breaking changes), `data_diff` (a fresh, passing audited diff when `--require-diff` is set), `base` (target unchanged since provisioning) and `conflicts` (the merge check is clean). `--check` evaluates gates without merging; a passing promotion merges and persists a `PromotionRecord` (refs, hashes, plan/run ids, gate results, timestamp) in the state store.
+Promotion is authorised by named gates, reported identically in human and JSON output: `run` (latest candidate run passed), `tests` (no failed tests), `blocked` (no blocked/cancelled model or seed work), `schema` (no unwaived breaking changes), `data_diff` (when `--require-diff` is set: a passing `--full` audited diff bound to this candidate→target pair and still fresh), `base` (target unchanged since provisioning; the merge asserts the evaluated target hash) and `conflicts` (the merge check is clean). `--check` evaluates gates without merging; a passing promotion merges and persists a `PromotionRecord` (refs, hashes, plan/run ids, gate results, timestamp) in the state store.
 
 Preconditions may include successful plan, successful execution, required tests passing, no blocking schema changes, no stale state and optional approval.
 

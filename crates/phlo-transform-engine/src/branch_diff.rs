@@ -32,7 +32,7 @@ use crate::adapter::Adapter;
 use crate::diff::{
     compare_column_lists, diff, DiffReport, DiffRequest, DiffStrategy, SchemaChange,
 };
-use crate::error::EngineError;
+use crate::error::{AdapterError, EngineError};
 use crate::state::{MaterializedRecord, SeedRecord, StateStore};
 use crate::util::now_rfc3339;
 
@@ -75,7 +75,7 @@ pub struct DatasetDiff {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_relation: Option<String>,
     /// Upstream model dependencies — the lineage hook for graph diffs.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upstream: Vec<String>,
 }
 
@@ -126,14 +126,19 @@ pub struct BranchDiffReport {
     /// materialisations, sorted by name.
     pub datasets: Vec<DatasetDiff>,
     /// Column-level changes for datasets present on at least one side.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schema_changes: Vec<ModelSchemaDiff>,
     /// Row counts for datasets present on at least one side.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rows: Vec<ModelRowDiff>,
     /// Deep per-model data diffs for changed models (only when `deep`).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diffs: Vec<DiffReport>,
+    /// Whether value-level diffs ran (`diff --full`). A shallow report
+    /// compared schema and row counts only — no data-diff policies were
+    /// evaluated, so it cannot satisfy a required data-diff audit.
+    #[serde(default)]
+    pub deep: bool,
     /// All deep diffs passed their policies (vacuously true without `deep`).
     pub passed: bool,
     pub started_at: String,
@@ -379,6 +384,9 @@ pub async fn branch_diff(
     }
 
     // Deep mode: keyed value diffs for changed models that declare keys.
+    // A keyless model is skipped only when it declares no diff policy — a
+    // declared policy (`require_keyed_diff`, row thresholds, ...) must be
+    // evaluated, not silently skipped.
     let mut diffs = Vec::new();
     if request.deep {
         for dataset in &datasets {
@@ -389,7 +397,7 @@ pub async fn branch_diff(
                 continue;
             };
             let key_columns = model_keys(model);
-            if key_columns.is_empty() {
+            if key_columns.is_empty() && model.config.diff.is_none() {
                 continue;
             }
             let resolved = relations.get(&dataset.dataset).unwrap();
@@ -444,6 +452,7 @@ pub async fn branch_diff(
         schema_changes,
         rows,
         diffs,
+        deep: request.deep,
         passed,
         started_at,
         finished_at: now_rfc3339(),
@@ -524,10 +533,20 @@ async fn row_count(adapter: &dyn Adapter, relation: &Relation) -> Result<i64, En
         .execute(&format!("SELECT count(*) FROM {}", relation.sql()))
         .await
         .map_err(EngineError::Adapter)?;
-    Ok(result
+    let value = result
         .rows
         .first()
         .and_then(|row| row.first())
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0))
+        .ok_or_else(|| {
+            EngineError::Adapter(AdapterError::new(
+                "MALFORMED_RESULT",
+                "count query returned no rows",
+            ))
+        })?;
+    value.parse().map_err(|_| {
+        EngineError::Adapter(AdapterError::new(
+            "MALFORMED_RESULT",
+            format!("count query returned non-numeric value `{value}`"),
+        ))
+    })
 }

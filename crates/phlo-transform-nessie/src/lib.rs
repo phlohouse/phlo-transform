@@ -235,11 +235,14 @@ impl NessieClient for InMemoryNessie {
         Ok(MergeOutcome::clean(source.hash))
     }
 
-    async fn can_merge(&self, from_ref: &str, _to_ref: &str) -> Result<MergeOutcome, NessieError> {
+    async fn can_merge(&self, from_ref: &str, to_ref: &str) -> Result<MergeOutcome, NessieError> {
         let references = self.references.lock().unwrap();
         let source = references
             .get(from_ref)
             .ok_or_else(|| NessieError::NotFound(from_ref.to_string()))?;
+        if !references.contains_key(to_ref) {
+            return Err(NessieError::NotFound(to_ref.to_string()));
+        }
         Ok(MergeOutcome::clean(source.hash.clone()))
     }
 
@@ -438,43 +441,15 @@ impl NessieClient for NessieRestClient {
         to_ref: &str,
         expected_target_hash: Option<&str>,
     ) -> Result<MergeOutcome, NessieError> {
-        let target = match expected_target_hash {
-            Some(hash) => format!("{}@{hash}", encode(to_ref)),
-            None => encode(to_ref),
-        };
-        let body = serde_json::json!({
-            "fromRefName": from_ref,
-            "fromHash": from_hash,
-        });
-        let response = self
-            .send(
-                self.request(
-                    reqwest::Method::POST,
-                    &format!("/trees/{target}/history/merge"),
-                )
-                .json(&body),
-            )
-            .await?;
-        let status = response.status();
-        let payload = response.text().await.unwrap_or_default();
-        let parsed: Result<MergeResponse, _> = serde_json::from_str(&payload);
-        match parsed {
-            Ok(merge) => Ok(merge_outcome(merge, &payload)),
-            Err(_) if status == reqwest::StatusCode::CONFLICT => Ok(MergeOutcome::conflict(
-                to_ref,
-                format!("merge conflict: {payload}"),
-            )),
-            Err(error) => Err(NessieError::Remote(format!("HTTP {status}: {error}"))),
-        }
+        self.post_merge(from_ref, from_hash, to_ref, expected_target_hash, false)
+            .await
     }
 
-    async fn can_merge(&self, from_ref: &str, _to_ref: &str) -> Result<MergeOutcome, NessieError> {
-        // Non-destructive optimistic check; the real merge reports conflicts.
-        let from = self
-            .get_reference(from_ref)
-            .await?
-            .ok_or_else(|| NessieError::NotFound(from_ref.to_string()))?;
-        Ok(MergeOutcome::clean(from.hash))
+    async fn can_merge(&self, from_ref: &str, to_ref: &str) -> Result<MergeOutcome, NessieError> {
+        // Nessie's `dryRun` merge runs the real conflict detection without
+        // committing — the `conflicts` promotion gate sees actual conflicts,
+        // not just that the source ref resolves.
+        self.post_merge(from_ref, None, to_ref, None, true).await
     }
 
     async fn assign_reference(&self, name: &str, hash: &str) -> Result<ReferenceInfo, NessieError> {
@@ -493,6 +468,46 @@ impl NessieClient for NessieRestClient {
             )
             .await?;
         Ok(response.reference)
+    }
+}
+
+impl NessieRestClient {
+    /// POST the merge endpoint. `dry_run` asks Nessie to evaluate the merge —
+    /// including conflict details — without committing it.
+    async fn post_merge(
+        &self,
+        from_ref: &str,
+        from_hash: Option<&str>,
+        to_ref: &str,
+        expected_target_hash: Option<&str>,
+        dry_run: bool,
+    ) -> Result<MergeOutcome, NessieError> {
+        let target = match expected_target_hash {
+            Some(hash) => format!("{}@{hash}", encode(to_ref)),
+            None => encode(to_ref),
+        };
+        let mut path = format!("/trees/{target}/history/merge?returnConflictDetailsAsResult=true");
+        if dry_run {
+            path.push_str("&dryRun=true");
+        }
+        let body = serde_json::json!({
+            "fromRefName": from_ref,
+            "fromHash": from_hash,
+        });
+        let response = self
+            .send(self.request(reqwest::Method::POST, &path).json(&body))
+            .await?;
+        let status = response.status();
+        let payload = response.text().await.unwrap_or_default();
+        let parsed: Result<MergeResponse, _> = serde_json::from_str(&payload);
+        match parsed {
+            Ok(merge) => Ok(merge_outcome(merge, &payload)),
+            Err(_) if status == reqwest::StatusCode::CONFLICT => Ok(MergeOutcome::conflict(
+                to_ref,
+                format!("merge conflict: {payload}"),
+            )),
+            Err(error) => Err(NessieError::Remote(format!("HTTP {status}: {error}"))),
+        }
     }
 }
 

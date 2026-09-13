@@ -193,8 +193,8 @@ impl Relation {
         }
     }
 
-    /// Parse the `display`/`sql` dotted form back: `catalog.schema.table` or
-    /// `schema.table`.
+    /// Parse the `display` dotted form back: `catalog.schema.table` or
+    /// `schema.table`. (`sql()` output is quoted and does not round-trip.)
     pub fn parse(spec: &str) -> Result<Relation, String> {
         let parts: Vec<&str> = spec.split('.').collect();
         match parts.as_slice() {

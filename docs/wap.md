@@ -108,25 +108,33 @@ PASS conflicts  — candidate merges cleanly
 
 - `run` — the candidate's latest recorded run finished fully passed.
 - `tests` — no test in that run failed.
-- `blocked` — no model was left blocked or cancelled.
+- `blocked` — no model or seed was left blocked or cancelled.
 - `schema` — the audited diff found no breaking schema changes, or they were
   waived with `--allow-breaking-schema`.
 - `data_diff` — only evaluated with `--require-diff`; the audited diff
-  (`branch_diff.json`, or `diff.json` for a single model) must exist, pass its
-  policies and still be fresh (its recorded candidate versions match the
-  candidate's current materialisations).
+  (`branch_diff.json` from a `--full` branch diff, or `diff.json` for a
+  single model) must exist, pass its policies, cover this exact
+  candidate→target pair, and still be fresh (its recorded candidate versions
+  match the candidate's current materialisations). A shallow branch diff —
+  schema and row counts only, no value-level policies — does not satisfy it.
 - `base` — the target's hash still equals the hash recorded when the
   candidate was provisioned. A target that advanced fails this gate; the
-  merge itself also carries the expected hash so a racing commit is rejected
-  by Nessie rather than silently merged.
-- `conflicts` — a non-destructive `can_merge` check reported no conflicts.
+  merge itself asserts the hash the gates were evaluated against (the
+  recorded base hash, or the hash resolved at promotion time when none was
+  recorded) so a racing commit is rejected by Nessie rather than silently
+  merged.
+- `conflicts` — a non-destructive merge check reported no conflicts. Against
+  a real Nessie this is the server's `dryRun` merge: the same conflict
+  detection the merge performs, without committing anything.
 
 `--check` evaluates and prints the gates without merging. A promotion that
 passes every gate merges, writes `promotion.json` to `.phlo/transform/` and
 persists the record in the state store's `promotions` table — promotion id,
 candidate/target refs and hashes, plan/run ids, gate results, merged flag,
 conflicts, timestamp — for later APIs and audit. With `--cleanup`, the
-candidate branch and its catalog are removed after a successful merge only.
+candidate branch and its catalog are removed after a successful merge only;
+a cleanup failure is reported and fails the command (the promotion record
+already persisted still shows the merge succeeded).
 
 ## Rollback
 

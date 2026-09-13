@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use phlo_transform_nessie::MergeOutcome;
 
 use crate::events::ExecutionStatus;
-use crate::state::{ModelRunRecord, RunSummary, TestRunRecord};
+use crate::state::{ModelRunRecord, RunSummary, SeedRunRecord, TestRunRecord};
 
 /// A single gate result.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +50,8 @@ pub struct GateInput {
     pub run: Option<RunSummary>,
     /// Model records of that run.
     pub model_runs: Vec<ModelRunRecord>,
+    /// Seed records of that run.
+    pub seed_runs: Vec<SeedRunRecord>,
     /// Test records of that run.
     pub test_runs: Vec<TestRunRecord>,
     /// Whether a passing data diff is required.
@@ -138,8 +140,8 @@ pub fn evaluate_gates(input: &GateInput) -> GateReport {
         ));
     }
 
-    // blocked: no blocked or cancelled model work may remain.
-    let blocked: Vec<&ModelRunRecord> = input
+    // blocked: no blocked or cancelled model or seed work may remain.
+    let blocked: Vec<String> = input
         .model_runs
         .iter()
         .filter(|record| {
@@ -148,6 +150,19 @@ pub fn evaluate_gates(input: &GateInput) -> GateReport {
                 ExecutionStatus::Blocked | ExecutionStatus::Cancelled
             )
         })
+        .map(|record| record.model_id.clone())
+        .chain(
+            input
+                .seed_runs
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.status,
+                        ExecutionStatus::Blocked | ExecutionStatus::Cancelled
+                    )
+                })
+                .map(|record| record.name.clone()),
+        )
         .collect();
     if input.run.is_none() {
         results.push(gate("blocked", false, "no run to audit".to_string()));
@@ -158,13 +173,9 @@ pub fn evaluate_gates(input: &GateInput) -> GateReport {
             "blocked",
             false,
             format!(
-                "{} models blocked or cancelled: {}",
+                "{} blocked or cancelled: {}",
                 blocked.len(),
-                blocked
-                    .iter()
-                    .map(|record| record.model_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                blocked.join(", ")
             ),
         ));
     }
