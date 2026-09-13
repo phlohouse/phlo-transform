@@ -1153,11 +1153,10 @@ fn audited_diff(
             }
         }
         // The artifact is stale when a dataset's recorded candidate version
-        // no longer matches the candidate's current materialisation.
+        // no longer matches the candidate's current materialisation — or when
+        // a dataset that had no candidate materialisation at diff time has one
+        // now (it stopped being `removed`/`absent` since the audit).
         for dataset in &report.datasets {
-            let Some(version) = &dataset.candidate_version else {
-                continue;
-            };
             let current = match dataset.kind {
                 phlo_transform_engine::DatasetKind::Model => state
                     .materialized_version(&dataset.dataset, Some(candidate))
@@ -1170,7 +1169,7 @@ fn audited_diff(
                     .flatten()
                     .map(|record| record.content_hash),
             };
-            if current.as_deref() != Some(version.as_str()) {
+            if current != dataset.candidate_version {
                 rejected = Some(format!(
                     "branch diff is stale: `{}` changed on the candidate since the diff",
                     dataset.dataset

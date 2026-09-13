@@ -232,8 +232,7 @@ pub trait StateStore: Send + Sync {
         environment: Option<&str>,
     ) -> Result<Vec<MaterializedRecord>, EngineError>;
 
-    /// Record a promotion (or a `--check` evaluation) for audit and later
-    /// APIs.
+    /// Record a promotion for audit and later APIs.
     fn record_promotion(
         &self,
         record: &crate::promotion::PromotionRecord,
