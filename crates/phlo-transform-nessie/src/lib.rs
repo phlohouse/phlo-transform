@@ -101,6 +101,9 @@ pub enum NessieError {
 pub trait NessieClient: Send + Sync {
     async fn get_reference(&self, name: &str) -> Result<Option<ReferenceInfo>, NessieError>;
 
+    /// Every reference (branches and tags), sorted by name.
+    async fn list_references(&self) -> Result<Vec<ReferenceInfo>, NessieError>;
+
     /// Create `name` from an existing reference (its name and hash).
     async fn create_branch(
         &self,
@@ -155,6 +158,13 @@ impl InMemoryNessie {
 impl NessieClient for InMemoryNessie {
     async fn get_reference(&self, name: &str) -> Result<Option<ReferenceInfo>, NessieError> {
         Ok(self.references.lock().unwrap().get(name).cloned())
+    }
+
+    async fn list_references(&self) -> Result<Vec<ReferenceInfo>, NessieError> {
+        let mut references: Vec<ReferenceInfo> =
+            self.references.lock().unwrap().values().cloned().collect();
+        references.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(references)
     }
 
     async fn create_branch(
@@ -225,11 +235,14 @@ impl NessieClient for InMemoryNessie {
         Ok(MergeOutcome::clean(source.hash))
     }
 
-    async fn can_merge(&self, from_ref: &str, _to_ref: &str) -> Result<MergeOutcome, NessieError> {
+    async fn can_merge(&self, from_ref: &str, to_ref: &str) -> Result<MergeOutcome, NessieError> {
         let references = self.references.lock().unwrap();
         let source = references
             .get(from_ref)
             .ok_or_else(|| NessieError::NotFound(from_ref.to_string()))?;
+        if !references.contains_key(to_ref) {
+            return Err(NessieError::NotFound(to_ref.to_string()));
+        }
         Ok(MergeOutcome::clean(source.hash.clone()))
     }
 
@@ -323,6 +336,12 @@ struct SingleReferenceResponse {
 }
 
 #[derive(Deserialize)]
+struct ReferencesResponse {
+    #[serde(default)]
+    references: Vec<ReferenceInfo>,
+}
+
+#[derive(Deserialize)]
 struct MergeResponse {
     #[serde(rename = "wasSuccessful", default)]
     was_successful: bool,
@@ -336,8 +355,10 @@ struct MergeResponse {
 struct MergeDetail {
     #[serde(default)]
     key: Option<MergeKey>,
-    #[serde(rename = "conflictType", default)]
-    conflict: Option<String>,
+    /// Nessie reports a conflict object (`conflictType`, `message`, `key`);
+    /// tolerate a bare string for older shapes.
+    #[serde(default)]
+    conflict: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -359,6 +380,15 @@ impl NessieClient for NessieRestClient {
             Err(NessieError::NotFound(_)) => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    async fn list_references(&self) -> Result<Vec<ReferenceInfo>, NessieError> {
+        let response: ReferencesResponse = self
+            .json(self.request(reqwest::Method::GET, "/trees"))
+            .await?;
+        let mut references = response.references;
+        references.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(references)
     }
 
     async fn create_branch(
@@ -384,10 +414,16 @@ impl NessieClient for NessieRestClient {
     }
 
     async fn delete_branch(&self, name: &str) -> Result<(), NessieError> {
+        // Nessie v2 deletes `name@hash`: resolve first so we delete exactly
+        // the observed hash rather than whatever the name has moved to.
+        let reference = self
+            .get_reference(name)
+            .await?
+            .ok_or_else(|| NessieError::NotFound(name.to_string()))?;
         let response = self
             .send(self.request(
                 reqwest::Method::DELETE,
-                &format!("/trees/{}?type=BRANCH", encode(name)),
+                &format!("/trees/{}@{}?type=BRANCH", encode(name), reference.hash),
             ))
             .await?;
         if response.status().is_success() {
@@ -407,43 +443,16 @@ impl NessieClient for NessieRestClient {
         to_ref: &str,
         expected_target_hash: Option<&str>,
     ) -> Result<MergeOutcome, NessieError> {
-        let target = match expected_target_hash {
-            Some(hash) => format!("{}@{hash}", encode(to_ref)),
-            None => encode(to_ref),
-        };
-        let body = serde_json::json!({
-            "fromRefName": from_ref,
-            "fromHash": from_hash,
-        });
-        let response = self
-            .send(
-                self.request(
-                    reqwest::Method::POST,
-                    &format!("/trees/{target}/history/merge"),
-                )
-                .json(&body),
-            )
-            .await?;
-        let status = response.status();
-        let payload = response.text().await.unwrap_or_default();
-        let parsed: Result<MergeResponse, _> = serde_json::from_str(&payload);
-        match parsed {
-            Ok(merge) => Ok(merge_outcome(merge, &payload)),
-            Err(_) if status == reqwest::StatusCode::CONFLICT => Ok(MergeOutcome::conflict(
-                to_ref,
-                format!("merge conflict: {payload}"),
-            )),
-            Err(error) => Err(NessieError::Remote(format!("HTTP {status}: {error}"))),
-        }
+        self.post_merge(from_ref, from_hash, to_ref, expected_target_hash, false)
+            .await
     }
 
-    async fn can_merge(&self, from_ref: &str, _to_ref: &str) -> Result<MergeOutcome, NessieError> {
-        // Non-destructive optimistic check; the real merge reports conflicts.
-        let from = self
-            .get_reference(from_ref)
-            .await?
-            .ok_or_else(|| NessieError::NotFound(from_ref.to_string()))?;
-        Ok(MergeOutcome::clean(from.hash))
+    async fn can_merge(&self, from_ref: &str, to_ref: &str) -> Result<MergeOutcome, NessieError> {
+        // Nessie's `dryRun` merge runs the real conflict detection without
+        // committing — the `conflicts` promotion gate sees actual conflicts,
+        // not just that the source ref resolves. `post_merge` pins the
+        // source's current head when no hash is given.
+        self.post_merge(from_ref, None, to_ref, None, true).await
     }
 
     async fn assign_reference(&self, name: &str, hash: &str) -> Result<ReferenceInfo, NessieError> {
@@ -465,6 +474,68 @@ impl NessieClient for NessieRestClient {
     }
 }
 
+impl NessieRestClient {
+    /// POST the merge endpoint. `dry_run` asks Nessie to evaluate the merge —
+    /// including conflict details — without committing it.
+    async fn post_merge(
+        &self,
+        from_ref: &str,
+        from_hash: Option<&str>,
+        to_ref: &str,
+        expected_target_hash: Option<&str>,
+        dry_run: bool,
+    ) -> Result<MergeOutcome, NessieError> {
+        // Nessie requires both hashes on a merge; resolve each ref's head
+        // when the caller did not pin one.
+        let expected_target_hash = match expected_target_hash {
+            Some(hash) => hash.to_string(),
+            None => {
+                self.get_reference(to_ref)
+                    .await?
+                    .ok_or_else(|| NessieError::NotFound(to_ref.to_string()))?
+                    .hash
+            }
+        };
+        let from_hash = match from_hash {
+            Some(hash) => hash.to_string(),
+            None => {
+                self.get_reference(from_ref)
+                    .await?
+                    .ok_or_else(|| NessieError::NotFound(from_ref.to_string()))?
+                    .hash
+            }
+        };
+        let path = format!(
+            "/trees/{}@{expected_target_hash}/history/merge",
+            encode(to_ref)
+        );
+        // The merge flags live in the request body as `is*` fields — the
+        // documented `dryRun`/`returnConflictDetailsAsResult` query params
+        // are silently ignored by the server (projectnessie/nessie#12130),
+        // which would turn a merge *check* into a real merge.
+        let body = serde_json::json!({
+            "fromRefName": from_ref,
+            "fromHash": from_hash,
+            "isDryRun": dry_run,
+            "isReturnConflictAsResult": true,
+        });
+        let response = self
+            .send(self.request(reqwest::Method::POST, &path).json(&body))
+            .await?;
+        let status = response.status();
+        let payload = response.text().await.unwrap_or_default();
+        let parsed: Result<MergeResponse, _> = serde_json::from_str(&payload);
+        match parsed {
+            Ok(merge) => Ok(merge_outcome(merge, &payload)),
+            Err(_) if status == reqwest::StatusCode::CONFLICT => Ok(MergeOutcome::conflict(
+                to_ref,
+                format!("merge conflict: {payload}"),
+            )),
+            Err(error) => Err(NessieError::Remote(format!("HTTP {status}: {error}"))),
+        }
+    }
+}
+
 /// Percent-encode a reference name for use in a path or query component.
 fn encode(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
@@ -483,15 +554,22 @@ fn merge_outcome(merge: MergeResponse, raw: &str) -> MergeOutcome {
         .details
         .into_iter()
         .filter_map(|detail| {
-            let kind = detail.conflict?;
+            let conflict = detail.conflict?;
             let path = detail
                 .key
                 .map(|key| key.elements.join("."))
                 .unwrap_or_default();
-            Some(Conflict {
-                path,
-                message: kind,
-            })
+            let message = match &conflict {
+                serde_json::Value::String(kind) => kind.clone(),
+                serde_json::Value::Object(fields) => fields
+                    .get("message")
+                    .and_then(|message| message.as_str())
+                    .or_else(|| fields.get("conflictType").and_then(|kind| kind.as_str()))
+                    .unwrap_or("merge conflict")
+                    .to_string(),
+                _ => "merge conflict".to_string(),
+            };
+            Some(Conflict { path, message })
         })
         .collect();
     if !merge.was_successful && conflicts.is_empty() {
@@ -544,6 +622,56 @@ mod tests {
         assert_eq!(
             nessie.get_reference("main").await.unwrap().unwrap().hash,
             "aaa"
+        );
+    }
+
+    #[test]
+    fn merge_outcome_parses_object_and_string_conflicts() {
+        // Current Nessie reports conflicts as objects; older shapes sent a
+        // bare string. Both must surface as conflicts, not a clean merge.
+        let object_shape: MergeResponse = serde_json::from_str(
+            r#"{
+                "wasSuccessful": false,
+                "details": [
+                    {
+                        "key": {"elements": ["assay", "results"]},
+                        "conflict": {
+                            "conflictType": "KEY_DIFFERS",
+                            "message": "key differs between source and target",
+                            "key": "assay.results"
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+        let outcome = merge_outcome(object_shape, "{}");
+        assert!(!outcome.is_clean());
+        assert_eq!(outcome.conflicts[0].path, "assay.results");
+        assert_eq!(
+            outcome.conflicts[0].message,
+            "key differs between source and target"
+        );
+
+        let string_shape: MergeResponse = serde_json::from_str(
+            r#"{
+                "wasSuccessful": false,
+                "details": [{"conflict": "VALUE_DIFFERS"}]
+            }"#,
+        )
+        .unwrap();
+        let outcome = merge_outcome(string_shape, "{}");
+        assert!(!outcome.is_clean());
+        assert_eq!(outcome.conflicts[0].message, "VALUE_DIFFERS");
+
+        // A failure with no parseable conflict still fails, generically.
+        let bare: MergeResponse =
+            serde_json::from_str(r#"{"wasSuccessful": false, "details": []}"#).unwrap();
+        let outcome = merge_outcome(bare, "server said no");
+        assert!(!outcome.is_clean());
+        assert_eq!(
+            outcome.conflicts[0].message,
+            "merge was not applied: server said no"
         );
     }
 }

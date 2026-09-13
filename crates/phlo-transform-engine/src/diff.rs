@@ -7,16 +7,16 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use phlo_transform_core::{ColumnTolerance, DataType, Relation};
 
 use crate::adapter::Adapter;
-use crate::error::EngineError;
+use crate::error::{AdapterError, EngineError};
 use crate::util::now_rfc3339;
 
 /// How a diff compares data.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffStrategy {
     Keyed,
@@ -42,7 +42,7 @@ pub struct DiffPolicy {
 }
 
 /// A single policy evaluation result.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PolicyResult {
     pub policy: String,
     pub passed: bool,
@@ -69,7 +69,7 @@ pub struct DiffRequest {
 }
 
 /// Row-level summary.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RowSummary {
     pub base_rows: i64,
     pub candidate_rows: i64,
@@ -81,7 +81,7 @@ pub struct RowSummary {
 }
 
 /// A schema change included in the diff.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SchemaChange {
     pub column: String,
     pub kind: String,
@@ -90,7 +90,7 @@ pub struct SchemaChange {
 }
 
 /// A structured diff report.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiffReport {
     pub diff_id: String,
     pub model: String,
@@ -104,15 +104,15 @@ pub struct DiffReport {
     pub coverage: String,
     pub key_columns: Vec<String>,
     pub row_summary: RowSummary,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub column_changes: BTreeMap<String, i64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schema_changes: Vec<SchemaChange>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partitions_added: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partitions_removed: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partitions_changed: Vec<String>,
     pub policy_results: Vec<PolicyResult>,
     pub passed: bool,
@@ -263,7 +263,7 @@ async fn row_count(adapter: &dyn Adapter, relation_sql: &str) -> Result<i64, Eng
         .execute(&format!("SELECT count(*) FROM {relation_sql}"))
         .await
         .map_err(EngineError::Adapter)?;
-    Ok(first_cell_i64(&result.rows))
+    first_cell_i64(&result.rows)
 }
 
 fn change_predicate(column: &str, tolerance: Option<&ColumnTolerance>) -> String {
@@ -322,8 +322,13 @@ async fn keyed_counts(
         join.join(" AND "),
     );
     let result = adapter.execute(&sql).await.map_err(EngineError::Adapter)?;
-    let row = result.rows.first().cloned().unwrap_or_default();
-    Ok((cell(&row, 0), cell(&row, 1), cell(&row, 2), cell(&row, 3)))
+    let row = result.rows.first().ok_or_else(|| {
+        EngineError::Adapter(AdapterError::new(
+            "MALFORMED_RESULT",
+            "count query returned no rows",
+        ))
+    })?;
+    Ok((cell(row, 0)?, cell(row, 1)?, cell(row, 2)?, cell(row, 3)?))
 }
 
 async fn column_changed(
@@ -344,7 +349,7 @@ async fn column_changed(
         join.join(" AND "),
     );
     let result = adapter.execute(&sql).await.map_err(EngineError::Adapter)?;
-    Ok(first_cell_i64(&result.rows))
+    first_cell_i64(&result.rows)
 }
 
 async fn partition_summary(
@@ -431,37 +436,57 @@ fn partition_delta(
 }
 
 async fn schema_changes(adapter: &dyn Adapter, request: &DiffRequest) -> Vec<SchemaChange> {
-    let Ok(candidate) = adapter.relation_columns(&request.candidate_relation).await else {
+    compare_columns(adapter, &request.candidate_relation, &request.base_relation).await
+}
+
+/// Column-level comparison of two relations: added/removed columns, type
+/// changes and nullability changes. Empty when either side's columns cannot
+/// be read.
+pub(crate) async fn compare_columns(
+    adapter: &dyn Adapter,
+    candidate: &phlo_transform_core::Relation,
+    base: &phlo_transform_core::Relation,
+) -> Vec<SchemaChange> {
+    let Ok(candidate_columns) = adapter.relation_columns(candidate).await else {
         return Vec::new();
     };
-    let Ok(base) = adapter.relation_columns(&request.base_relation).await else {
+    let Ok(base_columns) = adapter.relation_columns(base).await else {
         return Vec::new();
     };
-    if candidate.is_empty() && base.is_empty() {
+    compare_column_lists(&candidate_columns, &base_columns)
+}
+
+/// Column-level comparison of two column lists — usable when only one side
+/// exists (pass an empty list for the absent side).
+pub(crate) fn compare_column_lists(
+    candidate_columns: &[crate::adapter::ColumnInfo],
+    base_columns: &[crate::adapter::ColumnInfo],
+) -> Vec<SchemaChange> {
+    if candidate_columns.is_empty() && base_columns.is_empty() {
         return Vec::new();
     }
 
-    let candidate_types: BTreeMap<String, DataType> = candidate
+    let candidate_types: BTreeMap<String, (DataType, bool)> = candidate_columns
         .iter()
         .map(|column| {
             (
                 column.name.clone(),
-                DataType::parse_trino(&column.data_type),
+                (DataType::parse_trino(&column.data_type), column.nullable),
             )
         })
         .collect();
-    let base_types: BTreeMap<String, DataType> = base
+    let base_types: BTreeMap<String, (DataType, bool)> = base_columns
         .iter()
         .map(|column| {
             (
                 column.name.clone(),
-                DataType::parse_trino(&column.data_type),
+                (DataType::parse_trino(&column.data_type), column.nullable),
             )
         })
         .collect();
 
     let mut changes = Vec::new();
-    for (name, base_type) in &base_types {
+    for (name, (base_type, base_nullable)) in &base_types {
         match candidate_types.get(name) {
             None => changes.push(SchemaChange {
                 column: name.clone(),
@@ -469,20 +494,41 @@ async fn schema_changes(adapter: &dyn Adapter, request: &DiffRequest) -> Vec<Sch
                 detail: format!("{base_type} removed"),
                 safety: "full_rebuild_required".to_string(),
             }),
-            Some(candidate_type) if candidate_type != base_type => changes.push(SchemaChange {
-                column: name.clone(),
-                kind: "changed".to_string(),
-                detail: format!("{base_type} -> {candidate_type}"),
-                safety: if candidate_type.is_numeric() && base_type.is_numeric() {
-                    "review".to_string()
-                } else {
-                    "error".to_string()
-                },
-            }),
-            Some(_) => {}
+            Some((candidate_type, candidate_nullable)) => {
+                // Type and nullability are independent changes — a column
+                // that moved on both reports both.
+                if candidate_type != base_type {
+                    changes.push(SchemaChange {
+                        column: name.clone(),
+                        kind: "changed".to_string(),
+                        detail: format!("{base_type} -> {candidate_type}"),
+                        safety: if candidate_type.is_numeric() && base_type.is_numeric() {
+                            "review".to_string()
+                        } else {
+                            "error".to_string()
+                        },
+                    });
+                }
+                if candidate_nullable != base_nullable {
+                    changes.push(SchemaChange {
+                        column: name.clone(),
+                        kind: "nullability".to_string(),
+                        detail: if *candidate_nullable {
+                            "not null -> nullable".to_string()
+                        } else {
+                            "nullable -> not null".to_string()
+                        },
+                        safety: if *candidate_nullable {
+                            "safe".to_string()
+                        } else {
+                            "review".to_string()
+                        },
+                    });
+                }
+            }
         }
     }
-    for (name, candidate_type) in &candidate_types {
+    for (name, (candidate_type, _)) in &candidate_types {
         if !base_types.contains_key(name) {
             changes.push(SchemaChange {
                 column: name.clone(),
@@ -502,47 +548,66 @@ fn evaluate_policy(
     summary: &RowSummary,
 ) -> Vec<PolicyResult> {
     let mut results = Vec::new();
+    // Row-level counts only exist when the keyed path ran — aggregate or
+    // partition coverage leaves added/removed/modified unmeasured, and a
+    // threshold that was never measured must fail rather than pass on a
+    // vacuous zero.
+    let measured = !request.key_columns.is_empty()
+        && !matches!(request.strategy, DiffStrategy::Partition { .. });
+    let row_policy =
+        |name: &'static str, metric: &'static str, value: i64, max: i64| PolicyResult {
+            policy: name.to_string(),
+            passed: measured && value <= max,
+            detail: if measured {
+                format!("{metric} {value} (max {max})")
+            } else {
+                format!("{metric} cannot be measured without keyed row counts")
+            },
+        };
     if let Some(max) = policy.max_added_rows {
-        results.push(PolicyResult {
-            policy: "max_added_rows".to_string(),
-            passed: summary.added <= max,
-            detail: format!("added {} (max {max})", summary.added),
-        });
+        results.push(row_policy("max_added_rows", "added", summary.added, max));
     }
     if let Some(max) = policy.max_removed_rows {
-        results.push(PolicyResult {
-            policy: "max_removed_rows".to_string(),
-            passed: summary.removed <= max,
-            detail: format!("removed {} (max {max})", summary.removed),
-        });
+        results.push(row_policy(
+            "max_removed_rows",
+            "removed",
+            summary.removed,
+            max,
+        ));
     }
     if let Some(max) = policy.max_modified_rows {
-        results.push(PolicyResult {
-            policy: "max_modified_rows".to_string(),
-            passed: summary.modified <= max,
-            detail: format!("modified {} (max {max})", summary.modified),
-        });
+        results.push(row_policy(
+            "max_modified_rows",
+            "modified",
+            summary.modified,
+            max,
+        ));
     }
     if let Some(max_fraction) = policy.max_changed_fraction {
         let base = summary.base_rows.max(1) as f64;
         let fraction = (summary.added + summary.removed + summary.modified) as f64 / base;
         results.push(PolicyResult {
             policy: "max_changed_fraction".to_string(),
-            passed: fraction <= max_fraction,
-            detail: format!("changed fraction {fraction:.4} (max {max_fraction})"),
+            passed: measured && fraction <= max_fraction,
+            detail: if measured {
+                format!("changed fraction {fraction:.4} (max {max_fraction})")
+            } else {
+                "changed fraction cannot be measured without keyed row counts".to_string()
+            },
         });
     }
     if policy.require_keyed_diff {
         results.push(PolicyResult {
             policy: "require_keyed_diff".to_string(),
-            passed: !request.key_columns.is_empty(),
+            passed: measured,
             detail: "a stable key is required for keyed diffing".to_string(),
         });
     }
     if policy.require_full_diff {
         results.push(PolicyResult {
             policy: "require_full_diff".to_string(),
-            passed: matches!(request.strategy, DiffStrategy::Keyed | DiffStrategy::Full),
+            passed: !request.key_columns.is_empty()
+                && matches!(request.strategy, DiffStrategy::Keyed | DiffStrategy::Full),
             detail: "full/keyed coverage is required".to_string(),
         });
     }
@@ -553,17 +618,34 @@ fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-fn first_cell_i64(rows: &[Vec<String>]) -> i64 {
-    rows.first()
-        .and_then(|row| row.first())
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0)
+fn first_cell_i64(rows: &[Vec<String>]) -> Result<i64, EngineError> {
+    let value = rows.first().and_then(|row| row.first()).ok_or_else(|| {
+        EngineError::Adapter(AdapterError::new(
+            "MALFORMED_RESULT",
+            "count query returned no rows",
+        ))
+    })?;
+    value.parse().map_err(|_| {
+        EngineError::Adapter(AdapterError::new(
+            "MALFORMED_RESULT",
+            format!("count query returned non-numeric value `{value}`"),
+        ))
+    })
 }
 
-fn cell(row: &[String], index: usize) -> i64 {
-    row.get(index)
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0)
+fn cell(row: &[String], index: usize) -> Result<i64, EngineError> {
+    let value = row.get(index).ok_or_else(|| {
+        EngineError::Adapter(AdapterError::new(
+            "MALFORMED_RESULT",
+            format!("count query returned no column {index}"),
+        ))
+    })?;
+    value.parse().map_err(|_| {
+        EngineError::Adapter(AdapterError::new(
+            "MALFORMED_RESULT",
+            format!("count query returned non-numeric value `{value}`"),
+        ))
+    })
 }
 
 /// Attach a schema-safety classification (kept for compatibility).
@@ -638,6 +720,68 @@ mod tests {
         assert!(evaluate_policy(&policy, &request(false), &summary)
             .iter()
             .any(|result| !result.passed));
+    }
+
+    #[test]
+    fn keyless_policies_fail_closed() {
+        // Without a stable key, added/removed/modified are never measured —
+        // a threshold evaluated against unmeasured zeros must fail, not
+        // pass vacuously.
+        let policy = DiffPolicy {
+            max_added_rows: Some(10),
+            max_changed_fraction: Some(0.5),
+            require_full_diff: true,
+            ..Default::default()
+        };
+        let summary = RowSummary::default();
+        let mut keyless = request(false);
+        keyless.strategy = DiffStrategy::Full;
+        let results = evaluate_policy(&policy, &keyless, &summary);
+        assert_eq!(results.len(), 3);
+        for result in &results {
+            assert!(!result.passed, "{} should fail", result.policy);
+        }
+        // With keys and a keyed/full strategy the same policies measure.
+        let keyed = request(true);
+        let results = evaluate_policy(&policy, &keyed, &summary);
+        assert!(results.iter().all(|result| result.passed));
+    }
+
+    #[test]
+    fn partition_coverage_cannot_satisfy_row_thresholds() {
+        // A partition diff reports changed partitions, not row counts — the
+        // same fail-closed rule applies.
+        let policy = DiffPolicy {
+            max_added_rows: Some(0),
+            ..Default::default()
+        };
+        let mut partitioned = request(true);
+        partitioned.strategy = DiffStrategy::Partition {
+            columns: vec!["d".to_string()],
+        };
+        let results = evaluate_policy(&policy, &partitioned, &RowSummary::default());
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].passed);
+    }
+
+    #[test]
+    fn column_compare_reports_type_and_nullability_together() {
+        // A column that changed type AND nullability reports both changes.
+        let candidate = [crate::adapter::ColumnInfo {
+            name: "id".to_string(),
+            data_type: "bigint".to_string(),
+            nullable: true,
+        }];
+        let base = [crate::adapter::ColumnInfo {
+            name: "id".to_string(),
+            data_type: "varchar".to_string(),
+            nullable: false,
+        }];
+        let changes = compare_column_lists(&candidate, &base);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].kind, "changed");
+        assert_eq!(changes[1].kind, "nullability");
+        assert_eq!(changes[1].detail, "not null -> nullable");
     }
 
     #[test]

@@ -12,19 +12,20 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use phlo_transform_core::{
-    compile, compile_with_options, resolve_selection, Compilation, DataType, EmptySchemaProvider,
-    EmptySourceStateProvider, IncrementalStrategy, Materialization, ModelId, ModelOrigin,
-    Nullability, Relation, RelationSchema, SchemaColumn, Selection, SelectorSet, SemanticModel,
-    SemanticProject, SemanticSeed, SemanticTest, SourceId, SourceStateProvider,
+    compile, compile_with_options, resolve_selection, Compilation, DataType, DiffPolicySpec,
+    EmptySchemaProvider, EmptySourceStateProvider, IncrementalStrategy, Materialization, ModelId,
+    ModelOrigin, Nullability, Relation, RelationSchema, SchemaColumn, Selection, SelectorSet,
+    SemanticModel, SemanticProject, SemanticSeed, SemanticTest, SourceId, SourceStateProvider,
     StaticSchemaProvider, StaticSourceStateProvider, TestId,
 };
 use phlo_transform_engine::{
-    changed_models, collect_source_states, Adapter, AdapterError, ArtifactWriter, CancelHandle,
-    CatalogRequest, ColumnInfo, EngineError, EngineEvent, ExecutionStatus, FailureCategory,
-    MaterializedRecord, Membership, ModelResult, ModelRunRecord, Plan, PlanAction, PlanOptions,
-    Planner, QueryResult, ReasonKind, RetryPolicy, RunOptions, RunRecord, RunResult, RunSummary,
-    Runner, SeedRecord, SeedRunRecord, SqliteStateStore, StateStore, StoredPlan, StoredRun,
-    TestRunRecord,
+    branch_diff, changed_models, collect_source_states, materialized_for_environment, Adapter,
+    AdapterError, ArtifactWriter, BranchDiffRequest, CancelHandle, CatalogRequest, ColumnInfo,
+    DatasetStatus, EngineError, EngineEvent, ExecutionStatus, FailureCategory, MaterializedRecord,
+    Membership, ModelResult, ModelRunRecord, Plan, PlanAction, PlanOptions, Planner,
+    PromotionRecord, QueryResult, ReasonKind, RetryPolicy, RunOptions, RunRecord, RunResult,
+    RunSummary, Runner, SeedRecord, SeedRunRecord, SqliteStateStore, StateStore, StoredPlan,
+    StoredRun, TestRunRecord,
 };
 
 /// How a target should fail: the error to return, and how many attempts it
@@ -52,6 +53,11 @@ struct FakeAdapter {
     merges: Arc<Mutex<Vec<String>>>,
     replaced_partitions: Arc<Mutex<Vec<String>>>,
     columns: Arc<Mutex<Vec<ColumnInfo>>>,
+    /// Per-relation column metadata (keyed by `relation.display()`); the
+    /// shared `columns` list remains the fallback.
+    relation_columns: Arc<Mutex<BTreeMap<String, Vec<ColumnInfo>>>>,
+    /// Row counts keyed by `relation.sql()`, answering `SELECT count(*)`.
+    relation_counts: Arc<Mutex<BTreeMap<String, i64>>>,
     loaded_csvs: Arc<Mutex<Vec<String>>>,
     fail_loads: Arc<Mutex<BTreeSet<String>>>,
     source_states: Arc<Mutex<BTreeMap<String, String>>>,
@@ -145,6 +151,22 @@ impl FakeAdapter {
         *self.columns.lock().unwrap() = columns;
     }
 
+    /// Per-relation columns, keyed by `relation.display()`.
+    fn set_relation_columns(&self, relation: &str, columns: Vec<ColumnInfo>) {
+        self.relation_columns
+            .lock()
+            .unwrap()
+            .insert(relation.to_string(), columns);
+    }
+
+    /// A row count answered for `SELECT count(*) FROM <relation>`.
+    fn set_row_count(&self, relation: &Relation, rows: i64) {
+        self.relation_counts
+            .lock()
+            .unwrap()
+            .insert(relation.sql(), rows);
+    }
+
     fn set_max_value(&self, value: &str) {
         *self.max_value.lock().unwrap() = Some(value.to_string());
     }
@@ -169,6 +191,8 @@ impl FakeAdapter {
             merges: self.merges.clone(),
             replaced_partitions: self.replaced_partitions.clone(),
             columns: self.columns.clone(),
+            relation_columns: self.relation_columns.clone(),
+            relation_counts: self.relation_counts.clone(),
             loaded_csvs: self.loaded_csvs.clone(),
             fail_loads: self.fail_loads.clone(),
             source_states: self.source_states.clone(),
@@ -254,6 +278,32 @@ impl Adapter for FakeAdapter {
     }
 
     async fn execute(&self, sql: &str) -> Result<QueryResult, AdapterError> {
+        if let Some(relation) = sql.strip_prefix("SELECT count(*) FROM ") {
+            let rows = self
+                .relation_counts
+                .lock()
+                .unwrap()
+                .get(relation)
+                .copied()
+                .unwrap_or(0);
+            return Ok(QueryResult {
+                query_id: Some("count-query".to_string()),
+                columns: vec!["count".to_string()],
+                rows: vec![vec![rows.to_string()]],
+                row_count: 1,
+            });
+        }
+        // Other count queries (keyed diffs' added/removed/modified/unchanged)
+        // answer one zero per `count(*)` — the fake models empty tables.
+        if sql.contains("count(*)") {
+            let columns = sql.matches("count(*)").count().max(1);
+            return Ok(QueryResult {
+                query_id: Some("count-query".to_string()),
+                columns: vec!["count".to_string(); columns],
+                rows: vec![vec!["0".to_string(); columns]],
+                row_count: 1,
+            });
+        }
         if sql.to_ascii_lowercase().contains("max(") {
             if let Some(value) = self.max_value.lock().unwrap().clone() {
                 return Ok(QueryResult {
@@ -380,10 +430,16 @@ impl Adapter for FakeAdapter {
         self.in_flight.lock().unwrap().iter().cloned().collect()
     }
 
-    async fn relation_columns(
-        &self,
-        _relation: &Relation,
-    ) -> Result<Vec<ColumnInfo>, AdapterError> {
+    async fn relation_columns(&self, relation: &Relation) -> Result<Vec<ColumnInfo>, AdapterError> {
+        if let Some(columns) = self
+            .relation_columns
+            .lock()
+            .unwrap()
+            .get(&relation.display())
+            .cloned()
+        {
+            return Ok(columns);
+        }
         Ok(self.columns.lock().unwrap().clone())
     }
 
@@ -3273,6 +3329,24 @@ impl StateStore for FailingStore {
         self.inner.materialized_by_hash(version_hash)
     }
 
+    fn materialized_in(
+        &self,
+        environment: Option<&str>,
+    ) -> Result<Vec<MaterializedRecord>, EngineError> {
+        self.inner.materialized_in(environment)
+    }
+
+    fn record_promotion(
+        &self,
+        record: &phlo_transform_engine::PromotionRecord,
+    ) -> Result<(), EngineError> {
+        self.inner.record_promotion(record)
+    }
+
+    fn promotions(&self) -> Result<Vec<phlo_transform_engine::PromotionRecord>, EngineError> {
+        self.inner.promotions()
+    }
+
     fn set_watermark(
         &self,
         model_id: &str,
@@ -3302,6 +3376,10 @@ impl StateStore for FailingStore {
         environment: Option<&str>,
     ) -> Result<Option<SeedRecord>, EngineError> {
         self.inner.seed_state(name, environment)
+    }
+
+    fn seeds_in(&self, environment: Option<&str>) -> Result<Vec<SeedRecord>, EngineError> {
+        self.inner.seeds_in(environment)
     }
 }
 
@@ -3624,4 +3702,753 @@ async fn resume_full_rebuilds_when_schema_change_requires_it() {
         2,
         "bootstrap + resumed full rebuild"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Bundle 5: branch diffs and promotion records
+// ---------------------------------------------------------------------------
+
+fn version(hash: &str) -> phlo_transform_core::ModelVersion {
+    phlo_transform_core::ModelVersion {
+        hash: hash.to_string(),
+        sql_hash: hash.to_string(),
+        config_hash: "config".to_string(),
+        contract_hash: "contract".to_string(),
+        dependency_hash: "deps".to_string(),
+        source_state_hash: "sources".to_string(),
+        compiler_version: "0".to_string(),
+        target_hash: "target".to_string(),
+    }
+}
+
+fn materialized(model_id: &str, env: &str, hash: &str, target: &Relation) -> MaterializedRecord {
+    materialized_at(model_id, Some(env), hash, target, "t")
+}
+
+fn materialized_at(
+    model_id: &str,
+    env: Option<&str>,
+    hash: &str,
+    target: &Relation,
+    at: &str,
+) -> MaterializedRecord {
+    MaterializedRecord {
+        model_id: model_id.to_string(),
+        environment: env.map(|e| e.to_string()),
+        version: version(hash),
+        detail: None,
+        target: target.display(),
+        incremental_strategy: None,
+        incremental_key: None,
+        run_id: "run-1".to_string(),
+        materialized_at: at.to_string(),
+    }
+}
+
+/// The per-ref relation for a compiled model: same schema/table, the ref's
+/// catalog — mirrors `branch_diff`'s retargeting of unrecorded targets.
+fn ref_relation(catalog: &str, model: &phlo_transform_core::CompiledModel) -> Relation {
+    Relation {
+        catalog: Some(catalog.to_string()),
+        schema: model.target.schema.clone(),
+        table: model.target.table.clone(),
+    }
+}
+
+fn branch_compilation() -> Compilation {
+    let project = SemanticProject::in_memory(vec![
+        model("main.same", "select 1 as id"),
+        model("main.changed", "select * from main.same"),
+        model("main.added", "select 1 as id"),
+        model("main.inherited", "select 1 as id"),
+        model("main.never", "select 1 as id"),
+    ]);
+    let compilation = compile(&project);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+    compilation
+}
+
+fn branch_diff_request() -> BranchDiffRequest {
+    BranchDiffRequest {
+        candidate_ref: "ci/x".to_string(),
+        base_ref: "main".to_string(),
+        candidate_catalog: Some("phlo_ci_x".to_string()),
+        base_catalog: Some("phlo_main".to_string()),
+        deep: false,
+        default_schema: Some("default".to_string()),
+    }
+}
+
+#[tokio::test]
+async fn branch_diff_classifies_datasets() {
+    let compilation = branch_compilation();
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = SqliteStateStore::in_memory().unwrap();
+    let model = |name: &str| compilation.model_by_name(name).unwrap();
+
+    // same: recorded on both refs with the same version; exists on both.
+    let same_cand = ref_relation("phlo_ci_x", model("main.same"));
+    let same_base = ref_relation("phlo_main", model("main.same"));
+    state
+        .record_materialized(&materialized("main.same", "ci/x", "v1", &same_cand))
+        .unwrap();
+    state
+        .record_materialized(&materialized("main.same", "main", "v1", &same_base))
+        .unwrap();
+    adapter.existing.lock().unwrap().insert(same_cand.display());
+    adapter.existing.lock().unwrap().insert(same_base.display());
+
+    // changed: recorded on both with different versions.
+    let changed_cand = ref_relation("phlo_ci_x", model("main.changed"));
+    let changed_base = ref_relation("phlo_main", model("main.changed"));
+    state
+        .record_materialized(&materialized("main.changed", "ci/x", "v2", &changed_cand))
+        .unwrap();
+    state
+        .record_materialized(&materialized("main.changed", "main", "v1", &changed_base))
+        .unwrap();
+    adapter
+        .existing
+        .lock()
+        .unwrap()
+        .insert(changed_cand.display());
+    adapter
+        .existing
+        .lock()
+        .unwrap()
+        .insert(changed_base.display());
+
+    // added: candidate only.
+    let added_cand = ref_relation("phlo_ci_x", model("main.added"));
+    state
+        .record_materialized(&materialized("main.added", "ci/x", "v1", &added_cand))
+        .unwrap();
+    adapter
+        .existing
+        .lock()
+        .unwrap()
+        .insert(added_cand.display());
+
+    // removed: materialised on base by a model no longer in the workspace —
+    // the dataset surfaces through its record alone.
+    let dropped_base = Relation {
+        catalog: Some("phlo_main".to_string()),
+        schema: "main".to_string(),
+        table: "dropped".to_string(),
+    };
+    state
+        .record_materialized(&materialized("main.dropped", "main", "v1", &dropped_base))
+        .unwrap();
+    adapter
+        .existing
+        .lock()
+        .unwrap()
+        .insert(dropped_base.display());
+
+    // inherited: recorded on base only but visible on both refs — a Nessie
+    // branch sees the base's table without rewriting it.
+    let inh_cand = ref_relation("phlo_ci_x", model("main.inherited"));
+    let inh_base = ref_relation("phlo_main", model("main.inherited"));
+    state
+        .record_materialized(&materialized("main.inherited", "main", "v1", &inh_base))
+        .unwrap();
+    adapter.existing.lock().unwrap().insert(inh_cand.display());
+    adapter.existing.lock().unwrap().insert(inh_base.display());
+
+    // never: in the workspace, materialised nowhere.
+    let report = branch_diff(adapter, Some(&state), &compilation, &branch_diff_request())
+        .await
+        .unwrap();
+    assert!(!report.deep);
+
+    let status = |name: &str| {
+        report
+            .datasets
+            .iter()
+            .find(|dataset| dataset.dataset == name)
+            .map(|dataset| dataset.status)
+            .unwrap()
+    };
+    assert_eq!(status("main.same"), DatasetStatus::Unchanged);
+    assert_eq!(status("main.changed"), DatasetStatus::Changed);
+    assert_eq!(status("main.added"), DatasetStatus::Added);
+    assert_eq!(status("main.dropped"), DatasetStatus::Removed);
+    assert_eq!(status("main.inherited"), DatasetStatus::Unchanged);
+    assert_eq!(status("main.never"), DatasetStatus::Absent);
+
+    // Deterministic ordering by dataset name.
+    let names: Vec<&str> = report
+        .datasets
+        .iter()
+        .map(|dataset| dataset.dataset.as_str())
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted);
+
+    // Lineage hooks: upstream model deps travel with the dataset entry.
+    let changed = report
+        .datasets
+        .iter()
+        .find(|dataset| dataset.dataset == "main.changed")
+        .unwrap();
+    assert_eq!(changed.upstream, vec!["main.same".to_string()]);
+}
+
+#[tokio::test]
+async fn branch_diff_reports_schema_and_row_differences() {
+    let compilation = branch_compilation();
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = SqliteStateStore::in_memory().unwrap();
+    let model = |name: &str| compilation.model_by_name(name).unwrap();
+
+    let cand = ref_relation("phlo_ci_x", model("main.changed"));
+    let base = ref_relation("phlo_main", model("main.changed"));
+    state
+        .record_materialized(&materialized("main.changed", "ci/x", "v2", &cand))
+        .unwrap();
+    state
+        .record_materialized(&materialized("main.changed", "main", "v1", &base))
+        .unwrap();
+    adapter.existing.lock().unwrap().insert(cand.display());
+    adapter.existing.lock().unwrap().insert(base.display());
+
+    let col = |name: &str, data_type: &str, nullable: bool| ColumnInfo {
+        name: name.to_string(),
+        data_type: data_type.to_string(),
+        nullable,
+    };
+    adapter.set_relation_columns(
+        &cand.display(),
+        vec![col("id", "bigint", false), col("label", "varchar", true)],
+    );
+    adapter.set_relation_columns(
+        &base.display(),
+        vec![
+            col("id", "integer", false),
+            col("label", "varchar", false),
+            col("legacy", "varchar", true),
+        ],
+    );
+    adapter.set_row_count(&cand, 150);
+    adapter.set_row_count(&base, 100);
+
+    let report = branch_diff(adapter, Some(&state), &compilation, &branch_diff_request())
+        .await
+        .unwrap();
+
+    let schema = report
+        .schema_changes
+        .iter()
+        .find(|entry| entry.model == "main.changed")
+        .expect("schema diff for main.changed");
+    let kinds: BTreeMap<&str, &str> = schema
+        .changes
+        .iter()
+        .map(|change| (change.column.as_str(), change.kind.as_str()))
+        .collect();
+    assert_eq!(kinds.get("id"), Some(&"changed"));
+    assert_eq!(kinds.get("label"), Some(&"nullability"));
+    assert_eq!(kinds.get("legacy"), Some(&"removed"));
+
+    let rows = report
+        .rows
+        .iter()
+        .find(|entry| entry.dataset == "main.changed")
+        .expect("row diff for main.changed");
+    assert_eq!(rows.base_rows, Some(100));
+    assert_eq!(rows.candidate_rows, Some(150));
+    assert_eq!(rows.delta, Some(50));
+}
+
+#[tokio::test]
+async fn branch_diff_deep_runs_keyed_diffs_for_changed_models() {
+    let mut keyed = model("main.changed", "select * from main.same");
+    keyed.config.incremental = Some(IncrementalStrategy::Key {
+        columns: vec!["id".to_string()],
+    });
+    let project = SemanticProject::in_memory(vec![model("main.same", "select 1 as id"), keyed]);
+    let compilation = compile(&project);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = SqliteStateStore::in_memory().unwrap();
+    let changed = compilation.model_by_name("main.changed").unwrap();
+    let cand = ref_relation("phlo_ci_x", changed);
+    let base = ref_relation("phlo_main", changed);
+    state
+        .record_materialized(&materialized("main.changed", "ci/x", "v2", &cand))
+        .unwrap();
+    state
+        .record_materialized(&materialized("main.changed", "main", "v1", &base))
+        .unwrap();
+    adapter.existing.lock().unwrap().insert(cand.display());
+    adapter.existing.lock().unwrap().insert(base.display());
+
+    let mut request = branch_diff_request();
+    request.deep = true;
+    let report = branch_diff(adapter, Some(&state), &compilation, &request)
+        .await
+        .unwrap();
+    assert_eq!(report.diffs.len(), 1);
+    assert_eq!(report.diffs[0].model, "main.changed");
+    assert_eq!(report.diffs[0].key_columns, vec!["id".to_string()]);
+    assert!(report.deep);
+    assert!(report.passed);
+}
+
+#[tokio::test]
+async fn branch_diff_deep_evaluates_declared_policies_on_keyless_models() {
+    // A changed model with no stable key is normally skipped in deep mode —
+    // but when it declares a diff policy, that policy must still be
+    // evaluated. `require_keyed_diff` on a keyless model must fail the
+    // report, not pass silently.
+    let mut keyless = model("main.changed", "select * from main.same");
+    keyless.config.diff = Some(DiffPolicySpec {
+        require_keyed_diff: true,
+        ..Default::default()
+    });
+    let project = SemanticProject::in_memory(vec![model("main.same", "select 1 as id"), keyless]);
+    let compilation = compile(&project);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = SqliteStateStore::in_memory().unwrap();
+    let changed = compilation.model_by_name("main.changed").unwrap();
+    let cand = ref_relation("phlo_ci_x", changed);
+    let base = ref_relation("phlo_main", changed);
+    state
+        .record_materialized(&materialized("main.changed", "ci/x", "v2", &cand))
+        .unwrap();
+    state
+        .record_materialized(&materialized("main.changed", "main", "v1", &base))
+        .unwrap();
+    adapter.existing.lock().unwrap().insert(cand.display());
+    adapter.existing.lock().unwrap().insert(base.display());
+
+    let mut request = branch_diff_request();
+    request.deep = true;
+    let report = branch_diff(adapter, Some(&state), &compilation, &request)
+        .await
+        .unwrap();
+    assert_eq!(report.diffs.len(), 1);
+    let diff = &report.diffs[0];
+    assert!(diff.key_columns.is_empty());
+    assert_eq!(diff.coverage, "aggregate (row counts only)");
+    assert!(
+        diff.policy_results
+            .iter()
+            .any(|result| result.policy == "require_keyed_diff" && !result.passed),
+        "{:?}",
+        diff.policy_results
+    );
+    assert!(!report.passed);
+}
+
+#[tokio::test]
+async fn branch_diff_folds_default_environment_into_main() {
+    // Runs on `main` with no `--ref` record under the default (unlabeled)
+    // environment — `diff --to main` must still see them, or dropped models
+    // never classify `removed` and `unchanged` degrades to `changed`.
+    let compilation = branch_compilation();
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = SqliteStateStore::in_memory().unwrap();
+    let model = |name: &str| compilation.model_by_name(name).unwrap();
+
+    // same: recorded on candidate "ci/x" and on base via a default-env run.
+    let same_cand = ref_relation("phlo_ci_x", model("main.same"));
+    let same_base = ref_relation("phlo_main", model("main.same"));
+    state
+        .record_materialized(&materialized("main.same", "ci/x", "v1", &same_cand))
+        .unwrap();
+    state
+        .record_materialized(&materialized_at("main.same", None, "v1", &same_base, "t"))
+        .unwrap();
+    adapter.existing.lock().unwrap().insert(same_cand.display());
+    adapter.existing.lock().unwrap().insert(same_base.display());
+
+    // dropped: only a default-env record on base — surfaces as removed.
+    let dropped_base = Relation {
+        catalog: Some("phlo_main".to_string()),
+        schema: "main".to_string(),
+        table: "dropped".to_string(),
+    };
+    state
+        .record_materialized(&materialized_at(
+            "main.dropped",
+            None,
+            "v1",
+            &dropped_base,
+            "t",
+        ))
+        .unwrap();
+    adapter
+        .existing
+        .lock()
+        .unwrap()
+        .insert(dropped_base.display());
+
+    let report = branch_diff(adapter, Some(&state), &compilation, &branch_diff_request())
+        .await
+        .unwrap();
+    let status = |name: &str| {
+        report
+            .datasets
+            .iter()
+            .find(|dataset| dataset.dataset == name)
+            .map(|dataset| dataset.status)
+    };
+    assert_eq!(status("main.same"), Some(DatasetStatus::Unchanged));
+    assert_eq!(status("main.dropped"), Some(DatasetStatus::Removed));
+}
+
+#[test]
+fn materialized_for_environment_merges_default_env_by_latest() {
+    let state = SqliteStateStore::in_memory().unwrap();
+    let target = Relation {
+        catalog: Some("iceberg".to_string()),
+        schema: "main".to_string(),
+        table: "t".to_string(),
+    };
+    // An older explicit-"main" record and a newer default-env record: the
+    // latest materialisation describes the physical table.
+    state
+        .record_materialized(&materialized_at(
+            "main.t",
+            Some("main"),
+            "v1",
+            &target,
+            "2024-01-01T00:00:00Z",
+        ))
+        .unwrap();
+    state
+        .record_materialized(&materialized_at(
+            "main.t",
+            None,
+            "v2",
+            &target,
+            "2024-06-01T00:00:00Z",
+        ))
+        .unwrap();
+    let records = materialized_for_environment(&state, "main").unwrap();
+    assert_eq!(records["main.t"].version.hash, "v2");
+
+    // A different env does not fold in the default environment.
+    let dev = materialized_for_environment(&state, "dev").unwrap();
+    assert!(dev.is_empty());
+}
+
+#[test]
+fn promotion_records_persist_in_state() {
+    let state = SqliteStateStore::in_memory().unwrap();
+    let record = PromotionRecord {
+        promotion_id: "promo-1".to_string(),
+        candidate_ref: "ci/x".to_string(),
+        candidate_hash: Some("bbb".to_string()),
+        target_ref: "main".to_string(),
+        target_hash_before: "aaa".to_string(),
+        target_hash_after: Some("bbb".to_string()),
+        plan_id: Some("plan-1".to_string()),
+        run_id: Some("run-1".to_string()),
+        dry_run: false,
+        merged: true,
+        conflicts: Vec::new(),
+        gates: vec![phlo_transform_engine::GateResult {
+            name: "run".to_string(),
+            passed: true,
+            detail: "run run-1 passed".to_string(),
+        }],
+        timestamp: "2024-01-01T00:00:00Z".to_string(),
+        actor: None,
+    };
+    state.record_promotion(&record).unwrap();
+    let promotions = state.promotions().unwrap();
+    assert_eq!(promotions.len(), 1);
+    assert_eq!(promotions[0].promotion_id, "promo-1");
+    assert!(promotions[0].merged);
+    assert_eq!(promotions[0].gates.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Bundle 5: promotion gates
+// ---------------------------------------------------------------------------
+
+use phlo_transform_engine::{evaluate_gates, GateInput};
+use phlo_transform_nessie::MergeOutcome;
+
+fn passed_run() -> RunSummary {
+    RunSummary {
+        run_id: "run-1".to_string(),
+        plan_id: "plan-1".to_string(),
+        started_at: "t".to_string(),
+        finished_at: Some("t".to_string()),
+        status: ExecutionStatus::Passed,
+        model_count: 2,
+        failed_count: 0,
+    }
+}
+
+fn model_run(model_id: &str, status: ExecutionStatus) -> ModelRunRecord {
+    ModelRunRecord {
+        run_id: "run-1".to_string(),
+        model_id: model_id.to_string(),
+        materialization: "table".to_string(),
+        action: "build".to_string(),
+        status,
+        started_at: "t".to_string(),
+        finished_at: "t".to_string(),
+        sql_hash: "h".to_string(),
+        target: format!("cat.main.{model_id}"),
+        desired_version: "v".to_string(),
+        attempts: Vec::new(),
+        query_id: None,
+        error: None,
+        error_category: None,
+    }
+}
+
+fn test_run(test_id: &str, status: ExecutionStatus) -> TestRunRecord {
+    TestRunRecord {
+        run_id: "run-1".to_string(),
+        test_id: test_id.to_string(),
+        status,
+        row_count: 0,
+        query_id: None,
+        error: None,
+        error_category: None,
+        started_at: "t".to_string(),
+        finished_at: "t".to_string(),
+    }
+}
+
+fn seed_run(name: &str, status: ExecutionStatus) -> SeedRunRecord {
+    SeedRunRecord {
+        run_id: "run-1".to_string(),
+        name: name.to_string(),
+        status,
+        target: format!("cat.seeds.{name}"),
+        attempts: Vec::new(),
+        error: None,
+        error_category: None,
+        started_at: "t".to_string(),
+        finished_at: "t".to_string(),
+    }
+}
+
+/// A fully-green gate input: passed run, tests green, nothing blocked,
+/// passing diff, stable target, clean merge check.
+fn green_input() -> GateInput {
+    GateInput {
+        run: Some(passed_run()),
+        model_runs: vec![model_run("m.a", ExecutionStatus::Passed)],
+        seed_runs: vec![seed_run("countries", ExecutionStatus::Passed)],
+        test_runs: vec![test_run("t.a", ExecutionStatus::Passed)],
+        require_diff: true,
+        diff_passed: Some(true),
+        diff_rejected: None,
+        breaking_schema_changes: Vec::new(),
+        allow_breaking_schema: false,
+        expected_target_hash: Some("aaa".to_string()),
+        actual_target_hash: Some("aaa".to_string()),
+        merge_check: Some(MergeOutcome::clean("bbb")),
+    }
+}
+
+fn gate<'a>(
+    report: &'a phlo_transform_engine::GateReport,
+    name: &str,
+) -> &'a phlo_transform_engine::GateResult {
+    report
+        .results
+        .iter()
+        .find(|result| result.name == name)
+        .unwrap_or_else(|| panic!("gate {name} missing"))
+}
+
+#[test]
+fn all_gates_pass_on_green_input() {
+    let report = evaluate_gates(&green_input());
+    assert!(report.passed);
+    for name in [
+        "run",
+        "tests",
+        "blocked",
+        "schema",
+        "data_diff",
+        "base",
+        "conflicts",
+    ] {
+        assert!(gate(&report, name).passed, "gate {name} should pass");
+    }
+}
+
+#[test]
+fn failed_tests_block_promotion() {
+    let mut input = green_input();
+    input.test_runs = vec![
+        test_run("t.ok", ExecutionStatus::Passed),
+        test_run("t.bad", ExecutionStatus::Failed),
+    ];
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    let tests = gate(&report, "tests");
+    assert!(!tests.passed);
+    assert!(tests.detail.contains("t.bad"), "{}", tests.detail);
+}
+
+#[test]
+fn blocked_work_blocks_promotion() {
+    let mut input = green_input();
+    input.model_runs = vec![
+        model_run("m.a", ExecutionStatus::Passed),
+        model_run("m.b", ExecutionStatus::Blocked),
+        model_run("m.c", ExecutionStatus::Cancelled),
+    ];
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    let blocked = gate(&report, "blocked");
+    assert!(!blocked.passed);
+    assert!(blocked.detail.contains("m.b"), "{}", blocked.detail);
+    assert!(blocked.detail.contains("m.c"), "{}", blocked.detail);
+}
+
+#[test]
+fn blocked_seed_blocks_promotion() {
+    let mut input = green_input();
+    input.seed_runs = vec![seed_run("countries", ExecutionStatus::Blocked)];
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    let blocked = gate(&report, "blocked");
+    assert!(!blocked.passed);
+    assert!(blocked.detail.contains("countries"), "{}", blocked.detail);
+}
+
+#[test]
+fn blocked_test_blocks_promotion() {
+    // A test that never ran — blocked upstream or cancelled — is unverified
+    // work, same as a blocked model.
+    let mut input = green_input();
+    input.test_runs = vec![
+        test_run("t.ok", ExecutionStatus::Passed),
+        test_run("t.skipped", ExecutionStatus::Blocked),
+    ];
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    let blocked = gate(&report, "blocked");
+    assert!(!blocked.passed);
+    assert!(blocked.detail.contains("t.skipped"), "{}", blocked.detail);
+}
+
+#[test]
+fn missing_run_blocks_promotion() {
+    let mut input = green_input();
+    input.run = None;
+    input.model_runs = Vec::new();
+    input.test_runs = Vec::new();
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    assert!(!gate(&report, "run").passed);
+    assert!(!gate(&report, "tests").passed);
+    assert!(!gate(&report, "blocked").passed);
+}
+
+#[test]
+fn failed_diff_blocks_promotion_when_required() {
+    let mut input = green_input();
+    input.diff_passed = Some(false);
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    assert!(!gate(&report, "data_diff").passed);
+}
+
+#[test]
+fn stale_diff_artifact_blocks_promotion() {
+    let mut input = green_input();
+    input.diff_rejected = Some("branch diff is stale".to_string());
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    let diff = gate(&report, "data_diff");
+    assert!(!diff.passed);
+    assert!(diff.detail.contains("stale"), "{}", diff.detail);
+}
+
+#[test]
+fn stale_target_blocks_promotion() {
+    let mut input = green_input();
+    input.actual_target_hash = Some("zzz".to_string());
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    let base = gate(&report, "base");
+    assert!(!base.passed);
+    assert!(base.detail.contains("advanced"), "{}", base.detail);
+}
+
+#[test]
+fn merge_conflicts_block_promotion() {
+    let mut input = green_input();
+    input.merge_check = Some(MergeOutcome::conflict(
+        "marts.orders",
+        "content changed on both sides",
+    ));
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    let conflicts = gate(&report, "conflicts");
+    assert!(!conflicts.passed);
+    assert!(
+        conflicts.detail.contains("marts.orders"),
+        "{}",
+        conflicts.detail
+    );
+}
+
+#[test]
+fn breaking_schema_blocks_unless_waived() {
+    let mut input = green_input();
+    input.breaking_schema_changes = vec!["m.a.id: removed".to_string()];
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    assert!(!gate(&report, "schema").passed);
+
+    input.allow_breaking_schema = true;
+    let report = evaluate_gates(&input);
+    assert!(report.passed);
+    assert!(gate(&report, "schema").passed);
+}
+
+#[test]
+fn data_diff_gate_absent_when_not_required() {
+    let mut input = green_input();
+    input.require_diff = false;
+    input.diff_passed = None;
+    let report = evaluate_gates(&input);
+    assert!(report.passed);
+    assert!(report
+        .results
+        .iter()
+        .all(|result| result.name != "data_diff"));
+}
+
+#[test]
+fn gate_results_round_trip_through_json() {
+    let report = evaluate_gates(&green_input());
+    let json = serde_json::to_value(&report).expect("serialize");
+    let names: Vec<&str> = json["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "run",
+            "tests",
+            "blocked",
+            "schema",
+            "data_diff",
+            "base",
+            "conflicts"
+        ]
+    );
+    assert_eq!(json["passed"], true);
 }

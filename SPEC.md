@@ -1026,6 +1026,8 @@ A Git branch may map automatically or explicitly to a Nessie reference. Explicit
 phlo transform --ref feature/new-assay plan
 ```
 
+References are managed explicitly — `ref list`, `ref show`, `ref create --from <base>` and `ref delete` — and no command creates or deletes a branch as a side effect, except explicit candidate provisioning on `plan`/`apply`/`run --ref` and `--cleanup` on `promote`. `ref delete main` is refused: `main` is the default base, not a scratch branch. Provisioning is recorded per candidate in `environment_<sanitised ref>_<hash>.json` (plus the single-slot `environment.json`), and deleted with the branch.
+
 ## 46. Write-Audit-Publish
 
 Production-oriented execution follows:
@@ -1064,7 +1066,10 @@ Example:
 
 ```bash
 phlo transform promote feature/new-assay --to main
+phlo transform promote --from feature/new-assay --to main
 ```
+
+Promotion is authorised by named gates, reported identically in human and JSON output: `run` (latest candidate run passed), `tests` (no failed tests), `blocked` (no blocked/cancelled model, seed or test work), `schema` (no unwaived breaking changes), `data_diff` (when `--require-diff` is set: a passing `--full` audited diff bound to this candidate→target pair and still fresh — recorded versions matching both sides' current materialisations, and never a self-comparison), `base` (target unchanged since provisioning; the merge asserts the evaluated target hash) and `conflicts` (the merge check is clean). A candidate that advanced between gate evaluation and merge is refused rather than promoted unaudited. `--check` evaluates gates without merging; a passing promotion merges and persists a `PromotionRecord` (refs, hashes, plan/run ids, gate results, timestamp) in the state store.
 
 Preconditions may include successful plan, successful execution, required tests passing, no blocking schema changes, no stale state and optional approval.
 
@@ -1142,7 +1147,10 @@ Native command:
 
 ```bash
 phlo transform diff assay.results
+phlo transform diff --from feature/new-assay --to main
 ```
+
+With no model argument, `diff` compares two Nessie references: every dataset known to the workspace or recorded in state is classified `added`/`removed`/`changed`/`unchanged`/`absent`, schema and nullability changes are listed per model, row counts come from the catalogs, and `--full` runs keyed value diffs on changed models. `main`'s records include the default (unlabeled) environment, so state from a run with no `--ref` still counts. The report is the audit artifact promotion consumes.
 
 Example:
 
@@ -1193,7 +1201,7 @@ max_removed_rows = 0
 max_changed_fraction = 0.05
 ```
 
-This may become a promotion quality gate.
+This may become a promotion quality gate. Row thresholds require keyed coverage to measure; on a keyless model (or under `--partition`) they fail rather than pass on unmeasured zeros.
 
 ---
 

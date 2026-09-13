@@ -4,7 +4,7 @@
 //! promoted to a target reference. Promotion validates quality gates and
 //! target staleness before merging, and records a reproducible artifact.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use phlo_transform_nessie::{Conflict, NessieClient};
 
@@ -16,7 +16,9 @@ use crate::util::now_rfc3339;
 pub struct PromotionRequest {
     pub candidate_ref: String,
     pub target_ref: String,
-    /// Candidate hash that was audited, when known.
+    /// The candidate hash the gates were evaluated against. When given, the
+    /// candidate must still be at this hash at merge time — a branch that
+    /// advanced since the audit is refused rather than merged unaudited.
     pub candidate_hash: Option<String>,
     /// Target hash observed when the candidate was planned.
     pub expected_target_hash: Option<String>,
@@ -34,10 +36,12 @@ pub struct PromotionRequest {
     /// Only check preconditions; do not merge.
     pub dry_run: bool,
     pub actor: Option<String>,
+    /// Gate results computed by the caller, carried into the record.
+    pub gates: Vec<crate::gates::GateResult>,
 }
 
 /// A reproducible promotion record.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PromotionRecord {
     pub promotion_id: String,
     pub candidate_ref: String,
@@ -51,8 +55,11 @@ pub struct PromotionRecord {
     pub run_id: Option<String>,
     pub dry_run: bool,
     pub merged: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts: Vec<Conflict>,
+    /// The gate evaluation that authorised (or refused) this promotion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gates: Vec<crate::gates::GateResult>,
     pub timestamp: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
@@ -102,6 +109,19 @@ pub async fn promote(
             ))
         })?;
 
+    // The candidate must still be the commit that was audited: a branch that
+    // advanced between gate evaluation and promotion carries unaudited work,
+    // and merging it would make this record's `candidate_hash` a lie.
+    if let Some(expected) = &request.candidate_hash {
+        if expected != &candidate.hash {
+            return Err(EngineError::Promotion(format!(
+                "candidate `{}` advanced since the audit (expected {}, found {}); \
+                 re-run the audit and gates",
+                request.candidate_ref, expected, candidate.hash
+            )));
+        }
+    }
+
     let mut record = PromotionRecord {
         promotion_id: uuid::Uuid::new_v4().to_string(),
         candidate_ref: request.candidate_ref.clone(),
@@ -117,6 +137,7 @@ pub async fn promote(
         dry_run: request.dry_run,
         merged: false,
         conflicts: Vec::new(),
+        gates: request.gates.clone(),
         timestamp: now_rfc3339(),
         actor: request.actor.clone(),
     };
@@ -191,6 +212,7 @@ mod tests {
             allow_breaking_schema: false,
             dry_run,
             actor: None,
+            gates: Vec::new(),
         }
     }
 
@@ -237,6 +259,46 @@ mod tests {
         nessie.assign_reference("ci/pr-1", "bbb").await.unwrap();
         let error = promote(&nessie, &request(false)).await.unwrap_err();
         assert!(error.to_string().contains("advanced"));
+    }
+
+    #[tokio::test]
+    async fn blocks_when_candidate_advanced_since_audit() {
+        // The audit pinned the candidate at `bbb`; a racing commit moved the
+        // branch to `ccc` before the merge — promotion must refuse rather
+        // than merge unaudited work.
+        let nessie = InMemoryNessie::new();
+        nessie.seed("main", "aaa");
+        nessie
+            .create_branch("ci/pr-1", &ReferenceInfo::branch("main", "aaa"))
+            .await
+            .unwrap();
+        nessie.assign_reference("ci/pr-1", "bbb").await.unwrap();
+        let mut request = request(false);
+        request.candidate_hash = Some("bbb".to_string());
+        nessie.assign_reference("ci/pr-1", "ccc").await.unwrap();
+        let error = promote(&nessie, &request).await.unwrap_err();
+        assert!(error.to_string().contains("advanced"), "{error}");
+        // The target must not have been merged.
+        assert_eq!(
+            nessie.get_reference("main").await.unwrap().unwrap().hash,
+            "aaa"
+        );
+    }
+
+    #[tokio::test]
+    async fn promotes_when_candidate_hash_still_matches() {
+        let nessie = InMemoryNessie::new();
+        nessie.seed("main", "aaa");
+        nessie
+            .create_branch("ci/pr-1", &ReferenceInfo::branch("main", "aaa"))
+            .await
+            .unwrap();
+        nessie.assign_reference("ci/pr-1", "bbb").await.unwrap();
+        let mut request = request(false);
+        request.candidate_hash = Some("bbb".to_string());
+        let record = promote(&nessie, &request).await.unwrap();
+        assert!(record.merged);
+        assert_eq!(record.candidate_hash.as_deref(), Some("bbb"));
     }
 
     #[tokio::test]
@@ -288,6 +350,7 @@ mod schema_gate_tests {
             allow_breaking_schema: allow,
             dry_run: true,
             actor: None,
+            gates: Vec::new(),
         };
 
         assert!(promote(&nessie, &make(false)).await.is_err());

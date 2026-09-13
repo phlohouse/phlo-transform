@@ -73,6 +73,13 @@ pub struct DiffArtifact {
     pub diff: crate::diff::DiffReport,
 }
 
+/// `branch_diff.json`.
+#[derive(Clone, Debug, Serialize)]
+pub struct BranchDiffArtifact {
+    pub schema_version: u32,
+    pub diff: crate::branch_diff::BranchDiffReport,
+}
+
 /// `environment.json`.
 #[derive(Clone, Debug, Serialize)]
 pub struct EnvironmentArtifact {
@@ -206,6 +213,20 @@ impl ArtifactWriter {
         self.write(
             "diff",
             &DiffArtifact {
+                schema_version: SCHEMA_VERSION,
+                diff: diff.clone(),
+            },
+        )
+    }
+
+    /// Write `branch_diff.json`.
+    pub fn write_branch_diff(
+        &self,
+        diff: &crate::branch_diff::BranchDiffReport,
+    ) -> Result<(), EngineError> {
+        self.write(
+            "branch_diff",
+            &BranchDiffArtifact {
                 schema_version: SCHEMA_VERSION,
                 diff: diff.clone(),
             },
