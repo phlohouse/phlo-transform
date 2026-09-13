@@ -55,13 +55,28 @@ common scalar/aggregate functions (`count`, `sum`, `avg`, `min`, `max`,
 
 ## Lineage and impact
 
-Each `OutputColumn` carries its direct `ColumnRef` inputs. Model schemas form a
-column graph:
+Each `OutputColumn` carries `ColumnInput`s — a `ColumnRef` plus `directness`
+(`direct`/`indirect`), `transformation` (identity, transformation,
+aggregation, join, filter, group_by, sort, window, conditional) and the
+responsible expression. Every output column also records a `confidence`:
+`exact` when the AST proved the whole input set, `unknown` when part of the
+query could not be analysed.
+
+Compilation lowers those inputs into the canonical `LineageGraph`
+(`compilation.lineage`) — model, dataset, column and test nodes joined by
+`input`/`output`/`derives`/`contains`/`tests` edges. See
+[`docs/lineage.md`](lineage.md) for the graph model and query API. Reports are
+read off the graph:
 
 - `lineage <model>` — upstream/downstream models.
-- `lineage <model>.<column>` — direct inputs and transitive leaf columns.
+- `lineage <model>.<column>` — direct inputs, indirect inputs (join keys,
+  filters, grouping/sort keys) and transitive leaf columns, plus confidence
+  when it is not `exact`.
 - `impact <model>.<column>` — downstream columns, downstream models and the
-  tests attached to those models.
+  tests attached to those models. `impact <source-or-seed>.<column>` works
+  the same way.
+- `lineage --format graph` — the canonical document; `--format openlineage`
+  exports it as OpenLineage.
 
 Both commands support `--json`. The implementation reuses the same resolved
 representation as execution; there is no separate lineage parser.
@@ -115,10 +130,10 @@ warehouse-independent.
 ## Lineage and impact CLI
 
 `lineage <model> --upstream` and `--downstream` filter the direction (either
-may be shown; both by default). `impact` accepts either a `model.column` or a
-model name; the model form reports downstream models/tests without requiring
-catalogue schemas (useful offline), and column impact renders registered
-consumers.
+may be shown; both by default). `impact` accepts a `model.column`, a
+`source.column`/`seed.column` or a model name; the model form reports
+downstream models/tests without requiring catalogue schemas (useful offline),
+and column impact renders registered consumers.
 
 ## Remaining limitations
 
@@ -129,5 +144,8 @@ consumers.
   `Unknown` plus recorded limitations rather than errors.
 - Runtime execution of contract-derived assertions happens through the
   generated SQL tests; richer assertion types can be added later.
-- Offline column lineage/impact is only as precise as known schemas.
+- Offline column lineage/impact is only as precise as known schemas; columns
+  whose inputs cannot be fully resolved carry `confidence: unknown` rather
+  than a partial claim presented as exact. Seed schemas come from CSV headers,
+  so seed reads resolve without a catalogue.
 

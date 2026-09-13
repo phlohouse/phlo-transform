@@ -23,9 +23,9 @@ pub mod util;
 
 pub use adapter::{Adapter, CatalogRequest, ColumnInfo, QueryResult};
 pub use artifacts::{
-    ArtifactWriter, ColumnLineageArtifact, DiffArtifact, EnvironmentArtifact, GraphArtifactFile,
-    LineageArtifact, ManifestArtifact, ModelLineageArtifact, PlanArtifact, PromotionArtifact,
-    RunArtifact, SCHEMA_VERSION,
+    ArtifactWriter, DiffArtifact, EnvironmentArtifact, GraphArtifactFile, LineageArtifact,
+    ManifestArtifact, OpenLineageArtifact, PlanArtifact, PromotionArtifact, RunArtifact,
+    SCHEMA_VERSION,
 };
 pub use cancel::CancelHandle;
 pub use changed::changed_models;

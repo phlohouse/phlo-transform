@@ -152,6 +152,16 @@ struct Cli {
     command: Command,
 }
 
+/// Export formats for `lineage --format`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum LineageFormat {
+    /// Phlo's canonical lineage graph document.
+    Graph,
+    /// An OpenLineage document: a JSON array of spec-valid JobEvents and
+    /// DatasetEvents — a valid batch-endpoint payload.
+    Openlineage,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Compile the workspace and report diagnostics.
@@ -191,6 +201,11 @@ enum Command {
         /// Model (`assay.results`) or column (`assay.results.concentration`).
         /// Omit to print the model graph (optionally scoped by selectors).
         target: Option<String>,
+        /// Export the canonical lineage graph instead of the human listing:
+        /// `graph` emits Phlo's structured document, `openlineage` emits a
+        /// JSON array of OpenLineage JobEvents and DatasetEvents.
+        #[arg(long, value_enum)]
+        format: Option<LineageFormat>,
     },
     /// Show downstream impact of a column or a selection.
     Impact {
@@ -402,9 +417,14 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
         Command::Apply { .. } => run_apply(cli, &compilation, &set, git.as_ref(), false).await,
         Command::Run { .. } => run_apply(cli, &compilation, &set, git.as_ref(), true).await,
         Command::Test { .. } => run_test(cli, &compilation, &set, git.as_ref()).await,
-        Command::Lineage { target } => {
-            run_lineage(cli, &compilation, target.as_deref(), &set, git.as_ref())
-        }
+        Command::Lineage { target, format } => run_lineage(
+            cli,
+            &compilation,
+            target.as_deref(),
+            &set,
+            git.as_ref(),
+            *format,
+        ),
         Command::Impact { column } => {
             run_impact(cli, &compilation, column.as_deref(), &set, git.as_ref())
         }
@@ -1257,7 +1277,48 @@ fn run_lineage(
     target: Option<&str>,
     set: &SelectorSet,
     git: Option<&GitChanges>,
+    format: Option<LineageFormat>,
 ) -> Result<ExitCode, String> {
+    // `--format` exports the canonical lineage graph: scoped to a model
+    // target or a selection when given, the whole workspace otherwise.
+    if let Some(format) = format {
+        let scope = match target {
+            Some(target) => {
+                let id = ModelId::parse(target)
+                    .map_err(|error| format!("invalid model `{target}`: {error}"))?;
+                if compilation.model(&id).is_none() {
+                    return Err(format!(
+                        "`--format` exports model lineage; `{target}` is not a model"
+                    ));
+                }
+                Some(std::collections::BTreeSet::from([id]))
+            }
+            None if !set.is_unrestricted() => Some(
+                resolve(cli, compilation, set, git)?
+                    .ids()
+                    .into_iter()
+                    .collect(),
+            ),
+            None => None,
+        };
+        let graph = match &scope {
+            Some(models) => compilation.lineage.subgraph(models),
+            None => compilation.lineage.clone(),
+        };
+        return match format {
+            LineageFormat::Graph => {
+                print_json(&graph.document())?;
+                Ok(ExitCode::SUCCESS)
+            }
+            LineageFormat::Openlineage => {
+                let document =
+                    phlo_transform_openlineage::OpenLineageExporter::new(&graph).export();
+                print_json(&document)?;
+                Ok(ExitCode::SUCCESS)
+            }
+        };
+    }
+
     let Some(target) = target else {
         return run_graph_lineage(cli, compilation, set, git);
     };
@@ -1296,7 +1357,13 @@ fn run_lineage(
                 print_json(&report)?;
             } else {
                 println!("Column:     {}", report.column);
+                if report.confidence != phlo_transform_core::LineageConfidence::Exact {
+                    println!("Confidence: {}", confidence_label(report.confidence));
+                }
                 println!("Direct:     {}", join_or_none(&report.direct));
+                if !report.indirect.is_empty() {
+                    println!("Indirect:   {}", join_or_none(&report.indirect));
+                }
                 println!("Transitive: {}", join_or_none(&report.transitive));
             }
             Ok(ExitCode::SUCCESS)
@@ -1479,13 +1546,29 @@ fn run_impact(
     }
 
     let Some((model, name)) = column.rsplit_once('.') else {
-        return Err(format!("invalid column `{column}`; expected model.column"));
+        return Err(format!(
+            "invalid column `{column}`; expected model.column or dataset.column"
+        ));
     };
-    let id = ModelId::parse(model).map_err(|error| format!("invalid model `{model}`: {error}"))?;
-    if compilation.model(&id).is_none() {
-        return Err(format!("no such model: {}", id.logical_name()));
-    }
-    let target = phlo_transform_core::ColumnRef::model(id, name);
+    // A model column first; otherwise the prefix may be a source or seed
+    // dataset (`impact external.samples.volume`).
+    let target = if let Ok(id) = ModelId::parse(model) {
+        if compilation.model(&id).is_some() {
+            phlo_transform_core::ColumnRef::model(id, name)
+        } else if let Some(dataset) = compilation.lineage.dataset_by_name(model) {
+            let source = phlo_transform_core::SourceId::new(dataset.parts().to_vec())
+                .map_err(|error| error.to_string())?;
+            phlo_transform_core::ColumnRef::source(source, name)
+        } else {
+            return Err(format!("no such model or dataset: {model}"));
+        }
+    } else if let Some(dataset) = compilation.lineage.dataset_by_name(model) {
+        let source = phlo_transform_core::SourceId::new(dataset.parts().to_vec())
+            .map_err(|error| error.to_string())?;
+        phlo_transform_core::ColumnRef::source(source, name)
+    } else {
+        return Err(format!("invalid model `{model}`; no such dataset either"));
+    };
     let mut report = compilation.impact_report(&target);
     if let Some(members) = &members {
         report
@@ -1533,11 +1616,13 @@ fn run_selection_impact(
     let selection = resolve(cli, compilation, set, git)?;
     let members: std::collections::BTreeSet<ModelId> = selection.ids().into_iter().collect();
     let mut impacted: std::collections::BTreeSet<ModelId> = std::collections::BTreeSet::new();
-    let mut frontier: Vec<ModelId> = members.iter().cloned().collect();
-    while let Some(id) = frontier.pop() {
-        for dependent in compilation.dependents(&id) {
-            if impacted.insert(dependent.clone()) {
-                frontier.push(dependent);
+    for member in &members {
+        for node in compilation
+            .lineage
+            .downstream_transitive(&phlo_transform_core::LineageNode::Model(member.clone()))
+        {
+            if let phlo_transform_core::LineageNode::Model(id) = node {
+                impacted.insert(id);
             }
         }
     }
@@ -1546,8 +1631,11 @@ fn run_selection_impact(
     }
     let mut tests: Vec<String> = Vec::new();
     for id in &impacted {
-        for test in compilation.tests_for(id) {
-            tests.push(test.id.to_string());
+        for test in compilation
+            .lineage
+            .tests_for_dataset(&compilation.lineage.output_dataset(id))
+        {
+            tests.push(test.to_string());
         }
     }
     let impacted: Vec<String> = impacted.iter().map(|id| id.logical_name()).collect();
@@ -1578,6 +1666,17 @@ fn join_or_none(values: &[String]) -> String {
         "(none)".to_string()
     } else {
         values.join(", ")
+    }
+}
+
+fn confidence_label(confidence: phlo_transform_core::LineageConfidence) -> &'static str {
+    use phlo_transform_core::LineageConfidence::*;
+    match confidence {
+        Exact => "exact",
+        Inferred => "inferred",
+        Declared => "declared",
+        Runtime => "runtime",
+        Unknown => "unknown",
     }
 }
 

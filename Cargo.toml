@@ -9,6 +9,7 @@ members = [
     "crates/phlo-transform-daemon",
     "crates/phlo-transform-dbt",
     "crates/phlo-transform-duckdb",
+    "crates/phlo-transform-openlineage",
     "crates/phlo-transform-cli",
 ]
 
@@ -27,6 +28,7 @@ phlo-transform-dbt = { path = "crates/phlo-transform-dbt", version = "0.1.0" }
 phlo-transform-duckdb = { path = "crates/phlo-transform-duckdb", version = "0.1.0" }
 phlo-transform-engine = { path = "crates/phlo-transform-engine", version = "0.1.0" }
 phlo-transform-nessie = { path = "crates/phlo-transform-nessie", version = "0.1.0" }
+phlo-transform-openlineage = { path = "crates/phlo-transform-openlineage", version = "0.1.0" }
 phlo-transform-sql = { path = "crates/phlo-transform-sql", version = "0.1.0" }
 phlo-transform-trino = { path = "crates/phlo-transform-trino", version = "0.1.0" }
 

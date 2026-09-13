@@ -23,6 +23,7 @@ phlo-transform-dbt = { workspace = true }
 phlo-transform-duckdb = { workspace = true }
 phlo-transform-engine = { workspace = true }
 phlo-transform-nessie = { workspace = true }
+phlo-transform-openlineage = { workspace = true }
 phlo-transform-trino = { workspace = true }
 
 [dev-dependencies]

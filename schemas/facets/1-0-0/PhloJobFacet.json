@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/phlohouse/phlo-transform/schemas-facets-1.0.0/schemas/facets/1-0-0/PhloJobFacet.json",
+  "description": "Phlo Transform job metadata that has no standard OpenLineage equivalent.",
+  "type": "object",
+  "$defs": {
+    "PhloJobFacet": {
+      "allOf": [
+        {
+          "$ref": "https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/JobFacet"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "uri": {
+              "type": "string",
+              "description": "The model:// URI — the job's logical identity in Phlo."
+            },
+            "path": {
+              "type": "string",
+              "description": "Workspace-relative path of the model's SQL file."
+            },
+            "materialization": {
+              "type": "string",
+              "description": "How the model is materialized: view|table|incremental|ephemeral."
+            },
+            "workflow": {
+              "type": "string",
+              "description": "The owning workflow root, when the model belongs to one."
+            },
+            "version": {
+              "type": "string",
+              "description": "The content-addressed desired version of the model."
+            }
+          },
+          "required": ["uri", "materialization", "version"],
+          "additionalProperties": true
+        }
+      ],
+      "type": "object"
+    }
+  }
+}

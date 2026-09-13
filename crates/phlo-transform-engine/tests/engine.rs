@@ -428,6 +428,7 @@ async fn persists_run_history_and_writes_artifacts() {
         "manifest.json",
         "graph.json",
         "lineage.json",
+        "openlineage.json",
         "plan.json",
         "run.json",
     ] {
@@ -436,6 +437,22 @@ async fn persists_run_history_and_writes_artifacts() {
             "missing artifact {name}"
         );
     }
+
+    // `openlineage.json` carries the exported design-time document: a flat
+    // array of spec-valid OpenLineage events (a valid batch payload).
+    let document: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(directory.path().join("openlineage.json")).unwrap(),
+    )
+    .unwrap();
+    let events = document["document"].as_array().expect("event array");
+    assert!(!events.is_empty());
+    assert!(events.iter().all(|event| {
+        event["eventTime"].is_string()
+            && event["producer"] == "https://github.com/phlohouse/phlo-transform"
+            && event["schemaURL"].is_string()
+    }));
+    assert!(events.iter().any(|event| event.get("job").is_some()));
+    assert!(events.iter().any(|event| event.get("dataset").is_some()));
 }
 
 #[tokio::test]

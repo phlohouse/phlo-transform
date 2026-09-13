@@ -4,12 +4,19 @@ expression: "compilation.column_lineage_report(&results, \"concentration\").unwr
 ---
 {
   "column": "assay.results.concentration",
+  "confidence": "exact",
   "direct": [
     "assay.raw_results.signal",
     "external.samples.volume"
   ],
+  "indirect": [
+    "assay.raw_results.sample_id",
+    "external.samples.sample_id"
+  ],
   "transitive": [
+    "external.raw_results.sample_id",
     "external.raw_results.signal",
+    "external.samples.sample_id",
     "external.samples.volume"
   ]
 }

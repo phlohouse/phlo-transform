@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use phlo_transform_core::report::{ModelSummary, RootReport, SourceSummary, TestSummary};
-use phlo_transform_core::{Compilation, GraphArtifact};
+use phlo_transform_core::{Compilation, GraphArtifact, LineageDocument};
 
 use crate::error::EngineError;
 use crate::plan::Plan;
@@ -16,7 +16,10 @@ use crate::run::RunResult;
 use crate::util::now_rfc3339;
 
 /// Current artifact schema version.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 replaces the per-model column list in `lineage.json` with the
+/// canonical lineage graph document and adds `openlineage.json`.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// `manifest.json`.
 #[derive(Clone, Debug, Serialize)]
@@ -72,52 +75,29 @@ pub struct EnvironmentArtifact {
     pub environment: crate::environment::EnvironmentSetup,
 }
 
-/// `lineage.json`.
+/// `lineage.json` — the canonical lineage graph document. Every model,
+/// dataset, column and test node, every edge, and the directness /
+/// transformation / confidence metadata on column edges.
 #[derive(Clone, Debug, Serialize)]
 pub struct LineageArtifact {
     pub schema_version: u32,
-    pub models: Vec<ModelLineageArtifact>,
+    pub graph: LineageDocument,
 }
 
-/// Column lineage for one model.
+/// `openlineage.json` — the same graph exported as an OpenLineage
+/// static-lineage document: an `events` array in which every element is a
+/// spec-valid `JobEvent` or `DatasetEvent`.
 #[derive(Clone, Debug, Serialize)]
-pub struct ModelLineageArtifact {
-    pub model: String,
-    pub columns: Vec<ColumnLineageArtifact>,
-}
-
-/// Lineage of one output column.
-#[derive(Clone, Debug, Serialize)]
-pub struct ColumnLineageArtifact {
-    pub column: String,
-    pub data_type: String,
-    pub nullability: String,
-    pub inputs: Vec<String>,
+pub struct OpenLineageArtifact {
+    pub schema_version: u32,
+    pub document: serde_json::Value,
 }
 
 impl LineageArtifact {
     pub fn from_compilation(compilation: &Compilation) -> Self {
-        let models = compilation
-            .models
-            .iter()
-            .map(|model| ModelLineageArtifact {
-                model: model.id.logical_name(),
-                columns: model
-                    .schema
-                    .columns
-                    .iter()
-                    .map(|column| ColumnLineageArtifact {
-                        column: column.name.clone(),
-                        data_type: column.data_type.to_string(),
-                        nullability: column.nullability.to_string(),
-                        inputs: column.inputs.iter().map(|input| input.display()).collect(),
-                    })
-                    .collect(),
-            })
-            .collect();
         Self {
             schema_version: SCHEMA_VERSION,
-            models,
+            graph: compilation.lineage.document(),
         }
     }
 }
@@ -166,7 +146,18 @@ impl ArtifactWriter {
                 graph: compilation.graph_artifact(),
             },
         )?;
-        self.write("lineage", &LineageArtifact::from_compilation(compilation))
+        self.write("lineage", &LineageArtifact::from_compilation(compilation))?;
+        self.write(
+            "openlineage",
+            &OpenLineageArtifact {
+                schema_version: SCHEMA_VERSION,
+                document: serde_json::to_value(
+                    phlo_transform_openlineage::OpenLineageExporter::new(&compilation.lineage)
+                        .export(),
+                )
+                .map_err(|error| EngineError::Artifact(error.to_string()))?,
+            },
+        )
     }
 
     /// Write `plan.json`.

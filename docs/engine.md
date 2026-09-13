@@ -12,12 +12,13 @@ crates/
 ├── phlo-transform-core/     discovery, semantic model, compiler, DAG
 ├── phlo-transform-engine/   adapter trait, planner, scheduler, state, artifacts
 ├── phlo-transform-trino/    Trino HTTP adapter
+├── phlo-transform-openlineage/  canonical lineage graph → OpenLineage export
 └── phlo-transform-cli/      `phlo-transform` binary
 ```
 
 Dependency direction stays one-way:
-`cli → trino → engine → core → sql`. The compiler core gains no async,
-warehouse or storage dependencies.
+`cli → trino → engine → {core, openlineage} → core → sql`. The compiler core
+gains no async, warehouse or storage dependencies.
 
 ## Reserved name
 
@@ -256,13 +257,14 @@ records are what make planning and the `changed` selector state-aware; see
 
 ## Artifacts
 
-Written under `.phlo/transform/` with `schema_version = 1`:
+Written under `.phlo/transform/` with `schema_version = 2`:
 
 | File | Contents |
 |---|---|
 | `manifest.json` | workspace root, roots, models, sources, tests |
-| `graph.json` | graph nodes and edges |
-| `lineage.json` | inferred columns and column inputs per model |
+| `graph.json` | dependency-graph nodes and edges |
+| `lineage.json` | the canonical lineage graph document (models, datasets, columns, tests; direct/indirect/transformation/confidence on column edges) |
+| `openlineage.json` | the same graph exported as an OpenLineage design-time document (a JSON array of valid `JobEvent`/`DatasetEvent`s) |
 | `plan.json` | plan id, adapter, environment, planned models/tests, diagnostics |
 | `run.json` | run id, plan id, status, model/test results, events |
 | `environment.json` | provisioned base/candidate references and candidate catalog |
@@ -288,6 +290,5 @@ same results.
 
 ## Deferred
 
-Column/type inference, column lineage, contracts, content-addressed state,
-smart skip/caching, incremental materialisations, Nessie/WAP, data diff and
-the daemon remain later phases.
+Contracts, content-addressed state, smart skip/caching, incremental
+materialisations, Nessie/WAP, data diff and the daemon remain later phases.
