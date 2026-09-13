@@ -1751,3 +1751,136 @@ fn ref_delete_refuses_main() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("main"), "{}", stderr(&output));
 }
+
+/// `state runs`/`state show`/`state model` inspect what `run` recorded.
+#[test]
+fn state_commands_inspect_recorded_runs_on_duckdb() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let duckdb_path = root.join("local.duckdb");
+
+    std::fs::create_dir_all(root.join("transforms/shop")).expect("mkdir");
+    std::fs::write(
+        root.join("transforms/shop/events.sql"),
+        "select * from raw_events\n",
+    )
+    .expect("write model");
+
+    {
+        let connection = duckdb::Connection::open(&duckdb_path).expect("open duckdb");
+        connection
+            .execute_batch("create table main.raw_events as select 1 as id")
+            .expect("seed source");
+    }
+
+    let duckdb_arg = duckdb_path.to_str().expect("utf-8").to_string();
+    let root_arg = root.to_str().expect("utf-8").to_string();
+    let args = |extra: &[&'static str]| {
+        let mut args = vec![
+            "--root",
+            root_arg.as_str(),
+            "--adapter",
+            "duckdb",
+            "--duckdb-path",
+            duckdb_arg.as_str(),
+        ];
+        args.extend_from_slice(extra);
+        args
+    };
+
+    let output = run_unchecked(&args(&["run"]));
+    assert!(output.status.success(), "{}", stdout(&output));
+
+    // `state runs` lists the recorded run with its environment column.
+    let output = run_unchecked(&args(&["state", "runs"]));
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("passed"), "{body}");
+
+    // `state show` resolves a run-id prefix to its model records.
+    let output = run_unchecked(&args(&["--json", "state", "runs"]));
+    assert!(output.status.success(), "{}", stdout(&output));
+    let runs: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("json");
+    let run_id = runs[0]["run_id"].as_str().expect("run id").to_string();
+    let output = run_unchecked(&[
+        "--root",
+        root_arg.as_str(),
+        "--adapter",
+        "duckdb",
+        "--duckdb-path",
+        duckdb_arg.as_str(),
+        "state",
+        "show",
+        &run_id[..8],
+    ]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("shop.events"), "{body}");
+
+    // `state model` shows the recorded materialisation incl. the adapter
+    // that produced it.
+    let output = run_unchecked(&args(&["state", "model", "shop.events"]));
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("duckdb"), "{body}");
+}
+
+/// `--state <path>` redirects the SQLite state store location.
+#[test]
+fn state_flag_selects_sqlite_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("ws");
+    let state_path = dir.path().join("shared-state.db");
+    let duckdb_path = root.join("local.duckdb");
+
+    std::fs::create_dir_all(root.join("transforms/shop")).expect("mkdir");
+    std::fs::write(root.join("transforms/shop/events.sql"), "select 1 as id\n")
+        .expect("write model");
+
+    let state_arg = state_path.to_str().expect("utf-8").to_string();
+    let duckdb_arg = duckdb_path.to_str().expect("utf-8").to_string();
+    let root_arg = root.to_str().expect("utf-8").to_string();
+    let args = |extra: &[&'static str]| {
+        let mut args = vec![
+            "--root",
+            root_arg.as_str(),
+            "--adapter",
+            "duckdb",
+            "--duckdb-path",
+            duckdb_arg.as_str(),
+            "--state",
+            state_arg.as_str(),
+        ];
+        args.extend_from_slice(extra);
+        args
+    };
+
+    let output = run_unchecked(&args(&["run"]));
+    assert!(output.status.success(), "{}", stdout(&output));
+    assert!(state_path.exists(), "state file created at --state path");
+    // The default location must not be used.
+    assert!(!root.join(".phlo/transform/state.db").exists());
+
+    let output = run_unchecked(&args(&["state", "runs"]));
+    assert!(output.status.success(), "{}", stdout(&output));
+    assert!(stdout(&output).contains("passed"), "{}", stdout(&output));
+}
+
+/// A `--state postgres://...` URL that cannot connect is a hard error — it
+/// must never silently fall back to local state.
+#[test]
+fn unreachable_postgres_state_url_errors() {
+    let output = run(&[
+        "--root",
+        "fixtures/basic-multi-root",
+        "--state",
+        "postgres://user:secret@127.0.0.1:1/phlo",
+        "state",
+        "runs",
+    ]);
+    assert!(!output.status.success());
+    let message = stderr(&output);
+    assert!(message.contains("could not connect"), "{message}");
+    // Credentials in the URL must not echo back in the error.
+    assert!(!message.contains("secret"), "{message}");
+}

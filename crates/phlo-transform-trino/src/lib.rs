@@ -205,6 +205,24 @@ impl TrinoAdapter {
     fn transport_error(&self, error: reqwest::Error) -> AdapterError {
         AdapterError::new("TRINO_TRANSPORT", error.to_string()).retryable()
     }
+
+    /// The latest Iceberg snapshot id, when the relation is an Iceberg
+    /// table — the only strong content identity Trino can prove.
+    async fn iceberg_snapshot(&self, relation: &Relation) -> Option<String> {
+        let snapshots = Relation {
+            catalog: relation.catalog.clone(),
+            schema: relation.schema.clone(),
+            table: format!("{}$snapshots", relation.table),
+        };
+        self.run(&format!(
+            "SELECT snapshot_id FROM {} ORDER BY committed_at DESC LIMIT 1",
+            snapshots.sql()
+        ))
+        .await
+        .ok()
+        .and_then(|result| result.rows.first().and_then(|row| row.first()).cloned())
+        .map(|value| format!("snapshot:{value}"))
+    }
 }
 
 #[async_trait]
@@ -427,21 +445,8 @@ impl Adapter for TrinoAdapter {
 
     async fn source_state(&self, relation: &Relation) -> Result<Option<String>, AdapterError> {
         // Iceberg snapshot state, when the relation is an Iceberg table.
-        let snapshots = Relation {
-            catalog: relation.catalog.clone(),
-            schema: relation.schema.clone(),
-            table: format!("{}$snapshots", relation.table),
-        };
-        if let Ok(result) = self
-            .run(&format!(
-                "SELECT snapshot_id FROM {} ORDER BY committed_at DESC LIMIT 1",
-                snapshots.sql()
-            ))
-            .await
-        {
-            if let Some(value) = result.rows.first().and_then(|row| row.first()) {
-                return Ok(Some(format!("snapshot:{value}")));
-            }
+        if let Some(snapshot) = self.iceberg_snapshot(relation).await {
+            return Ok(Some(snapshot));
         }
 
         // Fallback: a stable fingerprint of the relation's schema, so schema
@@ -455,6 +460,13 @@ impl Adapter for TrinoAdapter {
             }
         }
         Ok(None)
+    }
+
+    /// For Iceberg the snapshot id is a strong identity: an unchanged value
+    /// proves the same physical output. Non-Iceberg relations have no
+    /// provable identity — schema fingerprints describe shape, not bytes.
+    async fn output_identity(&self, relation: &Relation) -> Result<Option<String>, AdapterError> {
+        Ok(self.iceberg_snapshot(relation).await)
     }
 
     async fn partition_counts(

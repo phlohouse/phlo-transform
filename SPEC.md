@@ -910,7 +910,9 @@ This makes source change detection substantially more precise than timestamp-onl
 
 Successful immutable model versions may be cached. Where a compatible desired model version already exists, it may be reused or promoted instead of recalculated.
 
-Cache reuse must account for environment and source-state compatibility.
+Cache reuse must account for environment and source-state compatibility. A version-hash match in another environment authorises reuse only when the record also names the same physical target relation, was produced by the same adapter, and carries a strong output identity (the adapter's post-write `output_identity` — e.g. the Iceberg snapshot id) that still matches what the relation reports — the hash says *what* should exist, not *where* it was written, *which engine* wrote it, or *that it is still there*. `output_identity` must prove physical contents: a schema fingerprint or row count describes shape, not bytes, so adapters that cannot prove identity (non-Iceberg relations, DuckDB) report none and never authorise reuse. Same-version records that fail any check produce a `cache_miss` build reason; a current-environment record produced by a different adapter or predating adapter tracking produces `adapter_change`, and one whose recorded output identity no longer matches the physical relation produces `output_drift`.
+
+Materialisation records are ordered writes, not last-writer-wins: `model_versions` and `seed_loads` only apply records that are not older than what is stored, and watermarks order by run generation, so two runs completing out of order cannot regress shared state.
 
 ---
 
@@ -953,8 +955,9 @@ Reason kinds are stable machine-readable codes (`sql_semantic_change`,
 `config_change`, `contract_change`, `dependency_change`, `upstream_rebuild`,
 `source_change`, `target_change`, `compiler_semantics_change`,
 `incremental_change`, `schema_change`, `missing_relation`, `unknown_state`,
-`cache_reuse`, `forced`, `unchanged`, `selected_dependency`,
-`selection_expansion`, `state_unavailable`). `--json` exposes them with an
+`cache_reuse`, `cache_miss`, `adapter_change`, `output_drift`, `forced`,
+`unchanged`, `selected_dependency`, `selection_expansion`,
+`state_unavailable`, `git_change`, `resumed_run`). `--json` exposes them with an
 optional `subject` (the dependency or source the reason is about), plus the
 resolved `selection` (terms, matched, expanded, required, exclude) and each
 model's `membership` (`selected` / `expanded` / `dependency`).
@@ -1583,7 +1586,10 @@ phlo transform list
 phlo transform promote
 phlo transform rollback
 phlo transform clean
+phlo transform state runs|show|model|promotions
 ```
+
+The state backend is selected by `--state`/`PHLO_STATE_URL`: a `postgres://`/`postgresql://` URL selects the shared PostgreSQL store; anything else is a SQLite file path (default `.phlo/transform/state.db`).
 
 ## 78. `check`
 

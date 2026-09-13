@@ -117,6 +117,16 @@ pub enum ReasonKind {
     /// Selected because a Git-aware change provider marked it changed
     /// (selection provenance — not a rebuild decision).
     GitChange,
+    /// An identical version exists in another environment but cannot be
+    /// safely reused here — the physical relation isn't reachable, or it
+    /// was produced by a different adapter.
+    CacheMiss,
+    /// The recorded materialisation was produced by a different adapter —
+    /// execution semantics differ, so the version alone can't be trusted.
+    AdapterChange,
+    /// The physical relation no longer holds the recorded materialisation —
+    /// another writer overwrote it since the version was recorded.
+    OutputDrift,
     /// Re-executed (or reused) as part of a resumed or retried run.
     ResumedRun,
 }
@@ -138,6 +148,9 @@ impl ReasonKind {
             ReasonKind::MissingRelation => "missing_relation",
             ReasonKind::UnknownState => "unknown_state",
             ReasonKind::CacheReuse => "cache_reuse",
+            ReasonKind::CacheMiss => "cache_miss",
+            ReasonKind::AdapterChange => "adapter_change",
+            ReasonKind::OutputDrift => "output_drift",
             ReasonKind::Forced => "forced",
             ReasonKind::Unchanged => "unchanged",
             ReasonKind::SelectedDependency => "selected_dependency",
@@ -551,13 +564,15 @@ impl Planner {
                     }
                     None => None,
                 };
-                let (action, reasons) = self.decide(
-                    model,
-                    current.as_ref(),
-                    exists,
-                    environment.as_deref(),
-                    options,
-                )?;
+                let (action, reasons) = self
+                    .decide(
+                        model,
+                        current.as_ref(),
+                        exists,
+                        environment.as_deref(),
+                        options,
+                    )
+                    .await?;
                 (action, reasons, current, exists)
             };
             reasons.append(&mut change_reasons);
@@ -829,7 +844,7 @@ impl Planner {
         }
     }
 
-    fn decide(
+    async fn decide(
         &self,
         model: &CompiledModel,
         current: Option<&MaterializedRecord>,
@@ -858,25 +873,101 @@ impl Planner {
         }
         let Some(current) = current else {
             // Not materialised in this environment; if the exact version
-            // exists elsewhere it is a cache candidate.
+            // exists elsewhere it is a cache candidate — but only a record
+            // naming this same physical relation, produced by this adapter,
+            // whose recorded strong output identity still matches what the
+            // relation reports. A record without a verifiable output
+            // identity is a version hash, not evidence.
             if let Some(state) = &self.state {
                 let elsewhere = state.materialized_by_hash(&desired.hash)?;
-                if let Some(hit) = elsewhere
+                let elsewhere: Vec<&MaterializedRecord> = elsewhere
                     .iter()
-                    .find(|record| record.environment.as_deref() != environment)
-                {
+                    .filter(|record| record.environment.as_deref() != environment)
+                    .collect();
+                let candidates: Vec<&MaterializedRecord> = elsewhere
+                    .iter()
+                    .filter(|record| {
+                        record.target == model.target.display()
+                            && record.adapter.as_deref() == Some(self.adapter.name())
+                    })
+                    .copied()
+                    .collect();
+                if !candidates.is_empty() {
+                    let live = self
+                        .adapter
+                        .output_identity(&model.target)
+                        .await
+                        .ok()
+                        .flatten();
+                    if let Some(hit) = candidates.iter().find(|record| {
+                        record.output_identity.is_some() && record.output_identity == live
+                    }) {
+                        let source_env = hit
+                            .environment
+                            .as_deref()
+                            .unwrap_or("the default environment");
+                        return Ok((
+                            PlanAction::Cached,
+                            vec![PlanReason::about(
+                                ReasonKind::CacheReuse,
+                                format!(
+                                    "exact desired version exists in {source_env} on the same relation (run {})",
+                                    short(&hit.run_id, 12)
+                                ),
+                                source_env.to_string(),
+                            )],
+                        ));
+                    }
+                    let source_env = candidates[0]
+                        .environment
+                        .as_deref()
+                        .unwrap_or("the default environment");
+                    let detail = match live {
+                        Some(live) => format!(
+                            "identical version recorded in {source_env} but {target} now reports \
+                             output `{live}` — another writer owns the relation; rebuilding",
+                            target = model.target.display()
+                        ),
+                        None => format!(
+                            "identical version recorded in {source_env} but {target} has no \
+                             verifiable output identity; rebuilding",
+                            target = model.target.display()
+                        ),
+                    };
+                    return Ok((
+                        PlanAction::Build,
+                        vec![PlanReason::about(
+                            ReasonKind::CacheMiss,
+                            detail,
+                            source_env.to_string(),
+                        )],
+                    ));
+                }
+                if let Some(hit) = elsewhere.first() {
                     let source_env = hit
                         .environment
                         .as_deref()
                         .unwrap_or("the default environment");
+                    let detail = if hit.adapter.as_deref() != Some(self.adapter.name()) {
+                        format!(
+                            "identical version exists in {source_env} but was materialised by \
+                             adapter `{}` (this run uses `{}`); metadata-only, rebuilding",
+                            hit.adapter.as_deref().unwrap_or("<unrecorded>"),
+                            self.adapter.name()
+                        )
+                    } else {
+                        format!(
+                            "identical version exists in {source_env} at {} but that relation \
+                             is not the one here ({}); metadata-only, rebuilding",
+                            hit.target,
+                            model.target.display()
+                        )
+                    };
                     return Ok((
-                        PlanAction::Cached,
+                        PlanAction::Build,
                         vec![PlanReason::about(
-                            ReasonKind::CacheReuse,
-                            format!(
-                                "identical version materialised in {source_env} (run {})",
-                                short(&hit.run_id, 12)
-                            ),
+                            ReasonKind::CacheMiss,
+                            detail,
                             source_env.to_string(),
                         )],
                     ));
@@ -898,6 +989,66 @@ impl Planner {
                 )],
             ));
         };
+
+        // A materialisation produced under a different adapter cannot vouch
+        // for this output — execution semantics differ between engines — and
+        // a record with no adapter cannot vouch for anything.
+        match &current.adapter {
+            Some(recorded_adapter) if recorded_adapter != self.adapter.name() => {
+                return Ok((
+                    PlanAction::Build,
+                    vec![PlanReason::simple(
+                        ReasonKind::AdapterChange,
+                        format!(
+                            "materialised by adapter `{recorded_adapter}`; current adapter is \
+                             `{}`",
+                            self.adapter.name()
+                        ),
+                    )],
+                ));
+            }
+            None => {
+                return Ok((
+                    PlanAction::Build,
+                    vec![PlanReason::simple(
+                        ReasonKind::AdapterChange,
+                        format!(
+                            "materialisation was recorded before adapter identity was tracked; \
+                             cannot verify it was produced by `{}`",
+                            self.adapter.name()
+                        ),
+                    )],
+                ));
+            }
+            _ => {}
+        }
+
+        // A recorded output identity that no longer matches what the adapter
+        // can prove means another writer overwrote the relation — the record
+        // is stale, whatever the version hash says.
+        if let Some(recorded_output) = &current.output_identity {
+            let live = self
+                .adapter
+                .output_identity(&model.target)
+                .await
+                .ok()
+                .flatten();
+            if live.as_deref() != Some(recorded_output.as_str()) {
+                return Ok((
+                    PlanAction::Build,
+                    vec![PlanReason::simple(
+                        ReasonKind::OutputDrift,
+                        format!(
+                            "{} no longer holds the recorded output{} — another writer owns \
+                             the relation",
+                            model.target.display(),
+                            live.map(|live| format!(" (now `{live}`)"))
+                                .unwrap_or_default()
+                        ),
+                    )],
+                ));
+            }
+        }
 
         if current.version.hash == desired.hash {
             return Ok((
