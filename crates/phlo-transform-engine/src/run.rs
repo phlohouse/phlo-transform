@@ -179,6 +179,8 @@ struct Completion {
     /// Attempts made in *this* invocation (earlier attempts from a resumed
     /// run are kept separately and prepended on write).
     attempts: Vec<Attempt>,
+    /// A state-store write failed inside the task — fatal for the run.
+    state_error: Option<String>,
     started_at: String,
     finished_at: String,
     duration_ms: u64,
@@ -378,11 +380,23 @@ impl Runner {
             ))
         })?;
 
-        if stored.record.status == ExecutionStatus::Passed {
-            return Err(EngineError::InvalidPlan(format!(
-                "run {} already passed — nothing to resume",
-                short_id(&run_id)
-            )));
+        // Resume continues an *interrupted* run — still `running` after a
+        // kill, or `cancelled`. A finished failed run is retried as a new
+        // run so its history stays immutable.
+        match stored.record.status {
+            ExecutionStatus::Passed => {
+                return Err(EngineError::InvalidPlan(format!(
+                    "run {} already passed — nothing to resume",
+                    short_id(&run_id)
+                )));
+            }
+            ExecutionStatus::Failed => {
+                return Err(EngineError::InvalidPlan(format!(
+                    "run {} already finished — retry its failed work with `--retry-failed`",
+                    short_id(&run_id)
+                )));
+            }
+            _ => {}
         }
         if options.environment != stored.record.environment {
             return Err(EngineError::InvalidPlan(format!(
@@ -485,8 +499,9 @@ impl Runner {
             )));
         }
 
-        // The failed portion: models whose run state never reached a
-        // satisfied terminal. Everything else stays as materialised.
+        // The failed portion: models and tests whose run state never
+        // reached a satisfied terminal. Everything else stays as
+        // materialised.
         let failed_ids: Vec<ModelId> = state
             .model_runs(&run_id)?
             .into_iter()
@@ -498,7 +513,16 @@ impl Runner {
             })
             .filter_map(|record| ModelId::parse(&record.model_id).ok())
             .collect();
-        if failed_ids.is_empty() {
+        // Only tests that executed and failed count as failed work — a
+        // blocked/cancelled test never ran; it rides along automatically
+        // when the models it reads are rebuilt below.
+        let failed_test_ids: BTreeSet<String> = state
+            .test_runs(&run_id)?
+            .into_iter()
+            .filter(|record| record.status == ExecutionStatus::Failed)
+            .map(|record| record.test_id)
+            .collect();
+        if failed_ids.is_empty() && failed_test_ids.is_empty() {
             return Err(EngineError::InvalidPlan(format!(
                 "run {} has no failed or blocked work to retry",
                 short_id(&run_id)
@@ -513,10 +537,34 @@ impl Runner {
                 )));
             }
         }
+        for test_id in &failed_test_ids {
+            if !compilation
+                .tests
+                .iter()
+                .any(|test| test.id.to_string() == *test_id)
+            {
+                return Err(EngineError::InvalidPlan(format!(
+                    "run {} is incompatible with the workspace: test `{test_id}` no longer exists",
+                    short_id(&run_id)
+                )));
+            }
+        }
 
-        let selection = Selection::of(compilation, &failed_ids);
+        // Select the failed models plus the targets of the failed tests, so
+        // those tests land in the plan against datasets that already exist.
+        let mut select_ids = failed_ids.clone();
+        for test in &compilation.tests {
+            if failed_test_ids.contains(&test.id.to_string()) {
+                for target in &test.targets {
+                    if !select_ids.contains(target) {
+                        select_ids.push(target.clone());
+                    }
+                }
+            }
+        }
+        let selection = Selection::of(compilation, &select_ids);
         let planner = Planner::new(self.adapter.clone(), self.state.clone());
-        let plan = planner
+        let mut plan = planner
             .plan(
                 compilation,
                 &selection,
@@ -525,13 +573,23 @@ impl Runner {
             )
             .await?;
 
-        // The failed portion may already be materialised — for example a
-        // previous retry fixed it. A retry that would only skip is noise.
-        if !plan
+        // Scope the tests to the failed portion: the failed tests
+        // themselves, plus tests over models this retry actually rebuilds
+        // (their data changed, so a stale pass no longer holds).
+        let rebuilt: BTreeSet<String> = plan
             .models
             .iter()
-            .any(|model| model.action == PlanAction::Build)
-        {
+            .filter(|model| model.action == PlanAction::Build)
+            .map(|model| model.id.clone())
+            .collect();
+        plan.tests.retain(|test| {
+            failed_test_ids.contains(&test.id)
+                || test.targets.iter().any(|target| rebuilt.contains(target))
+        });
+
+        // The failed portion may already be materialised — for example a
+        // previous retry fixed it. A retry that would only skip is noise.
+        if rebuilt.is_empty() && plan.tests.is_empty() {
             return Err(EngineError::InvalidPlan(format!(
                 "the failed portion of run {} is already materialised — nothing to retry",
                 short_id(&run_id)
@@ -569,7 +627,15 @@ impl Runner {
             let compiled = compilation.model(&id).expect("checked compatible");
             let desired = compiled.version.hash.clone();
             let exists = self.adapter.relation_exists(&compiled.target).await?;
-            let reused = prior.reusable_model(&id, &desired).is_some();
+            // Reuse requires the earlier success *and* its relation still
+            // present — a dropped target means the work has to run again.
+            let reused = exists && prior.reusable_model(&id, &desired).is_some();
+            let current_version = match &self.state {
+                Some(state) => state
+                    .materialized_version(&id.logical_name(), options.environment.as_deref())?
+                    .map(|record| record.version.hash),
+                None => None,
+            };
             let mut reasons = Vec::new();
             if reused {
                 reasons.push(PlanReason::simple(
@@ -592,17 +658,38 @@ impl Runner {
                     ));
                 }
             }
-            let current_version = match &self.state {
-                Some(state) => state
-                    .materialized_version(&id.logical_name(), options.environment.as_deref())?
-                    .map(|record| record.version.hash),
-                None => None,
+            // Re-decide the action against current state for everything not
+            // carried over: the stored action is stale once the desired
+            // version moved or the target relation changed underneath us.
+            // Mirrors the planner's rules — missing relation builds,
+            // matching materialised version skips, a version materialised
+            // in another environment is a cache candidate, otherwise build.
+            let action = if reused {
+                PlanAction::parse(&stored_model.action)
+            } else if !exists {
+                PlanAction::Build
+            } else if current_version.as_deref() == Some(desired.as_str()) {
+                PlanAction::Skip
+            } else {
+                match &self.state {
+                    Some(state) => {
+                        let elsewhere = state.materialized_by_hash(&desired)?;
+                        if elsewhere.iter().any(|record| {
+                            record.environment.as_deref() != options.environment.as_deref()
+                        }) {
+                            PlanAction::Cached
+                        } else {
+                            PlanAction::Build
+                        }
+                    }
+                    None => PlanAction::Build,
+                }
             };
             models.push(PlannedModel {
                 id: stored_model.id.clone(),
                 target: compiled.target.display(),
                 materialization: compiled.config.materialization.to_string(),
-                action: PlanAction::parse(&stored_model.action),
+                action,
                 reasons,
                 membership: Membership::Selected,
                 exists,
@@ -628,40 +715,59 @@ impl Runner {
             });
         }
 
-        let seeds = manifest
-            .seeds
-            .iter()
-            .map(|stored_seed| {
-                let compiled = compilation
-                    .seeds
-                    .iter()
-                    .find(|seed| seed.name == stored_seed.name);
-                let desired = compiled
-                    .map(|seed| seed.content_hash.clone())
-                    .unwrap_or_else(|| stored_seed.desired_version.clone());
-                let reused =
-                    prior.reusable_seed(&stored_seed.name, &stored_seed.desired_version, &desired);
-                PlannedSeed {
-                    name: stored_seed.name.clone(),
-                    target: stored_seed.target.clone(),
-                    path: stored_seed.path.clone(),
-                    action: if reused {
-                        PlanAction::Skip
-                    } else {
-                        PlanAction::parse(&stored_seed.action)
-                    },
-                    desired_version: desired,
-                    reasons: if reused {
-                        vec![PlanReason::simple(
-                            ReasonKind::ResumedRun,
-                            "loaded earlier in this run — reused",
-                        )]
-                    } else {
-                        Vec::new()
-                    },
+        let seed_default_catalog = compilation.defaults.catalog.as_deref();
+        let seed_default_schema = compilation
+            .defaults
+            .schema
+            .as_deref()
+            .or_else(|| adapter_default_schema(self.adapter.name()));
+        let mut seeds = Vec::with_capacity(manifest.seeds.len());
+        for stored_seed in &manifest.seeds {
+            let compiled = compilation
+                .seeds
+                .iter()
+                .find(|seed| seed.name == stored_seed.name);
+            let desired = compiled
+                .map(|seed| seed.content_hash.clone())
+                .unwrap_or_else(|| stored_seed.desired_version.clone());
+            let exists = match compiled {
+                Some(seed) => {
+                    let relation = seed_relation(
+                        seed,
+                        seed_default_catalog,
+                        seed_default_schema,
+                        self.adapter.name(),
+                    );
+                    self.adapter.relation_exists(&relation).await?
                 }
-            })
-            .collect();
+                None => false,
+            };
+            let reused = exists
+                && prior.reusable_seed(&stored_seed.name, &stored_seed.desired_version, &desired);
+            seeds.push(PlannedSeed {
+                name: stored_seed.name.clone(),
+                target: stored_seed.target.clone(),
+                path: stored_seed.path.clone(),
+                // A seed reloads when its content changed or its target is
+                // gone, even if the stored plan had skipped it.
+                action: if reused {
+                    PlanAction::Skip
+                } else if stored_seed.desired_version != desired || !exists {
+                    PlanAction::Build
+                } else {
+                    PlanAction::parse(&stored_seed.action)
+                },
+                desired_version: desired,
+                reasons: if reused {
+                    vec![PlanReason::simple(
+                        ReasonKind::ResumedRun,
+                        "loaded earlier in this run — reused",
+                    )]
+                } else {
+                    Vec::new()
+                },
+            });
+        }
 
         let tests = manifest
             .tests
@@ -823,7 +929,13 @@ impl Runner {
                     )),
                     0,
                 ));
-                self.persist_seed(&run_id, seed_results.last().expect("just pushed"));
+                let now = now_rfc3339();
+                self.persist_seed(
+                    &run_id,
+                    seed_results.last().expect("just pushed"),
+                    &now,
+                    &now,
+                )?;
                 continue;
             }
             // A non-building seed is either skipped or — on a resumed run
@@ -846,7 +958,8 @@ impl Runner {
                 // Reused seeds keep their original record; skipped ones get
                 // a fresh skip row.
                 if !reused {
-                    self.persist_seed(&run_id, &result);
+                    let now = now_rfc3339();
+                    self.persist_seed(&run_id, &result, &now, &now)?;
                 }
                 seed_results.push(result);
                 continue;
@@ -869,7 +982,7 @@ impl Runner {
                     &run_id,
                     &mut events,
                 )
-                .await;
+                .await?;
             if result.status == ExecutionStatus::Failed && options.fail_fast {
                 fail_fast = true;
             }
@@ -976,7 +1089,7 @@ impl Runner {
                 });
                 let result =
                     model_result(model, outcome, Vec::new(), None, None, 0, plan_info.get(id));
-                self.persist_model(&run_id, &result);
+                self.persist_model(&run_id, &result)?;
                 results.insert(id.clone(), result);
             }
             release_dependents(id, &dependents, &mut remaining);
@@ -1024,7 +1137,7 @@ impl Runner {
                     FailureCategory::Dependency,
                     "blocked by a failed seed load",
                 ));
-                self.persist_model(&run_id, &result);
+                self.persist_model(&run_id, &result)?;
                 results.insert(id.clone(), result);
                 let blocked = block_dependents(
                     id,
@@ -1037,7 +1150,7 @@ impl Runner {
                 );
                 for child in blocked {
                     if let Some(result) = results.get(&child) {
-                        self.persist_model(&run_id, result);
+                        self.persist_model(&run_id, result)?;
                     }
                 }
             }
@@ -1056,6 +1169,9 @@ impl Runner {
         let semaphore = Arc::new(Semaphore::new(options.concurrency.max(1)));
         let concurrency = options.concurrency.max(1);
         let mut inflight = 0usize;
+        // Per-model adapter views tracking in-flight query ids — used to
+        // cancel warehouse queries on timeout and shutdown.
+        let mut attempt_adapters: BTreeMap<ModelId, Arc<dyn Adapter>> = BTreeMap::new();
 
         while inflight > 0 || !ready.is_empty() {
             while let Ok(event) = event_rx.try_recv() {
@@ -1084,11 +1200,19 @@ impl Runner {
                     continue;
                 };
                 let started = now_rfc3339();
-                self.persist_model_start(&run_id, model, &started, plan_info.get(&id));
+                self.persist_model_start(&run_id, model, &started, plan_info.get(&id))?;
 
+                // A tracked adapter view exposes this model's in-flight
+                // query ids so timeout/fail-fast can cancel the warehouse
+                // query itself; untracked adapters degrade to dropping the
+                // attempt's future.
                 let adapter = self.adapter.clone();
+                let attempt_adapter = adapter.track_attempt().unwrap_or_else(|| adapter.clone());
+                attempt_adapters.insert(id.clone(), attempt_adapter.clone());
                 let target = model.target.clone();
                 let compiled_sql = model.compiled_sql.clone();
+                let materialization = model.config.materialization.to_string();
+                let sql_hash = sha256_hex(&model.compiled_sql);
                 let op = exec_op(model, plan_info.get(&id));
                 let permit = semaphore.clone();
                 let target_lock = target_locks.get(&target.display()).cloned();
@@ -1097,19 +1221,30 @@ impl Runner {
                 let cancel = options.cancel.clone();
                 let name = id.logical_name();
                 let tx = event_tx.clone();
-                // Resume: attempt numbering continues across invocations of
-                // the same run.
-                let prior_attempts = prior
+                // Resume: attempt numbering and the attempt list continue
+                // across invocations of the same run.
+                let prior_attempts: Vec<Attempt> = prior
                     .models
                     .get(&name)
-                    .map(|record| record.attempts.len() as u32)
-                    .unwrap_or(0);
+                    .map(|record| record.attempts.clone())
+                    .unwrap_or_default();
+                let attempt_count_offset = prior_attempts.len() as u32;
+                let info = plan_info.get(&id);
+                let action = info
+                    .map(|model| model.action.as_str().to_string())
+                    .unwrap_or_else(|| "build".to_string());
+                let desired_version = info
+                    .map(|model| model.desired_version.clone())
+                    .unwrap_or_default();
+                let task_state = self.state.clone();
+                let task_run_id = run_id.clone();
                 let task_id = id.clone();
                 join_set.spawn(async move {
                     let mut attempts: Vec<Attempt> = Vec::new();
-                    let mut attempt_no = prior_attempts;
+                    let mut attempt_no = attempt_count_offset;
                     let first_started_at = started;
                     let task_started = Instant::now();
+                    let mut state_error: Option<String> = None;
                     let outcome = loop {
                         attempt_no += 1;
                         let attempt_started_at = now_rfc3339();
@@ -1122,12 +1257,19 @@ impl Runner {
                             Some(lock) => Some(lock.clone().acquire_owned().await),
                             None => None,
                         };
-                        let op = execute_op(&adapter, &target, &compiled_sql, &op);
+                        let op = execute_op(&attempt_adapter, &target, &compiled_sql, &op);
                         let result = match timeout {
                             Some(limit) => match tokio::time::timeout(limit, op).await {
                                 Ok(Ok(query)) => Ok(query),
                                 Ok(Err(error)) => Err(classify_adapter_error(&error, attempt_no)),
-                                Err(_) => Err(timeout_failure(limit, attempt_no)),
+                                Err(_) => {
+                                    // Kill the in-flight warehouse query
+                                    // where the adapter can name it.
+                                    for query_id in attempt_adapter.in_flight_queries() {
+                                        let _ = attempt_adapter.cancel(&query_id).await;
+                                    }
+                                    Err(timeout_failure(limit, attempt_no))
+                                }
                             },
                             None => op
                                 .await
@@ -1156,6 +1298,33 @@ impl Runner {
                                     query_id: None,
                                     failure: Some(failure.clone()),
                                 });
+                                // Persist every attempt as it lands — a
+                                // crash during backoff must not lose the
+                                // attempts already made. A failed write is
+                                // fatal: resumability depends on it.
+                                if let Some(state) = &task_state {
+                                    let mut all = prior_attempts.clone();
+                                    all.extend(attempts.iter().cloned());
+                                    if let Err(error) = state.record_model(&ModelRunRecord {
+                                        run_id: task_run_id.clone(),
+                                        model_id: name.clone(),
+                                        materialization: materialization.clone(),
+                                        action: action.clone(),
+                                        status: ExecutionStatus::Running,
+                                        started_at: first_started_at.clone(),
+                                        finished_at: String::new(),
+                                        sql_hash: sql_hash.clone(),
+                                        target: target.display(),
+                                        desired_version: desired_version.clone(),
+                                        attempts: all,
+                                        query_id: None,
+                                        error: Some(failure.message.clone()),
+                                        error_category: Some(failure.category.code().to_string()),
+                                    }) {
+                                        state_error = Some(error.to_string());
+                                        break Err(failure);
+                                    }
+                                }
                                 if retryable && !cancel.is_cancelled() {
                                     let delay = retry.delay(attempt_no);
                                     let _ = tx.send(EngineEvent::ModelRetrying {
@@ -1175,6 +1344,7 @@ impl Runner {
                         id: task_id,
                         outcome,
                         attempts,
+                        state_error,
                         started_at: first_started_at,
                         finished_at: now_rfc3339(),
                         duration_ms: task_started.elapsed().as_millis() as u64,
@@ -1207,6 +1377,15 @@ impl Runner {
                 }
             };
             let id = completion.id.clone();
+            attempt_adapters.remove(&id);
+            // A state-store write failed inside the task — the run cannot
+            // claim honest progress, so it dies.
+            if let Some(error) = completion.state_error {
+                return Err(EngineError::State(format!(
+                    "could not persist {} progress: {error}",
+                    id.logical_name()
+                )));
+            }
             let model = compilation.model(&id).expect("planned model exists");
             let info = plan_info.get(&id);
             // Resume continuity: the record keeps attempts from earlier
@@ -1238,7 +1417,7 @@ impl Runner {
                             info,
                         )
                     };
-                    self.persist_model(&run_id, &result);
+                    self.persist_model(&run_id, &result)?;
                     results.insert(id.clone(), result);
                     release_dependents(&id, &dependents, &mut remaining);
                     let new_ready = dependents
@@ -1286,7 +1465,7 @@ impl Runner {
                         )
                         .with_failure(failure)
                     };
-                    self.persist_model(&run_id, &result);
+                    self.persist_model(&run_id, &result)?;
                     results.insert(id.clone(), result);
                     if options.fail_fast {
                         fail_fast = true;
@@ -1303,7 +1482,7 @@ impl Runner {
                         );
                         for child in blocked {
                             if let Some(result) = results.get(&child) {
-                                self.persist_model(&run_id, result);
+                                self.persist_model(&run_id, result)?;
                             }
                         }
                         // Stop scheduling new work and try to stop active
@@ -1326,7 +1505,7 @@ impl Runner {
                         );
                         for child in blocked {
                             if let Some(result) = results.get(&child) {
-                                self.persist_model(&run_id, result);
+                                self.persist_model(&run_id, result)?;
                             }
                         }
                     }
@@ -1338,6 +1517,18 @@ impl Runner {
         // that never reached a terminal state.
         if cancelled || fail_fast {
             join_set.abort_all();
+            // Ask each adapter view to kill its in-flight warehouse
+            // queries. Untracked adapters report none and degrade to the
+            // abort alone.
+            for attempt_adapter in attempt_adapters.values() {
+                for query_id in attempt_adapter.in_flight_queries() {
+                    if let Err(error) = attempt_adapter.cancel(&query_id).await {
+                        warnings.push(format!(
+                            "could not cancel in-flight query {query_id}: {error}"
+                        ));
+                    }
+                }
+            }
         }
         while let Some(joined) = join_set.join_next().await {
             inflight = inflight.saturating_sub(1);
@@ -1345,6 +1536,13 @@ impl Runner {
                 // A task that completed before the abort is reported
                 // accurately — it really did run.
                 let id = completion.id.clone();
+                attempt_adapters.remove(&id);
+                if let Some(error) = completion.state_error {
+                    return Err(EngineError::State(format!(
+                        "could not persist {} progress: {error}",
+                        id.logical_name()
+                    )));
+                }
                 if status.get(&id).copied().unwrap_or_default().is_terminal() {
                     continue;
                 }
@@ -1394,7 +1592,7 @@ impl Runner {
                     duration_ms: result.duration_ms,
                 });
                 status.insert(id.clone(), final_status);
-                self.persist_model(&run_id, &result);
+                self.persist_model(&run_id, &result)?;
                 results.insert(id.clone(), result);
                 if new_ready {
                     release_dependents(&id, &dependents, &mut remaining);
@@ -1410,7 +1608,7 @@ impl Runner {
                     );
                     for child in blocked {
                         if let Some(result) = results.get(&child) {
-                            self.persist_model(&run_id, result);
+                            self.persist_model(&run_id, result)?;
                         }
                     }
                 }
@@ -1465,7 +1663,7 @@ impl Runner {
                     plan_info.get(id),
                 )
                 .with_failure(failure);
-                self.persist_model(&run_id, &result);
+                self.persist_model(&run_id, &result)?;
                 results.insert(id.clone(), result);
             }
         }
@@ -1481,7 +1679,7 @@ impl Runner {
                 &run_id,
                 cancelled || fail_fast,
             )
-            .await;
+            .await?;
 
         let failed = results
             .values()
@@ -1562,25 +1760,6 @@ impl Runner {
                     })?;
                 }
             }
-            for result in &tests {
-                state.record_test(&TestRunRecord {
-                    run_id: run_id.clone(),
-                    test_id: result.test.clone(),
-                    status: result.status,
-                    row_count: result.row_count,
-                    query_id: result.query_id.clone(),
-                    error: result
-                        .failure
-                        .as_ref()
-                        .map(|failure| failure.message.clone()),
-                    error_category: result
-                        .failure
-                        .as_ref()
-                        .map(|failure| failure.category.code().to_string()),
-                    started_at: started_at.clone(),
-                    finished_at: finished_at.clone(),
-                })?;
-            }
             state.finish_run(&run_id, run_status, &finished_at, counts.failed)?;
         }
 
@@ -1617,19 +1796,20 @@ impl Runner {
     }
 
     /// Persist a model's start transition so a crash leaves an honest
-    /// "running" record.
+    /// "running" record. A failed write is fatal: resumability depends on
+    /// this record being real.
     fn persist_model_start(
         &self,
         run_id: &str,
         model: &phlo_transform_core::CompiledModel,
         started_at: &str,
         info: Option<&PlannedModel>,
-    ) {
+    ) -> Result<(), EngineError> {
         let Some(state) = &self.state else {
-            return;
+            return Ok(());
         };
         let (desired_version, _, _) = plan_result_fields(info);
-        let _ = state.record_model(&ModelRunRecord {
+        state.record_model(&ModelRunRecord {
             run_id: run_id.to_string(),
             model_id: model.id.logical_name(),
             materialization: model.config.materialization.to_string(),
@@ -1646,15 +1826,15 @@ impl Runner {
             query_id: None,
             error: None,
             error_category: None,
-        });
+        })
     }
 
-    /// Persist a model's terminal state.
-    fn persist_model(&self, run_id: &str, result: &ModelResult) {
+    /// Persist a model's terminal state. A failed write is fatal.
+    fn persist_model(&self, run_id: &str, result: &ModelResult) -> Result<(), EngineError> {
         let Some(state) = &self.state else {
-            return;
+            return Ok(());
         };
-        let _ = state.record_model(&ModelRunRecord {
+        state.record_model(&ModelRunRecord {
             run_id: run_id.to_string(),
             model_id: result.model.clone(),
             materialization: result.materialization.clone(),
@@ -1675,15 +1855,22 @@ impl Runner {
                 .failure
                 .as_ref()
                 .map(|failure| failure.category.code().to_string()),
-        });
+        })
     }
 
-    /// Persist a seed's terminal state.
-    fn persist_seed(&self, run_id: &str, result: &SeedResult) {
+    /// Persist a seed's state — called after every attempt, so a crash
+    /// mid-retry leaves the attempts already made. Fatal on write error.
+    fn persist_seed(
+        &self,
+        run_id: &str,
+        result: &SeedResult,
+        started_at: &str,
+        finished_at: &str,
+    ) -> Result<(), EngineError> {
         let Some(state) = &self.state else {
-            return;
+            return Ok(());
         };
-        let _ = state.record_seed_run(&SeedRunRecord {
+        state.record_seed_run(&SeedRunRecord {
             run_id: run_id.to_string(),
             name: result.seed.clone(),
             status: result.status,
@@ -1697,12 +1884,14 @@ impl Runner {
                 .failure
                 .as_ref()
                 .map(|failure| failure.category.code().to_string()),
-            started_at: now_rfc3339(),
-            finished_at: now_rfc3339(),
-        });
+            started_at: started_at.to_string(),
+            finished_at: finished_at.to_string(),
+        })
     }
 
-    /// Load one seed with the shared retry/classification policy.
+    /// Load one seed with the shared retry/classification policy. Each
+    /// attempt is persisted as it lands, so a crash mid-backoff leaves the
+    /// attempts already made.
     async fn run_seed(
         &self,
         planned_seed: &PlannedSeed,
@@ -1711,10 +1900,11 @@ impl Runner {
         options: &RunOptions,
         run_id: &str,
         events: &mut Vec<EngineEvent>,
-    ) -> SeedResult {
+    ) -> Result<SeedResult, EngineError> {
         let mut attempts = Vec::new();
         let mut attempt_no = 0u32;
         let task_started = Instant::now();
+        let seed_started_at = now_rfc3339();
         let outcome = loop {
             attempt_no += 1;
             let started_at = now_rfc3339();
@@ -1754,6 +1944,17 @@ impl Runner {
                         query_id: None,
                         failure: Some(failure.clone()),
                     });
+                    // Persist each attempt as it lands — a crash during
+                    // backoff must not lose the attempts already made.
+                    let in_progress = SeedResult {
+                        seed: planned_seed.name.clone(),
+                        target: relation.display(),
+                        status: ExecutionStatus::Running,
+                        attempts: attempts.clone(),
+                        failure: Some(failure.clone()),
+                        duration_ms: task_started.elapsed().as_millis() as u64,
+                    };
+                    self.persist_seed(run_id, &in_progress, &seed_started_at, &now_rfc3339())?;
                     if retryable && !options.cancel.is_cancelled() {
                         let delay = options.retry.delay(attempt_no);
                         events.push(EngineEvent::SeedRetrying {
@@ -1786,8 +1987,8 @@ impl Runner {
             failure: outcome,
             duration_ms: task_started.elapsed().as_millis() as u64,
         };
-        self.persist_seed(run_id, &result);
-        result
+        self.persist_seed(run_id, &result, &seed_started_at, &now_rfc3339())?;
+        Ok(result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1801,9 +2002,9 @@ impl Runner {
         options: &RunOptions,
         run_id: &str,
         stopped: bool,
-    ) -> Vec<TestResult> {
+    ) -> Result<Vec<TestResult>, EngineError> {
         if !options.run_tests {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let planned_tests: BTreeSet<&str> =
             plan.tests.iter().map(|test| test.id.as_str()).collect();
@@ -1832,22 +2033,7 @@ impl Runner {
                     )),
                     duration_ms: 0,
                 };
-                if let Some(state) = &self.state {
-                    let _ = state.record_test(&TestRunRecord {
-                        run_id: run_id.to_string(),
-                        test_id: result.test.clone(),
-                        status: result.status,
-                        row_count: 0,
-                        query_id: None,
-                        error: result
-                            .failure
-                            .as_ref()
-                            .map(|failure| failure.message.clone()),
-                        error_category: Some(FailureCategory::Cancelled.code().to_string()),
-                        started_at: now_rfc3339(),
-                        finished_at: now_rfc3339(),
-                    });
-                }
+                self.persist_test(run_id, &result)?;
                 results.push(result);
                 continue;
             }
@@ -1898,22 +2084,7 @@ impl Runner {
                     )),
                     duration_ms: 0,
                 };
-                if let Some(state) = &self.state {
-                    let _ = state.record_test(&TestRunRecord {
-                        run_id: run_id.to_string(),
-                        test_id: result.test.clone(),
-                        status: result.status,
-                        row_count: 0,
-                        query_id: None,
-                        error: result
-                            .failure
-                            .as_ref()
-                            .map(|failure| failure.message.clone()),
-                        error_category: Some(FailureCategory::Dependency.code().to_string()),
-                        started_at: now_rfc3339(),
-                        finished_at: now_rfc3339(),
-                    });
-                }
+                self.persist_test(run_id, &result)?;
                 results.push(result);
                 continue;
             }
@@ -1967,29 +2138,36 @@ impl Runner {
                 failure,
                 duration_ms,
             };
-            if let Some(state) = &self.state {
-                let _ = state.record_test(&TestRunRecord {
-                    run_id: run_id.to_string(),
-                    test_id: result.test.clone(),
-                    status: result.status,
-                    row_count: result.row_count,
-                    query_id: result.query_id.clone(),
-                    error: result
-                        .failure
-                        .as_ref()
-                        .map(|failure| failure.message.clone()),
-                    error_category: result
-                        .failure
-                        .as_ref()
-                        .map(|failure| failure.category.code().to_string()),
-                    started_at: now_rfc3339(),
-                    finished_at: now_rfc3339(),
-                });
-            }
+            self.persist_test(run_id, &result)?;
             results.push(result);
         }
 
-        results
+        Ok(results)
+    }
+
+    /// Persist a test's outcome. Fatal on write error — a failed test must
+    /// be on record.
+    fn persist_test(&self, run_id: &str, result: &TestResult) -> Result<(), EngineError> {
+        let Some(state) = &self.state else {
+            return Ok(());
+        };
+        state.record_test(&TestRunRecord {
+            run_id: run_id.to_string(),
+            test_id: result.test.clone(),
+            status: result.status,
+            row_count: result.row_count,
+            query_id: result.query_id.clone(),
+            error: result
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.clone()),
+            error_category: result
+                .failure
+                .as_ref()
+                .map(|failure| failure.category.code().to_string()),
+            started_at: now_rfc3339(),
+            finished_at: now_rfc3339(),
+        })
     }
 }
 

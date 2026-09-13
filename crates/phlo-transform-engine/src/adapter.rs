@@ -4,6 +4,7 @@
 //! in the adapter, not the engine.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -85,6 +86,22 @@ pub trait Adapter: Send + Sync {
     ) -> Result<QueryResult, AdapterError>;
 
     async fn cancel(&self, query_id: &str) -> Result<(), AdapterError>;
+
+    /// A view of this adapter that tracks the queries started through it,
+    /// so the runner can cancel this attempt's in-flight warehouse work on
+    /// timeout or shutdown. `None` (the default) means the adapter cannot
+    /// report in-flight query ids — cancellation then degrades to dropping
+    /// the attempt's future.
+    fn track_attempt(&self) -> Option<Arc<dyn Adapter>> {
+        None
+    }
+
+    /// Query ids currently executing through a tracked attempt view —
+    /// only meaningful on adapters returned by [`Adapter::track_attempt`].
+    /// The default is empty (untracked).
+    fn in_flight_queries(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Read column metadata for an existing relation.
     async fn relation_columns(&self, relation: &Relation) -> Result<Vec<ColumnInfo>, AdapterError>;

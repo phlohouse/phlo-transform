@@ -2408,6 +2408,7 @@ dependencies = [
  "phlo-transform-nessie",
  "phlo-transform-openlineage",
  "phlo-transform-trino",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

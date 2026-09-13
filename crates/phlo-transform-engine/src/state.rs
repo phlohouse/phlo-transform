@@ -209,6 +209,8 @@ pub trait StateStore: Send + Sync {
     fn model_runs(&self, run_id: &str) -> Result<Vec<ModelRunRecord>, EngineError>;
     /// Every seed execution record of a run.
     fn seed_runs(&self, run_id: &str) -> Result<Vec<SeedRunRecord>, EngineError>;
+    /// Every test execution record of a run.
+    fn test_runs(&self, run_id: &str) -> Result<Vec<TestRunRecord>, EngineError>;
 
     /// Record the version attached to a successful materialisation.
     fn record_materialized(&self, record: &MaterializedRecord) -> Result<(), EngineError>;
@@ -737,6 +739,34 @@ impl StateStore for SqliteStateStore {
                     attempts: attempts
                         .and_then(|json| serde_json::from_str(&json).ok())
                         .unwrap_or_default(),
+                    error: row.get(5)?,
+                    error_category: row.get(6)?,
+                    started_at: row.get(7)?,
+                    finished_at: row.get(8)?,
+                })
+            })
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| EngineError::State(error.to_string()))
+    }
+
+    fn test_runs(&self, run_id: &str) -> Result<Vec<TestRunRecord>, EngineError> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT run_id, test_id, status, row_count, query_id, error, error_category, started_at, finished_at
+                 FROM test_runs WHERE run_id = ?1 ORDER BY test_id",
+            )
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        let rows = statement
+            .query_map(rusqlite::params![run_id], |row| {
+                let status: String = row.get(2)?;
+                Ok(TestRunRecord {
+                    run_id: row.get(0)?,
+                    test_id: row.get(1)?,
+                    status: parse_status(&status),
+                    row_count: row.get::<_, i64>(3)? as u64,
+                    query_id: row.get(4)?,
                     error: row.get(5)?,
                     error_category: row.get(6)?,
                     started_at: row.get(7)?,

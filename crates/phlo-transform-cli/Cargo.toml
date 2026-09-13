@@ -30,4 +30,5 @@ phlo-transform-trino = { workspace = true }
 assert_cmd = "2"
 duckdb = { workspace = true }
 insta = "1"
+rusqlite = { workspace = true }
 tempfile = "3"

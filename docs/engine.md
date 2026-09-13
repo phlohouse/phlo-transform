@@ -90,6 +90,12 @@ pub trait Adapter: Send + Sync {
     async fn merge(&self, relation: &Relation, key_columns: &[String], sql: &str) -> Result<QueryResult, AdapterError>;
     async fn replace_partitions(&self, relation: &Relation, partition_columns: &[String], sql: &str) -> Result<QueryResult, AdapterError>;
     async fn cancel(&self, query_id: &str) -> Result<(), AdapterError>;
+    /// A per-attempt view that tracks the queries started through it, so
+    /// the runner can cancel this attempt's in-flight warehouse work on
+    /// timeout or shutdown. `None` (default) = cannot report in-flight ids.
+    fn track_attempt(&self) -> Option<Arc<dyn Adapter>> { None }
+    /// Query ids currently executing through a tracked view (default empty).
+    fn in_flight_queries(&self) -> Vec<String> { Vec::new() }
     async fn relation_columns(&self, relation: &Relation) -> Result<Vec<ColumnInfo>, AdapterError>;
     async fn ensure_catalog(&self, request: &CatalogRequest) -> Result<(), AdapterError>;
     async fn ensure_schema(&self, relation: &Relation) -> Result<(), AdapterError>;
@@ -213,11 +219,18 @@ dependents of the failure `blocked` and unrelated not-started work
 `cancelled`. Without it, independent branches run to completion.
 
 `--model-timeout 30s|5m|1h` bounds each attempt; expiry is a `timeout`
-failure and the runner calls `Adapter::cancel` with the query id when the
-adapter reported one. Cancellation is the same cooperative path as Ctrl-C:
-a `CancelHandle` stops scheduling, aborts tasks and reports the run as
-`cancelled`. Adapters that cannot cancel still surface the real outcome —
-the engine never claims a model was cancelled when it actually completed.
+failure. Each attempt runs through a *tracked* adapter view
+(`track_attempt`/`in_flight_queries`): adapters that report in-flight
+query ids get real warehouse cancellation — the engine calls
+`Adapter::cancel` for every query the attempt still has running, both on
+timeout and when fail-fast/cancellation aborts in-flight tasks. The Trino
+adapter tracks statements by the id Trino assigns at `POST /v1/statement`
+and kills them with `DELETE /v1/query/{id}`; adapters that cannot report
+in-flight ids degrade to dropping the attempt's future. Cancellation is
+the same cooperative path as Ctrl-C: a `CancelHandle` stops scheduling,
+aborts tasks, cancels tracked queries and reports the run as `cancelled`.
+Adapters that cannot cancel still surface the real outcome — the engine
+never claims a model was cancelled when it actually completed.
 
 ### Seeds and tests
 
@@ -229,18 +242,24 @@ own execution status.
 
 ### Resume and retry-failed
 
-`--resume <run-id>` continues an interrupted or failed run **under the same
-run id**: the stored plan is reloaded, genuinely passed/cached work is
-reused (models and seeds verified against the current compiled versions),
-and failed/blocked/cancelled/unfinished work reruns. Resume refuses with an
-explicit explanation when the workspace changed incompatibly — a stored
-model no longer exists, or a previously-passed model's desired version no
-longer matches.
+`--resume <run-id>` continues an **interrupted** run — one still `running`
+after a killed process, or `cancelled` — **under the same run id**: the
+stored plan is reloaded, genuinely passed work is reused (a model's
+earlier `passed` counts only when its desired version still matches *and*
+its target relation still exists; a seed's earlier `passed` counts only
+when its content hash still matches and its target exists), and everything
+else is re-planned against current state — a stored `skip`/`cached`
+decision is never trusted once the version underneath it moved. Resume
+refuses with an explicit explanation when the workspace changed
+incompatibly (a stored model or seed no longer exists), and refuses a
+finished run outright: a `failed` run is continued with `--retry-failed`
+so its history stays immutable.
 
 `--retry-failed <run-id>` starts a **new** run (`continued_from` links it)
-covering only the failed/blocked portion of a completed failed run plus the
-upstream work it still needs; everything else is skipped. Neither accepts
-selection flags — the prior run defines the work.
+covering the failed/blocked/cancelled models of a finished run, plus the
+upstream work they still need, plus any tests that failed — tests whose
+datasets rebuilt re-verify too. Everything else is skipped. Neither
+accepts selection flags — the prior run defines the work.
 
 ### Run summary
 

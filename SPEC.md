@@ -1427,7 +1427,7 @@ D PASS
 E PASS
 ```
 
-With `--fail-fast`, the first unrecoverable failure instead stops new scheduling: dependents of the failure are `blocked`, unrelated not-started work is `cancelled`, and in-flight tasks are aborted (with adapter cancellation attempted where supported).
+With `--fail-fast`, the first unrecoverable failure instead stops new scheduling: dependents of the failure are `blocked`, unrelated not-started work is `cancelled`, and in-flight tasks are aborted. Each attempt runs through a tracked adapter view that reports its in-flight query ids, so abort and per-attempt `--model-timeout` cancel the underlying warehouse query where the adapter supports it (Trino: `DELETE /v1/query/{id}`); adapters that cannot report in-flight queries degrade to dropping the attempt's future.
 
 ## 65. Retry behaviour
 
@@ -1437,12 +1437,12 @@ Every failure carries a stable machine-readable category (`adapter`, `sql`, `tes
 
 ## 65a. Interrupted runs
 
-Execution progress is persisted incrementally: the run row and stored plan are written before scheduling, and each node record lands as it finishes. A killed process therefore leaves an accurate partial record rather than a misleadingly successful one.
+Execution progress is persisted incrementally: the run row and stored plan are written before scheduling, each node record lands as it transitions, and every failed attempt is persisted before its retry backoff begins. A state-store write failure is fatal to the run — progress that cannot be recorded cannot be trusted for resume. A killed process therefore leaves an accurate partial record rather than a misleadingly successful one.
 
 Two continuations rebuild from that state:
 
-- `run --resume <run-id>` — continue the same run id: reuse verified `passed`/`cached` work, rerun failed/blocked/cancelled/unfinished work. Refuses with an explicit error when the workspace changed incompatibly.
-- `run --retry-failed <run-id>` — start a new run (linked by `continued_from`) over only the failed/blocked portion plus required dependencies.
+- `run --resume <run-id>` — continue an *interrupted* run (still `running`, or `cancelled`) under the same run id. Verified `passed` work is reused (a model's earlier `passed` counts only when its desired version still matches and its target relation still exists; a seed's only when its content hash matches and its target exists); every other node is re-planned against current state — stored `skip`/`cached` decisions are never trusted once the underlying version moved. A finished run is refused: `failed` redirects to `--retry-failed`.
+- `run --retry-failed <run-id>` — start a new run (linked by `continued_from`) over the failed/blocked/cancelled models of a finished run, the dependencies they still need, and any tests that failed; tests over rebuilt models re-verify too.
 
 Only `passed` materialisations update materialised-version state; a model version is never recorded as successful before execution genuinely completes.
 

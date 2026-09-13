@@ -20,9 +20,11 @@ use phlo_transform_core::{
 };
 use phlo_transform_engine::{
     changed_models, collect_source_states, Adapter, AdapterError, ArtifactWriter, CancelHandle,
-    CatalogRequest, ColumnInfo, EngineEvent, ExecutionStatus, FailureCategory, Membership,
-    ModelResult, Plan, PlanAction, PlanOptions, Planner, QueryResult, ReasonKind, RetryPolicy,
-    RunOptions, RunResult, Runner, SqliteStateStore, StateStore,
+    CatalogRequest, ColumnInfo, EngineError, EngineEvent, ExecutionStatus, FailureCategory,
+    MaterializedRecord, Membership, ModelResult, ModelRunRecord, Plan, PlanAction, PlanOptions,
+    Planner, QueryResult, ReasonKind, RetryPolicy, RunOptions, RunRecord, RunResult, RunSummary,
+    Runner, SeedRecord, SeedRunRecord, SqliteStateStore, StateStore, StoredPlan, StoredRun,
+    TestRunRecord,
 };
 
 /// How a target should fail: the error to return, and how many attempts it
@@ -35,29 +37,35 @@ struct FailSpec {
 
 #[derive(Default)]
 struct FakeAdapter {
-    existing: Mutex<BTreeSet<String>>,
-    fail_targets: Mutex<BTreeSet<String>>,
+    existing: Arc<Mutex<BTreeSet<String>>>,
+    fail_targets: Arc<Mutex<BTreeSet<String>>>,
     /// Per-target injected failures: `(error, times)` — `times` bounds the
     /// failure to the first N attempts so `flaky` targets recover.
-    fail_modes: Mutex<BTreeMap<String, FailSpec>>,
+    fail_modes: Arc<Mutex<BTreeMap<String, FailSpec>>>,
     /// Attempt counts per target, for asserting retry behaviour.
-    attempt_counts: Mutex<BTreeMap<String, usize>>,
+    attempt_counts: Arc<Mutex<BTreeMap<String, usize>>>,
     /// Per-target delay override, for fail-fast/timeout tests.
-    delay_for: Mutex<BTreeMap<String, u64>>,
-    created: Mutex<Vec<String>>,
-    appends: Mutex<Vec<String>>,
-    append_sqls: Mutex<Vec<String>>,
-    merges: Mutex<Vec<String>>,
-    replaced_partitions: Mutex<Vec<String>>,
-    columns: Mutex<Vec<ColumnInfo>>,
-    loaded_csvs: Mutex<Vec<String>>,
-    fail_loads: Mutex<BTreeSet<String>>,
-    source_states: Mutex<BTreeMap<String, String>>,
-    max_value: Mutex<Option<String>>,
-    test_rows: Mutex<u64>,
+    delay_for: Arc<Mutex<BTreeMap<String, u64>>>,
+    created: Arc<Mutex<Vec<String>>>,
+    appends: Arc<Mutex<Vec<String>>>,
+    append_sqls: Arc<Mutex<Vec<String>>>,
+    merges: Arc<Mutex<Vec<String>>>,
+    replaced_partitions: Arc<Mutex<Vec<String>>>,
+    columns: Arc<Mutex<Vec<ColumnInfo>>>,
+    loaded_csvs: Arc<Mutex<Vec<String>>>,
+    fail_loads: Arc<Mutex<BTreeSet<String>>>,
+    source_states: Arc<Mutex<BTreeMap<String, String>>>,
+    max_value: Arc<Mutex<Option<String>>>,
+    test_rows: Arc<Mutex<u64>>,
     delay_ms: u64,
-    current: AtomicUsize,
-    max_concurrent: AtomicUsize,
+    current: Arc<AtomicUsize>,
+    max_concurrent: Arc<AtomicUsize>,
+    /// Query ids in flight through *this* adapter handle — a tracked
+    /// attempt view gets its own registry.
+    in_flight: Arc<Mutex<BTreeSet<String>>>,
+    /// Query ids passed to `cancel` — shared across tracked views so tests
+    /// can observe what the runner killed.
+    cancelled: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl FakeAdapter {
@@ -141,7 +149,55 @@ impl FakeAdapter {
         *self.max_value.lock().unwrap() = Some(value.to_string());
     }
 
+    /// Query ids `cancel` was asked to kill (across all tracked views).
+    fn cancelled_queries(&self) -> Vec<String> {
+        self.cancelled.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// A per-attempt view sharing all fake state except the in-flight
+    /// registry — mirrors how a real adapter reports only its own queries.
+    fn attempt_view(&self) -> Self {
+        Self {
+            existing: self.existing.clone(),
+            fail_targets: self.fail_targets.clone(),
+            fail_modes: self.fail_modes.clone(),
+            attempt_counts: self.attempt_counts.clone(),
+            delay_for: self.delay_for.clone(),
+            created: self.created.clone(),
+            appends: self.appends.clone(),
+            append_sqls: self.append_sqls.clone(),
+            merges: self.merges.clone(),
+            replaced_partitions: self.replaced_partitions.clone(),
+            columns: self.columns.clone(),
+            loaded_csvs: self.loaded_csvs.clone(),
+            fail_loads: self.fail_loads.clone(),
+            source_states: self.source_states.clone(),
+            max_value: self.max_value.clone(),
+            test_rows: self.test_rows.clone(),
+            delay_ms: self.delay_ms,
+            current: self.current.clone(),
+            max_concurrent: self.max_concurrent.clone(),
+            in_flight: Arc::new(Mutex::new(BTreeSet::new())),
+            cancelled: self.cancelled.clone(),
+        }
+    }
+
     async fn create(
+        &self,
+        relation: &Relation,
+        query_id: &str,
+    ) -> Result<QueryResult, AdapterError> {
+        // A unique id per (operation, target): registering it before the
+        // delay means a dropped future leaves the id in-flight, matching
+        // how a warehouse keeps running the statement.
+        let qid = format!("{query_id}:{}", relation.display());
+        self.in_flight.lock().unwrap().insert(qid.clone());
+        let result = self.create_inner(relation, &qid).await;
+        self.in_flight.lock().unwrap().remove(&qid);
+        result
+    }
+
+    async fn create_inner(
         &self,
         relation: &Relation,
         query_id: &str,
@@ -310,8 +366,18 @@ impl Adapter for FakeAdapter {
         })
     }
 
-    async fn cancel(&self, _query_id: &str) -> Result<(), AdapterError> {
+    async fn cancel(&self, query_id: &str) -> Result<(), AdapterError> {
+        self.cancelled.lock().unwrap().insert(query_id.to_string());
+        self.in_flight.lock().unwrap().remove(query_id);
         Ok(())
+    }
+
+    fn track_attempt(&self) -> Option<Arc<dyn Adapter>> {
+        Some(Arc::new(self.attempt_view()))
+    }
+
+    fn in_flight_queries(&self) -> Vec<String> {
+        self.in_flight.lock().unwrap().iter().cloned().collect()
     }
 
     async fn relation_columns(
@@ -382,6 +448,50 @@ async fn plan_all(compilation: &Compilation, adapter: Arc<FakeAdapter>) -> Plan 
         .plan(compilation, &selected, None, &PlanOptions::default())
         .await
         .expect("plan succeeds")
+}
+
+/// A state-aware plan — materialisation history shapes skip/cached
+/// decisions, unlike [`plan_all`] which always builds.
+async fn plan_all_with_state(
+    compilation: &Compilation,
+    adapter: Arc<FakeAdapter>,
+    state: Arc<SqliteStateStore>,
+    environment: Option<String>,
+) -> Plan {
+    let selected = Selection::all(compilation);
+    Planner::new(adapter, Some(state))
+        .plan(compilation, &selected, environment, &PlanOptions::default())
+        .await
+        .expect("plan succeeds")
+}
+
+/// Drive `apply` in a background task and abort it `after` — the closest a
+/// test gets to a killed process: the run record stays `running` with
+/// whatever progress landed. Returns the interrupted run's id.
+async fn interrupt_apply(
+    adapter: Arc<FakeAdapter>,
+    state: Arc<SqliteStateStore>,
+    compilation: &Compilation,
+    plan: &Plan,
+    options: RunOptions,
+    after: Duration,
+) -> String {
+    let handle = {
+        let runner = Runner::new(adapter, Some(state.clone()));
+        let compilation = compilation.clone();
+        let plan = plan.clone();
+        tokio::spawn(async move { runner.apply(&compilation, &plan, &options).await })
+    };
+    tokio::time::sleep(after).await;
+    handle.abort();
+    let _ = handle.await;
+    state
+        .runs()
+        .unwrap()
+        .into_iter()
+        .find(|run| run.status == ExecutionStatus::Running)
+        .expect("an interrupted run stays running")
+        .run_id
 }
 
 #[tokio::test]
@@ -2160,28 +2270,33 @@ async fn resume_reuses_passed_work_and_reruns_the_rest() {
     let adapter = Arc::new(FakeAdapter::default());
     adapter.set_test_rows(0);
     adapter.fail_with("assay.results", AdapterError::new("FAKE001", "boom"));
+    adapter.slow_target("analytics.e", 1500);
     let state = Arc::new(SqliteStateStore::in_memory().unwrap());
     let runner = Runner::new(adapter.clone(), Some(state.clone()));
+    let plan = plan_all(&compilation, adapter.clone()).await;
 
-    let first = runner
-        .apply(
-            &compilation,
-            &plan_all(&compilation, adapter.clone()).await,
-            &RunOptions::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(first.status, ExecutionStatus::Failed);
+    // Kill the run mid-flight: `assay.results` has already failed (blocking
+    // `reporting.monthly`); `analytics.e` on the independent branch was
+    // still building — its record stays `running`.
+    let run_id = interrupt_apply(
+        adapter.clone(),
+        state.clone(),
+        &compilation,
+        &plan,
+        RunOptions::default(),
+        Duration::from_millis(250),
+    )
+    .await;
     let created_before = adapter.created.lock().unwrap().len();
 
     adapter.heal("assay.results");
     let resumed = runner
-        .resume(&compilation, &first.run_id[..8], &RunOptions::default())
+        .resume(&compilation, &run_id[..8], &RunOptions::default())
         .await
         .unwrap();
 
     // Same run id — the run was continued, not replaced.
-    assert_eq!(resumed.run_id, first.run_id);
+    assert_eq!(resumed.run_id, run_id);
     assert_eq!(resumed.status, ExecutionStatus::Passed);
     assert_eq!(
         model_result(&resumed, "assay.raw").status,
@@ -2199,10 +2314,18 @@ async fn resume_reuses_passed_work_and_reruns_the_rest() {
         model_result(&resumed, "reporting.monthly").status,
         ExecutionStatus::Passed
     );
-    // Only the failed/blocked work re-executed against the adapter.
+    assert_eq!(
+        model_result(&resumed, "analytics.e").status,
+        ExecutionStatus::Passed
+    );
+    // Only the failed/interrupted work re-executed against the adapter.
     let created = adapter.created.lock().unwrap().clone();
-    let new_creates = &created[created_before..];
-    assert_eq!(new_creates, vec!["assay.results", "reporting.monthly"]);
+    let mut new_creates: Vec<&String> = created[created_before..].iter().collect();
+    new_creates.sort();
+    assert_eq!(
+        new_creates,
+        vec!["analytics.e", "assay.results", "reporting.monthly"]
+    );
 
     // The model record accumulated attempts across invocations.
     let records = state.model_runs(&resumed.run_id).unwrap();
@@ -2220,7 +2343,7 @@ async fn resume_reuses_passed_work_and_reruns_the_rest() {
 
 #[tokio::test]
 async fn resume_does_not_trust_stale_success_when_versions_changed() {
-    // run1: `main.a` passes, `main.b` (dependent) fails.
+    // run1: `main.a` passes; the process dies while `main.b` builds.
     let build = |a_sql: &str| {
         let compilation = compile(&SemanticProject::in_memory(vec![
             model("main.a", a_sql),
@@ -2231,25 +2354,25 @@ async fn resume_does_not_trust_stale_success_when_versions_changed() {
     };
     let compilation = build("select 1 as id from external.a");
     let adapter = Arc::new(FakeAdapter::default());
-    adapter.fail_with("main.b", AdapterError::new("FAKE001", "boom"));
+    adapter.slow_target("main.b", 1500);
     let state = Arc::new(SqliteStateStore::in_memory().unwrap());
     let runner = Runner::new(adapter.clone(), Some(state.clone()));
-    let first = runner
-        .apply(
-            &compilation,
-            &plan_all(&compilation, adapter.clone()).await,
-            &RunOptions::default(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(first.status, ExecutionStatus::Failed);
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let run_id = interrupt_apply(
+        adapter.clone(),
+        state.clone(),
+        &compilation,
+        &plan,
+        RunOptions::default(),
+        Duration::from_millis(250),
+    )
+    .await;
 
     // `main.a` changed since the run — its earlier success is stale and
     // must not be reused.
-    adapter.heal("main.b");
     let changed = build("select 1 as id, 'x' as extra from external.a");
     let resumed = runner
-        .resume(&changed, &first.run_id[..8], &RunOptions::default())
+        .resume(&changed, &run_id[..8], &RunOptions::default())
         .await
         .unwrap();
     assert_eq!(resumed.status, ExecutionStatus::Passed);
@@ -2268,6 +2391,37 @@ async fn resume_does_not_trust_stale_success_when_versions_changed() {
 async fn resume_refuses_an_incompatible_workspace() {
     let compilation = project_with_tests();
     let adapter = Arc::new(FakeAdapter::default());
+    adapter.slow_target("reporting.monthly", 1500);
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let run_id = interrupt_apply(
+        adapter.clone(),
+        state.clone(),
+        &compilation,
+        &plan,
+        RunOptions::default(),
+        Duration::from_millis(250),
+    )
+    .await;
+
+    // A model the run executed no longer exists — refuse rather than guess.
+    let shrunk = compile(&SemanticProject::in_memory(vec![
+        model("assay.raw", "select * from external.raw_assay_results"),
+        model("assay.results", "select * from assay.raw"),
+    ]));
+    let error = runner
+        .resume(&shrunk, &run_id[..8], &RunOptions::default())
+        .await
+        .expect_err("incompatible resume refused");
+    assert!(error.to_string().contains("no longer exists"), "{error}");
+}
+
+#[tokio::test]
+async fn resume_redirects_a_finished_failed_run_to_retry_failed() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
     adapter.fail_with("assay.results", AdapterError::new("FAKE001", "boom"));
     let state = Arc::new(SqliteStateStore::in_memory().unwrap());
     let runner = Runner::new(adapter.clone(), Some(state.clone()));
@@ -2279,17 +2433,15 @@ async fn resume_refuses_an_incompatible_workspace() {
         )
         .await
         .unwrap();
+    assert_eq!(first.status, ExecutionStatus::Failed);
 
-    // A model the run executed no longer exists — refuse rather than guess.
-    let shrunk = compile(&SemanticProject::in_memory(vec![
-        model("assay.raw", "select * from external.raw_assay_results"),
-        model("assay.results", "select * from assay.raw"),
-    ]));
+    // A finished run's history is immutable: resume refuses and points at
+    // --retry-failed instead of rewriting it.
     let error = runner
-        .resume(&shrunk, &first.run_id[..8], &RunOptions::default())
+        .resume(&compilation, &first.run_id[..8], &RunOptions::default())
         .await
-        .expect_err("incompatible resume refused");
-    assert!(error.to_string().contains("no longer exists"), "{error}");
+        .expect_err("a finished run is not resumable");
+    assert!(error.to_string().contains("--retry-failed"), "{error}");
 }
 
 #[tokio::test]
@@ -2601,4 +2753,570 @@ async fn results_follow_plan_order_not_completion_order() {
         .collect();
     let plan_order: Vec<&str> = plan.models.iter().map(|model| model.id.as_str()).collect();
     assert_eq!(result_order, plan_order);
+}
+
+#[tokio::test]
+async fn resume_replans_a_model_skipped_in_the_interrupted_run() {
+    // run 1 builds and passes; run 2 is killed while the changed `main.b`
+    // builds, leaving `main.a` recorded as skipped.
+    let build = |a_sql: &str, b_sql: &str| {
+        let compilation = compile(&SemanticProject::in_memory(vec![
+            model("main.a", a_sql),
+            model("main.b", b_sql),
+        ]));
+        assert!(compilation.is_ok());
+        compilation
+    };
+    let v1 = build(
+        "select 1 as id from external.a",
+        "select 2 as id from external.b",
+    );
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+    runner
+        .apply(
+            &v1,
+            &plan_all(&v1, adapter.clone()).await,
+            &RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(adapter.attempts("main.a"), 1);
+
+    // run 2: `main.a` unchanged → skipped; `main.b` rebuilds slowly and the
+    // process dies mid-build.
+    let v2 = build(
+        "select 1 as id from external.a",
+        "select 2 as id, 'x' as extra from external.b",
+    );
+    adapter.slow_target("main.b", 1500);
+    let plan2 = plan_all_with_state(&v2, adapter.clone(), state.clone(), None).await;
+    let run_id = interrupt_apply(
+        adapter.clone(),
+        state.clone(),
+        &v2,
+        &plan2,
+        RunOptions::default(),
+        Duration::from_millis(250),
+    )
+    .await;
+    let record = state
+        .model_runs(&run_id)
+        .unwrap()
+        .into_iter()
+        .find(|record| record.model_id == "main.a")
+        .unwrap();
+    assert_eq!(record.status, ExecutionStatus::Skipped);
+
+    // `main.a` then changes — resuming must not keep its stale skip.
+    let v3 = build(
+        "select 7 as id from external.a",
+        "select 2 as id, 'x' as extra from external.b",
+    );
+    let resumed = runner
+        .resume(&v3, &run_id[..8], &RunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(resumed.status, ExecutionStatus::Passed);
+    assert_eq!(
+        model_result(&resumed, "main.a").status,
+        ExecutionStatus::Passed
+    );
+    assert_eq!(
+        adapter.attempts("main.a"),
+        2,
+        "a stale skip must become a build when the version moved"
+    );
+}
+
+#[tokio::test]
+async fn resume_replans_a_model_cached_in_the_interrupted_run() {
+    // `dev` materialises both models; the `prod` run is killed mid-`main.b`
+    // (changed for prod so it builds) leaving `main.a` cached from `dev`'s
+    // identical version.
+    let build = |a_sql: &str, b_sql: &str| {
+        let compilation = compile(&SemanticProject::in_memory(vec![
+            model("main.a", a_sql),
+            model("main.b", b_sql),
+        ]));
+        assert!(compilation.is_ok());
+        compilation
+    };
+    let v1 = build(
+        "select 1 as id from external.a",
+        "select 2 as id from external.b",
+    );
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+    let dev = RunOptions {
+        environment: Some("dev".to_string()),
+        ..Default::default()
+    };
+    runner
+        .apply(&v1, &plan_all(&v1, adapter.clone()).await, &dev)
+        .await
+        .unwrap();
+    assert_eq!(adapter.attempts("main.a"), 1);
+
+    // `main.b` differs from the dev build so the prod run has real work to
+    // interrupt; `main.a` is unchanged so prod plans it as a cross-env
+    // cache hit.
+    let v2 = build(
+        "select 1 as id from external.a",
+        "select 3 as id from external.b",
+    );
+    let prod = RunOptions {
+        environment: Some("prod".to_string()),
+        ..Default::default()
+    };
+    adapter.slow_target("main.b", 1500);
+    let plan2 = plan_all_with_state(
+        &v2,
+        adapter.clone(),
+        state.clone(),
+        Some("prod".to_string()),
+    )
+    .await;
+    let run_id = interrupt_apply(
+        adapter.clone(),
+        state.clone(),
+        &v2,
+        &plan2,
+        prod.clone(),
+        Duration::from_millis(250),
+    )
+    .await;
+    let record = state
+        .model_runs(&run_id)
+        .unwrap()
+        .into_iter()
+        .find(|record| record.model_id == "main.a")
+        .unwrap();
+    assert_eq!(record.status, ExecutionStatus::Cached);
+
+    // `main.a` then changes: the new version was never materialised
+    // anywhere — resume must build it rather than keep the stale cache.
+    let v3 = build(
+        "select 9 as id from external.a",
+        "select 3 as id from external.b",
+    );
+    let resumed = runner.resume(&v3, &run_id[..8], &prod).await.unwrap();
+    assert_eq!(resumed.status, ExecutionStatus::Passed);
+    assert_eq!(
+        adapter.attempts("main.a"),
+        2,
+        "a stale cache hit must become a build when the version moved"
+    );
+}
+
+#[tokio::test]
+async fn resume_reloads_a_seed_skipped_in_the_interrupted_run() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("seeds")).unwrap();
+    std::fs::write(
+        dir.path().join("seeds/raw_events.csv"),
+        "id,status\n1,placed\n",
+    )
+    .unwrap();
+    let build = |hash: &str, slow_sql: &str| {
+        let mut project = SemanticProject::in_memory(vec![
+            model("main.events", "select * from raw.raw_events"),
+            model("main.slow", slow_sql),
+        ]);
+        project.workspace_root = Some(dir.path().to_path_buf());
+        project.seeds = vec![SemanticSeed {
+            name: "raw_events".to_string(),
+            path: PathBuf::from("seeds/raw_events.csv"),
+            schema: Some("raw".to_string()),
+            content_hash: hash.to_string(),
+            columns: vec!["id".to_string(), "status".to_string()],
+        }];
+        let compilation = compile(&project);
+        assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+        compilation
+    };
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+
+    // run 1: seed loads, models build.
+    let v1 = build("hash-v1", "select 1 as id from external.slow");
+    runner
+        .apply(
+            &v1,
+            &plan_all(&v1, adapter.clone()).await,
+            &RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(adapter.loaded_csvs.lock().unwrap().len(), 1);
+
+    // run 2 (interrupted): seed unchanged → skipped; `main.slow` changed so
+    // it rebuilds — the process dies mid-build.
+    let v2 = build("hash-v1", "select 2 as id from external.slow");
+    adapter.slow_target("main.slow", 1500);
+    let plan2 = plan_all_with_state(&v2, adapter.clone(), state.clone(), None).await;
+    let run_id = interrupt_apply(
+        adapter.clone(),
+        state.clone(),
+        &v2,
+        &plan2,
+        RunOptions::default(),
+        Duration::from_millis(250),
+    )
+    .await;
+    let record = state
+        .seed_runs(&run_id)
+        .unwrap()
+        .into_iter()
+        .find(|record| record.name == "raw_events")
+        .unwrap();
+    assert_eq!(record.status, ExecutionStatus::Skipped);
+
+    // The CSV then changed — resume must reload, not keep the stale skip.
+    let v3 = build("hash-v2", "select 2 as id from external.slow");
+    let resumed = runner
+        .resume(&v3, &run_id[..8], &RunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(resumed.status, ExecutionStatus::Passed);
+    assert_eq!(resumed.seeds[0].status, ExecutionStatus::Passed);
+    assert_eq!(
+        adapter.loaded_csvs.lock().unwrap().len(),
+        2,
+        "a changed seed must reload even though it was skipped in the run"
+    );
+}
+
+#[tokio::test]
+async fn retry_failed_reruns_a_failed_test() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    // Every test query returns rows — both tests fail while all models pass.
+    adapter.set_test_rows(3);
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+    let first = runner
+        .apply(
+            &compilation,
+            &plan_all(&compilation, adapter.clone()).await,
+            &RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status, ExecutionStatus::Failed);
+    assert!(first
+        .tests
+        .iter()
+        .all(|test| test.status == ExecutionStatus::Failed));
+
+    adapter.set_test_rows(0);
+    let retry = runner
+        .retry_failed(&compilation, &first.run_id[..8], &RunOptions::default())
+        .await
+        .expect("test-only failures are retryable work");
+
+    assert_ne!(retry.run_id, first.run_id);
+    assert_eq!(retry.continued_from.as_deref(), Some(first.run_id.as_str()));
+    assert!(retry
+        .tests
+        .iter()
+        .all(|test| test.status == ExecutionStatus::Passed));
+    // No model needed rebuilding — the failed tests rerun against the
+    // already-materialised datasets.
+    assert!(retry.models.iter().all(|model| model.status.is_satisfied()));
+    assert_eq!(adapter.attempts("assay.raw"), 1, "nothing rebuilt");
+    assert_eq!(retry.status, ExecutionStatus::Passed);
+    assert_eq!(state.runs().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_killed_run_keeps_the_attempts_it_already_made() {
+    // `main.flaky` fails once with a retryable error; a huge backoff parks
+    // the run mid-retry — killing it there must still show the attempt.
+    let compilation = compile(&SemanticProject::in_memory(vec![model(
+        "main.flaky",
+        "select 1 as id from external.a",
+    )]));
+    assert!(compilation.is_ok());
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.fail_first(
+        "main.flaky",
+        1,
+        AdapterError::new("TRINO_TRANSPORT", "connection reset").retryable(),
+    );
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let run_id = interrupt_apply(
+        adapter.clone(),
+        state.clone(),
+        &compilation,
+        &plan,
+        RunOptions {
+            retry: RetryPolicy {
+                retries: 3,
+                base_delay: Duration::from_secs(60),
+                max_delay: Duration::from_secs(60),
+            },
+            ..Default::default()
+        },
+        Duration::from_millis(250),
+    )
+    .await;
+
+    let records = state.model_runs(&run_id).unwrap();
+    let record = records
+        .iter()
+        .find(|record| record.model_id == "main.flaky")
+        .unwrap();
+    assert_eq!(record.status, ExecutionStatus::Running);
+    assert_eq!(
+        record.attempts.len(),
+        1,
+        "the failed attempt must be persisted before backoff, not lost"
+    );
+    assert!(record.attempts[0]
+        .failure
+        .as_ref()
+        .is_some_and(|failure| failure.retryable));
+
+    // And resume continues the attempt numbering rather than restarting.
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+    let resumed = runner
+        .resume(&compilation, &run_id[..8], &RunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(resumed.status, ExecutionStatus::Passed);
+    let record = state
+        .model_runs(&run_id)
+        .unwrap()
+        .into_iter()
+        .find(|record| record.model_id == "main.flaky")
+        .unwrap();
+    assert_eq!(record.attempts.len(), 2, "{:?}", record.attempts);
+    assert_eq!(record.attempts[1].attempt, 2);
+}
+
+#[tokio::test]
+async fn timeout_cancels_the_in_flight_query() {
+    let compilation = compile(&SemanticProject::in_memory(vec![model(
+        "main.slow",
+        "select 1 as id from external.a",
+    )]));
+    assert!(compilation.is_ok());
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.slow_target("main.slow", 5000);
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let runner = Runner::new(adapter.clone(), None);
+    let result = runner
+        .apply(
+            &compilation,
+            &plan,
+            &RunOptions {
+                model_timeout: Some(Duration::from_millis(100)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let model = model_result(&result, "main.slow");
+    assert_eq!(model.status, ExecutionStatus::Failed);
+    assert_eq!(
+        model.failure.as_ref().unwrap().category,
+        FailureCategory::Timeout
+    );
+    assert!(
+        adapter
+            .cancelled_queries()
+            .iter()
+            .any(|query| query.ends_with(":main.slow")),
+        "the in-flight warehouse query must be cancelled, not just dropped"
+    );
+}
+
+#[tokio::test]
+async fn fail_fast_cancels_in_flight_queries() {
+    // `main.a` fails shortly after `main.b` starts building — fail-fast
+    // aborts b's task *and* cancels its warehouse query.
+    let compilation = compile(&SemanticProject::in_memory(vec![
+        model("main.a", "select 1 as id from external.a"),
+        model("main.b", "select 2 as id from external.b"),
+    ]));
+    assert!(compilation.is_ok());
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.fail_with("main.a", AdapterError::new("FAKE001", "boom"));
+    adapter.slow_target("main.a", 100);
+    adapter.slow_target("main.b", 5000);
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let runner = Runner::new(adapter.clone(), None);
+    let result = runner
+        .apply(
+            &compilation,
+            &plan,
+            &RunOptions {
+                concurrency: 2,
+                fail_fast: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        model_result(&result, "main.a").status,
+        ExecutionStatus::Failed
+    );
+    assert_eq!(
+        model_result(&result, "main.b").status,
+        ExecutionStatus::Cancelled
+    );
+    assert!(
+        adapter
+            .cancelled_queries()
+            .iter()
+            .any(|query| query.ends_with(":main.b")),
+        "fail-fast must cancel in-flight warehouse queries"
+    );
+}
+
+/// A store that accepts everything except `record_model` — a mid-run write
+/// failure stand-in.
+struct FailingStore {
+    inner: SqliteStateStore,
+}
+
+impl FailingStore {
+    fn new(inner: SqliteStateStore) -> Self {
+        Self { inner }
+    }
+}
+
+impl StateStore for FailingStore {
+    fn start_run(&self, run: &RunRecord, plan: &StoredPlan) -> Result<(), EngineError> {
+        self.inner.start_run(run, plan)
+    }
+
+    fn reopen_run(&self, run_id: &str) -> Result<(), EngineError> {
+        self.inner.reopen_run(run_id)
+    }
+
+    fn finish_run(
+        &self,
+        run_id: &str,
+        status: ExecutionStatus,
+        finished_at: &str,
+        failed_count: usize,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .finish_run(run_id, status, finished_at, failed_count)
+    }
+
+    fn record_model(&self, _record: &ModelRunRecord) -> Result<(), EngineError> {
+        Err(EngineError::State("simulated write failure".to_string()))
+    }
+
+    fn record_seed_run(&self, record: &SeedRunRecord) -> Result<(), EngineError> {
+        self.inner.record_seed_run(record)
+    }
+
+    fn record_test(&self, record: &TestRunRecord) -> Result<(), EngineError> {
+        self.inner.record_test(record)
+    }
+
+    fn runs(&self) -> Result<Vec<RunSummary>, EngineError> {
+        self.inner.runs()
+    }
+
+    fn latest_run(&self, environment: Option<&str>) -> Result<Option<RunSummary>, EngineError> {
+        self.inner.latest_run(environment)
+    }
+
+    fn run(&self, run_id: &str) -> Result<Option<StoredRun>, EngineError> {
+        self.inner.run(run_id)
+    }
+
+    fn find_runs(&self, prefix: &str) -> Result<Vec<RunSummary>, EngineError> {
+        self.inner.find_runs(prefix)
+    }
+
+    fn model_runs(&self, run_id: &str) -> Result<Vec<ModelRunRecord>, EngineError> {
+        self.inner.model_runs(run_id)
+    }
+
+    fn seed_runs(&self, run_id: &str) -> Result<Vec<SeedRunRecord>, EngineError> {
+        self.inner.seed_runs(run_id)
+    }
+
+    fn test_runs(&self, run_id: &str) -> Result<Vec<TestRunRecord>, EngineError> {
+        self.inner.test_runs(run_id)
+    }
+
+    fn record_materialized(&self, record: &MaterializedRecord) -> Result<(), EngineError> {
+        self.inner.record_materialized(record)
+    }
+
+    fn materialized_version(
+        &self,
+        model_id: &str,
+        environment: Option<&str>,
+    ) -> Result<Option<MaterializedRecord>, EngineError> {
+        self.inner.materialized_version(model_id, environment)
+    }
+
+    fn materialized_by_hash(
+        &self,
+        version_hash: &str,
+    ) -> Result<Vec<MaterializedRecord>, EngineError> {
+        self.inner.materialized_by_hash(version_hash)
+    }
+
+    fn set_watermark(
+        &self,
+        model_id: &str,
+        environment: Option<&str>,
+        value: &str,
+        run_id: &str,
+    ) -> Result<(), EngineError> {
+        self.inner
+            .set_watermark(model_id, environment, value, run_id)
+    }
+
+    fn watermark(
+        &self,
+        model_id: &str,
+        environment: Option<&str>,
+    ) -> Result<Option<String>, EngineError> {
+        self.inner.watermark(model_id, environment)
+    }
+
+    fn record_seed(&self, record: &SeedRecord) -> Result<(), EngineError> {
+        self.inner.record_seed(record)
+    }
+
+    fn seed_state(
+        &self,
+        name: &str,
+        environment: Option<&str>,
+    ) -> Result<Option<SeedRecord>, EngineError> {
+        self.inner.seed_state(name, environment)
+    }
+}
+
+#[tokio::test]
+async fn a_state_write_failure_is_fatal_not_silent() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    let store: Arc<dyn StateStore> =
+        Arc::new(FailingStore::new(SqliteStateStore::in_memory().unwrap()));
+    let runner = Runner::new(adapter.clone(), Some(store));
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let error = runner
+        .apply(&compilation, &plan, &RunOptions::default())
+        .await
+        .expect_err("a failed state write must stop the run");
+    assert!(matches!(error, EngineError::State(_)), "{error}");
 }

@@ -5,6 +5,8 @@
 //! protocol is simple enough to speak directly
 //! (<https://trino.io/docs/current/develop/client-protocol.html>).
 
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -62,6 +64,12 @@ impl TrinoConfig {
 pub struct TrinoAdapter {
     client: reqwest::Client,
     config: TrinoConfig,
+    /// Query ids executing through this adapter instance. Entries are added
+    /// as soon as Trino assigns an id and removed when the statement
+    /// completes; if the caller drops the statement future, the id remains
+    /// registered so [`TrinoAdapter::in_flight_queries`] can still name it
+    /// for cancellation.
+    in_flight: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl TrinoAdapter {
@@ -70,7 +78,20 @@ impl TrinoAdapter {
             .timeout(config.timeout)
             .build()
             .map_err(|error| AdapterError::new("TRINO_CLIENT", error.to_string()))?;
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            in_flight: Arc::new(Mutex::new(BTreeSet::new())),
+        })
+    }
+
+    /// Query ids currently executing through this adapter — the set
+    /// [`phlo_transform_engine::Adapter::in_flight_queries`] reports.
+    pub fn in_flight_queries(&self) -> Vec<String> {
+        self.in_flight
+            .lock()
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
@@ -103,7 +124,7 @@ impl TrinoAdapter {
             .map_err(|error| self.transport_error(error))?;
 
         let status = response.status();
-        let mut payload: StatementResponse = response
+        let payload: StatementResponse = response
             .json()
             .await
             .map_err(|error| self.transport_error(error))?;
@@ -115,7 +136,31 @@ impl TrinoAdapter {
             ));
         }
 
+        // Register the id as soon as Trino assigns it. If this future is
+        // dropped mid-flight (timeout, abort) the id stays registered so a
+        // caller can still cancel the warehouse query; a completed
+        // statement deregisters itself.
         let query_id = payload.id.clone();
+        if let Some(id) = &query_id {
+            if let Ok(mut set) = self.in_flight.lock() {
+                set.insert(id.clone());
+            }
+        }
+        let result = self.follow(payload, query_id.clone()).await;
+        if let Some(id) = &query_id {
+            if let Ok(mut set) = self.in_flight.lock() {
+                set.remove(id);
+            }
+        }
+        result
+    }
+
+    /// Follow `nextUri` pages until the statement finishes.
+    async fn follow(
+        &self,
+        mut payload: StatementResponse,
+        query_id: Option<String>,
+    ) -> Result<QueryResult, AdapterError> {
         let mut columns = Vec::new();
         let mut rows = Vec::new();
 
@@ -304,6 +349,21 @@ impl Adapter for TrinoAdapter {
                 format!("cancel returned HTTP {}", response.status()),
             ))
         }
+    }
+
+    /// A tracked view shares the client and config but gets a fresh
+    /// in-flight registry, so it reports only the queries started through
+    /// it — exactly the set one model attempt can cancel.
+    fn track_attempt(&self) -> Option<Arc<dyn Adapter>> {
+        Some(Arc::new(Self {
+            client: self.client.clone(),
+            config: self.config.clone(),
+            in_flight: Arc::new(Mutex::new(BTreeSet::new())),
+        }))
+    }
+
+    fn in_flight_queries(&self) -> Vec<String> {
+        TrinoAdapter::in_flight_queries(self)
     }
 
     async fn relation_columns(&self, relation: &Relation) -> Result<Vec<ColumnInfo>, AdapterError> {

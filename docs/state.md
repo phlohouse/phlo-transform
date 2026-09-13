@@ -116,10 +116,14 @@ whose desired versions no longer match (`EngineError::StalePlan`).
 Runs are persisted while they execute, not just at the end. `start_run`
 writes the run row — id, plan id, environment, started timestamp — together
 with the stored `plan` itself *before* the scheduler dispatches anything,
-and each model/seed/test record is written as it reaches a terminal status
-(`model_runs`, `seed_runs`, `test_runs`, plus `model_attempts` for every
-retry). A process killed mid-run therefore leaves an accurate partial
-record: passed work is marked passed, everything else stays unfinished.
+and each model/seed/test record is written as it transitions
+(`model_runs`, `seed_runs`, `test_runs`; per-attempt detail lives in
+`attempts_json`). Every failed attempt is persisted before its retry
+backoff begins — a process killed mid-retry still shows the attempts it
+made. State-store write failures are fatal to the run rather than silently
+dropped: an execution record that cannot be written cannot be trusted for
+resume. A killed process therefore leaves an accurate partial record:
+passed work is marked passed, everything else stays unfinished.
 
 Each execution record carries the fields needed to reconstruct what
 happened: status (`passed`/`failed`/`skipped`/`cached`/`blocked`/
@@ -129,24 +133,29 @@ and query id. `finish_run` stamps the run's final status and failed count.
 
 This is what `--resume` and `--retry-failed` rebuild from:
 
-- **`run --resume <run-id>`** reloads the stored plan and the prior per-node
-  records, then reruns everything that did not reach `passed`/`cached`.
-  Reuse is verified, not trusted: a previously-passed model is kept only if
-  its desired version still matches the freshly compiled one, and a seed is
-  reused only when its recorded hash matches the current file. If the
-  workspace changed incompatibly — a stored model is gone, or a passed
-  model's desired version moved — resume refuses with an explicit error
-  rather than guessing. The run keeps the same run id.
+- **`run --resume <run-id>`** continues an *interrupted* run — still
+  `running` after a kill, or `cancelled` — under the same run id. It
+  reloads the stored plan and prior per-node records, then re-plans every
+  node that is not being reused. Reuse is verified, not trusted: a
+  previously-passed model is kept only if its desired version still
+  matches the fresh compile *and* its target relation still exists; a seed
+  is reused only when its recorded content hash matches the current file
+  and its target exists. Stored `skip`/`cached` decisions are never
+  trusted — the action is re-decided against current state, so a version
+  that moved since the interruption becomes a build. A finished run is not
+  resumable: `failed` redirects to `--retry-failed`, `passed` is a no-op.
 - **`run --retry-failed <run-id>`** creates a new run (`continued_from`
-  links back) whose plan contains only the failed/blocked portion of the
-  finished run plus the dependencies it still needs; the rest is skipped.
-  If nothing failed there is nothing to retry and the command says so.
+  links back) over the failed/blocked/cancelled models of a finished run,
+  the dependencies they still need, and any tests that failed — tests over
+  rebuilt models re-verify as well. If nothing failed there is nothing to
+  retry and the command says so.
 
-Safe to reuse: `passed` model records whose desired version still matches,
-`cached`/`skipped` plan decisions, and `passed` seed records with matching
-hashes. Never trusted: `failed`/`blocked`/`cancelled` records, unfinished
-records from a killed run, and any record whose desired version differs
-from the current compile.
+Safe to reuse: `passed` model records whose desired version still matches
+and whose target still exists, and `passed` seed records with matching
+hashes and existing targets. Never trusted: `failed`/`blocked`/`cancelled`
+records, unfinished records from a killed run, stored `skip`/`cached`
+actions whose underlying version moved, and any record whose desired
+version differs from the current compile.
 
 ## Inspect
 

@@ -1282,8 +1282,81 @@ fn run_fails_cleanly_and_reports_the_summary() {
     assert_eq!(child["failure"]["category"], "dependency");
 }
 
+/// The id of the still-`running` run — waits until the run has actually
+/// started, so a test can kill the process mid-flight.
+fn running_run_id(dir: &tempfile::TempDir) -> String {
+    let db = dir.path().join(".phlo/transform/state.db");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if db.exists() {
+            if let Ok(connection) = rusqlite::Connection::open(&db) {
+                // Read-only while the run holds the writer — retry on busy.
+                if let Ok(id) = connection.query_row(
+                    "select run_id from runs where status = 'running' order by started_at desc limit 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                ) {
+                    return id;
+                }
+            }
+        }
+        assert!(std::time::Instant::now() < deadline, "run never started");
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 #[test]
-fn resume_continues_the_same_run() {
+fn resume_continues_an_interrupted_run() {
+    let dir = resilience_workspace();
+    // Make `main.broken` heavy rather than broken so the run is reliably
+    // in-flight when we kill it — `@table` materialisation forces the query
+    // to execute (~3s); `main.child` queues behind it.
+    std::fs::write(
+        dir.path()
+            .join("workflows/main/transforms/broken.sql"),
+        "-- @table\nselect sum(t1.x * t2.y) as total from range(0,300000) t1(x), range(0,3000) t2(y)\n",
+    )
+    .unwrap();
+    let base = resilience_args(&dir);
+    let mut args = base.clone();
+    args.push("run".into());
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_phlo-transform"))
+        .current_dir(workspace_root())
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn run");
+
+    // Kill the process mid-run — the state store keeps an honest partial
+    // record: `main.ok` passed, `main.broken` still `running`.
+    let run_id = running_run_id(&dir);
+    // Give the run a moment to record the in-flight model.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    child.kill().expect("kill mid-run");
+    child.wait().unwrap();
+    let short = &run_id[..8];
+
+    // Resume recompiles the workspace — make the heavy model trivial so the
+    // resumed build is fast. `main.ok` is reused; `main.broken` and
+    // `main.child` run, all under the same run id.
+    std::fs::write(
+        dir.path().join("workflows/main/transforms/broken.sql"),
+        "select 1 as id\n",
+    )
+    .unwrap();
+    let mut args = base.clone();
+    args.extend(["run".into(), "--resume".into(), short.into()]);
+    let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains(&format!("Run {short}  PASSED")), "{body}");
+    assert!(body.contains("cached"), "{body}");
+    assert_eq!(last_run_id(&dir), run_id, "resume keeps the run id");
+}
+
+#[test]
+fn resume_redirects_a_finished_run_to_retry_failed() {
     let dir = resilience_workspace();
     let base = resilience_args(&dir);
     let mut args = base.clone();
@@ -1291,26 +1364,15 @@ fn resume_continues_the_same_run() {
     let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
     assert!(!output.status.success());
     let run_id = last_run_id(&dir);
-    let short = &run_id[..8];
 
-    // Resume while still broken: passed work is reused as `cached`, the
-    // failed model reruns and fails again, under the same run id.
+    // A finished run's history is immutable — resume refuses and points at
+    // --retry-failed.
     let mut args = base.clone();
-    args.extend(["run".into(), "--resume".into(), short.into()]);
+    args.extend(["run".into(), "--resume".into(), run_id[..8].into()]);
     let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
     assert!(!output.status.success());
-    let body = stdout(&output);
-    assert!(body.contains(&format!("Run {short}")), "{body}");
-    assert!(body.contains("cached"), "{body}");
-    assert_eq!(last_run_id(&dir), run_id, "resume keeps the run id");
-
-    // Materialise the source, resume again: the run goes green.
-    heal_workspace(&dir);
-    let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
-    assert!(output.status.success(), "{}", stdout(&output));
-    let body = stdout(&output);
-    assert!(body.contains(&format!("Run {short}  PASSED")), "{body}");
-    assert_eq!(last_run_id(&dir), run_id);
+    let stderr = String::from_utf8(output.stderr.clone()).expect("utf-8 stderr");
+    assert!(stderr.contains("--retry-failed"), "{stderr}");
 }
 
 #[test]
