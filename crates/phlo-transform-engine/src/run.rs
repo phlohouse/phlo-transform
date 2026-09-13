@@ -1,23 +1,39 @@
 //! Execution: dependency-aware, bounded-concurrency model and test runs.
+//!
+//! The runner consumes a [`Plan`] — the planner stays the source of truth
+//! for *what* runs — and decides *how* it executes: bounded parallelism,
+//! retries with backoff for transient adapter failures, `--fail-fast`
+//! shutdown, per-attempt timeouts, per-target write serialisation, and
+//! incremental state persistence so an interrupted run can be resumed or a
+//! failed one retried.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
-use phlo_transform_core::{Compilation, IncrementalStrategy, Materialization, ModelId};
+use phlo_transform_core::{
+    Compilation, IncrementalStrategy, Materialization, ModelId, Relation, Selection,
+};
 
 use crate::adapter::Adapter;
 use crate::cancel::CancelHandle;
 use crate::error::{AdapterError, EngineError};
 use crate::events::{EngineEvent, ExecutionStatus};
-use crate::plan::{Plan, PlanAction, PlannedModel};
+use crate::failure::{
+    classify_adapter_error, timeout_failure, Attempt, Failure, FailureCategory, RetryPolicy,
+};
+use crate::plan::{
+    Membership, Plan, PlanAction, PlanOptions, PlanReason, PlanSelection, PlannedModel,
+    PlannedSeed, PlannedTest, Planner, ReasonKind,
+};
 use crate::source_state::{adapter_default_schema, relation_for_source, seed_relation};
 use crate::state::{
-    MaterializedRecord, ModelRunRecord, RunRecord, SeedRecord, StateStore, TestRunRecord,
+    MaterializedRecord, ModelRunRecord, RunRecord, SeedRecord, SeedRunRecord, StateStore,
+    StoredPlan, StoredPlanModel, StoredPlanSeed, StoredPlanTest, TestRunRecord,
 };
 use crate::util::{now_rfc3339, sha256_hex};
 
@@ -25,9 +41,16 @@ use crate::util::{now_rfc3339, sha256_hex};
 #[derive(Clone, Debug)]
 pub struct RunOptions {
     pub environment: Option<String>,
+    /// Maximum concurrent model builds (`--jobs`).
     pub concurrency: usize,
     /// Run custom tests after the models.
     pub run_tests: bool,
+    /// Stop scheduling new work on the first unrecoverable failure.
+    pub fail_fast: bool,
+    /// Retry policy for transient adapter failures.
+    pub retry: RetryPolicy,
+    /// Per-attempt timeout for model builds and test executions.
+    pub model_timeout: Option<Duration>,
     /// Cooperative cancellation signal.
     pub cancel: CancelHandle,
 }
@@ -38,6 +61,9 @@ impl Default for RunOptions {
             environment: None,
             concurrency: 4,
             run_tests: true,
+            fail_fast: false,
+            retry: RetryPolicy::default(),
+            model_timeout: None,
             cancel: CancelHandle::default(),
         }
     }
@@ -49,6 +75,8 @@ pub struct ModelResult {
     pub model: String,
     pub target: String,
     pub materialization: String,
+    /// The plan action that governed this model (`build`, `skip`, `cached`).
+    pub action: String,
     pub status: ExecutionStatus,
     pub desired_version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,7 +84,16 @@ pub struct ModelResult {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reasons: Vec<String>,
     pub query_id: Option<String>,
-    pub error: Option<String>,
+    /// Every attempt made, oldest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<Attempt>,
+    /// Structured failure detail — category, adapter error, attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Failure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
     pub duration_ms: u64,
     pub sql_hash: String,
 }
@@ -67,7 +104,11 @@ pub struct SeedResult {
     pub seed: String,
     pub target: String,
     pub status: ExecutionStatus,
-    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<Attempt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Failure>,
+    pub duration_ms: u64,
 }
 
 /// The outcome of a single test.
@@ -77,7 +118,34 @@ pub struct TestResult {
     pub status: ExecutionStatus,
     pub row_count: u64,
     pub query_id: Option<String>,
-    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<Failure>,
+    pub duration_ms: u64,
+}
+
+/// Per-status counts across every node in the run (models, seeds, tests).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct RunCounts {
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub cached: usize,
+    pub blocked: usize,
+    pub cancelled: usize,
+}
+
+impl RunCounts {
+    fn add(&mut self, status: ExecutionStatus) {
+        match status {
+            ExecutionStatus::Passed => self.passed += 1,
+            ExecutionStatus::Failed => self.failed += 1,
+            ExecutionStatus::Skipped => self.skipped += 1,
+            ExecutionStatus::Cached => self.cached += 1,
+            ExecutionStatus::Blocked => self.blocked += 1,
+            ExecutionStatus::Cancelled => self.cancelled += 1,
+            _ => {}
+        }
+    }
 }
 
 /// The result of applying a plan.
@@ -85,9 +153,18 @@ pub struct TestResult {
 pub struct RunResult {
     pub run_id: String,
     pub plan_id: String,
+    pub environment: Option<String>,
+    /// The run this execution continues: the same id for `resume`, the
+    /// original id for `retry_failed` (which creates a new run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continued_from: Option<String>,
     pub status: ExecutionStatus,
     pub started_at: String,
     pub finished_at: String,
+    /// Per-status counts over models, seeds and tests.
+    pub counts: RunCounts,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     pub models: Vec<ModelResult>,
     pub tests: Vec<TestResult>,
     /// Seed loads performed before model builds.
@@ -95,9 +172,15 @@ pub struct RunResult {
     pub events: Vec<EngineEvent>,
 }
 
+/// What a spawned model task reports back.
 struct Completion {
     id: ModelId,
-    result: Result<crate::adapter::QueryResult, AdapterError>,
+    outcome: Result<crate::adapter::QueryResult, Failure>,
+    /// Attempts made in *this* invocation (earlier attempts from a resumed
+    /// run are kept separately and prepended on write).
+    attempts: Vec<Attempt>,
+    started_at: String,
+    finished_at: String,
     duration_ms: u64,
 }
 
@@ -207,6 +290,36 @@ pub struct Runner {
     state: Option<Arc<dyn StateStore>>,
 }
 
+/// Prior per-node records used by `resume` to decide what is safely reusable.
+#[derive(Default)]
+struct PriorRun {
+    models: BTreeMap<String, ModelRunRecord>,
+    seeds: BTreeMap<String, SeedRunRecord>,
+}
+
+impl PriorRun {
+    /// A model's earlier success is reusable only when the version it built
+    /// is still the desired version — stale success is never trusted.
+    fn reusable_model(&self, id: &ModelId, desired_version: &str) -> Option<&ModelRunRecord> {
+        let record = self.models.get(&id.logical_name())?;
+        if record.status == ExecutionStatus::Passed && record.desired_version == desired_version {
+            Some(record)
+        } else {
+            None
+        }
+    }
+
+    /// A seed's earlier load is reusable when it succeeded and the stored
+    /// desired version still matches the seed's current content hash.
+    fn reusable_seed(&self, name: &str, stored_version: &str, current_hash: &str) -> bool {
+        stored_version == current_hash
+            && matches!(
+                self.seeds.get(name),
+                Some(record) if record.status == ExecutionStatus::Passed
+            )
+    }
+}
+
 impl Runner {
     pub fn new(adapter: Arc<dyn Adapter>, state: Option<Arc<dyn StateStore>>) -> Self {
         Self { adapter, state }
@@ -225,10 +338,380 @@ impl Runner {
         if let Some(reason) = plan.staleness(compilation) {
             return Err(EngineError::StalePlan(reason));
         }
-
         let run_id = uuid::Uuid::new_v4().to_string();
+        self.execute(
+            compilation,
+            plan,
+            options,
+            run_id,
+            None,
+            PriorRun::default(),
+            false,
+        )
+        .await
+    }
+
+    /// Continue an interrupted run: models that genuinely passed at their
+    /// still-desired version are kept; failed, blocked, cancelled and
+    /// never-reached models run again. The run keeps its original id.
+    pub async fn resume(
+        &self,
+        compilation: &Compilation,
+        run_id_or_prefix: &str,
+        options: &RunOptions,
+    ) -> Result<RunResult, EngineError> {
+        if !compilation.is_ok() {
+            return Err(EngineError::Compilation);
+        }
+        let state = self
+            .state
+            .clone()
+            .ok_or_else(|| EngineError::State("resume requires a state store".to_string()))?;
+        let run_id = resolve_run_id(state.as_ref(), run_id_or_prefix)?;
+        let stored = state
+            .run(&run_id)?
+            .ok_or_else(|| EngineError::InvalidPlan(format!("no run `{run_id_or_prefix}`")))?;
+        let manifest = stored.plan.clone().ok_or_else(|| {
+            EngineError::InvalidPlan(format!(
+                "run {} predates resumable run state; rerun its failed work with `--retry-failed`",
+                short_id(&run_id)
+            ))
+        })?;
+
+        if stored.record.status == ExecutionStatus::Passed {
+            return Err(EngineError::InvalidPlan(format!(
+                "run {} already passed — nothing to resume",
+                short_id(&run_id)
+            )));
+        }
+        if options.environment != stored.record.environment {
+            return Err(EngineError::InvalidPlan(format!(
+                "run {} targeted environment {:?}; refusing to resume into {:?}",
+                short_id(&run_id),
+                stored.record.environment,
+                options.environment
+            )));
+        }
+
+        // Compatibility: every node the run executed must still exist in the
+        // freshly compiled workspace. A changed desired version is *not*
+        // incompatible — it simply means the stale success cannot be reused.
+        for stored_model in &manifest.models {
+            let id = ModelId::parse(&stored_model.id)
+                .map_err(|error| EngineError::InvalidPlan(error.to_string()))?;
+            if compilation.model(&id).is_none() {
+                return Err(EngineError::InvalidPlan(format!(
+                    "run {} is incompatible with the workspace: model `{}` no longer exists",
+                    short_id(&run_id),
+                    stored_model.id
+                )));
+            }
+        }
+        for stored_seed in &manifest.seeds {
+            if !compilation
+                .seeds
+                .iter()
+                .any(|seed| seed.name == stored_seed.name)
+            {
+                return Err(EngineError::InvalidPlan(format!(
+                    "run {} is incompatible with the workspace: seed `{}` no longer exists",
+                    short_id(&run_id),
+                    stored_seed.name
+                )));
+            }
+        }
+
+        let prior = PriorRun {
+            models: state
+                .model_runs(&run_id)?
+                .into_iter()
+                .map(|record| (record.model_id.clone(), record))
+                .collect(),
+            seeds: state
+                .seed_runs(&run_id)?
+                .into_iter()
+                .map(|record| (record.name.clone(), record))
+                .collect(),
+        };
+
+        let plan = self
+            .resume_plan(compilation, &stored, &manifest, &prior, options)
+            .await?;
+        self.execute(
+            compilation,
+            &plan,
+            options,
+            run_id.clone(),
+            Some(run_id),
+            prior,
+            true,
+        )
+        .await
+    }
+
+    /// Create a new run over the failed/blocked portion of a finished run,
+    /// re-planning through the normal machinery so changed versions and
+    /// now-materialised upstreams are handled correctly.
+    pub async fn retry_failed(
+        &self,
+        compilation: &Compilation,
+        run_id_or_prefix: &str,
+        options: &RunOptions,
+    ) -> Result<RunResult, EngineError> {
+        if !compilation.is_ok() {
+            return Err(EngineError::Compilation);
+        }
+        let state = self
+            .state
+            .clone()
+            .ok_or_else(|| EngineError::State("retry requires a state store".to_string()))?;
+        let run_id = resolve_run_id(state.as_ref(), run_id_or_prefix)?;
+        let stored = state
+            .run(&run_id)?
+            .ok_or_else(|| EngineError::InvalidPlan(format!("no run `{run_id_or_prefix}`")))?;
+
+        if stored.record.finished_at.is_none() {
+            return Err(EngineError::InvalidPlan(format!(
+                "run {} did not finish — continue it with `--resume`",
+                short_id(&run_id)
+            )));
+        }
+        if options.environment != stored.record.environment {
+            return Err(EngineError::InvalidPlan(format!(
+                "run {} targeted environment {:?}; refusing to retry into {:?}",
+                short_id(&run_id),
+                stored.record.environment,
+                options.environment
+            )));
+        }
+
+        // The failed portion: models whose run state never reached a
+        // satisfied terminal. Everything else stays as materialised.
+        let failed_ids: Vec<ModelId> = state
+            .model_runs(&run_id)?
+            .into_iter()
+            .filter(|record| {
+                matches!(
+                    record.status,
+                    ExecutionStatus::Failed | ExecutionStatus::Blocked | ExecutionStatus::Cancelled
+                )
+            })
+            .filter_map(|record| ModelId::parse(&record.model_id).ok())
+            .collect();
+        if failed_ids.is_empty() {
+            return Err(EngineError::InvalidPlan(format!(
+                "run {} has no failed or blocked work to retry",
+                short_id(&run_id)
+            )));
+        }
+        for id in &failed_ids {
+            if compilation.model(id).is_none() {
+                return Err(EngineError::InvalidPlan(format!(
+                    "run {} is incompatible with the workspace: model `{}` no longer exists",
+                    short_id(&run_id),
+                    id.logical_name()
+                )));
+            }
+        }
+
+        let selection = Selection::of(compilation, &failed_ids);
+        let planner = Planner::new(self.adapter.clone(), self.state.clone());
+        let plan = planner
+            .plan(
+                compilation,
+                &selection,
+                options.environment.clone(),
+                &PlanOptions::default(),
+            )
+            .await?;
+
+        // The failed portion may already be materialised — for example a
+        // previous retry fixed it. A retry that would only skip is noise.
+        if !plan
+            .models
+            .iter()
+            .any(|model| model.action == PlanAction::Build)
+        {
+            return Err(EngineError::InvalidPlan(format!(
+                "the failed portion of run {} is already materialised — nothing to retry",
+                short_id(&run_id)
+            )));
+        }
+
+        let new_run_id = uuid::Uuid::new_v4().to_string();
+        self.execute(
+            compilation,
+            &plan,
+            options,
+            new_run_id,
+            Some(run_id),
+            PriorRun::default(),
+            false,
+        )
+        .await
+    }
+
+    /// Rebuild the stored plan against the current compilation for a resume.
+    /// Desired versions come from the current compilation; `full_rebuild`/
+    /// `watermark` come from the stored plan.
+    async fn resume_plan(
+        &self,
+        compilation: &Compilation,
+        stored: &crate::state::StoredRun,
+        manifest: &StoredPlan,
+        prior: &PriorRun,
+        options: &RunOptions,
+    ) -> Result<Plan, EngineError> {
+        let mut models = Vec::with_capacity(manifest.models.len());
+        for stored_model in &manifest.models {
+            let id = ModelId::parse(&stored_model.id)
+                .map_err(|error| EngineError::InvalidPlan(error.to_string()))?;
+            let compiled = compilation.model(&id).expect("checked compatible");
+            let desired = compiled.version.hash.clone();
+            let exists = self.adapter.relation_exists(&compiled.target).await?;
+            let reused = prior.reusable_model(&id, &desired).is_some();
+            let mut reasons = Vec::new();
+            if reused {
+                reasons.push(PlanReason::simple(
+                    ReasonKind::ResumedRun,
+                    "passed earlier in this run at the same version — reused",
+                ));
+            } else {
+                let why = match prior.models.get(&stored_model.id).map(|r| r.status) {
+                    Some(status) if status.is_terminal() => {
+                        format!("resumed run; previous status was {}", status.label())
+                    }
+                    Some(_) => "resumed run; execution was interrupted".to_string(),
+                    None => "resumed run; model never started".to_string(),
+                };
+                reasons.push(PlanReason::simple(ReasonKind::ResumedRun, why));
+                if stored_model.desired_version != desired {
+                    reasons.push(PlanReason::simple(
+                        ReasonKind::ResumedRun,
+                        "desired version changed since the original run",
+                    ));
+                }
+            }
+            let current_version = match &self.state {
+                Some(state) => state
+                    .materialized_version(&id.logical_name(), options.environment.as_deref())?
+                    .map(|record| record.version.hash),
+                None => None,
+            };
+            models.push(PlannedModel {
+                id: stored_model.id.clone(),
+                target: compiled.target.display(),
+                materialization: compiled.config.materialization.to_string(),
+                action: PlanAction::parse(&stored_model.action),
+                reasons,
+                membership: Membership::Selected,
+                exists,
+                incremental: compiled
+                    .config
+                    .incremental
+                    .as_ref()
+                    .map(|strategy| strategy.as_str().to_string()),
+                full_rebuild: stored_model.full_rebuild,
+                watermark: stored_model.watermark.clone(),
+                desired_version: desired,
+                current_version,
+                dependencies: compiled
+                    .model_dependencies()
+                    .map(|dep| dep.logical_name())
+                    .collect(),
+                sources: compiled
+                    .source_dependencies()
+                    .map(|source| source.logical_name())
+                    .collect(),
+                sql_hash: sha256_hex(&compiled.compiled_sql),
+                compiled_sql: compiled.compiled_sql.clone(),
+            });
+        }
+
+        let seeds = manifest
+            .seeds
+            .iter()
+            .map(|stored_seed| {
+                let compiled = compilation
+                    .seeds
+                    .iter()
+                    .find(|seed| seed.name == stored_seed.name);
+                let desired = compiled
+                    .map(|seed| seed.content_hash.clone())
+                    .unwrap_or_else(|| stored_seed.desired_version.clone());
+                let reused =
+                    prior.reusable_seed(&stored_seed.name, &stored_seed.desired_version, &desired);
+                PlannedSeed {
+                    name: stored_seed.name.clone(),
+                    target: stored_seed.target.clone(),
+                    path: stored_seed.path.clone(),
+                    action: if reused {
+                        PlanAction::Skip
+                    } else {
+                        PlanAction::parse(&stored_seed.action)
+                    },
+                    desired_version: desired,
+                    reasons: if reused {
+                        vec![PlanReason::simple(
+                            ReasonKind::ResumedRun,
+                            "loaded earlier in this run — reused",
+                        )]
+                    } else {
+                        Vec::new()
+                    },
+                }
+            })
+            .collect();
+
+        let tests = manifest
+            .tests
+            .iter()
+            .map(|stored_test| PlannedTest {
+                id: stored_test.id.clone(),
+                generated: false,
+                targets: stored_test.targets.clone(),
+                sources: stored_test.sources.clone(),
+            })
+            .collect();
+
+        Ok(Plan {
+            id: stored.record.plan_id.clone(),
+            created_at: now_rfc3339(),
+            environment: stored.record.environment.clone(),
+            adapter: self.adapter.name().to_string(),
+            compiler_semantics_version: phlo_transform_core::COMPILER_SEMANTICS_VERSION.to_string(),
+            blocked: false,
+            selection: PlanSelection {
+                terms: vec![format!("--resume {}", short_id(&stored.record.run_id))],
+                ..Default::default()
+            },
+            git: None,
+            warnings: Vec::new(),
+            seeds,
+            models,
+            tests,
+            diagnostics: compilation.diagnostics.clone(),
+        })
+    }
+
+    /// Shared execution driver for fresh runs, resumes and retries.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute(
+        &self,
+        compilation: &Compilation,
+        plan: &Plan,
+        options: &RunOptions,
+        run_id: String,
+        continued_from: Option<String>,
+        prior: PriorRun,
+        resume: bool,
+    ) -> Result<RunResult, EngineError> {
         let started_at = now_rfc3339();
-        let mut events = Vec::new();
+        let mut events = vec![EngineEvent::RunStarted {
+            run_id: run_id.clone(),
+            plan_id: plan.id.clone(),
+            continued_from: continued_from.clone(),
+        }];
 
         let planned: Vec<ModelId> = plan
             .models
@@ -242,6 +725,48 @@ impl Runner {
             .filter_map(|model| ModelId::parse(&model.id).ok().map(|id| (id, model.clone())))
             .collect();
 
+        // Persist the run before any work: a killed process must leave an
+        // honest "running" record, never a silent gap.
+        let stored_plan = StoredPlan::from_plan(plan, &options.environment);
+        if let Some(state) = &self.state {
+            if resume {
+                state.reopen_run(&run_id)?;
+            } else {
+                state.start_run(
+                    &RunRecord {
+                        run_id: run_id.clone(),
+                        plan_id: plan.id.clone(),
+                        environment: options.environment.clone(),
+                        started_at: started_at.clone(),
+                        finished_at: None,
+                        status: ExecutionStatus::Running,
+                        model_count: planned.len(),
+                        failed_count: 0,
+                    },
+                    &stored_plan,
+                )?;
+            }
+        }
+
+        // Two planned models writing the same physical relation must not
+        // race: serialise them on a per-target lock and surface a warning.
+        let mut target_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for model in &compilation.models {
+            if planned_set.contains(&model.id) {
+                *target_counts.entry(model.target.display()).or_default() += 1;
+            }
+        }
+        let mut warnings = Vec::new();
+        let mut target_locks: BTreeMap<String, Arc<Semaphore>> = BTreeMap::new();
+        for (target, count) in &target_counts {
+            if *count > 1 {
+                warnings.push(format!(
+                    "{target} is written by {count} planned models; their writes are serialised"
+                ));
+                target_locks.insert(target.clone(), Arc::new(Semaphore::new(1)));
+            }
+        }
+
         // Ensure target schemas/namespaces exist before any write.
         let mut schemas: BTreeSet<(Option<String>, String)> = BTreeSet::new();
         for model in &compilation.models {
@@ -250,7 +775,7 @@ impl Runner {
             }
         }
         for (catalog, schema) in &schemas {
-            let relation = phlo_transform_core::Relation {
+            let relation = Relation {
                 catalog: catalog.clone(),
                 schema: schema.clone(),
                 table: String::new(),
@@ -261,8 +786,13 @@ impl Runner {
                 .map_err(EngineError::Adapter)?;
         }
 
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<EngineEvent>();
+        let mut cancelled = false;
+        let mut fail_fast = false;
+
         // Load planned seeds before any model build: seed relations are the
-        // physical inputs the models select from.
+        // physical inputs the models select from. A failed seed blocks every
+        // model that reads it; under --fail-fast it cancels the rest.
         let mut seed_results: Vec<SeedResult> = Vec::new();
         for planned_seed in &plan.seeds {
             let Some(seed) = compilation
@@ -272,19 +802,6 @@ impl Runner {
             else {
                 continue;
             };
-            if planned_seed.action != PlanAction::Build {
-                events.push(EngineEvent::SeedFinished {
-                    seed: planned_seed.name.clone(),
-                    status: ExecutionStatus::Skipped,
-                });
-                seed_results.push(SeedResult {
-                    seed: planned_seed.name.clone(),
-                    target: planned_seed.target.clone(),
-                    status: ExecutionStatus::Skipped,
-                    error: None,
-                });
-                continue;
-            }
             let relation = seed_relation(
                 seed,
                 compilation.defaults.catalog.as_deref(),
@@ -295,6 +812,46 @@ impl Runner {
                     .or_else(|| adapter_default_schema(self.adapter.name())),
                 self.adapter.name(),
             );
+            if cancelled || fail_fast {
+                seed_results.push(seed_result(
+                    planned_seed,
+                    ExecutionStatus::Cancelled,
+                    Vec::new(),
+                    Some(Failure::without_attempt(
+                        FailureCategory::Cancelled,
+                        "not started",
+                    )),
+                    0,
+                ));
+                self.persist_seed(&run_id, seed_results.last().expect("just pushed"));
+                continue;
+            }
+            // A non-building seed is either skipped or — on a resumed run
+            // where it already loaded successfully — cached reuse.
+            if planned_seed.action != PlanAction::Build {
+                let reused = matches!(
+                    prior.seeds.get(&seed.name),
+                    Some(record) if record.status == ExecutionStatus::Passed
+                );
+                let outcome = if reused {
+                    ExecutionStatus::Cached
+                } else {
+                    ExecutionStatus::Skipped
+                };
+                events.push(EngineEvent::SeedFinished {
+                    seed: planned_seed.name.clone(),
+                    status: outcome,
+                });
+                let result = seed_result(planned_seed, outcome, Vec::new(), None, 0);
+                // Reused seeds keep their original record; skipped ones get
+                // a fresh skip row.
+                if !reused {
+                    self.persist_seed(&run_id, &result);
+                }
+                seed_results.push(result);
+                continue;
+            }
+
             self.adapter
                 .ensure_schema(&relation)
                 .await
@@ -303,35 +860,26 @@ impl Runner {
                 Some(root) => root.join(&seed.path),
                 None => seed.path.clone(),
             };
-            events.push(EngineEvent::SeedStarted {
-                seed: planned_seed.name.clone(),
-            });
-            match self.adapter.load_csv(&relation, &path).await {
-                Ok(_) => {
-                    events.push(EngineEvent::SeedFinished {
-                        seed: planned_seed.name.clone(),
-                        status: ExecutionStatus::Passed,
-                    });
-                    seed_results.push(SeedResult {
-                        seed: planned_seed.name.clone(),
-                        target: relation.display(),
-                        status: ExecutionStatus::Passed,
-                        error: None,
-                    });
-                }
-                Err(error) => {
-                    events.push(EngineEvent::SeedFinished {
-                        seed: planned_seed.name.clone(),
-                        status: ExecutionStatus::Failed,
-                    });
-                    seed_results.push(SeedResult {
-                        seed: planned_seed.name.clone(),
-                        target: relation.display(),
-                        status: ExecutionStatus::Failed,
-                        error: Some(error.to_string()),
-                    });
-                }
+            let result = self
+                .run_seed(
+                    planned_seed,
+                    &relation,
+                    &path,
+                    options,
+                    &run_id,
+                    &mut events,
+                )
+                .await;
+            if result.status == ExecutionStatus::Failed && options.fail_fast {
+                fail_fast = true;
             }
+            if options.cancel.is_cancelled() {
+                cancelled = true;
+            }
+            seed_results.push(result);
+        }
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
         }
 
         // A seed that failed to load must block every model that reads it —
@@ -370,8 +918,43 @@ impl Runner {
             .collect();
         let mut results: BTreeMap<ModelId, ModelResult> = BTreeMap::new();
 
+        // Resume reuse: models that passed at their still-desired version are
+        // carried over without re-executing. Their earlier run records stay
+        // untouched — they already hold the attempts that produced them.
+        for id in &planned {
+            let Some(model) = compilation.model(id) else {
+                continue;
+            };
+            if prior.reusable_model(id, &model.version.hash).is_some() {
+                status.insert(id.clone(), ExecutionStatus::Cached);
+                events.push(EngineEvent::ModelFinished {
+                    model: id.logical_name(),
+                    status: ExecutionStatus::Cached,
+                    query_id: None,
+                    duration_ms: 0,
+                });
+                let mut result = model_result(
+                    model,
+                    ExecutionStatus::Cached,
+                    Vec::new(),
+                    None,
+                    None,
+                    0,
+                    plan_info.get(id),
+                );
+                result
+                    .reasons
+                    .push("reused from earlier in this run".to_string());
+                results.insert(id.clone(), result);
+                release_dependents(id, &dependents, &mut remaining);
+            }
+        }
+
         // Skip or reuse models that do not need building, releasing dependents.
         for id in &planned {
+            if status.get(id) != Some(&ExecutionStatus::Pending) {
+                continue;
+            }
             let action = plan_info
                 .get(id)
                 .map(|model| model.action)
@@ -379,25 +962,22 @@ impl Runner {
             if action == PlanAction::Build || action == PlanAction::Unknown {
                 continue;
             }
-            status.insert(id.clone(), ExecutionStatus::Skipped);
+            let outcome = match action {
+                PlanAction::Cached => ExecutionStatus::Cached,
+                _ => ExecutionStatus::Skipped,
+            };
+            status.insert(id.clone(), outcome);
             if let Some(model) = compilation.model(id) {
                 events.push(EngineEvent::ModelFinished {
                     model: id.logical_name(),
-                    status: ExecutionStatus::Skipped,
+                    status: outcome,
                     query_id: None,
                     duration_ms: 0,
                 });
-                results.insert(
-                    id.clone(),
-                    model_result(
-                        model,
-                        ExecutionStatus::Skipped,
-                        None,
-                        None,
-                        0,
-                        plan_info.get(id),
-                    ),
-                );
+                let result =
+                    model_result(model, outcome, Vec::new(), None, None, 0, plan_info.get(id));
+                self.persist_model(&run_id, &result);
+                results.insert(id.clone(), result);
             }
             release_dependents(id, &dependents, &mut remaining);
         }
@@ -431,18 +1011,22 @@ impl Runner {
                     query_id: None,
                     duration_ms: 0,
                 });
-                results.insert(
-                    id.clone(),
-                    model_result(
-                        model,
-                        ExecutionStatus::Blocked,
-                        None,
-                        Some("blocked by a failed seed load".to_string()),
-                        0,
-                        plan_info.get(id),
-                    ),
-                );
-                block_dependents(
+                let result = model_result(
+                    model,
+                    ExecutionStatus::Blocked,
+                    Vec::new(),
+                    None,
+                    None,
+                    0,
+                    plan_info.get(id),
+                )
+                .with_failure(Failure::without_attempt(
+                    FailureCategory::Dependency,
+                    "blocked by a failed seed load",
+                ));
+                self.persist_model(&run_id, &result);
+                results.insert(id.clone(), result);
+                let blocked = block_dependents(
                     id,
                     &dependents,
                     &mut status,
@@ -451,6 +1035,11 @@ impl Runner {
                     &plan_info,
                     &mut events,
                 );
+                for child in blocked {
+                    if let Some(result) = results.get(&child) {
+                        self.persist_model(&run_id, result);
+                    }
+                }
             }
         }
 
@@ -467,9 +1056,14 @@ impl Runner {
         let semaphore = Arc::new(Semaphore::new(options.concurrency.max(1)));
         let concurrency = options.concurrency.max(1);
         let mut inflight = 0usize;
-        let mut cancelled = false;
 
         while inflight > 0 || !ready.is_empty() {
+            while let Ok(event) = event_rx.try_recv() {
+                events.push(event);
+            }
+            if cancelled || fail_fast {
+                break;
+            }
             if options.cancel.is_cancelled() {
                 cancelled = true;
                 break;
@@ -489,45 +1083,107 @@ impl Runner {
                 let Some(model) = compilation.model(&id) else {
                     continue;
                 };
+                let started = now_rfc3339();
+                self.persist_model_start(&run_id, model, &started, plan_info.get(&id));
+
                 let adapter = self.adapter.clone();
                 let target = model.target.clone();
                 let compiled_sql = model.compiled_sql.clone();
                 let op = exec_op(model, plan_info.get(&id));
                 let permit = semaphore.clone();
+                let target_lock = target_locks.get(&target.display()).cloned();
+                let retry = options.retry.clone();
+                let timeout = options.model_timeout;
+                let cancel = options.cancel.clone();
+                let name = id.logical_name();
+                let tx = event_tx.clone();
+                // Resume: attempt numbering continues across invocations of
+                // the same run.
+                let prior_attempts = prior
+                    .models
+                    .get(&name)
+                    .map(|record| record.attempts.len() as u32)
+                    .unwrap_or(0);
                 let task_id = id.clone();
                 join_set.spawn(async move {
-                    let _permit = permit.acquire_owned().await;
-                    let started = Instant::now();
-                    let result = match op {
-                        ExecOp::View => {
-                            adapter.create_or_replace_view(&target, &compiled_sql).await
-                        }
-                        ExecOp::Table => {
-                            adapter
-                                .create_or_replace_table(&target, &compiled_sql)
+                    let mut attempts: Vec<Attempt> = Vec::new();
+                    let mut attempt_no = prior_attempts;
+                    let first_started_at = started;
+                    let task_started = Instant::now();
+                    let outcome = loop {
+                        attempt_no += 1;
+                        let attempt_started_at = now_rfc3339();
+                        let attempt_started = Instant::now();
+                        // The slot and the target lock are held only for the
+                        // attempt itself — a retrying model does not occupy
+                        // either while backing off.
+                        let _permit = permit.clone().acquire_owned().await;
+                        let _target_guard = match &target_lock {
+                            Some(lock) => Some(lock.clone().acquire_owned().await),
+                            None => None,
+                        };
+                        let op = execute_op(&adapter, &target, &compiled_sql, &op);
+                        let result = match timeout {
+                            Some(limit) => match tokio::time::timeout(limit, op).await {
+                                Ok(Ok(query)) => Ok(query),
+                                Ok(Err(error)) => Err(classify_adapter_error(&error, attempt_no)),
+                                Err(_) => Err(timeout_failure(limit, attempt_no)),
+                            },
+                            None => op
                                 .await
-                        }
-                        ExecOp::Append => adapter.append(&target, &compiled_sql).await,
-                        ExecOp::Merge(keys) => adapter.merge(&target, &keys, &compiled_sql).await,
-                        ExecOp::ReplacePartitions(columns) => {
-                            adapter
-                                .replace_partitions(&target, &columns, &compiled_sql)
-                                .await
-                        }
-                        ExecOp::TimeWindow { predicate } => {
-                            let filtered = format!(
-                                "SELECT * FROM ({compiled_sql}) AS __phlo_src WHERE {predicate}"
-                            );
-                            adapter.append(&target, &filtered).await
+                                .map_err(|error| classify_adapter_error(&error, attempt_no)),
+                        };
+                        let duration_ms = attempt_started.elapsed().as_millis() as u64;
+                        drop(_target_guard);
+                        drop(_permit);
+                        match result {
+                            Ok(query) => {
+                                attempts.push(Attempt {
+                                    attempt: attempt_no,
+                                    started_at: attempt_started_at,
+                                    duration_ms,
+                                    query_id: query.query_id.clone(),
+                                    failure: None,
+                                });
+                                break Ok(query);
+                            }
+                            Err(failure) => {
+                                let retryable = retry.should_retry(&failure, attempt_no);
+                                attempts.push(Attempt {
+                                    attempt: attempt_no,
+                                    started_at: attempt_started_at,
+                                    duration_ms,
+                                    query_id: None,
+                                    failure: Some(failure.clone()),
+                                });
+                                if retryable && !cancel.is_cancelled() {
+                                    let delay = retry.delay(attempt_no);
+                                    let _ = tx.send(EngineEvent::ModelRetrying {
+                                        model: name.clone(),
+                                        attempt: attempt_no,
+                                        delay_ms: delay.as_millis() as u64,
+                                        reason: failure.message.clone(),
+                                    });
+                                    tokio::time::sleep(delay).await;
+                                    continue;
+                                }
+                                break Err(failure);
+                            }
                         }
                     };
                     Completion {
                         id: task_id,
-                        result,
-                        duration_ms: started.elapsed().as_millis() as u64,
+                        outcome,
+                        attempts,
+                        started_at: first_started_at,
+                        finished_at: now_rfc3339(),
+                        duration_ms: task_started.elapsed().as_millis() as u64,
                     }
                 });
                 inflight += 1;
+            }
+            if ready.is_empty() && inflight == 0 {
+                break;
             }
 
             let joined = tokio::select! {
@@ -544,11 +1200,24 @@ impl Runner {
                 break;
             };
             inflight -= 1;
-            let completion = joined.map_err(|error| EngineError::State(error.to_string()))?;
+            let completion = match joined {
+                Ok(completion) => completion,
+                Err(error) => {
+                    return Err(EngineError::State(format!("model task failed: {error}")));
+                }
+            };
             let id = completion.id.clone();
             let model = compilation.model(&id).expect("planned model exists");
             let info = plan_info.get(&id);
-            match completion.result {
+            // Resume continuity: the record keeps attempts from earlier
+            // invocations of this run.
+            let mut all_attempts = prior
+                .models
+                .get(&id.logical_name())
+                .map(|record| record.attempts.clone())
+                .unwrap_or_default();
+            all_attempts.extend(completion.attempts.iter().cloned());
+            match completion.outcome {
                 Ok(query) => {
                     status.insert(id.clone(), ExecutionStatus::Passed);
                     events.push(EngineEvent::ModelFinished {
@@ -557,17 +1226,20 @@ impl Runner {
                         query_id: query.query_id.clone(),
                         duration_ms: completion.duration_ms,
                     });
-                    results.insert(
-                        id.clone(),
-                        model_result(
+                    let result = ModelResult {
+                        query_id: query.query_id,
+                        ..model_result(
                             model,
                             ExecutionStatus::Passed,
-                            query.query_id,
-                            None,
+                            all_attempts,
+                            Some(completion.started_at.clone()),
+                            Some(completion.finished_at.clone()),
                             completion.duration_ms,
                             info,
-                        ),
-                    );
+                        )
+                    };
+                    self.persist_model(&run_id, &result);
+                    results.insert(id.clone(), result);
                     release_dependents(&id, &dependents, &mut remaining);
                     let new_ready = dependents
                         .get(&id)
@@ -594,7 +1266,7 @@ impl Runner {
                         .await?;
                     }
                 }
-                Err(error) => {
+                Err(failure) => {
                     status.insert(id.clone(), ExecutionStatus::Failed);
                     events.push(EngineEvent::ModelFinished {
                         model: id.logical_name(),
@@ -602,18 +1274,132 @@ impl Runner {
                         query_id: None,
                         duration_ms: completion.duration_ms,
                     });
-                    results.insert(
-                        id.clone(),
+                    let result = ModelResult {
+                        ..model_result(
+                            model,
+                            ExecutionStatus::Failed,
+                            all_attempts,
+                            Some(completion.started_at.clone()),
+                            Some(completion.finished_at.clone()),
+                            completion.duration_ms,
+                            info,
+                        )
+                        .with_failure(failure)
+                    };
+                    self.persist_model(&run_id, &result);
+                    results.insert(id.clone(), result);
+                    if options.fail_fast {
+                        fail_fast = true;
+                        // Dependents of the failed model can never run —
+                        // they are blocked, not merely unscheduled.
+                        let blocked = block_dependents(
+                            &id,
+                            &dependents,
+                            &mut status,
+                            &mut results,
+                            compilation,
+                            &plan_info,
+                            &mut events,
+                        );
+                        for child in blocked {
+                            if let Some(result) = results.get(&child) {
+                                self.persist_model(&run_id, result);
+                            }
+                        }
+                        // Stop scheduling new work and try to stop active
+                        // work: aborting the Tokio task drops the in-flight
+                        // future (for HTTP adapters this closes the request);
+                        // whether the warehouse kills the statement depends
+                        // on the adapter — we report the task as cancelled,
+                        // not the query.
+                        join_set.abort_all();
+                        ready.clear();
+                    } else {
+                        let blocked = block_dependents(
+                            &id,
+                            &dependents,
+                            &mut status,
+                            &mut results,
+                            compilation,
+                            &plan_info,
+                            &mut events,
+                        );
+                        for child in blocked {
+                            if let Some(result) = results.get(&child) {
+                                self.persist_model(&run_id, result);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Shut down: drain or abort in-flight tasks, then classify anything
+        // that never reached a terminal state.
+        if cancelled || fail_fast {
+            join_set.abort_all();
+        }
+        while let Some(joined) = join_set.join_next().await {
+            inflight = inflight.saturating_sub(1);
+            if let Ok(completion) = joined {
+                // A task that completed before the abort is reported
+                // accurately — it really did run.
+                let id = completion.id.clone();
+                if status.get(&id).copied().unwrap_or_default().is_terminal() {
+                    continue;
+                }
+                let model = compilation.model(&id).expect("planned model exists");
+                let info = plan_info.get(&id);
+                let mut all_attempts = prior
+                    .models
+                    .get(&id.logical_name())
+                    .map(|record| record.attempts.clone())
+                    .unwrap_or_default();
+                all_attempts.extend(completion.attempts.iter().cloned());
+                let (result, new_ready) = match completion.outcome {
+                    Ok(query) => (
+                        ModelResult {
+                            query_id: query.query_id.clone(),
+                            ..model_result(
+                                model,
+                                ExecutionStatus::Passed,
+                                all_attempts,
+                                Some(completion.started_at.clone()),
+                                Some(completion.finished_at.clone()),
+                                completion.duration_ms,
+                                info,
+                            )
+                        },
+                        true,
+                    ),
+                    Err(failure) => (
                         model_result(
                             model,
                             ExecutionStatus::Failed,
-                            None,
-                            Some(error.to_string()),
+                            all_attempts,
+                            Some(completion.started_at.clone()),
+                            Some(completion.finished_at.clone()),
                             completion.duration_ms,
                             info,
-                        ),
-                    );
-                    block_dependents(
+                        )
+                        .with_failure(failure),
+                        false,
+                    ),
+                };
+                let final_status = result.status;
+                events.push(EngineEvent::ModelFinished {
+                    model: id.logical_name(),
+                    status: final_status,
+                    query_id: result.query_id.clone(),
+                    duration_ms: result.duration_ms,
+                });
+                status.insert(id.clone(), final_status);
+                self.persist_model(&run_id, &result);
+                results.insert(id.clone(), result);
+                if new_ready {
+                    release_dependents(&id, &dependents, &mut remaining);
+                } else {
+                    let blocked = block_dependents(
                         &id,
                         &dependents,
                         &mut status,
@@ -622,71 +1408,80 @@ impl Runner {
                         &plan_info,
                         &mut events,
                     );
+                    for child in blocked {
+                        if let Some(result) = results.get(&child) {
+                            self.persist_model(&run_id, result);
+                        }
+                    }
                 }
             }
         }
-
-        if cancelled {
-            join_set.abort_all();
-            while join_set.join_next().await.is_some() {}
-            for id in &planned {
-                if status.get(id).copied().unwrap_or_default().is_terminal() {
-                    continue;
-                }
-                status.insert(id.clone(), ExecutionStatus::Cancelled);
-                if let Some(model) = compilation.model(id) {
-                    events.push(EngineEvent::ModelFinished {
-                        model: id.logical_name(),
-                        status: ExecutionStatus::Cancelled,
-                        query_id: None,
-                        duration_ms: 0,
-                    });
-                    results.insert(
-                        id.clone(),
-                        model_result(
-                            model,
-                            ExecutionStatus::Cancelled,
-                            None,
-                            Some("run cancelled".to_string()),
-                            0,
-                            plan_info.get(id),
-                        ),
-                    );
-                }
-            }
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
         }
 
+        // Everything left non-terminal was never started or was cut off:
+        // cancelled on shutdown/fail-fast, blocked otherwise.
         for id in &planned {
-            if !status.get(id).copied().unwrap_or_default().is_terminal() {
-                status.insert(id.clone(), ExecutionStatus::Blocked);
-                if let Some(model) = compilation.model(id) {
-                    results.insert(
-                        id.clone(),
-                        model_result(
-                            model,
-                            ExecutionStatus::Blocked,
-                            None,
-                            Some("blocked by an upstream failure".to_string()),
-                            0,
-                            plan_info.get(id),
-                        ),
-                    );
-                }
+            if status.get(id).copied().unwrap_or_default().is_terminal() {
+                continue;
+            }
+            let (final_status, failure) = if cancelled || fail_fast {
+                (
+                    ExecutionStatus::Cancelled,
+                    Failure::without_attempt(
+                        FailureCategory::Cancelled,
+                        if cancelled {
+                            "run cancelled"
+                        } else {
+                            "cancelled by fail-fast shutdown"
+                        },
+                    ),
+                )
+            } else {
+                (
+                    ExecutionStatus::Blocked,
+                    Failure::without_attempt(
+                        FailureCategory::Dependency,
+                        "blocked by an upstream failure",
+                    ),
+                )
+            };
+            status.insert(id.clone(), final_status);
+            if let Some(model) = compilation.model(id) {
+                events.push(EngineEvent::ModelFinished {
+                    model: id.logical_name(),
+                    status: final_status,
+                    query_id: None,
+                    duration_ms: 0,
+                });
+                let result = model_result(
+                    model,
+                    final_status,
+                    Vec::new(),
+                    None,
+                    None,
+                    0,
+                    plan_info.get(id),
+                )
+                .with_failure(failure);
+                self.persist_model(&run_id, &result);
+                results.insert(id.clone(), result);
             }
         }
 
-        let tests = if options.run_tests && !cancelled {
-            self.run_tests(
+        let tests = self
+            .run_tests(
                 compilation,
                 plan,
                 &status,
                 &failed_seed_targets,
                 &mut events,
+                options,
+                &run_id,
+                cancelled || fail_fast,
             )
-            .await
-        } else {
-            Vec::new()
-        };
+            .await;
 
         let failed = results
             .values()
@@ -707,34 +1502,19 @@ impl Runner {
 
         let finished_at = now_rfc3339();
 
+        let mut counts = RunCounts::default();
+        for result in results.values() {
+            counts.add(result.status);
+        }
+        for result in &seed_results {
+            counts.add(result.status);
+        }
+        for result in &tests {
+            counts.add(result.status);
+        }
+
         if let Some(state) = &self.state {
-            let failed_count = results
-                .values()
-                .filter(|result| result.status == ExecutionStatus::Failed)
-                .count();
-            state.start_run(&RunRecord {
-                run_id: run_id.clone(),
-                plan_id: plan.id.clone(),
-                environment: options.environment.clone(),
-                started_at: started_at.clone(),
-                finished_at: None,
-                status: ExecutionStatus::Running,
-                model_count: planned.len(),
-                failed_count,
-            })?;
             for result in results.values() {
-                state.record_model(&ModelRunRecord {
-                    run_id: run_id.clone(),
-                    model_id: result.model.clone(),
-                    materialization: result.materialization.clone(),
-                    status: result.status,
-                    started_at: started_at.clone(),
-                    finished_at: finished_at.clone(),
-                    sql_hash: result.sql_hash.clone(),
-                    target: result.target.clone(),
-                    query_id: result.query_id.clone(),
-                    error: result.error.clone(),
-                })?;
                 // Record the materialised version after a successful build.
                 if result.status == ExecutionStatus::Passed {
                     if let Ok(id) = ModelId::parse(&result.model) {
@@ -789,12 +1569,19 @@ impl Runner {
                     status: result.status,
                     row_count: result.row_count,
                     query_id: result.query_id.clone(),
-                    error: result.error.clone(),
+                    error: result
+                        .failure
+                        .as_ref()
+                        .map(|failure| failure.message.clone()),
+                    error_category: result
+                        .failure
+                        .as_ref()
+                        .map(|failure| failure.category.code().to_string()),
                     started_at: started_at.clone(),
                     finished_at: finished_at.clone(),
                 })?;
             }
-            state.finish_run(&run_id, run_status, &finished_at)?;
+            state.finish_run(&run_id, run_status, &finished_at, counts.failed)?;
         }
 
         events.push(EngineEvent::RunFinished {
@@ -815,9 +1602,13 @@ impl Runner {
         Ok(RunResult {
             run_id,
             plan_id: plan.id.clone(),
+            environment: options.environment.clone(),
+            continued_from,
             status: run_status,
             started_at,
             finished_at,
+            counts,
+            warnings,
             models,
             tests,
             seeds: seed_results,
@@ -825,6 +1616,181 @@ impl Runner {
         })
     }
 
+    /// Persist a model's start transition so a crash leaves an honest
+    /// "running" record.
+    fn persist_model_start(
+        &self,
+        run_id: &str,
+        model: &phlo_transform_core::CompiledModel,
+        started_at: &str,
+        info: Option<&PlannedModel>,
+    ) {
+        let Some(state) = &self.state else {
+            return;
+        };
+        let (desired_version, _, _) = plan_result_fields(info);
+        let _ = state.record_model(&ModelRunRecord {
+            run_id: run_id.to_string(),
+            model_id: model.id.logical_name(),
+            materialization: model.config.materialization.to_string(),
+            action: info
+                .map(|model| model.action.as_str().to_string())
+                .unwrap_or_else(|| "build".to_string()),
+            status: ExecutionStatus::Running,
+            started_at: started_at.to_string(),
+            finished_at: String::new(),
+            sql_hash: sha256_hex(&model.compiled_sql),
+            target: model.target.display(),
+            desired_version,
+            attempts: Vec::new(),
+            query_id: None,
+            error: None,
+            error_category: None,
+        });
+    }
+
+    /// Persist a model's terminal state.
+    fn persist_model(&self, run_id: &str, result: &ModelResult) {
+        let Some(state) = &self.state else {
+            return;
+        };
+        let _ = state.record_model(&ModelRunRecord {
+            run_id: run_id.to_string(),
+            model_id: result.model.clone(),
+            materialization: result.materialization.clone(),
+            action: result.action.clone(),
+            status: result.status,
+            started_at: result.started_at.clone().unwrap_or_default(),
+            finished_at: result.finished_at.clone().unwrap_or_default(),
+            sql_hash: result.sql_hash.clone(),
+            target: result.target.clone(),
+            desired_version: result.desired_version.clone(),
+            attempts: result.attempts.clone(),
+            query_id: result.query_id.clone(),
+            error: result
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.clone()),
+            error_category: result
+                .failure
+                .as_ref()
+                .map(|failure| failure.category.code().to_string()),
+        });
+    }
+
+    /// Persist a seed's terminal state.
+    fn persist_seed(&self, run_id: &str, result: &SeedResult) {
+        let Some(state) = &self.state else {
+            return;
+        };
+        let _ = state.record_seed_run(&SeedRunRecord {
+            run_id: run_id.to_string(),
+            name: result.seed.clone(),
+            status: result.status,
+            target: result.target.clone(),
+            attempts: result.attempts.clone(),
+            error: result
+                .failure
+                .as_ref()
+                .map(|failure| failure.message.clone()),
+            error_category: result
+                .failure
+                .as_ref()
+                .map(|failure| failure.category.code().to_string()),
+            started_at: now_rfc3339(),
+            finished_at: now_rfc3339(),
+        });
+    }
+
+    /// Load one seed with the shared retry/classification policy.
+    async fn run_seed(
+        &self,
+        planned_seed: &PlannedSeed,
+        relation: &Relation,
+        path: &std::path::Path,
+        options: &RunOptions,
+        run_id: &str,
+        events: &mut Vec<EngineEvent>,
+    ) -> SeedResult {
+        let mut attempts = Vec::new();
+        let mut attempt_no = 0u32;
+        let task_started = Instant::now();
+        let outcome = loop {
+            attempt_no += 1;
+            let started_at = now_rfc3339();
+            let started = Instant::now();
+            events.push(EngineEvent::SeedStarted {
+                seed: planned_seed.name.clone(),
+            });
+            let load = self.adapter.load_csv(relation, path);
+            let result = match options.model_timeout {
+                Some(limit) => match tokio::time::timeout(limit, load).await {
+                    Ok(Ok(query)) => Ok(query),
+                    Ok(Err(error)) => Err(classify_adapter_error(&error, attempt_no)),
+                    Err(_) => Err(timeout_failure(limit, attempt_no)),
+                },
+                None => load
+                    .await
+                    .map_err(|error| classify_adapter_error(&error, attempt_no)),
+            };
+            let duration_ms = started.elapsed().as_millis() as u64;
+            match result {
+                Ok(query) => {
+                    attempts.push(Attempt {
+                        attempt: attempt_no,
+                        started_at,
+                        duration_ms,
+                        query_id: query.query_id,
+                        failure: None,
+                    });
+                    break None;
+                }
+                Err(failure) => {
+                    let retryable = options.retry.should_retry(&failure, attempt_no);
+                    attempts.push(Attempt {
+                        attempt: attempt_no,
+                        started_at,
+                        duration_ms,
+                        query_id: None,
+                        failure: Some(failure.clone()),
+                    });
+                    if retryable && !options.cancel.is_cancelled() {
+                        let delay = options.retry.delay(attempt_no);
+                        events.push(EngineEvent::SeedRetrying {
+                            seed: planned_seed.name.clone(),
+                            attempt: attempt_no,
+                            delay_ms: delay.as_millis() as u64,
+                            reason: failure.message.clone(),
+                        });
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    break Some(failure);
+                }
+            }
+        };
+        let status = if outcome.is_none() {
+            ExecutionStatus::Passed
+        } else {
+            ExecutionStatus::Failed
+        };
+        events.push(EngineEvent::SeedFinished {
+            seed: planned_seed.name.clone(),
+            status,
+        });
+        let result = SeedResult {
+            seed: planned_seed.name.clone(),
+            target: relation.display(),
+            status,
+            attempts,
+            failure: outcome,
+            duration_ms: task_started.elapsed().as_millis() as u64,
+        };
+        self.persist_seed(run_id, &result);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn run_tests(
         &self,
         compilation: &Compilation,
@@ -832,7 +1798,13 @@ impl Runner {
         model_status: &BTreeMap<ModelId, ExecutionStatus>,
         failed_seed_targets: &BTreeSet<String>,
         events: &mut Vec<EngineEvent>,
+        options: &RunOptions,
+        run_id: &str,
+        stopped: bool,
     ) -> Vec<TestResult> {
+        if !options.run_tests {
+            return Vec::new();
+        }
         let planned_tests: BTreeSet<&str> =
             plan.tests.iter().map(|test| test.id.as_str()).collect();
         let default_catalog = compilation.defaults.catalog.as_deref();
@@ -847,68 +1819,263 @@ impl Runner {
             if !planned_tests.contains(test.id.to_string().as_str()) {
                 continue;
             }
-            let targets_ready = test.targets.iter().all(|target| {
-                matches!(
-                    model_status.get(target),
-                    Some(ExecutionStatus::Passed) | Some(ExecutionStatus::Skipped)
-                )
-            });
-            let sources_ready = test.sources.iter().all(|source| {
-                !failed_seed_targets.contains(
-                    &relation_for_source(source, default_catalog, default_schema).display(),
-                )
-            });
-            if !targets_ready || !sources_ready {
+            if stopped || options.cancel.is_cancelled() {
+                // Never started under cancellation/fail-fast.
+                let result = TestResult {
+                    test: test.id.to_string(),
+                    status: ExecutionStatus::Cancelled,
+                    row_count: 0,
+                    query_id: None,
+                    failure: Some(Failure::without_attempt(
+                        FailureCategory::Cancelled,
+                        "not started",
+                    )),
+                    duration_ms: 0,
+                };
+                if let Some(state) = &self.state {
+                    let _ = state.record_test(&TestRunRecord {
+                        run_id: run_id.to_string(),
+                        test_id: result.test.clone(),
+                        status: result.status,
+                        row_count: 0,
+                        query_id: None,
+                        error: result
+                            .failure
+                            .as_ref()
+                            .map(|failure| failure.message.clone()),
+                        error_category: Some(FailureCategory::Cancelled.code().to_string()),
+                        started_at: now_rfc3339(),
+                        finished_at: now_rfc3339(),
+                    });
+                }
+                results.push(result);
+                continue;
+            }
+            let missing: Vec<String> = test
+                .targets
+                .iter()
+                .filter(|target| {
+                    !model_status
+                        .get(target)
+                        .copied()
+                        .unwrap_or_default()
+                        .is_satisfied()
+                })
+                .map(|target| target.logical_name())
+                .collect();
+            let bad_sources: Vec<String> = test
+                .sources
+                .iter()
+                .filter(|source| {
+                    failed_seed_targets.contains(
+                        &relation_for_source(source, default_catalog, default_schema).display(),
+                    )
+                })
+                .map(|source| source.logical_name())
+                .collect();
+            if !missing.is_empty() || !bad_sources.is_empty() {
+                // The test is a consumer of the datasets it reads: when they
+                // are unavailable it is blocked, not silently dropped.
+                let reason = if !missing.is_empty() {
+                    format!("targets not ready: {}", missing.join(", "))
+                } else {
+                    format!("seed sources failed to load: {}", bad_sources.join(", "))
+                };
+                events.push(EngineEvent::TestFinished {
+                    test: test.id.to_string(),
+                    status: ExecutionStatus::Blocked,
+                    row_count: 0,
+                    query_id: None,
+                });
+                let result = TestResult {
+                    test: test.id.to_string(),
+                    status: ExecutionStatus::Blocked,
+                    row_count: 0,
+                    query_id: None,
+                    failure: Some(Failure::without_attempt(
+                        FailureCategory::Dependency,
+                        reason,
+                    )),
+                    duration_ms: 0,
+                };
+                if let Some(state) = &self.state {
+                    let _ = state.record_test(&TestRunRecord {
+                        run_id: run_id.to_string(),
+                        test_id: result.test.clone(),
+                        status: result.status,
+                        row_count: 0,
+                        query_id: None,
+                        error: result
+                            .failure
+                            .as_ref()
+                            .map(|failure| failure.message.clone()),
+                        error_category: Some(FailureCategory::Dependency.code().to_string()),
+                        started_at: now_rfc3339(),
+                        finished_at: now_rfc3339(),
+                    });
+                }
+                results.push(result);
                 continue;
             }
 
             events.push(EngineEvent::TestStarted {
                 test: test.id.to_string(),
             });
-            match self.adapter.execute(&test.compiled_sql).await {
-                Ok(query) => {
-                    let status = if query.row_count == 0 {
-                        ExecutionStatus::Passed
-                    } else {
-                        ExecutionStatus::Failed
-                    };
-                    events.push(EngineEvent::TestFinished {
-                        test: test.id.to_string(),
-                        status,
-                        row_count: query.row_count,
-                        query_id: query.query_id.clone(),
-                    });
-                    results.push(TestResult {
-                        test: test.id.to_string(),
-                        status,
-                        row_count: query.row_count,
-                        query_id: query.query_id,
-                        error: if status == ExecutionStatus::Failed {
-                            Some(format!("test returned {} row(s)", query.row_count))
-                        } else {
-                            None
-                        },
-                    });
+            let started = Instant::now();
+            let run = self.adapter.execute(&test.compiled_sql);
+            let outcome = match options.model_timeout {
+                Some(limit) => match tokio::time::timeout(limit, run).await {
+                    Ok(result) => result.map_err(|error| classify_adapter_error(&error, 1)),
+                    Err(_) => Err(timeout_failure(limit, 1)),
+                },
+                None => run.await.map_err(|error| classify_adapter_error(&error, 1)),
+            };
+            let duration_ms = started.elapsed().as_millis() as u64;
+            // A test "fails" when it returns rows — the assertion found
+            // violating data — which is a `test` failure, not a query error.
+            let (status, row_count, query_id, failure) = match outcome {
+                Ok(query) if query.row_count == 0 => {
+                    (ExecutionStatus::Passed, 0, query.query_id, None)
                 }
-                Err(error) => {
-                    events.push(EngineEvent::TestFinished {
-                        test: test.id.to_string(),
-                        status: ExecutionStatus::Failed,
-                        row_count: 0,
-                        query_id: None,
-                    });
-                    results.push(TestResult {
-                        test: test.id.to_string(),
-                        status: ExecutionStatus::Failed,
-                        row_count: 0,
-                        query_id: None,
-                        error: Some(error.to_string()),
-                    });
-                }
+                Ok(query) => (
+                    ExecutionStatus::Failed,
+                    query.row_count,
+                    query.query_id,
+                    Some(Failure {
+                        category: FailureCategory::Test,
+                        message: format!("test returned {} row(s)", query.row_count),
+                        adapter_code: None,
+                        adapter_message: None,
+                        attempt: 1,
+                        at: now_rfc3339(),
+                        retryable: false,
+                    }),
+                ),
+                Err(failure) => (ExecutionStatus::Failed, 0, None, Some(failure)),
+            };
+            events.push(EngineEvent::TestFinished {
+                test: test.id.to_string(),
+                status,
+                row_count,
+                query_id: query_id.clone(),
+            });
+            let result = TestResult {
+                test: test.id.to_string(),
+                status,
+                row_count,
+                query_id,
+                failure,
+                duration_ms,
+            };
+            if let Some(state) = &self.state {
+                let _ = state.record_test(&TestRunRecord {
+                    run_id: run_id.to_string(),
+                    test_id: result.test.clone(),
+                    status: result.status,
+                    row_count: result.row_count,
+                    query_id: result.query_id.clone(),
+                    error: result
+                        .failure
+                        .as_ref()
+                        .map(|failure| failure.message.clone()),
+                    error_category: result
+                        .failure
+                        .as_ref()
+                        .map(|failure| failure.category.code().to_string()),
+                    started_at: now_rfc3339(),
+                    finished_at: now_rfc3339(),
+                });
             }
+            results.push(result);
         }
 
         results
+    }
+}
+
+/// Run a model's physical operation once.
+async fn execute_op(
+    adapter: &Arc<dyn Adapter>,
+    target: &Relation,
+    compiled_sql: &str,
+    op: &ExecOp,
+) -> Result<crate::adapter::QueryResult, AdapterError> {
+    match op {
+        ExecOp::View => adapter.create_or_replace_view(target, compiled_sql).await,
+        ExecOp::Table => adapter.create_or_replace_table(target, compiled_sql).await,
+        ExecOp::Append => adapter.append(target, compiled_sql).await,
+        ExecOp::Merge(keys) => adapter.merge(target, keys, compiled_sql).await,
+        ExecOp::ReplacePartitions(columns) => {
+            adapter
+                .replace_partitions(target, columns, compiled_sql)
+                .await
+        }
+        ExecOp::TimeWindow { predicate } => {
+            let filtered =
+                format!("SELECT * FROM ({compiled_sql}) AS __phlo_src WHERE {predicate}");
+            adapter.append(target, &filtered).await
+        }
+    }
+}
+
+/// Resolve a run id or unique prefix to a full run id.
+fn resolve_run_id(state: &dyn StateStore, id_or_prefix: &str) -> Result<String, EngineError> {
+    let matches = state.find_runs(id_or_prefix)?;
+    match matches.len() {
+        0 => Err(EngineError::InvalidPlan(format!(
+            "no run matches `{id_or_prefix}`"
+        ))),
+        1 => Ok(matches[0].run_id.clone()),
+        _ => Err(EngineError::InvalidPlan(format!(
+            "`{id_or_prefix}` matches {} runs; give a longer prefix",
+            matches.len()
+        ))),
+    }
+}
+
+/// A short run id for display.
+fn short_id(run_id: &str) -> &str {
+    run_id.get(..8).unwrap_or(run_id)
+}
+
+impl StoredPlan {
+    fn from_plan(plan: &Plan, environment: &Option<String>) -> Self {
+        Self {
+            plan_id: plan.id.clone(),
+            environment: environment.clone(),
+            models: plan
+                .models
+                .iter()
+                .map(|model| StoredPlanModel {
+                    id: model.id.clone(),
+                    target: model.target.clone(),
+                    action: model.action.as_str().to_string(),
+                    desired_version: model.desired_version.clone(),
+                    full_rebuild: model.full_rebuild,
+                    watermark: model.watermark.clone(),
+                })
+                .collect(),
+            seeds: plan
+                .seeds
+                .iter()
+                .map(|seed| StoredPlanSeed {
+                    name: seed.name.clone(),
+                    target: seed.target.clone(),
+                    path: seed.path.clone(),
+                    action: seed.action.as_str().to_string(),
+                    desired_version: seed.desired_version.clone(),
+                })
+                .collect(),
+            tests: plan
+                .tests
+                .iter()
+                .map(|test| StoredPlanTest {
+                    id: test.id.clone(),
+                    targets: test.targets.clone(),
+                    sources: test.sources.clone(),
+                })
+                .collect(),
+        }
     }
 }
 
@@ -927,11 +2094,29 @@ fn plan_result_fields(info: Option<&PlannedModel>) -> (String, Option<String>, V
     }
 }
 
+fn seed_result(
+    planned_seed: &PlannedSeed,
+    status: ExecutionStatus,
+    attempts: Vec<Attempt>,
+    failure: Option<Failure>,
+    duration_ms: u64,
+) -> SeedResult {
+    SeedResult {
+        seed: planned_seed.name.clone(),
+        target: planned_seed.target.clone(),
+        status,
+        attempts,
+        failure,
+        duration_ms,
+    }
+}
+
 fn model_result(
     model: &phlo_transform_core::CompiledModel,
     status: ExecutionStatus,
-    query_id: Option<String>,
-    error: Option<String>,
+    attempts: Vec<Attempt>,
+    started_at: Option<String>,
+    finished_at: Option<String>,
     duration_ms: u64,
     info: Option<&PlannedModel>,
 ) -> ModelResult {
@@ -940,14 +2125,27 @@ fn model_result(
         model: model.id.logical_name(),
         target: model.target.display(),
         materialization: model.config.materialization.to_string(),
+        action: info
+            .map(|model| model.action.as_str().to_string())
+            .unwrap_or_else(|| "build".to_string()),
         status,
         desired_version,
         previous_version,
         reasons,
-        query_id,
-        error,
+        query_id: None,
+        attempts,
+        failure: None,
+        started_at,
+        finished_at,
         duration_ms,
         sql_hash: sha256_hex(&model.compiled_sql),
+    }
+}
+
+impl ModelResult {
+    fn with_failure(mut self, failure: Failure) -> Self {
+        self.failure = Some(failure);
+        self
     }
 }
 
@@ -965,6 +2163,7 @@ fn release_dependents(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn block_dependents(
     id: &ModelId,
     dependents: &BTreeMap<ModelId, Vec<ModelId>>,
@@ -973,9 +2172,10 @@ fn block_dependents(
     compilation: &Compilation,
     plan_info: &BTreeMap<ModelId, PlannedModel>,
     events: &mut Vec<EngineEvent>,
-) {
+) -> Vec<ModelId> {
+    let mut newly_blocked = Vec::new();
     let Some(children) = dependents.get(id) else {
-        return;
+        return newly_blocked;
     };
     for child in children {
         let current = status.get(child).copied().unwrap_or_default();
@@ -995,14 +2195,20 @@ fn block_dependents(
                 model_result(
                     model,
                     ExecutionStatus::Blocked,
+                    Vec::new(),
                     None,
-                    Some(format!("blocked by {}", id.logical_name())),
+                    None,
                     0,
                     plan_info.get(child),
-                ),
+                )
+                .with_failure(Failure::without_attempt(
+                    FailureCategory::Dependency,
+                    format!("upstream {} failed", id.logical_name()),
+                )),
             );
         }
-        block_dependents(
+        newly_blocked.push(child.clone());
+        newly_blocked.extend(block_dependents(
             child,
             dependents,
             status,
@@ -1010,8 +2216,9 @@ fn block_dependents(
             compilation,
             plan_info,
             events,
-        );
+        ));
     }
+    newly_blocked
 }
 
 /// After a successful time-window append, advance the committed watermark to

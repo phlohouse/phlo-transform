@@ -17,9 +17,14 @@ use crate::util::now_rfc3339;
 
 /// Current artifact schema version.
 ///
+/// Version 3 records execution resilience in `run.json`: per-status counts,
+/// per-attempt records, structured failures with stable categories,
+/// `cached`/`blocked`/`cancelled` statuses, and `continued_from` for
+/// resumed/retried runs.
+///
 /// Version 2 replaces the per-model column list in `lineage.json` with the
 /// canonical lineage graph document and adds `openlineage.json`.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// `manifest.json`.
 #[derive(Clone, Debug, Serialize)]

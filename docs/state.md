@@ -111,6 +111,43 @@ A plan records the desired version of every planned model. At apply time the
 runner recomputes against the freshly compiled workspace and rejects a plan
 whose desired versions no longer match (`EngineError::StalePlan`).
 
+## Run progress
+
+Runs are persisted while they execute, not just at the end. `start_run`
+writes the run row — id, plan id, environment, started timestamp — together
+with the stored `plan` itself *before* the scheduler dispatches anything,
+and each model/seed/test record is written as it reaches a terminal status
+(`model_runs`, `seed_runs`, `test_runs`, plus `model_attempts` for every
+retry). A process killed mid-run therefore leaves an accurate partial
+record: passed work is marked passed, everything else stays unfinished.
+
+Each execution record carries the fields needed to reconstruct what
+happened: status (`passed`/`failed`/`skipped`/`cached`/`blocked`/
+`cancelled`), attempt count, per-attempt failure detail (`category`,
+message, adapter error code, retryable flag), timestamps, desired version
+and query id. `finish_run` stamps the run's final status and failed count.
+
+This is what `--resume` and `--retry-failed` rebuild from:
+
+- **`run --resume <run-id>`** reloads the stored plan and the prior per-node
+  records, then reruns everything that did not reach `passed`/`cached`.
+  Reuse is verified, not trusted: a previously-passed model is kept only if
+  its desired version still matches the freshly compiled one, and a seed is
+  reused only when its recorded hash matches the current file. If the
+  workspace changed incompatibly — a stored model is gone, or a passed
+  model's desired version moved — resume refuses with an explicit error
+  rather than guessing. The run keeps the same run id.
+- **`run --retry-failed <run-id>`** creates a new run (`continued_from`
+  links back) whose plan contains only the failed/blocked portion of the
+  finished run plus the dependencies it still needs; the rest is skipped.
+  If nothing failed there is nothing to retry and the command says so.
+
+Safe to reuse: `passed` model records whose desired version still matches,
+`cached`/`skipped` plan decisions, and `passed` seed records with matching
+hashes. Never trusted: `failed`/`blocked`/`cancelled` records, unfinished
+records from a killed run, and any record whose desired version differs
+from the current compile.
+
 ## Inspect
 
 `inspect` shows desired/current versions and `status` (`new`/`changed`/

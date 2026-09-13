@@ -166,21 +166,91 @@ reports.
 
 ## Execution
 
-`Runner::apply` schedules models with Tokio and a bounded `Semaphore`.
-Dependencies always run before dependents. On failure, dependents are marked
-`blocked` transitively while independent branches continue. States are:
+`Runner::apply` consumes a plan — it never re-decides *what* should run — and
+schedules models with Tokio `JoinSet`s bounded by a `Semaphore`
+(`--jobs`, default 4). Scheduling is indegree-based: each model becomes
+runnable the moment every required upstream model and seed reaches a
+satisfied terminal state, and independent branches proceed concurrently.
+Seeds run before models; a failed seed blocks its consumers like any other
+dependency.
+
+States:
 
 ```text
-pending ready running passed failed skipped blocked cancelled
+pending → ready → running → passed | failed
+                          → skipped | cached   (satisfied without executing)
+                          → blocked            (a required upstream failed)
+                          → cancelled          (fail-fast or external cancel)
 ```
 
-After models, custom tests whose target models all passed are executed; a test
-passes when it returns zero rows. Any failed model or test fails the run.
+`skipped`/`cached` satisfy dependents; `failed`/`blocked`/`cancelled` do
+not. Dependents of a failed node are `blocked` transitively — a blocked
+model is not reported as a SQL failure. Models that would write the same
+physical relation are serialised on a per-target lock, so a skipped parent
+and a rebuilt child can never race the same table.
 
-Cancellation is cooperative: `Runner::apply` races its scheduling loop against
-a `CancelHandle`. On cancellation it aborts in-flight model tasks, marks every
-unfinished model `cancelled`, skips tests and reports the run as `cancelled`.
-The CLI wires `Ctrl-C` to the handle; tests can drive it programmatically.
+### Failures and retries
+
+Every failure is a structured `Failure`: a stable `category` (`adapter`,
+`sql`, `test`, `timeout`, `cancelled`, `dependency`, `state`, `internal`),
+a message, the adapter error code/message when applicable, the attempt
+number and a `retryable` flag. Every attempt is recorded (`Attempt`:
+number, timing, query id, failure) so run history shows each try.
+
+`RetryPolicy` centralises retry decisions (`--retries`, default 0 extra
+attempts; bounded exponential backoff from 200 ms doubling to a 5 s
+ceiling). Only adapter failures the adapter itself marked `retryable` are
+retried — SQL-semantic error codes (`SYNTAX_ERROR`, `COLUMN_NOT_FOUND`,
+`TABLE_NOT_FOUND`, `TYPE_MISMATCH`, …) fail once, and test, timeout,
+dependency and cancellation failures are never retried. Compilation and
+planning errors are not execution retries.
+
+### Fail-fast, timeouts, cancellation
+
+`--fail-fast` changes shutdown only: on the first unrecoverable failure the
+scheduler stops dispatching new work, aborts in-flight tasks, marks
+dependents of the failure `blocked` and unrelated not-started work
+`cancelled`. Without it, independent branches run to completion.
+
+`--model-timeout 30s|5m|1h` bounds each attempt; expiry is a `timeout`
+failure and the runner calls `Adapter::cancel` with the query id when the
+adapter reported one. Cancellation is the same cooperative path as Ctrl-C:
+a `CancelHandle` stops scheduling, aborts tasks and reports the run as
+`cancelled`. Adapters that cannot cancel still surface the real outcome —
+the engine never claims a model was cancelled when it actually completed.
+
+### Seeds and tests
+
+Seeds load before models and follow the same failure/retry policy; a failed
+seed blocks its consumers. Tests run after models, only when every dataset
+they read is available; a test fails when its query errors or returns rows.
+A failed test fails the run (`test` category) without rewriting the model's
+own execution status.
+
+### Resume and retry-failed
+
+`--resume <run-id>` continues an interrupted or failed run **under the same
+run id**: the stored plan is reloaded, genuinely passed/cached work is
+reused (models and seeds verified against the current compiled versions),
+and failed/blocked/cancelled/unfinished work reruns. Resume refuses with an
+explicit explanation when the workspace changed incompatibly — a stored
+model no longer exists, or a previously-passed model's desired version no
+longer matches.
+
+`--retry-failed <run-id>` starts a **new** run (`continued_from` links it)
+covering only the failed/blocked portion of a completed failed run plus the
+upstream work it still needs; everything else is skipped. Neither accepts
+selection flags — the prior run defines the work.
+
+### Run summary
+
+`RunResult` is the machine-readable summary (`run_id`, `plan_id`,
+`continued_from`, `status`, `counts`, per-model/seed/test results with
+`failure`, `attempts`, `query_id`, timings) — `run.json` and `--json` both
+serialise it. Human output derives from the same value: status counts, a
+FAILED/BLOCKED breakdown naming categories, and the suggested
+`--retry-failed`/`--resume` commands. Results are reported in plan order
+regardless of execution order.
 
 ## Tests
 
@@ -249,15 +319,18 @@ JSON plan can echo the resolved selection back to the caller.
 ## Operational state
 
 A `StateStore` trait with a SQLite implementation (`rusqlite`, bundled)
-records runs, per-model executions, per-test executions and materialised
-model versions (including `version_detail` — the named dependency/source
-inputs behind each version hash) at `.phlo/transform/state.db`. The version
-records are what make planning and the `changed` selector state-aware; see
-[`docs/state.md`](state.md).
+records runs, per-model/seed/test executions and materialised model
+versions (including `version_detail` — the named dependency/source inputs
+behind each version hash) at `.phlo/transform/state.db`. Runs are persisted
+incrementally: `start_run` stores the plan with the run record before
+execution begins, and every model/seed/test result is written as it lands —
+a killed process leaves an accurate partial record, which is what
+`--resume`/`--retry-failed` rebuild from. Only `passed` builds update the
+materialised-version table. See [`docs/state.md`](state.md).
 
 ## Artifacts
 
-Written under `.phlo/transform/` with `schema_version = 2`:
+Written under `.phlo/transform/` with `schema_version = 3`:
 
 | File | Contents |
 |---|---|
@@ -266,7 +339,7 @@ Written under `.phlo/transform/` with `schema_version = 2`:
 | `lineage.json` | the canonical lineage graph document (models, datasets, columns, tests; direct/indirect/transformation/confidence on column edges) |
 | `openlineage.json` | the same graph exported as an OpenLineage design-time document (a JSON array of valid `JobEvent`/`DatasetEvent`s) |
 | `plan.json` | plan id, adapter, environment, planned models/tests, diagnostics |
-| `run.json` | run id, plan id, status, model/test results, events |
+| `run.json` | run id, plan id, `continued_from`, status, per-status counts, model/seed/test results with structured failures and attempts, events |
 | `environment.json` | provisioned base/candidate references and candidate catalog |
 | `diff.json` | data/schema diff report (strategy, rows, columns, partitions, policies) |
 | `promotion.json` | promotion id, references/hashes, gates, conflicts, timestamp |
@@ -276,9 +349,11 @@ Written under `.phlo/transform/` with `schema_version = 2`:
 ## Observability
 
 The engine emits structured `EngineEvent`s (`compile_started`,
-`plan_created`, `model_started`, `model_finished`, `test_started`,
-`test_finished`, `run_finished`, ...). Human CLI output is derived from the
-same results.
+`plan_created`, `run_started`, `seed_started`, `seed_retrying`,
+`seed_finished`, `model_queued`, `model_started`, `model_retrying`,
+`model_finished`, `test_started`, `test_finished`, `run_finished`). Human
+CLI output, `run.json` and state persistence all derive from the same
+stream — terminal output is never the execution API.
 
 ## Testing strategy
 

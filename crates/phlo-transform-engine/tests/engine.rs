@@ -20,14 +20,30 @@ use phlo_transform_core::{
 };
 use phlo_transform_engine::{
     changed_models, collect_source_states, Adapter, AdapterError, ArtifactWriter, CancelHandle,
-    CatalogRequest, ColumnInfo, ExecutionStatus, Membership, Plan, PlanAction, PlanOptions,
-    Planner, QueryResult, ReasonKind, RunOptions, Runner, SqliteStateStore, StateStore,
+    CatalogRequest, ColumnInfo, EngineEvent, ExecutionStatus, FailureCategory, Membership,
+    ModelResult, Plan, PlanAction, PlanOptions, Planner, QueryResult, ReasonKind, RetryPolicy,
+    RunOptions, RunResult, Runner, SqliteStateStore, StateStore,
 };
+
+/// How a target should fail: the error to return, and how many attempts it
+/// applies to (`None` = every attempt).
+#[derive(Clone)]
+struct FailSpec {
+    error: AdapterError,
+    times: Option<usize>,
+}
 
 #[derive(Default)]
 struct FakeAdapter {
     existing: Mutex<BTreeSet<String>>,
     fail_targets: Mutex<BTreeSet<String>>,
+    /// Per-target injected failures: `(error, times)` — `times` bounds the
+    /// failure to the first N attempts so `flaky` targets recover.
+    fail_modes: Mutex<BTreeMap<String, FailSpec>>,
+    /// Attempt counts per target, for asserting retry behaviour.
+    attempt_counts: Mutex<BTreeMap<String, usize>>,
+    /// Per-target delay override, for fail-fast/timeout tests.
+    delay_for: Mutex<BTreeMap<String, u64>>,
     created: Mutex<Vec<String>>,
     appends: Mutex<Vec<String>>,
     append_sqls: Mutex<Vec<String>>,
@@ -62,6 +78,50 @@ impl FakeAdapter {
         adapter
     }
 
+    /// `target` fails with `error` on every attempt.
+    fn fail_with(&self, target: &str, error: AdapterError) {
+        self.fail_modes
+            .lock()
+            .unwrap()
+            .insert(target.to_string(), FailSpec { error, times: None });
+    }
+
+    /// `target` fails with `error` on its first `times` attempts, then
+    /// succeeds — a transiently failing target.
+    fn fail_first(&self, target: &str, times: usize, error: AdapterError) {
+        self.fail_modes.lock().unwrap().insert(
+            target.to_string(),
+            FailSpec {
+                error,
+                times: Some(times),
+            },
+        );
+    }
+
+    /// `target` takes `delay_ms` to build regardless of the global delay.
+    fn slow_target(&self, target: &str, delay_ms: u64) {
+        self.delay_for
+            .lock()
+            .unwrap()
+            .insert(target.to_string(), delay_ms);
+    }
+
+    /// How many attempts a target saw.
+    fn attempts(&self, target: &str) -> usize {
+        self.attempt_counts
+            .lock()
+            .unwrap()
+            .get(target)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Stop failing a target — the simulated "fix" between runs.
+    fn heal(&self, target: &str) {
+        self.fail_targets.lock().unwrap().remove(target);
+        self.fail_modes.lock().unwrap().remove(target);
+    }
+
     fn set_test_rows(&self, rows: u64) {
         *self.test_rows.lock().unwrap() = rows;
     }
@@ -86,14 +146,32 @@ impl FakeAdapter {
         relation: &Relation,
         query_id: &str,
     ) -> Result<QueryResult, AdapterError> {
+        let display = relation.display();
         let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_concurrent.fetch_max(now, Ordering::SeqCst);
-        if self.delay_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+        let delay = self
+            .delay_for
+            .lock()
+            .unwrap()
+            .get(&display)
+            .copied()
+            .unwrap_or(self.delay_ms);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
         }
         self.current.fetch_sub(1, Ordering::SeqCst);
 
-        let display = relation.display();
+        let attempt = {
+            let mut counts = self.attempt_counts.lock().unwrap();
+            let count = counts.entry(display.clone()).or_default();
+            *count += 1;
+            *count
+        };
+        if let Some(spec) = self.fail_modes.lock().unwrap().get(&display).cloned() {
+            if spec.times.is_none_or(|times| attempt <= times) {
+                return Err(spec.error);
+            }
+        }
         if self.fail_targets.lock().unwrap().contains(&display) {
             return Err(AdapterError::new(
                 "FAKE001",
@@ -171,6 +249,17 @@ impl Adapter for FakeAdapter {
         path: &Path,
     ) -> Result<QueryResult, AdapterError> {
         let display = relation.display();
+        let attempt = {
+            let mut counts = self.attempt_counts.lock().unwrap();
+            let count = counts.entry(display.clone()).or_default();
+            *count += 1;
+            *count
+        };
+        if let Some(spec) = self.fail_modes.lock().unwrap().get(&display).cloned() {
+            if spec.times.is_none_or(|times| attempt <= times) {
+                return Err(spec.error);
+            }
+        }
         if self.fail_loads.lock().unwrap().contains(&display) {
             return Err(AdapterError::new(
                 "FAKE001",
@@ -1356,7 +1445,7 @@ async fn seed_tests_pull_the_seed_into_the_plan() {
     assert_eq!(result.tests.len(), 1);
     assert_eq!(result.tests[0].status, ExecutionStatus::Passed);
 
-    // A failed load skips the test entirely.
+    // A failed load blocks the test — it never reads a stale table.
     let compilation = build();
     let adapter = Arc::new(FakeAdapter::default());
     adapter.set_test_rows(0);
@@ -1372,7 +1461,17 @@ async fn seed_tests_pull_the_seed_into_the_plan() {
         .await
         .expect("run succeeds");
     assert_eq!(result.status, ExecutionStatus::Failed);
-    assert!(result.tests.is_empty(), "{:?}", result.tests);
+    assert_eq!(result.tests.len(), 1);
+    assert_eq!(result.tests[0].status, ExecutionStatus::Blocked);
+    assert_eq!(
+        result.tests[0].failure.as_ref().unwrap().category,
+        FailureCategory::Dependency
+    );
+    // The model that does not read the seed still ran.
+    assert!(result
+        .models
+        .iter()
+        .any(|model| model.status == ExecutionStatus::Passed));
 }
 
 /// The second plan after a run is all Skip with an `unchanged` reason; the
@@ -1784,4 +1883,722 @@ async fn dependency_change_reason_names_the_moved_input() {
         .expect("a dependency-change reason");
     assert!(reason.detail.contains("assay.raw"), "{}", reason.detail);
     assert_eq!(reason.subject.as_deref(), Some("assay.raw"));
+}
+
+// ---------------------------------------------------------------------
+// Execution resilience: retries, fail-fast, timeouts, resume, retry.
+// ---------------------------------------------------------------------
+
+/// A retry policy with millisecond-scale backoff for tests.
+fn retrying(retries: u32) -> RunOptions {
+    RunOptions {
+        retry: RetryPolicy {
+            retries,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(10),
+        },
+        ..Default::default()
+    }
+}
+
+fn model_result<'a>(result: &'a RunResult, name: &str) -> &'a ModelResult {
+    result
+        .models
+        .iter()
+        .find(|model| model.model == name)
+        .unwrap_or_else(|| panic!("no model result for {name}"))
+}
+
+#[tokio::test]
+async fn transient_adapter_failure_retries_then_succeeds() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    adapter.fail_first(
+        "assay.raw",
+        1,
+        AdapterError::new("TRINO_TRANSPORT", "temporary network failure").retryable(),
+    );
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let runner = Runner::new(adapter.clone(), None);
+    let result = runner
+        .apply(&compilation, &plan, &retrying(2))
+        .await
+        .unwrap();
+
+    let raw = model_result(&result, "assay.raw");
+    assert_eq!(raw.status, ExecutionStatus::Passed);
+    assert_eq!(raw.attempts.len(), 2, "{:?}", raw.attempts);
+    assert_eq!(raw.attempts[0].attempt, 1);
+    assert!(raw.attempts[0].failure.is_some());
+    assert_eq!(adapter.attempts("assay.raw"), 2);
+    assert!(result.events.iter().any(|event| matches!(
+        event,
+        EngineEvent::ModelRetrying { model, attempt: 1, .. } if model == "assay.raw"
+    )));
+    assert_eq!(result.status, ExecutionStatus::Passed);
+}
+
+#[tokio::test]
+async fn sql_errors_fail_once_and_are_not_retried() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    adapter.fail_with(
+        "assay.results",
+        AdapterError::new("COLUMN_NOT_FOUND", "column `titre` does not exist"),
+    );
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let runner = Runner::new(adapter.clone(), None);
+    let result = runner
+        .apply(&compilation, &plan, &retrying(5))
+        .await
+        .unwrap();
+
+    let failed = model_result(&result, "assay.results");
+    assert_eq!(failed.status, ExecutionStatus::Failed);
+    assert_eq!(adapter.attempts("assay.results"), 1);
+    assert_eq!(failed.attempts.len(), 1);
+    let failure = failed.failure.as_ref().expect("structured failure");
+    assert_eq!(failure.category, FailureCategory::Sql);
+    assert_eq!(failure.adapter_code.as_deref(), Some("COLUMN_NOT_FOUND"));
+    assert!(!failure.retryable);
+    assert_eq!(
+        model_result(&result, "reporting.monthly").status,
+        ExecutionStatus::Blocked
+    );
+    assert_eq!(result.status, ExecutionStatus::Failed);
+}
+
+#[tokio::test]
+async fn retry_exhaustion_records_every_attempt() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    adapter.fail_with(
+        "assay.raw",
+        AdapterError::new("TRINO_TRANSPORT", "warehouse unreachable").retryable(),
+    );
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let runner = Runner::new(adapter.clone(), None);
+    let result = runner
+        .apply(&compilation, &plan, &retrying(2))
+        .await
+        .unwrap();
+
+    let raw = model_result(&result, "assay.raw");
+    assert_eq!(raw.status, ExecutionStatus::Failed);
+    assert_eq!(adapter.attempts("assay.raw"), 3);
+    assert_eq!(raw.attempts.len(), 3);
+    assert_eq!(
+        raw.attempts
+            .iter()
+            .map(|attempt| attempt.attempt)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert!(raw.attempts.iter().all(|attempt| attempt.failure.is_some()));
+    let failure = raw.failure.as_ref().unwrap();
+    assert_eq!(failure.category, FailureCategory::Adapter);
+    assert_eq!(failure.attempt, 3);
+}
+
+#[tokio::test]
+async fn fail_fast_stops_scheduling_and_cancels_inflight() {
+    let compilation = compile(&SemanticProject::in_memory(vec![
+        model("main.a", "select * from external.a"),
+        model("main.b", "select * from external.b"),
+        model("main.c", "select * from main.b"),
+        model("main.d", "select * from main.a"),
+    ]));
+    assert!(compilation.is_ok());
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.fail_with("main.a", AdapterError::new("FAKE001", "boom"));
+    adapter.slow_target("main.b", 500);
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let runner = Runner::new(adapter.clone(), None);
+    let result = runner
+        .apply(
+            &compilation,
+            &plan,
+            &RunOptions {
+                concurrency: 2,
+                run_tests: false,
+                fail_fast: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        model_result(&result, "main.a").status,
+        ExecutionStatus::Failed
+    );
+    // `d` can never run — it is blocked, not just unscheduled.
+    assert_eq!(
+        model_result(&result, "main.d").status,
+        ExecutionStatus::Blocked
+    );
+    // `b` was in flight when the failure landed and `c` never started: both
+    // are cancelled under fail-fast.
+    assert_eq!(
+        model_result(&result, "main.b").status,
+        ExecutionStatus::Cancelled
+    );
+    assert_eq!(
+        model_result(&result, "main.c").status,
+        ExecutionStatus::Cancelled
+    );
+    assert_eq!(result.status, ExecutionStatus::Failed);
+    assert_eq!(result.counts.failed, 1);
+    assert_eq!(result.counts.blocked, 1);
+    assert_eq!(result.counts.cancelled, 2);
+}
+
+#[tokio::test]
+async fn model_timeout_is_classified_distinctly() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.slow_target("assay.raw", 10_000);
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let runner = Runner::new(adapter.clone(), None);
+    let result = runner
+        .apply(
+            &compilation,
+            &plan,
+            &RunOptions {
+                run_tests: false,
+                model_timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let raw = model_result(&result, "assay.raw");
+    assert_eq!(raw.status, ExecutionStatus::Failed);
+    let failure = raw.failure.as_ref().unwrap();
+    assert_eq!(failure.category, FailureCategory::Timeout);
+    assert_eq!(failure.attempt, 1);
+    // The timeout blocks dependents but the independent branch still ran.
+    assert_eq!(
+        model_result(&result, "assay.results").status,
+        ExecutionStatus::Blocked
+    );
+    assert_eq!(
+        model_result(&result, "analytics.d").status,
+        ExecutionStatus::Passed
+    );
+    assert_eq!(result.status, ExecutionStatus::Failed);
+}
+
+#[tokio::test]
+async fn run_progress_is_persisted_incrementally() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    adapter.fail_with("assay.results", AdapterError::new("FAKE001", "boom"));
+    let plan = plan_all(&compilation, adapter.clone()).await;
+
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+    let result = runner
+        .apply(&compilation, &plan, &RunOptions::default())
+        .await
+        .unwrap();
+
+    // The run record carries its manifest and final status.
+    let stored = state.run(&result.run_id).unwrap().expect("run persisted");
+    assert_eq!(stored.record.status, ExecutionStatus::Failed);
+    assert!(stored.record.finished_at.is_some());
+    assert!(stored.plan.is_some(), "plan manifest persisted for resume");
+    assert_eq!(stored.record.failed_count, 1);
+
+    // Per-model progress: every node has a record with the right status and
+    // failure classification.
+    let records = state.model_runs(&result.run_id).unwrap();
+    let status_of = |name: &str| {
+        records
+            .iter()
+            .find(|record| record.model_id == name)
+            .map(|record| record.status)
+    };
+    assert_eq!(status_of("assay.raw"), Some(ExecutionStatus::Passed));
+    assert_eq!(status_of("assay.results"), Some(ExecutionStatus::Failed));
+    assert_eq!(
+        status_of("reporting.monthly"),
+        Some(ExecutionStatus::Blocked)
+    );
+    let failed = records
+        .iter()
+        .find(|record| record.model_id == "assay.results")
+        .unwrap();
+    assert_eq!(failed.error_category.as_deref(), Some("adapter"));
+    assert_eq!(failed.attempts.len(), 1);
+    assert!(!failed.desired_version.is_empty());
+
+    // Only genuinely built models are recorded as materialised.
+    assert!(state
+        .materialized_version("assay.results", None)
+        .unwrap()
+        .is_none());
+    assert!(state
+        .materialized_version("assay.raw", None)
+        .unwrap()
+        .is_some());
+
+    // Prefix lookup resolves the run for resume/retry commands.
+    let found = state.find_runs(&result.run_id[..8]).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].run_id, result.run_id);
+}
+
+#[tokio::test]
+async fn resume_reuses_passed_work_and_reruns_the_rest() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    adapter.fail_with("assay.results", AdapterError::new("FAKE001", "boom"));
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+
+    let first = runner
+        .apply(
+            &compilation,
+            &plan_all(&compilation, adapter.clone()).await,
+            &RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status, ExecutionStatus::Failed);
+    let created_before = adapter.created.lock().unwrap().len();
+
+    adapter.heal("assay.results");
+    let resumed = runner
+        .resume(&compilation, &first.run_id[..8], &RunOptions::default())
+        .await
+        .unwrap();
+
+    // Same run id — the run was continued, not replaced.
+    assert_eq!(resumed.run_id, first.run_id);
+    assert_eq!(resumed.status, ExecutionStatus::Passed);
+    assert_eq!(
+        model_result(&resumed, "assay.raw").status,
+        ExecutionStatus::Cached
+    );
+    assert_eq!(
+        model_result(&resumed, "analytics.d").status,
+        ExecutionStatus::Cached
+    );
+    assert_eq!(
+        model_result(&resumed, "assay.results").status,
+        ExecutionStatus::Passed
+    );
+    assert_eq!(
+        model_result(&resumed, "reporting.monthly").status,
+        ExecutionStatus::Passed
+    );
+    // Only the failed/blocked work re-executed against the adapter.
+    let created = adapter.created.lock().unwrap().clone();
+    let new_creates = &created[created_before..];
+    assert_eq!(new_creates, vec!["assay.results", "reporting.monthly"]);
+
+    // The model record accumulated attempts across invocations.
+    let records = state.model_runs(&resumed.run_id).unwrap();
+    let results = records
+        .iter()
+        .find(|record| record.model_id == "assay.results")
+        .unwrap();
+    assert_eq!(results.status, ExecutionStatus::Passed);
+    assert_eq!(results.attempts.len(), 2, "{:?}", results.attempts);
+    assert_eq!(results.attempts[1].attempt, 2);
+
+    // Still exactly one run in history.
+    assert_eq!(state.runs().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn resume_does_not_trust_stale_success_when_versions_changed() {
+    // run1: `main.a` passes, `main.b` (dependent) fails.
+    let build = |a_sql: &str| {
+        let compilation = compile(&SemanticProject::in_memory(vec![
+            model("main.a", a_sql),
+            model("main.b", "select * from main.a"),
+        ]));
+        assert!(compilation.is_ok());
+        compilation
+    };
+    let compilation = build("select 1 as id from external.a");
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.fail_with("main.b", AdapterError::new("FAKE001", "boom"));
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+    let first = runner
+        .apply(
+            &compilation,
+            &plan_all(&compilation, adapter.clone()).await,
+            &RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status, ExecutionStatus::Failed);
+
+    // `main.a` changed since the run — its earlier success is stale and
+    // must not be reused.
+    adapter.heal("main.b");
+    let changed = build("select 1 as id, 'x' as extra from external.a");
+    let resumed = runner
+        .resume(&changed, &first.run_id[..8], &RunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(resumed.status, ExecutionStatus::Passed);
+    assert_eq!(
+        model_result(&resumed, "main.a").status,
+        ExecutionStatus::Passed
+    );
+    assert_eq!(
+        adapter.attempts("main.a"),
+        2,
+        "stale success must not be reused"
+    );
+}
+
+#[tokio::test]
+async fn resume_refuses_an_incompatible_workspace() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.fail_with("assay.results", AdapterError::new("FAKE001", "boom"));
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+    let first = runner
+        .apply(
+            &compilation,
+            &plan_all(&compilation, adapter.clone()).await,
+            &RunOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    // A model the run executed no longer exists — refuse rather than guess.
+    let shrunk = compile(&SemanticProject::in_memory(vec![
+        model("assay.raw", "select * from external.raw_assay_results"),
+        model("assay.results", "select * from assay.raw"),
+    ]));
+    let error = runner
+        .resume(&shrunk, &first.run_id[..8], &RunOptions::default())
+        .await
+        .expect_err("incompatible resume refused");
+    assert!(error.to_string().contains("no longer exists"), "{error}");
+}
+
+#[tokio::test]
+async fn retry_failed_reruns_only_the_failed_portion() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    adapter.fail_with("assay.results", AdapterError::new("FAKE001", "boom"));
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+
+    let first = runner
+        .apply(
+            &compilation,
+            &plan_all(&compilation, adapter.clone()).await,
+            &RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status, ExecutionStatus::Failed);
+
+    adapter.heal("assay.results");
+    let retry = runner
+        .retry_failed(&compilation, &first.run_id[..8], &RunOptions::default())
+        .await
+        .unwrap();
+
+    // A new run continuing the old one.
+    assert_ne!(retry.run_id, first.run_id);
+    assert_eq!(retry.continued_from.as_deref(), Some(first.run_id.as_str()));
+    // The failed/blocked models rerun and pass; `assay.raw` is pulled in as
+    // a dependency of `assay.results` but already materialised, so it is
+    // skipped without touching the adapter.
+    let failed = model_result(&retry, "assay.results");
+    assert_eq!(failed.status, ExecutionStatus::Passed);
+    assert_eq!(
+        model_result(&retry, "reporting.monthly").status,
+        ExecutionStatus::Passed
+    );
+    assert_eq!(
+        model_result(&retry, "assay.raw").status,
+        ExecutionStatus::Skipped
+    );
+    assert_eq!(
+        adapter.attempts("assay.raw"),
+        1,
+        "the passed upstream must not rebuild"
+    );
+    // The healthy independent branch is not part of the retry at all.
+    assert!(!retry
+        .models
+        .iter()
+        .any(|model| model.model.starts_with("analytics.")));
+    assert_eq!(retry.status, ExecutionStatus::Passed);
+    assert_eq!(state.runs().unwrap().len(), 2);
+
+    // A second retry of the same run finds the failed portion already
+    // materialised — it refuses rather than producing an all-skip no-op.
+    let error = runner
+        .retry_failed(&compilation, &first.run_id[..8], &RunOptions::default())
+        .await
+        .expect_err("nothing left to retry");
+    assert!(error.to_string().contains("nothing to retry"), "{error}");
+}
+
+#[tokio::test]
+async fn retry_failed_refuses_an_unfinished_run() {
+    // Simulate a killed process: a run row that never finished.
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let compilation = project_with_tests();
+    let plan = plan_all(&compilation, Arc::new(FakeAdapter::default())).await;
+    state
+        .start_run(
+            &phlo_transform_engine::RunRecord {
+                run_id: "deadbeef-0000-0000-0000-000000000000".to_string(),
+                plan_id: plan.id.clone(),
+                environment: None,
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                finished_at: None,
+                status: ExecutionStatus::Running,
+                model_count: plan.models.len(),
+                failed_count: 0,
+            },
+            &phlo_transform_engine::StoredPlan {
+                plan_id: plan.id.clone(),
+                environment: None,
+                models: Vec::new(),
+                seeds: Vec::new(),
+                tests: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    let adapter = Arc::new(FakeAdapter::default());
+    let runner = Runner::new(adapter, Some(state));
+    let error = runner
+        .retry_failed(&compilation, "deadbeef", &RunOptions::default())
+        .await
+        .expect_err("unfinished runs must be resumed, not retried");
+    assert!(error.to_string().contains("--resume"), "{error}");
+}
+
+#[tokio::test]
+async fn cancelled_run_can_be_resumed() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::with_delay(60));
+    adapter.set_test_rows(0);
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+
+    let cancel = CancelHandle::default();
+    let signal = cancel.clone();
+    let options = RunOptions {
+        concurrency: 1,
+        cancel,
+        ..Default::default()
+    };
+    let first = {
+        let runner = Runner::new(adapter.clone(), Some(state.clone()));
+        let compilation = compilation.clone();
+        let plan = plan.clone();
+        let handle = tokio::spawn(async move { runner.apply(&compilation, &plan, &options).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        signal.cancel();
+        handle.await.unwrap().unwrap()
+    };
+    assert_eq!(first.status, ExecutionStatus::Cancelled);
+
+    // Resume the cancelled run: cancelled/not-started work runs now.
+    let resumed = runner
+        .resume(&compilation, &first.run_id[..8], &RunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(resumed.status, ExecutionStatus::Passed);
+    assert!(resumed
+        .models
+        .iter()
+        .all(|model| model.status.is_satisfied()));
+}
+
+#[tokio::test]
+async fn a_failed_test_fails_the_run_not_the_model() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(3);
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+    let result = runner
+        .apply(&compilation, &plan, &RunOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(result.status, ExecutionStatus::Failed);
+    // The model execution itself passed — only the assertion failed.
+    assert!(result
+        .models
+        .iter()
+        .all(|model| model.status == ExecutionStatus::Passed));
+    assert!(result
+        .tests
+        .iter()
+        .all(|test| test.status == ExecutionStatus::Failed));
+    let failure = result.tests[0].failure.as_ref().unwrap();
+    assert_eq!(failure.category, FailureCategory::Test);
+    // And the materialisation was recorded — the table really was built.
+    assert!(state
+        .materialized_version("assay.results", None)
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn seed_loads_retry_under_the_same_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("seeds")).unwrap();
+    std::fs::write(
+        dir.path().join("seeds/raw_events.csv"),
+        "id,status\n1,placed\n",
+    )
+    .unwrap();
+    let mut project =
+        SemanticProject::in_memory(vec![model("main.events", "select * from raw.raw_events")]);
+    project.workspace_root = Some(dir.path().to_path_buf());
+    project.seeds = vec![SemanticSeed {
+        name: "raw_events".to_string(),
+        path: PathBuf::from("seeds/raw_events.csv"),
+        schema: Some("raw".to_string()),
+        content_hash: "hash-v1".to_string(),
+        columns: vec!["id".to_string(), "status".to_string()],
+    }];
+    let compilation = compile(&project);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.fail_first(
+        "raw.raw_events",
+        1,
+        AdapterError::new("TRINO_TRANSPORT", "transient").retryable(),
+    );
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let runner = Runner::new(adapter.clone(), None);
+    let result = runner
+        .apply(&compilation, &plan, &retrying(1))
+        .await
+        .unwrap();
+
+    assert_eq!(result.seeds.len(), 1);
+    assert_eq!(result.seeds[0].status, ExecutionStatus::Passed);
+    assert_eq!(result.seeds[0].attempts.len(), 2);
+    assert!(result.events.iter().any(|event| matches!(
+        event,
+        EngineEvent::SeedRetrying { seed, attempt: 1, .. } if seed == "raw_events"
+    )));
+    assert_eq!(result.status, ExecutionStatus::Passed);
+}
+
+#[tokio::test]
+async fn seed_failure_blocks_consumers_and_fails_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("seeds")).unwrap();
+    std::fs::write(
+        dir.path().join("seeds/raw_events.csv"),
+        "id,status\n1,placed\n",
+    )
+    .unwrap();
+    let mut project = SemanticProject::in_memory(vec![
+        model("main.events", "select * from raw.raw_events"),
+        model("main.other", "select * from external.other"),
+    ]);
+    project.workspace_root = Some(dir.path().to_path_buf());
+    project.seeds = vec![SemanticSeed {
+        name: "raw_events".to_string(),
+        path: PathBuf::from("seeds/raw_events.csv"),
+        schema: Some("raw".to_string()),
+        content_hash: "hash-v1".to_string(),
+        columns: vec!["id".to_string(), "status".to_string()],
+    }];
+    let compilation = compile(&project);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter
+        .fail_loads
+        .lock()
+        .unwrap()
+        .insert("raw.raw_events".to_string());
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let runner = Runner::new(adapter.clone(), None);
+    let result = runner
+        .apply(&compilation, &plan, &RunOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(result.seeds[0].status, ExecutionStatus::Failed);
+    // The consumer is blocked — it never read a missing seed table.
+    assert_eq!(
+        model_result(&result, "main.events").status,
+        ExecutionStatus::Blocked
+    );
+    assert_eq!(
+        model_result(&result, "main.events")
+            .failure
+            .as_ref()
+            .unwrap()
+            .category,
+        FailureCategory::Dependency
+    );
+    // The independent model still ran.
+    assert_eq!(
+        model_result(&result, "main.other").status,
+        ExecutionStatus::Passed
+    );
+    assert_eq!(result.status, ExecutionStatus::Failed);
+    assert!(adapter
+        .created
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|target| target != "main.events"));
+}
+
+#[tokio::test]
+async fn results_follow_plan_order_not_completion_order() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    // Give an early model a longer delay so completion order would differ
+    // from plan order if results were unordered.
+    adapter.slow_target("analytics.d", 50);
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let runner = Runner::new(adapter.clone(), None);
+    let result = runner
+        .apply(
+            &compilation,
+            &plan,
+            &RunOptions {
+                concurrency: 4,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let result_order: Vec<&str> = result
+        .models
+        .iter()
+        .map(|model| model.model.as_str())
+        .collect();
+    let plan_order: Vec<&str> = plan.models.iter().map(|model| model.id.as_str()).collect();
+    assert_eq!(result_order, plan_order);
 }
