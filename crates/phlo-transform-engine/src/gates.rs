@@ -64,10 +64,19 @@ pub struct GateInput {
     pub breaking_schema_changes: Vec<String>,
     /// Explicit waiver for breaking schema changes.
     pub allow_breaking_schema: bool,
-    /// The target hash observed when the candidate was provisioned.
+    /// The target hash the evidence was established against — the commit
+    /// the candidate was provably cut from, or the commit a hash-bound diff
+    /// audited. `None` means there is no evidence the candidate relates to
+    /// the current target.
     pub expected_target_hash: Option<String>,
     /// The target hash right now.
     pub actual_target_hash: Option<String>,
+    /// The candidate ref's head right now — the commit that would merge.
+    /// The recorded run must have validated exactly this commit.
+    pub actual_candidate_hash: Option<String>,
+    /// Whether a fresh audited diff artifact backed `breaking_schema_changes`
+    /// — `false` means "no evidence", which must never read as "no changes".
+    pub schema_audited: bool,
     /// A non-destructive merge check, when one was performed.
     pub merge_check: Option<MergeOutcome>,
 }
@@ -87,10 +96,28 @@ fn gate(name: &str, passed: bool, detail: impl Into<String>) -> GateResult {
 pub fn evaluate_gates(input: &GateInput) -> GateReport {
     let mut results = Vec::new();
 
-    // run: the candidate must have a finished, fully successful run.
+    // run: the candidate must have a finished, fully successful run — and
+    // that run must have validated the commit actually being promoted. A
+    // run bound to an older head (or to nothing) does not cover it.
     match &input.run {
         Some(run) if run.status == ExecutionStatus::Passed && run.failed_count == 0 => {
-            results.push(gate("run", true, format!("run {} passed", run.run_id)));
+            match (&input.actual_candidate_hash, run.reference_hash.as_deref()) {
+                (Some(actual), Some(recorded)) if actual == recorded => results.push(gate(
+                    "run",
+                    true,
+                    format!("run {} passed candidate@{}", run.run_id, recorded),
+                )),
+                (Some(actual), recorded) => results.push(gate(
+                    "run",
+                    false,
+                    format!(
+                        "candidate is now {actual}; last successful run {} validated {}",
+                        run.run_id,
+                        recorded.unwrap_or("an unrecorded commit")
+                    ),
+                )),
+                (None, _) => results.push(gate("run", true, format!("run {} passed", run.run_id))),
+            }
         }
         Some(run) => results.push(gate(
             "run",
@@ -192,27 +219,43 @@ pub fn evaluate_gates(input: &GateInput) -> GateReport {
         ));
     }
 
-    // schema: breaking schema changes block unless explicitly waived.
-    if input.breaking_schema_changes.is_empty() {
-        results.push(gate("schema", true, "no breaking schema changes"));
-    } else if input.allow_breaking_schema {
-        results.push(gate(
-            "schema",
-            true,
-            format!(
-                "{} breaking changes waived",
-                input.breaking_schema_changes.len()
-            ),
-        ));
-    } else {
+    // schema: breaking schema changes block unless explicitly waived — but
+    // only when an audited diff actually inspected the pair. An absent or
+    // stale artifact is not evidence of compatibility.
+    if !input.breaking_schema_changes.is_empty() {
+        if input.allow_breaking_schema {
+            results.push(gate(
+                "schema",
+                true,
+                format!(
+                    "{} breaking changes waived",
+                    input.breaking_schema_changes.len()
+                ),
+            ));
+        } else {
+            results.push(gate(
+                "schema",
+                false,
+                format!(
+                    "breaking schema changes: {}",
+                    input.breaking_schema_changes.join(", ")
+                ),
+            ));
+        }
+    } else if !input.schema_audited {
         results.push(gate(
             "schema",
             false,
-            format!(
-                "breaking schema changes: {}",
-                input.breaking_schema_changes.join(", ")
-            ),
+            match &input.diff_rejected {
+                Some(rejected) => format!("schema audit unusable: {rejected}"),
+                None => {
+                    "schema compatibility was not audited; run `diff --from <candidate> --to <target> --full`"
+                        .to_string()
+                }
+            },
         ));
+    } else {
+        results.push(gate("schema", true, "no breaking schema changes"));
     }
 
     // data_diff: only evaluated when a diff is required.
@@ -239,11 +282,17 @@ pub fn evaluate_gates(input: &GateInput) -> GateReport {
             false,
             format!("target advanced since planning (expected {expected}, found {actual})"),
         )),
-        (Some(_), Some(_)) => results.push(gate("base", true, "target unchanged since planning")),
-        _ => results.push(gate(
+        (Some(_), Some(_)) => results.push(gate(
             "base",
             true,
-            "no recorded base hash — target freshness not verified".to_string(),
+            "target unchanged since the evidence base was recorded",
+        )),
+        _ => results.push(gate(
+            "base",
+            false,
+            "candidate base provenance is unknown — recreate the candidate from the \
+             current target or audit it with `diff --from <candidate> --to <target> --full`"
+                .to_string(),
         )),
     }
 

@@ -778,6 +778,7 @@ impl Runner {
                         run_id: run_id.clone(),
                         plan_id: plan.id.clone(),
                         environment: options.environment.clone(),
+                        reference_hash: None,
                         started_at: started_at.clone(),
                         finished_at: None,
                         status: ExecutionStatus::Running,

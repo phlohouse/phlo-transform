@@ -1026,7 +1026,7 @@ A Git branch may map automatically or explicitly to a Nessie reference. Explicit
 phlo transform --ref feature/new-assay plan
 ```
 
-References are managed explicitly — `ref list`, `ref show`, `ref create --from <base>` and `ref delete` — and no command creates or deletes a branch as a side effect, except explicit candidate provisioning on `plan`/`apply`/`run --ref` and `--cleanup` on `promote`. `ref delete main` is refused: `main` is the default base, not a scratch branch. Provisioning is recorded per candidate in `environment_<sanitised ref>_<hash>.json` (plus the single-slot `environment.json`), and deleted with the branch.
+References are managed explicitly — `ref list`, `ref show`, `ref create --from <base>` and `ref delete` — and no command creates or deletes a branch as a side effect, except explicit candidate provisioning on `plan`/`apply`/`run --ref` and `--cleanup` on `promote`. `ref delete main` is refused: `main` is the default base, not a scratch branch. Provisioning is recorded per candidate in `environment_<sanitised ref>_<hash>.json` (plus the single-slot `environment.json`), and deleted with the branch. Each artifact carries `created_from` — the reference and commit the candidate was provably created from, recorded at `ref create` or first provisioning and preserved across re-provisioning. A pre-existing branch Phlo did not create has unrecorded provenance; promotion refuses it rather than redefine its base as the current target head.
 
 ## 46. Write-Audit-Publish
 
@@ -1069,7 +1069,7 @@ phlo transform promote feature/new-assay --to main
 phlo transform promote --from feature/new-assay --to main
 ```
 
-Promotion is authorised by named gates, reported identically in human and JSON output: `run` (latest candidate run passed), `tests` (no failed tests), `blocked` (no blocked/cancelled model, seed or test work), `schema` (no unwaived breaking changes), `data_diff` (when `--require-diff` is set: a passing `--full` audited diff bound to this candidate→target pair and still fresh — recorded versions matching both sides' current materialisations, and never a self-comparison), `base` (target unchanged since provisioning; the merge asserts the evaluated target hash) and `conflicts` (the merge check is clean). A candidate that advanced between gate evaluation and merge is refused rather than promoted unaudited. `--check` evaluates gates without merging; a passing promotion merges and persists a `PromotionRecord` (refs, hashes, plan/run ids, gate results, timestamp) in the state store.
+Promotion is authorised by named gates, reported identically in human and JSON output: `run` (latest candidate run passed and validated the exact commit being promoted — a passed run is bound to the candidate head **after** its writes land, and a candidate that advanced since its run, or a run recorded before commit binding, fails), `tests` (no failed tests), `blocked` (no blocked/cancelled model, seed or test work), `schema` (a fresh audited diff inspected this pair at these commits and found no unwaived breaking changes — absent or stale evidence fails closed, never reading "no evidence" as "no changes"), `data_diff` (when `--require-diff` is set: a passing `--full` audited diff bound to this candidate→target pair at the commits being promoted — the artifact records both refs' resolved heads and is rejected when they no longer match — still fresh per recorded versions, and never a self-comparison; a single-model `diff.json` is never promotion evidence), `base` (the target still equals the commit the evidence was established against — the hash-bound artifact's recorded base, else the candidate's `created_from` provenance; unknown provenance fails rather than redefining the base as the current head, and the merge asserts the evaluated target hash) and `conflicts` (the merge check is clean). A candidate that advanced between gate evaluation and merge is refused rather than promoted unaudited. `--check` evaluates gates without merging; a passing promotion merges and persists a `PromotionRecord` (refs, hashes, plan/run ids, gate results, timestamp) in the state store.
 
 Preconditions may include successful plan, successful execution, required tests passing, no blocking schema changes, no stale state and optional approval.
 
@@ -1150,7 +1150,7 @@ phlo transform diff assay.results
 phlo transform diff --from feature/new-assay --to main
 ```
 
-With no model argument, `diff` compares two Nessie references: every dataset known to the workspace or recorded in state is classified `added`/`removed`/`changed`/`unchanged`/`absent`, schema and nullability changes are listed per model, row counts come from the catalogs, and `--full` runs keyed value diffs on changed models. `main`'s records include the default (unlabeled) environment, so state from a run with no `--ref` still counts. The report is the audit artifact promotion consumes.
+With no model argument, `diff` compares two Nessie references: every dataset known to the workspace or recorded in state is classified `added`/`removed`/`changed`/`unchanged`/`absent`, schema and nullability changes are listed per model, row counts come from the catalogs, and `--full` runs keyed value diffs on changed models. `main`'s records include the default (unlabeled) environment, so state from a run with no `--ref` still counts. When Nessie is configured the report records both refs' resolved commit hashes, binding the evidence to exact branch heads. The report is the audit artifact promotion consumes.
 
 Example:
 
@@ -1552,7 +1552,7 @@ These files are interfaces, not incidental logs.
 
 ## 75. Run artifact
 
-`run.json` includes run ID, plan ID, `continued_from`, environment, timestamps, model/seed/test results, compiled SQL hashes, query IDs, per-status counts, model versions, source versions, timings, per-attempt records and structured failures (category, adapter code, retryable flag).
+`run.json` includes run ID, plan ID, `continued_from`, environment, the candidate reference hash the run validated (`reference_hash`, bound post-run), timestamps, model/seed/test results, compiled SQL hashes, query IDs, per-status counts, model versions, source versions, timings, per-attempt records and structured failures (category, adapter code, retryable flag).
 
 ---
 

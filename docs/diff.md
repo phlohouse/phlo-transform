@@ -149,12 +149,13 @@ zeros, and `require_full_diff` likewise fails without a stable key.
 ## WAP integration
 
 `PromotionRequest` accepts `diff_passed` and `require_diff`. `phlo-transform
-promote --require-diff` reads `branch_diff.json` first (falling back to the
-single-model `diff.json`) and requires a passing value-level diff that
-covers the exact candidate→target pair being promoted: an artifact naming
-different refs, one produced without `--full`, one whose recorded versions
-no longer match either side's materialised state, or a self-comparison is
-rejected, failing the `data_diff` promotion gate.
+promote --require-diff` reads `branch_diff.json` and requires a passing
+value-level diff that covers the exact candidate→target pair being promoted:
+an artifact naming different refs, one produced without `--full`, one whose
+recorded versions no longer match either side's materialised state, or a
+self-comparison is rejected, failing the `data_diff` promotion gate. The
+single-model `diff.json` is not promotion evidence — it examined one model
+and cannot certify a branch.
 
 ## Execution and coverage
 

@@ -19,13 +19,13 @@ use phlo_transform_core::{
     StaticSchemaProvider, StaticSourceStateProvider, TestId,
 };
 use phlo_transform_engine::{
-    branch_diff, changed_models, collect_source_states, materialized_for_environment, Adapter,
-    AdapterError, ArtifactWriter, BranchDiffRequest, CancelHandle, CatalogRequest, ColumnInfo,
-    DatasetStatus, EngineError, EngineEvent, ExecutionStatus, FailureCategory, MaterializedRecord,
-    Membership, ModelResult, ModelRunRecord, Plan, PlanAction, PlanOptions, Planner,
-    PromotionRecord, QueryResult, ReasonKind, RetryPolicy, RunOptions, RunRecord, RunResult,
-    RunSummary, Runner, SeedRecord, SeedRunRecord, SqliteStateStore, StateStore, StoredPlan,
-    StoredRun, TestRunRecord,
+    branch_diff, changed_models, collect_source_states, ensure_environment,
+    materialized_for_environment, Adapter, AdapterError, ArtifactWriter, BranchDiffRequest,
+    CancelHandle, CatalogRequest, ColumnInfo, DatasetStatus, EngineError, EngineEvent,
+    EnvironmentSpec, ExecutionStatus, FailureCategory, MaterializedRecord, Membership, ModelResult,
+    ModelRunRecord, Plan, PlanAction, PlanOptions, Planner, PromotionRecord, QueryResult,
+    ReasonKind, RetryPolicy, RunOptions, RunRecord, RunResult, RunSummary, Runner, SeedRecord,
+    SeedRunRecord, SqliteStateStore, StateStore, StoredPlan, StoredRun, TestRunRecord,
 };
 
 /// How a target should fail: the error to return, and how many attempts it
@@ -2564,6 +2564,56 @@ async fn retry_failed_reruns_only_the_failed_portion() {
 }
 
 #[tokio::test]
+async fn a_run_binds_its_post_execution_reference_hash() {
+    // The run row starts unbound; the orchestration layer records the
+    // environment's post-run head once execution and tests have passed.
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    let plan = plan_all(&compilation, adapter.clone()).await;
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+    let result = runner
+        .apply(
+            &compilation,
+            &plan,
+            &RunOptions {
+                environment: Some("ci/x".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, ExecutionStatus::Passed);
+
+    let before = state
+        .latest_run(Some("ci/x"))
+        .unwrap()
+        .expect("run recorded");
+    assert_eq!(before.reference_hash, None);
+
+    state
+        .bind_run_reference_hash(&result.run_id, "post-run-head")
+        .unwrap();
+    let bound = state
+        .latest_run(Some("ci/x"))
+        .unwrap()
+        .expect("run recorded");
+    assert_eq!(bound.reference_hash.as_deref(), Some("post-run-head"));
+    // `run()` reads the same column.
+    assert_eq!(
+        state
+            .run(&result.run_id)
+            .unwrap()
+            .expect("run")
+            .record
+            .reference_hash
+            .as_deref(),
+        Some("post-run-head")
+    );
+}
+
+#[tokio::test]
 async fn retry_failed_refuses_an_unfinished_run() {
     // Simulate a killed process: a run row that never finished.
     let state = Arc::new(SqliteStateStore::in_memory().unwrap());
@@ -2580,6 +2630,7 @@ async fn retry_failed_refuses_an_unfinished_run() {
                 status: ExecutionStatus::Running,
                 model_count: plan.models.len(),
                 failed_count: 0,
+                reference_hash: None,
             },
             &phlo_transform_engine::StoredPlan {
                 plan_id: plan.id.clone(),
@@ -3259,6 +3310,14 @@ impl StateStore for FailingStore {
         self.inner.reopen_run(run_id)
     }
 
+    fn bind_run_reference_hash(
+        &self,
+        run_id: &str,
+        reference_hash: &str,
+    ) -> Result<(), EngineError> {
+        self.inner.bind_run_reference_hash(run_id, reference_hash)
+    }
+
     fn finish_run(
         &self,
         run_id: &str,
@@ -3776,6 +3835,8 @@ fn branch_diff_request() -> BranchDiffRequest {
         base_catalog: Some("phlo_main".to_string()),
         deep: false,
         default_schema: Some("default".to_string()),
+        candidate_hash: None,
+        base_hash: None,
     }
 }
 
@@ -4185,6 +4246,7 @@ fn passed_run() -> RunSummary {
         status: ExecutionStatus::Passed,
         model_count: 2,
         failed_count: 0,
+        reference_hash: None,
     }
 }
 
@@ -4250,6 +4312,8 @@ fn green_input() -> GateInput {
         allow_breaking_schema: false,
         expected_target_hash: Some("aaa".to_string()),
         actual_target_hash: Some("aaa".to_string()),
+        actual_candidate_hash: None,
+        schema_audited: true,
         merge_check: Some(MergeOutcome::clean("bbb")),
     }
 }
@@ -4416,6 +4480,115 @@ fn breaking_schema_blocks_unless_waived() {
 }
 
 #[test]
+fn run_bound_to_the_candidate_commit_passes() {
+    let mut input = green_input();
+    input.run.as_mut().unwrap().reference_hash = Some("c1".to_string());
+    input.actual_candidate_hash = Some("c1".to_string());
+    let report = evaluate_gates(&input);
+    let run = gate(&report, "run");
+    assert!(run.passed, "{}", run.detail);
+    assert!(run.detail.contains("c1"), "{}", run.detail);
+}
+
+#[test]
+fn candidate_advanced_since_the_run_blocks_promotion() {
+    // The run passed — but against c1, while the branch now heads at c2.
+    // Whatever c2 contains was never validated.
+    let mut input = green_input();
+    input.run.as_mut().unwrap().reference_hash = Some("c1".to_string());
+    input.actual_candidate_hash = Some("c2".to_string());
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    let run = gate(&report, "run");
+    assert!(!run.passed);
+    assert!(run.detail.contains("c2"), "{}", run.detail);
+    assert!(run.detail.contains("c1"), "{}", run.detail);
+}
+
+#[test]
+fn run_without_a_recorded_commit_blocks_a_known_candidate() {
+    // A pre-binding run record cannot prove which commit it validated.
+    let mut input = green_input();
+    input.actual_candidate_hash = Some("c1".to_string());
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    let run = gate(&report, "run");
+    assert!(!run.passed);
+    assert!(run.detail.contains("unrecorded"), "{}", run.detail);
+}
+
+#[test]
+fn unbound_candidate_still_passes_the_run_gate() {
+    // Callers that cannot resolve the candidate head (no Nessie) keep the
+    // pre-binding verdict — the commit-binding gate only fires when the
+    // candidate hash is known.
+    let mut input = green_input();
+    input.run.as_mut().unwrap().reference_hash = Some("c1".to_string());
+    let report = evaluate_gates(&input);
+    assert!(gate(&report, "run").passed);
+}
+
+#[test]
+fn unknown_base_provenance_blocks_promotion() {
+    let mut input = green_input();
+    input.expected_target_hash = None;
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    let base = gate(&report, "base");
+    assert!(!base.passed);
+    assert!(base.detail.contains("provenance"), "{}", base.detail);
+}
+
+#[test]
+fn missing_target_resolution_blocks_the_base_gate() {
+    let mut input = green_input();
+    input.actual_target_hash = None;
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    assert!(!gate(&report, "base").passed);
+}
+
+#[test]
+fn unaudited_schema_blocks_promotion() {
+    // No artifact inspected the pair: "no breaking changes" would be a claim
+    // about an audit that never ran.
+    let mut input = green_input();
+    input.schema_audited = false;
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    let schema = gate(&report, "schema");
+    assert!(!schema.passed);
+    assert!(schema.detail.contains("not audited"), "{}", schema.detail);
+}
+
+#[test]
+fn unaudited_schema_reports_why_the_evidence_was_rejected() {
+    let mut input = green_input();
+    input.schema_audited = false;
+    input.diff_rejected = Some("branch diff is stale: `m.a` changed".to_string());
+    let report = evaluate_gates(&input);
+    let schema = gate(&report, "schema");
+    assert!(!schema.passed);
+    assert!(schema.detail.contains("stale"), "{}", schema.detail);
+}
+
+#[test]
+fn a_schema_waiver_does_not_waive_unrelated_gates() {
+    // The waiver covers breaking changes only — provenance and run-binding
+    // failures still block.
+    let mut input = green_input();
+    input.breaking_schema_changes = vec!["m.a.id: removed".to_string()];
+    input.allow_breaking_schema = true;
+    input.expected_target_hash = None;
+    input.actual_candidate_hash = Some("c2".to_string());
+    let report = evaluate_gates(&input);
+    assert!(!report.passed);
+    assert!(gate(&report, "schema").passed, "waiver applies to schema");
+    assert!(!gate(&report, "base").passed, "provenance still required");
+    assert!(!gate(&report, "run").passed, "run binding still required");
+}
+
+#[test]
 fn data_diff_gate_absent_when_not_required() {
     let mut input = green_input();
     input.require_diff = false;
@@ -4451,4 +4624,71 @@ fn gate_results_round_trip_through_json() {
         ]
     );
     assert_eq!(json["passed"], true);
+}
+
+// ---------------------------------------------------------------------------
+// Promotion provenance: EnvironmentSetup::created_from
+// ---------------------------------------------------------------------------
+
+use phlo_transform_nessie::InMemoryNessie;
+
+fn environment_spec(candidate: &str) -> EnvironmentSpec {
+    EnvironmentSpec {
+        base_ref: "main".to_string(),
+        candidate_ref: candidate.to_string(),
+        nessie_uri: None,
+        warehouse: None,
+        catalog: "phlo_test".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn a_branch_we_create_records_its_origin() {
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let adapter = FakeAdapter::default();
+
+    let setup = ensure_environment(&nessie, &adapter, &environment_spec("ci/x"))
+        .await
+        .expect("provisioned");
+
+    assert!(setup.created_branch);
+    let origin = setup.created_from.expect("cut-from provenance");
+    assert_eq!(origin.name, "main");
+    assert_eq!(origin.hash, "aaa");
+}
+
+#[tokio::test]
+async fn a_preexisting_branch_has_unknown_provenance() {
+    // The branch exists but nobody recorded where it was cut from —
+    // `ensure_environment` must not redefine its base as today's `main`.
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "bbb").seed("ci/x", "ccc");
+    let adapter = FakeAdapter::default();
+
+    let setup = ensure_environment(&nessie, &adapter, &environment_spec("ci/x"))
+        .await
+        .expect("provisioned");
+
+    assert!(!setup.created_branch);
+    assert!(setup.created_from.is_none());
+    // `base` still reports the current resolution — informational only.
+    assert_eq!(setup.base.hash, "bbb");
+}
+
+#[tokio::test]
+async fn the_base_ref_as_candidate_is_its_own_provenance() {
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let adapter = FakeAdapter::default();
+
+    let setup = ensure_environment(&nessie, &adapter, &environment_spec("main"))
+        .await
+        .expect("provisioned");
+
+    assert!(!setup.created_branch);
+    assert_eq!(
+        setup.created_from.as_ref().map(|base| base.hash.as_str()),
+        Some("aaa")
+    );
 }
