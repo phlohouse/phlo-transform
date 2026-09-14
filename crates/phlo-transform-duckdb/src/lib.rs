@@ -16,7 +16,9 @@ use duckdb::types::ValueRef;
 use duckdb::Connection;
 
 use phlo_transform_core::Relation;
-use phlo_transform_engine::{Adapter, AdapterError, CatalogRequest, ColumnInfo, QueryResult};
+use phlo_transform_engine::{
+    Adapter, AdapterError, CatalogRequest, CatalogStatus, ColumnInfo, QueryResult,
+};
 
 /// An `Adapter` backed by an embedded DuckDB database.
 pub struct DuckDbAdapter {
@@ -336,9 +338,14 @@ impl Adapter for DuckDbAdapter {
             .collect())
     }
 
-    async fn ensure_catalog(&self, _request: &CatalogRequest) -> Result<(), AdapterError> {
-        // DuckDB has no Nessie catalog provisioning.
-        Ok(())
+    async fn ensure_catalog(
+        &self,
+        _request: &CatalogRequest,
+    ) -> Result<CatalogStatus, AdapterError> {
+        // DuckDB has no Nessie catalog provisioning — the catalog the plan
+        // retargets to is whatever the caller pinned via the catalog
+        // override, and nothing here can verify its ref binding.
+        Ok(CatalogStatus::Unmanaged)
     }
 
     async fn ensure_schema(&self, relation: &Relation) -> Result<(), AdapterError> {

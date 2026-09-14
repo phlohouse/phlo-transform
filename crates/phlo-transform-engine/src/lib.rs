@@ -19,6 +19,7 @@ pub mod error;
 pub mod events;
 pub mod failure;
 pub mod gates;
+pub mod lineage_diff;
 pub mod plan;
 pub mod promotion;
 pub mod run;
@@ -27,7 +28,7 @@ pub mod state;
 pub mod state_postgres;
 pub mod util;
 
-pub use adapter::{Adapter, CatalogRequest, ColumnInfo, QueryResult};
+pub use adapter::{Adapter, CatalogRequest, CatalogStatus, ColumnInfo, QueryResult};
 pub use artifacts::{
     ArtifactWriter, CandidateProvenance, DiffArtifact, EnvironmentArtifact, GraphArtifactFile,
     LineageArtifact, LineageDiffArtifact, LineageEnvironment, ManifestArtifact,
@@ -52,11 +53,16 @@ pub use contracts::{
 pub use diff::{
     diff, DiffPolicy, DiffReport, DiffRequest, DiffStrategy, PolicyResult, RowSummary, SchemaChange,
 };
-pub use environment::{catalog_name, ensure_environment, EnvironmentSetup, EnvironmentSpec};
+pub use environment::{
+    catalog_name, compile_for_catalog, enrich_sources, ensure_candidate, ensure_environment,
+    provision_candidate, CandidateWorkspace, EnvironmentContext, EnvironmentMode, EnvironmentSetup,
+    EnvironmentSpec, EnvironmentTarget,
+};
 pub use error::{AdapterError, EngineError};
 pub use events::{EngineEvent, ExecutionStatus};
 pub use failure::{Attempt, Failure, FailureCategory, RetryPolicy};
 pub use gates::{evaluate_gates, GateInput, GateReport, GateResult};
+pub use lineage_diff::LineageDiffContext;
 pub use plan::{
     dependency_closure, diff_reasons, Membership, Plan, PlanAction, PlanOptions, PlanReason,
     PlanSelection, PlannedModel, PlannedSeed, PlannedTest, Planner, ReasonKind,

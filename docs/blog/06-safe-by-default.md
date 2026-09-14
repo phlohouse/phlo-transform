@@ -18,7 +18,8 @@ phlo-transform apply --ref ci/pr-1 --from main
 That one command does three things:
 
 1. creates the Nessie branch `ci/pr-1` from `main` if the branch is missing;
-2. provisions a branch-scoped Trino catalog (named `phlo_<ref>` by default,
+2. provisions a branch-scoped Trino catalog (named `phlo_<ref>_<hash>` by
+   default — the hash makes punctuation-equivalent refs collision-proof —
    overridable with `--catalog`) that points at the branch;
 3. compiles the workspace against that catalog and applies the plan there.
 

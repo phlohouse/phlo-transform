@@ -30,19 +30,22 @@ use std::time::Duration;
 
 use axum::extract::{Path as AxumPath, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use phlo_transform_core::{
-    checkout_tree, compile, load_project, resolve_selection, ColumnRef, Compilation, ModelId,
-    SelectorSet, SemanticProject,
+    compile, load_project, resolve_selection, ColumnRef, Compilation, ModelId, SelectorSet,
+    SemanticProject,
 };
 use phlo_transform_engine::util::now_rfc3339;
 use phlo_transform_engine::{
     branch_diff, catalog_name, compiled_catalog, read_environment_for, Adapter, ArtifactWriter,
-    BranchDiffRequest, ExecutionStatus, PlanOptions, Planner, StateStore,
+    BranchDiffRequest, EngineError, EnvironmentContext, EnvironmentMode, ExecutionStatus,
+    PlanOptions, Planner, RunSummary, StateStore,
 };
 use phlo_transform_nessie::NessieClient;
 
@@ -62,6 +65,18 @@ pub struct ServiceConfig {
     pub catalog: Option<String>,
     /// Fallback schema for diff seed targets (the CLI's `--trino-schema`).
     pub default_schema: Option<String>,
+    /// The Nessie URI catalogs should be provisioned against — the address
+    /// the *warehouse* uses to reach Nessie, which may differ from the URI
+    /// the daemon's own client uses (e.g. a container-network hostname).
+    /// Environment-targeted operations pass it to `ensure_catalog`.
+    pub nessie_uri: Option<String>,
+    /// Iceberg warehouse location for provisioned catalogs (the CLI's
+    /// `--warehouse`).
+    pub warehouse: Option<String>,
+    /// Bearer token required on every endpoint except `/status`
+    /// (the CLI's `daemon --token`). `None` serves unauthenticated —
+    /// appropriate only for loopback use.
+    pub token: Option<String>,
 }
 
 /// A live, coherent workspace snapshot plus engine handles.
@@ -81,13 +96,17 @@ impl WorkspaceService {
 
     /// Load a workspace root with the given engine handles.
     pub fn load_with_config(root: &Path, config: ServiceConfig) -> Arc<Self> {
-        let compilation = Arc::new(compile_root(root));
+        let compilation = Arc::new(compile_root(root, config.catalog.as_deref()));
         Arc::new(Self {
             root: root.to_path_buf(),
             snapshot: RwLock::new(compilation),
             last_update: RwLock::new(now_rfc3339()),
+            ops: Arc::new(OperationStore::open(
+                ArtifactWriter::for_workspace(root)
+                    .directory()
+                    .join("operations.jsonl"),
+            )),
             config,
-            ops: Arc::new(OperationStore::default()),
         })
     }
 
@@ -115,13 +134,47 @@ impl WorkspaceService {
         self.config.environment.as_deref()
     }
 
+    /// The `--catalog` override, when configured.
+    pub fn catalog_override(&self) -> Option<&str> {
+        self.config.catalog.as_deref()
+    }
+
+    /// The catalog-facing Nessie URI used when provisioning environments.
+    pub fn nessie_uri(&self) -> Option<&str> {
+        self.config.nessie_uri.as_deref()
+    }
+
+    /// The warehouse location for provisioned catalogs.
+    pub fn warehouse(&self) -> Option<&str> {
+        self.config.warehouse.as_deref()
+    }
+
+    /// The bearer token the API requires, when one was configured.
+    pub fn token(&self) -> Option<&str> {
+        self.config.token.as_deref()
+    }
+
+    /// The environment-resolution context every operation and read shares —
+    /// one code path so a plan's physical target is always the target a run
+    /// against the same environment would execute. Borrows the service.
+    pub fn environment_context(&self) -> EnvironmentContext<'_> {
+        EnvironmentContext {
+            root: &self.root,
+            nessie: self.config.nessie.as_deref(),
+            adapter: self.config.adapter.as_deref(),
+            nessie_uri: self.config.nessie_uri.as_deref(),
+            warehouse: self.config.warehouse.as_deref(),
+            catalog: self.config.catalog.as_deref(),
+        }
+    }
+
     pub fn operations(&self) -> Arc<OperationStore> {
         self.ops.clone()
     }
 
     /// Recompile the workspace and publish a new snapshot atomically.
     pub fn reload(&self) {
-        let compilation = Arc::new(compile_root(&self.root));
+        let compilation = Arc::new(compile_root(&self.root, self.config.catalog.as_deref()));
         *self.snapshot.write().expect("snapshot lock") = compilation;
         *self.last_update.write().expect("snapshot lock") = now_rfc3339();
     }
@@ -131,9 +184,16 @@ impl WorkspaceService {
     }
 }
 
-fn compile_root(root: &Path) -> Compilation {
+fn compile_root(root: &Path, catalog: Option<&str>) -> Compilation {
     match load_project(root) {
-        Ok(project) => compile(&project),
+        Ok(mut project) => {
+            // The `--catalog` override applies to every compile — the same
+            // rule the CLI applies before `compile(&project)`.
+            if let Some(catalog) = catalog {
+                project.defaults.catalog = Some(catalog.to_string());
+            }
+            compile(&project)
+        }
         Err(diagnostics) => {
             let project = SemanticProject {
                 workspace_root: Some(root.to_path_buf()),
@@ -155,13 +215,15 @@ pub fn router(service: Arc<WorkspaceService>) -> Router {
         .route("/v1/models/{id}", get(inspect))
         .route("/v1/lineage", get(lineage_document))
         .route("/v1/lineage/{target}", get(lineage))
-        .route("/v1/impact/{column}", get(impact))
+        .route("/v1/impact", get(impact_selection))
+        .route("/v1/impact/{target}", get(impact))
         .route("/v1/graph", get(graph))
         .route("/v1/plan", get(plan))
         .route("/v1/diff/lineage", get(diff_lineage))
         .route("/v1/diff/branch", get(diff_branch))
         .route("/v1/state/runs", get(state_runs))
         .route("/v1/state/runs/{id}", get(state_run))
+        .route("/v1/state/runs/{id}/failed", get(state_run_failed))
         .route("/v1/state/models/{id}", get(state_model))
         .route("/v1/state/promotions", get(state_promotions))
         .route(
@@ -171,7 +233,46 @@ pub fn router(service: Arc<WorkspaceService>) -> Router {
         .route("/v1/operations/{id}", get(operations_get))
         .route("/v1/operations/{id}/cancel", post(operations_cancel))
         .route("/v1/reload", post(reload_handler))
+        .layer(middleware::from_fn_with_state(
+            service.clone(),
+            require_auth,
+        ))
         .with_state(service)
+}
+
+/// Bearer-token gate: when the service was configured with a token, every
+/// endpoint except `/status` (liveness) requires `Authorization: Bearer
+/// <token>`. Without a token the API is unauthenticated — loopback only.
+async fn require_auth(
+    State(service): State<Arc<WorkspaceService>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(token) = service.token() else {
+        return next.run(request).await;
+    };
+    if request.uri().path() == "/status" {
+        return next.run(request).await;
+    }
+    let authorised = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == format!("Bearer {token}"));
+    if authorised {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": {
+                    "code": "API015",
+                    "message": "missing or invalid bearer token",
+                }
+            })),
+        )
+            .into_response()
+    }
 }
 
 /// Serve the API on a local address until the process is stopped.
@@ -371,29 +472,147 @@ async fn lineage_document(State(service): State<Arc<WorkspaceService>>) -> ApiRe
     ))
 }
 
+/// `phlo-transform impact <target>` — a model name reports its downstream
+/// models and their tests; `model.column` (or `dataset.column`) reports the
+/// column-level impact report.
 async fn impact(
     State(service): State<Arc<WorkspaceService>>,
-    AxumPath(column): AxumPath<String>,
+    AxumPath(target): AxumPath<String>,
 ) -> ApiResult {
     let snapshot = service.snapshot();
-    let Some((model, name)) = column.rsplit_once('.') else {
+    // A model-only target reports downstream models/tests (works offline).
+    if let Some(model) = snapshot.model_by_name(&target) {
+        let lineage = snapshot
+            .model_lineage_report(&model.id)
+            .expect("model exists");
+        let mut tests: Vec<String> = Vec::new();
+        for dependent in &lineage.downstream {
+            if let Ok(id) = ModelId::parse(dependent) {
+                tests.extend(
+                    snapshot
+                        .tests_for(&id)
+                        .iter()
+                        .map(|test| test.id.to_string()),
+                );
+            }
+        }
+        return Ok(Json(json!({
+            "model": model.id.logical_name(),
+            "downstream_models": lineage.downstream,
+            "tests": tests,
+        })));
+    }
+    let Some((model, name)) = target.rsplit_once('.') else {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "API005",
-            format!("invalid column `{column}`"),
+            format!("invalid impact target `{target}`; expected model or model.column"),
         ));
     };
-    let Ok(id) = ModelId::parse(model) else {
+    // A model column first; otherwise the prefix may be a source or seed
+    // dataset (`impact external.samples.volume`), like the CLI.
+    let target = if let Ok(id) = ModelId::parse(model) {
+        if snapshot.model(&id).is_some() {
+            ColumnRef::model(id, name)
+        } else if let Some(dataset) = snapshot.lineage.dataset_by_name(model) {
+            let source = phlo_transform_core::SourceId::new(dataset.parts().to_vec())
+                .map_err(|error| api_error(StatusCode::BAD_REQUEST, "API005", error.to_string()))?;
+            ColumnRef::source(source, name)
+        } else {
+            return Err(api_error(
+                StatusCode::NOT_FOUND,
+                "API005",
+                format!("no such model or dataset: {model}"),
+            ));
+        }
+    } else if let Some(dataset) = snapshot.lineage.dataset_by_name(model) {
+        let source = phlo_transform_core::SourceId::new(dataset.parts().to_vec())
+            .map_err(|error| api_error(StatusCode::BAD_REQUEST, "API005", error.to_string()))?;
+        ColumnRef::source(source, name)
+    } else {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "API005",
-            format!("invalid model `{model}`"),
+            format!("invalid model `{model}`; no such dataset either"),
         ));
     };
-    let target = ColumnRef::model(id, name);
     Ok(Json(
         serde_json::to_value(snapshot.impact_report(&target)).expect("report serialises"),
     ))
+}
+
+#[derive(Debug, Deserialize)]
+struct ImpactQuery {
+    /// Selector terms — repeat `?select=` for each (same syntax as the CLI).
+    #[serde(default, deserialize_with = "string_or_seq")]
+    select: Vec<String>,
+}
+
+/// `phlo-transform impact --select <terms>` — the selection's blast radius:
+/// dependents outside the selected set, plus the tests covering them.
+async fn impact_selection(
+    RawQuery(raw): RawQuery,
+    State(service): State<Arc<WorkspaceService>>,
+) -> ApiResult {
+    let query = parse_query::<ImpactQuery>(&raw)?;
+    if query.select.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "API005",
+            "impact needs a target (`/v1/impact/{target}`) or `?select=` terms".to_string(),
+        ));
+    }
+    let snapshot = service.snapshot();
+    let set = match SelectorSet::parse(&query.select, &[], &[], false, false) {
+        Ok(set) => set,
+        Err(error) => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "API006",
+                error.to_string(),
+            ))
+        }
+    };
+    let selection = match resolve_selection(&snapshot, &set, None) {
+        Ok(selection) => selection,
+        Err(error) => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "API006",
+                error.to_string(),
+            ))
+        }
+    };
+    let members: std::collections::BTreeSet<ModelId> = selection.ids().into_iter().collect();
+    let mut impacted: std::collections::BTreeSet<ModelId> = std::collections::BTreeSet::new();
+    for member in &members {
+        for node in snapshot
+            .lineage
+            .downstream_transitive(&phlo_transform_core::LineageNode::Model(member.clone()))
+        {
+            if let phlo_transform_core::LineageNode::Model(id) = node {
+                impacted.insert(id);
+            }
+        }
+    }
+    for member in &members {
+        impacted.remove(member);
+    }
+    let mut tests: Vec<String> = Vec::new();
+    for id in &impacted {
+        for test in snapshot
+            .lineage
+            .tests_for_dataset(&snapshot.lineage.output_dataset(id))
+        {
+            tests.push(test.to_string());
+        }
+    }
+    let impacted: Vec<String> = impacted.iter().map(|id| id.logical_name()).collect();
+    Ok(Json(json!({
+        "selected": selection,
+        "impacted_models": impacted,
+        "tests": tests,
+    })))
 }
 
 async fn graph(State(service): State<Arc<WorkspaceService>>) -> ApiResult {
@@ -426,18 +645,44 @@ struct PlanQuery {
     #[serde(default, deserialize_with = "string_or_seq")]
     select: Vec<String>,
     environment: Option<String>,
+    /// The ref `environment` resolves against — `run`'s `base` param.
+    /// Defaults to `main`.
+    base: Option<String>,
     #[serde(default)]
     force: bool,
 }
 
 /// `phlo-transform plan` — needs an adapter (and optionally a state store
-/// for change detection), exactly like the CLI.
+/// for change detection), exactly like the CLI. An `environment` resolves
+/// through the same `EnvironmentContext` a run uses, in `ReadOnly` mode:
+/// the plan targets the candidate's physical catalog (existing relations
+/// may report missing) without provisioning anything.
 async fn plan(RawQuery(raw): RawQuery, State(service): State<Arc<WorkspaceService>>) -> ApiResult {
     let query = parse_query::<PlanQuery>(&raw)?;
     let Some(adapter) = service.adapter() else {
         return Err(missing("adapter"));
     };
-    let compilation = service.snapshot();
+    let environment = query
+        .environment
+        .or_else(|| service.default_environment().map(str::to_string));
+    let base_ref = query.base.clone().unwrap_or_else(|| "main".to_string());
+    let target = service
+        .environment_context()
+        .resolve(environment.as_deref(), &base_ref, EnvironmentMode::ReadOnly)
+        .await
+        .map_err(|error| match error {
+            EngineError::NotConfigured(_) => {
+                api_error(StatusCode::SERVICE_UNAVAILABLE, "API007", error.to_string())
+            }
+            error => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "API011",
+                error.to_string(),
+            ),
+        })?;
+    let compilation = target
+        .compilation
+        .map_or_else(|| service.snapshot(), Arc::new);
     let set = match SelectorSet::parse(&query.select, &[], &[], false, false) {
         Ok(set) => set,
         Err(error) => {
@@ -458,9 +703,6 @@ async fn plan(RawQuery(raw): RawQuery, State(service): State<Arc<WorkspaceServic
             ))
         }
     };
-    let environment = query
-        .environment
-        .or_else(|| service.default_environment().map(str::to_string));
     let planner = Planner::new(adapter, service.state());
     match planner
         .plan(
@@ -484,9 +726,14 @@ async fn plan(RawQuery(raw): RawQuery, State(service): State<Arc<WorkspaceServic
 struct LineageDiffQuery {
     /// Git ref to compare against — `phlo-transform lineage --diff <ref>`.
     base: String,
+    /// Optional second ref — `lineage --diff <base> <candidate>` compares
+    /// the exact refs; omitted compares merge-base → workspace.
+    candidate: Option<String>,
 }
 
-/// `phlo-transform lineage --diff <ref>` — read-only, offline. The base
+/// `phlo-transform lineage --diff <base> [candidate]` — the shared
+/// engine orchestration (`LineageDiffContext`), so the response is the
+/// same provenance artifact the CLI writes and `promote` audits. The base
 /// tree is extracted into a temp dir and compiled; the worktree is never
 /// touched.
 async fn diff_lineage(
@@ -494,29 +741,30 @@ async fn diff_lineage(
     State(service): State<Arc<WorkspaceService>>,
 ) -> ApiResult {
     let query = parse_query::<LineageDiffQuery>(&raw)?;
-    let root = service.root().to_path_buf();
-    let candidate = service.snapshot();
-    let base_ref = query.base.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let tree = checkout_tree(&root, &query.base).map_err(|error| error.to_string())?;
-        let base = compile_root(&tree.workspace);
-        Ok::<_, String>((
-            phlo_transform_core::lineage_diff(&base.lineage, &candidate.lineage),
-            tree.commit,
-        ))
-    })
-    .await;
+    let context = phlo_transform_engine::LineageDiffContext {
+        root: service.root().to_path_buf(),
+        workspace: Some(service.snapshot()),
+        catalog: service.catalog_override().map(str::to_string),
+        adapter: service.adapter(),
+        nessie: service.nessie(),
+        candidate_env: service.default_environment().map(str::to_string),
+        write_artifact: true,
+    };
+    let result = match &query.candidate {
+        Some(candidate) => context.diff_ref_vs_ref(&query.base, candidate).await,
+        None => context.diff_vs_ref(&query.base).await,
+    };
     match result {
-        Ok(Ok((diff, commit))) => Ok(Json(json!({
-            "schema_version": phlo_transform_engine::SCHEMA_VERSION,
-            "diff": diff,
-            "base_ref": base_ref,
-            "base_commit": commit,
-        }))),
-        Ok(Err(message)) => Err(api_error(
+        Ok(artifact) => Ok(Json(
+            serde_json::to_value(&artifact).expect("artifact serialises"),
+        )),
+        Err(
+            error @ (phlo_transform_engine::EngineError::Git(_)
+            | phlo_transform_engine::EngineError::FailedDiagnostics { .. }),
+        ) => Err(api_error(
             StatusCode::BAD_REQUEST,
             "API010",
-            format!("lineage diff against `{base_ref}` failed: {message}"),
+            format!("lineage diff failed: {error}"),
         )),
         Err(error) => Err(api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -669,6 +917,34 @@ async fn state_runs(
     Ok(Json(serde_json::to_value(&runs).expect("runs serialise")))
 }
 
+/// Resolve a run id or unique prefix to its summary — the CLI's prefix
+/// semantics: `API013` when nothing matches, `API014` when ambiguous.
+fn resolve_run(state: &dyn StateStore, id: &str) -> Result<RunSummary, (StatusCode, Json<Value>)> {
+    let matches = state.find_runs(id).map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "API011",
+            error.to_string(),
+        )
+    })?;
+    match matches.as_slice() {
+        [] => Err(api_error(
+            StatusCode::NOT_FOUND,
+            "API013",
+            format!("no run matches `{id}`"),
+        )),
+        [only] => Ok(only.clone()),
+        _ => Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "API014",
+            format!(
+                "`{id}` matches {} runs — give a longer prefix",
+                matches.len()
+            ),
+        )),
+    }
+}
+
 /// `phlo-transform state show <run>` — run record + stored plan + per-item
 /// records. The id may be a unique prefix, like the CLI.
 async fn state_run(
@@ -676,33 +952,7 @@ async fn state_run(
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult {
     let state = require_state(&service)?;
-    let matches = state.find_runs(&id).map_err(|error| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "API011",
-            error.to_string(),
-        )
-    })?;
-    let summary = match matches.as_slice() {
-        [] => {
-            return Err(api_error(
-                StatusCode::NOT_FOUND,
-                "API013",
-                format!("no run matches `{id}`"),
-            ))
-        }
-        [only] => only,
-        _ => {
-            return Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "API014",
-                format!(
-                    "`{id}` matches {} runs — give a longer prefix",
-                    matches.len()
-                ),
-            ))
-        }
-    };
+    let summary = resolve_run(state.as_ref(), &id)?;
     let stored = state
         .run(&summary.run_id)
         .map_err(|error| {
@@ -743,6 +993,68 @@ async fn state_run(
     Ok(Json(json!({
         "run": stored.record,
         "plan": stored.plan,
+        "models": models,
+        "seeds": seeds,
+        "tests": tests,
+    })))
+}
+
+/// `phlo-transform state show <run> --failed` — the failed/blocked/
+/// cancelled items of one run: what `resume`/`retry_failed` would pick up.
+async fn state_run_failed(
+    State(service): State<Arc<WorkspaceService>>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult {
+    let state = require_state(&service)?;
+    let summary = resolve_run(state.as_ref(), &id)?;
+    let models = state
+        .model_runs(&summary.run_id)
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "API011",
+                error.to_string(),
+            )
+        })?
+        .into_iter()
+        .filter(|record| {
+            matches!(
+                record.status,
+                ExecutionStatus::Failed | ExecutionStatus::Blocked | ExecutionStatus::Cancelled
+            )
+        })
+        .collect::<Vec<_>>();
+    let seeds = state
+        .seed_runs(&summary.run_id)
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "API011",
+                error.to_string(),
+            )
+        })?
+        .into_iter()
+        .filter(|record| {
+            matches!(
+                record.status,
+                ExecutionStatus::Failed | ExecutionStatus::Blocked | ExecutionStatus::Cancelled
+            )
+        })
+        .collect::<Vec<_>>();
+    let tests = state
+        .test_runs(&summary.run_id)
+        .map_err(|error| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "API011",
+                error.to_string(),
+            )
+        })?
+        .into_iter()
+        .filter(|record| record.status == ExecutionStatus::Failed)
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "run_id": summary.run_id,
         "models": models,
         "seeds": seeds,
         "tests": tests,
@@ -844,16 +1156,36 @@ async fn operations_submit(
     // that can never run.
     let needs = match &params {
         Params::Run(_) | Params::Test(_) => service.adapter().is_none().then_some("adapter"),
+        Params::Resume(_) | Params::RetryFailed(_) => {
+            if service.adapter().is_none() {
+                Some("adapter")
+            } else {
+                service.state().is_none().then_some("state")
+            }
+        }
         Params::Promote(_) => service.nessie().is_none().then_some("nessie"),
         Params::Reload(_) => None,
     };
     if let Some(what) = needs {
         return Err(missing(what));
     }
-    let record = match ops.submit(&params, idempotency_key.as_deref()) {
+    let record = match ops
+        .submit(&params, idempotency_key.as_deref())
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.code, error.message))?
+    {
         SubmitOutcome::New(record) => record,
         SubmitOutcome::Replayed(record) => {
             return Ok(Json(json!({ "operation": record, "replayed": true })))
+        }
+        SubmitOutcome::Conflict(existing) => {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "API016",
+                format!(
+                    "idempotency key already used for a different `{}` request — it owns operation `{}`",
+                    existing.kind, existing.id
+                ),
+            ))
         }
         SubmitOutcome::Busy => {
             return Err(api_error(

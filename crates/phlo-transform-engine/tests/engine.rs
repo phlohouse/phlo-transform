@@ -20,13 +20,15 @@ use phlo_transform_core::{
     TestId,
 };
 use phlo_transform_engine::{
-    branch_diff, changed_models, collect_source_states, ensure_environment,
-    materialized_for_environment, Adapter, AdapterError, ArtifactWriter, BranchDiffRequest,
-    CancelHandle, CatalogRequest, ColumnInfo, ContractSafety, DatasetStatus, EngineError,
-    EngineEvent, EnvironmentSpec, ExecutionStatus, FailureCategory, MaterializedRecord, Membership,
-    ModelResult, ModelRunRecord, Plan, PlanAction, PlanOptions, Planner, PromotionRecord,
-    QueryResult, ReasonKind, RetryPolicy, RunOptions, RunRecord, RunResult, RunSummary, Runner,
-    SeedRecord, SeedRunRecord, SqliteStateStore, StateStore, StoredPlan, StoredRun, TestRunRecord,
+    branch_diff, catalog_name, changed_models, collect_source_states, ensure_candidate,
+    ensure_environment, materialized_for_environment, read_environment_for,
+    write_environment_artifacts, Adapter, AdapterError, ArtifactWriter, BranchDiffRequest,
+    CancelHandle, CatalogRequest, CatalogStatus, ColumnInfo, ContractSafety, DatasetStatus,
+    EngineError, EngineEvent, EnvironmentContext, EnvironmentMode, EnvironmentSetup,
+    EnvironmentSpec, ExecutionStatus, FailureCategory, MaterializedRecord, Membership, ModelResult,
+    ModelRunRecord, Plan, PlanAction, PlanOptions, Planner, PromotionRecord, QueryResult,
+    ReasonKind, RetryPolicy, RunOptions, RunRecord, RunResult, RunSummary, Runner, SeedRecord,
+    SeedRunRecord, SqliteStateStore, StateStore, StoredPlan, StoredRun, TestRunRecord,
 };
 
 /// How a target should fail: the error to return, and how many attempts it
@@ -77,6 +79,10 @@ struct FakeAdapter {
     /// Query ids passed to `cancel` — shared across tracked views so tests
     /// can observe what the runner killed.
     cancelled: Arc<Mutex<BTreeSet<String>>>,
+    /// Catalogs this adapter claims to have provisioned — a first call for
+    /// a name reports `Created`, later calls report `Unverified` (the fake
+    /// cannot read back the bound ref, like Trino).
+    catalogs: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl FakeAdapter {
@@ -216,6 +222,7 @@ impl FakeAdapter {
             max_concurrent: self.max_concurrent.clone(),
             in_flight: Arc::new(Mutex::new(BTreeSet::new())),
             cancelled: self.cancelled.clone(),
+            catalogs: self.catalogs.clone(),
         }
     }
 
@@ -456,8 +463,19 @@ impl Adapter for FakeAdapter {
         Ok(self.columns.lock().unwrap().clone())
     }
 
-    async fn ensure_catalog(&self, _request: &CatalogRequest) -> Result<(), AdapterError> {
-        Ok(())
+    async fn ensure_catalog(
+        &self,
+        request: &CatalogRequest,
+    ) -> Result<CatalogStatus, AdapterError> {
+        if request.reference.is_none() || request.nessie_uri.is_none() {
+            return Ok(CatalogStatus::Unmanaged);
+        }
+        let mut catalogs = self.catalogs.lock().unwrap();
+        if catalogs.insert(request.catalog.clone()) {
+            Ok(CatalogStatus::Created)
+        } else {
+            Ok(CatalogStatus::Unverified)
+        }
     }
 
     async fn ensure_schema(&self, _relation: &Relation) -> Result<(), AdapterError> {
@@ -5350,15 +5368,17 @@ fn gate_results_round_trip_through_json() {
 // Promotion provenance: EnvironmentSetup::created_from
 // ---------------------------------------------------------------------------
 
-use phlo_transform_nessie::InMemoryNessie;
+use phlo_transform_nessie::{InMemoryNessie, NessieClient};
 
 fn environment_spec(candidate: &str) -> EnvironmentSpec {
     EnvironmentSpec {
         base_ref: "main".to_string(),
         candidate_ref: candidate.to_string(),
-        nessie_uri: None,
+        // A catalog-facing URI so `ensure_catalog` genuinely engages — the
+        // FakeAdapter reports Unmanaged without one.
+        nessie_uri: Some("http://nessie.invalid".to_string()),
         warehouse: None,
-        catalog: "phlo_test".to_string(),
+        catalog: Some("phlo_test".to_string()),
     }
 }
 
@@ -5411,4 +5431,426 @@ async fn the_base_ref_as_candidate_is_its_own_provenance() {
         setup.created_from.as_ref().map(|base| base.hash.as_str()),
         Some("aaa")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Candidate catalog identity: collision-safe names + verified bindings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn catalog_names_for_punctuation_equivalent_refs_never_collide() {
+    let slashed = catalog_name("ci/pr-1");
+    let underscored = catalog_name("ci_pr_1");
+    let dashed = catalog_name("ci-pr-1");
+    // All three fold to the same readable prefix — the ref's own hash is
+    // what keeps them on distinct physical catalogs.
+    for name in [&slashed, &underscored, &dashed] {
+        assert!(name.starts_with("phlo_ci_pr_1_"), "{name}");
+    }
+    assert_ne!(slashed, underscored);
+    assert_ne!(slashed, dashed);
+    assert_ne!(underscored, dashed);
+    assert_eq!(catalog_name("ci/pr-1"), slashed, "names are deterministic");
+}
+
+#[test]
+fn a_ref_with_no_readable_characters_still_gets_a_valid_name() {
+    let name = catalog_name("!!!");
+    assert!(name.starts_with("phlo_"), "{name}");
+    assert!(name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'));
+    assert_ne!(name, catalog_name("???"));
+}
+
+#[tokio::test]
+async fn a_fresh_candidate_gets_the_generated_catalog_name() {
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+
+    let setup = ensure_candidate(
+        dir.path(),
+        &nessie,
+        &adapter,
+        &EnvironmentSpec {
+            catalog: None,
+            ..environment_spec("ci/pr-1")
+        },
+    )
+    .await
+    .expect("provisioned");
+
+    assert_eq!(setup.catalog, catalog_name("ci/pr-1"));
+    assert_eq!(setup.catalog_status, CatalogStatus::Created);
+}
+
+#[tokio::test]
+async fn a_rerun_of_the_same_candidate_reuses_its_recorded_catalog() {
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+    let spec = EnvironmentSpec {
+        catalog: None,
+        ..environment_spec("ci/pr-1")
+    };
+
+    let first = ensure_candidate(dir.path(), &nessie, &adapter, &spec)
+        .await
+        .expect("first provision");
+    // The catalog now exists in the adapter: the second call reports
+    // Unverified, and the recorded binding is what accepts it.
+    let second = ensure_candidate(dir.path(), &nessie, &adapter, &spec)
+        .await
+        .expect("reprovision");
+
+    assert_eq!(second.catalog, first.catalog);
+    assert_eq!(second.catalog_status, CatalogStatus::Unverified);
+    // Recorded cut-from provenance survives the rerun.
+    assert_eq!(
+        second.created_from.as_ref().map(|base| base.hash.as_str()),
+        Some("aaa")
+    );
+}
+
+#[tokio::test]
+async fn an_unverified_catalog_recorded_for_this_ref_is_accepted() {
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa").seed("ci/x", "bbb");
+    let adapter = FakeAdapter::default();
+    // `custom_cat` already exists — a later ensure reports Unverified.
+    adapter
+        .catalogs
+        .lock()
+        .unwrap()
+        .insert("custom_cat".to_string());
+    let dir = tempfile::tempdir().unwrap();
+    // Recorded evidence: this workspace bound `ci/x` to `custom_cat` before.
+    write_environment_artifacts(
+        dir.path(),
+        &EnvironmentSetup {
+            base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
+            candidate: phlo_transform_nessie::ReferenceInfo::branch("ci/x", "bbb"),
+            created_from: Some(phlo_transform_nessie::ReferenceInfo::branch("main", "aaa")),
+            created_branch: true,
+            catalog: "custom_cat".to_string(),
+            catalog_status: CatalogStatus::Created,
+        },
+    )
+    .expect("writes");
+
+    let setup = ensure_candidate(
+        dir.path(),
+        &nessie,
+        &adapter,
+        &EnvironmentSpec {
+            catalog: None,
+            ..environment_spec("ci/x")
+        },
+    )
+    .await
+    .expect("recorded binding is honoured");
+
+    assert_eq!(setup.catalog, "custom_cat");
+    assert_eq!(setup.catalog_status, CatalogStatus::Unverified);
+}
+
+#[tokio::test]
+async fn an_unverified_catalog_with_no_recorded_binding_is_refused() {
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa").seed("ci/x", "bbb");
+    let adapter = FakeAdapter::default();
+    adapter
+        .catalogs
+        .lock()
+        .unwrap()
+        .insert("foreign".to_string());
+    let dir = tempfile::tempdir().unwrap();
+
+    let error = ensure_candidate(
+        dir.path(),
+        &nessie,
+        &adapter,
+        &EnvironmentSpec {
+            catalog: Some("foreign".to_string()),
+            ..environment_spec("ci/x")
+        },
+    )
+    .await
+    .expect_err("an existing foreign catalog must not be adopted on name alone");
+
+    assert!(error.to_string().contains("cannot be verified"), "{error}");
+}
+
+#[tokio::test]
+async fn a_catalog_claimed_by_another_candidate_is_refused() {
+    let nessie = InMemoryNessie::new();
+    nessie
+        .seed("main", "aaa")
+        .seed("ci/x", "bbb")
+        .seed("ci/y", "ccc");
+    let adapter = FakeAdapter::default();
+    adapter
+        .catalogs
+        .lock()
+        .unwrap()
+        .insert("shared".to_string());
+    let dir = tempfile::tempdir().unwrap();
+    // `ci/y`'s evidence says `shared` is its catalog.
+    write_environment_artifacts(
+        dir.path(),
+        &EnvironmentSetup {
+            base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
+            candidate: phlo_transform_nessie::ReferenceInfo::branch("ci/y", "ccc"),
+            created_from: Some(phlo_transform_nessie::ReferenceInfo::branch("main", "aaa")),
+            created_branch: true,
+            catalog: "shared".to_string(),
+            catalog_status: CatalogStatus::Created,
+        },
+    )
+    .expect("writes");
+
+    let error = ensure_candidate(
+        dir.path(),
+        &nessie,
+        &adapter,
+        &EnvironmentSpec {
+            catalog: Some("shared".to_string()),
+            ..environment_spec("ci/x")
+        },
+    )
+    .await
+    .expect_err("one catalog must never serve two candidate refs");
+
+    assert!(
+        error
+            .to_string()
+            .contains("already claimed by another candidate"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_catalog_name_claimed_by_another_candidate_is_refused() {
+    // The catalog does not exist in the adapter — it would report Created —
+    // but another candidate's evidence already claims the name. The claim
+    // check precedes provisioning: a stale or conflicting artifact can never
+    // let two refs share one physical catalog.
+    let nessie = InMemoryNessie::new();
+    nessie
+        .seed("main", "aaa")
+        .seed("ci/x", "bbb")
+        .seed("ci/y", "ccc");
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+    write_environment_artifacts(
+        dir.path(),
+        &EnvironmentSetup {
+            base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
+            candidate: phlo_transform_nessie::ReferenceInfo::branch("ci/y", "ccc"),
+            created_from: Some(phlo_transform_nessie::ReferenceInfo::branch("main", "aaa")),
+            created_branch: true,
+            catalog: "claimed".to_string(),
+            catalog_status: CatalogStatus::Created,
+        },
+    )
+    .expect("writes");
+
+    let error = ensure_candidate(
+        dir.path(),
+        &nessie,
+        &adapter,
+        &EnvironmentSpec {
+            catalog: Some("claimed".to_string()),
+            ..environment_spec("ci/x")
+        },
+    )
+    .await
+    .expect_err("recorded claims win over a fresh create");
+
+    assert!(
+        error
+            .to_string()
+            .contains("already claimed by another candidate"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_catalog_created_fresh_is_accepted() {
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+
+    let setup = ensure_candidate(
+        dir.path(),
+        &nessie,
+        &adapter,
+        &EnvironmentSpec {
+            catalog: Some("pinned".to_string()),
+            ..environment_spec("ci/x")
+        },
+    )
+    .await
+    .expect("provisioned");
+
+    assert_eq!(setup.catalog, "pinned");
+    assert_eq!(setup.catalog_status, CatalogStatus::Created);
+}
+
+// ---------------------------------------------------------------------------
+// EnvironmentContext::resolve — the shared plan/run environment resolution
+// ---------------------------------------------------------------------------
+
+fn resolve_context<'a>(
+    root: &'a Path,
+    nessie: Option<&'a InMemoryNessie>,
+    adapter: Option<&'a FakeAdapter>,
+    nessie_uri: Option<&'a str>,
+) -> EnvironmentContext<'a> {
+    EnvironmentContext {
+        root,
+        nessie: nessie.map(|n| n as &dyn NessieClient),
+        adapter: adapter.map(|a| a as &dyn Adapter),
+        nessie_uri,
+        warehouse: None,
+        catalog: None,
+    }
+}
+
+/// A minimal on-disk workspace — `resolve(ReadOnly)` recompiles it.
+fn write_workspace(root: &Path) {
+    std::fs::write(
+        root.join("phlo.toml"),
+        "[transform]\ndefault_materialization = \"table\"\n",
+    )
+    .expect("phlo.toml");
+    let transforms = root.join("transforms").join("assay");
+    std::fs::create_dir_all(&transforms).expect("dirs");
+    std::fs::write(transforms.join("raw.sql"), "select 1 as id\n").expect("raw.sql");
+}
+
+#[tokio::test]
+async fn a_read_only_resolve_never_provisions() {
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+    write_workspace(dir.path());
+
+    let target = resolve_context(
+        dir.path(),
+        Some(&nessie),
+        Some(&adapter),
+        Some("http://nessie"),
+    )
+    .resolve(Some("ci/pr-1"), "main", EnvironmentMode::ReadOnly)
+    .await
+    .expect("resolved");
+
+    let expected = catalog_name("ci/pr-1");
+    assert_eq!(target.catalog.as_deref(), Some(expected.as_str()));
+    assert!(target.compilation.is_some());
+    assert!(target.setup.is_none(), "nothing was provisioned");
+    assert!(
+        nessie.get_reference("ci/pr-1").await.unwrap().is_none(),
+        "a preview must not create the branch"
+    );
+    assert!(
+        adapter.catalogs.lock().unwrap().is_empty(),
+        "a preview must not create the catalog"
+    );
+    assert!(read_environment_for(dir.path(), "ci/pr-1").is_none());
+}
+
+#[tokio::test]
+async fn read_only_and_ensure_resolve_the_same_physical_catalog() {
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+    write_workspace(dir.path());
+    let context = resolve_context(
+        dir.path(),
+        Some(&nessie),
+        Some(&adapter),
+        Some("http://nessie"),
+    );
+
+    let preview = context
+        .resolve(Some("ci/pr-1"), "main", EnvironmentMode::ReadOnly)
+        .await
+        .expect("preview");
+    let ensured = context
+        .resolve(Some("ci/pr-1"), "main", EnvironmentMode::Ensure)
+        .await
+        .expect("ensured");
+
+    assert_eq!(preview.catalog, ensured.catalog);
+    assert_eq!(
+        ensured.setup.as_ref().map(|setup| setup.catalog_status),
+        Some(CatalogStatus::Created)
+    );
+    // After the ensure, a read resolves the recorded binding — same catalog.
+    let after = context
+        .resolve(Some("ci/pr-1"), "main", EnvironmentMode::ReadOnly)
+        .await
+        .expect("re-resolve");
+    assert_eq!(after.catalog, ensured.catalog);
+    assert!(after.setup.is_some(), "the recorded binding is returned");
+}
+
+#[tokio::test]
+async fn a_nessie_backed_environment_without_a_catalog_uri_fails_closed() {
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+
+    for mode in [EnvironmentMode::ReadOnly, EnvironmentMode::Ensure] {
+        let result = resolve_context(dir.path(), Some(&nessie), Some(&adapter), None)
+            .resolve(Some("dev"), "main", mode)
+            .await;
+        match result {
+            Err(error @ EngineError::NotConfigured(_)) => {
+                assert!(error.to_string().contains("dev"), "{error}");
+            }
+            Err(error) => panic!("expected NotConfigured, got {error}"),
+            Ok(_) => panic!("a claimed branch without provisioning capability must fail"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_nessie_less_environment_is_an_honest_label() {
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+    let target = resolve_context(dir.path(), None, Some(&adapter), None)
+        .resolve(Some("dev"), "main", EnvironmentMode::Ensure)
+        .await
+        .expect("label-only mode resolves to the default target");
+    assert!(target.compilation.is_none());
+    assert!(target.catalog.is_none());
+}
+
+#[tokio::test]
+async fn the_base_ref_is_not_a_candidate() {
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+    let target = resolve_context(
+        dir.path(),
+        Some(&nessie),
+        Some(&adapter),
+        Some("http://nessie"),
+    )
+    .resolve(Some("main"), "main", EnvironmentMode::Ensure)
+    .await
+    .expect("base ref");
+    assert!(target.compilation.is_none());
+    assert!(target.catalog.is_none());
 }

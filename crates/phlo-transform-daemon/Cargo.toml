@@ -23,6 +23,8 @@ phlo-transform-nessie = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
 tempfile = "3"
+testcontainers = "0.28"
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 phlo-transform-duckdb = { workspace = true }
 phlo-transform-engine = { workspace = true }
+phlo-transform-trino = { workspace = true }

@@ -97,6 +97,38 @@ pub fn read_environment_for(workspace_root: &Path, candidate: &str) -> Option<En
         .or_else(|| read_environment(workspace_root).filter(matches))
 }
 
+/// Every recorded environment binding in this workspace: the per-candidate
+/// files plus the single-slot `environment.json`, deduplicated by candidate
+/// name. Used to detect one physical catalog claimed by two refs.
+pub fn environment_artifacts(workspace_root: &Path) -> Vec<EnvironmentSetup> {
+    let directory = artifact_path(workspace_root, "");
+    let parse = |text: String| -> Option<EnvironmentSetup> {
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        serde_json::from_value(value.get("environment")?.clone()).ok()
+    };
+    let mut setups: Vec<EnvironmentSetup> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&directory) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with("environment") || !name.ends_with(".json") {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                if let Some(setup) = parse(text) {
+                    if !setups
+                        .iter()
+                        .any(|seen: &EnvironmentSetup| seen.candidate.name == setup.candidate.name)
+                    {
+                        setups.push(setup);
+                    }
+                }
+            }
+        }
+    }
+    setups
+}
+
 /// Drop a candidate's local provisioning evidence after its branch is gone.
 pub fn remove_environment_artifacts(workspace_root: &Path, candidate: &str) {
     let _ = std::fs::remove_file(artifact_path(

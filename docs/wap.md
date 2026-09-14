@@ -61,10 +61,19 @@ PLAN → WRITE candidate branch → AUDIT (tests) → PUBLISH (promote)
 3. models are compiled with that catalog as the physical target and applied
    there. `main` is untouched until promotion.
 
-The provisioned catalog name defaults to `phlo_<sanitized ref>` and can be
+The provisioned catalog name defaults to `phlo_<sanitised ref>_<hash>` — the
+readable ref plus 8 hex of its SHA-256, so punctuation-equivalent refs
+(`ci/pr-1`, `ci_pr_1`) can never collide on one physical catalog — and can be
 overridden with `--catalog`; `--warehouse` sets the Iceberg warehouse (for
-example `local:///tmp/phlo-warehouse` or `s3://bucket/wh`). Provisioning is
-recorded in `.phlo/transform/environment.json` — the workspace's current
+example `local:///tmp/phlo-warehouse` or `s3://bucket/wh`). Because a
+catalog's bound Nessie ref cannot be read back over SQL, an existing catalog
+is never adopted on name alone: an `unverified` catalog is accepted only when
+its name is the candidate's own generated convention or a recorded artifact
+binds it to the same ref, and a catalog another candidate's evidence claims is
+refused outright. The provisioning records `catalog_status` (`created`,
+`unverified`, `unmanaged`) so cleanup drops only catalogs Phlo provably
+created. Provisioning is recorded in
+`.phlo/transform/environment.json` — the workspace's current
 environment — plus a per-candidate copy named
 `environment_<sanitised ref>_<hash>.json`, so one candidate's evidence
 survives another being provisioned and similarly-named refs never share a

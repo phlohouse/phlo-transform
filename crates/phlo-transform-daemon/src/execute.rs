@@ -1,20 +1,21 @@
-//! Operation executors: run/test/promote/reload, reusing the same engine
-//! entry points and report DTOs as the CLI so API results are byte-identical
-//! in shape to `--json` output.
+//! Operation executors: run/resume/retry_failed/test/promote/reload,
+//! reusing the same engine entry points and report DTOs as the CLI so API
+//! results are byte-identical in shape to `--json` output.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use phlo_transform_core::{resolve_selection, SelectorSet};
+use phlo_transform_core::{resolve_selection, Compilation, SelectorSet};
 use phlo_transform_engine::{
-    audited_diff, audited_lineage, catalog_name, contract_breaking_changes, evaluate_gates,
-    read_environment_for, remove_environment_artifacts, ArtifactWriter, ExecutionStatus, GateInput,
-    PlanOptions, Planner, PromotionRequest, RetryPolicy, RunOptions, Runner,
+    audited_diff, audited_lineage, contract_breaking_changes, evaluate_gates, read_environment_for,
+    remove_environment_artifacts, ArtifactWriter, CatalogStatus, EngineError, EnvironmentMode,
+    ExecutionStatus, GateInput, PlanOptions, Planner, PromotionRequest, RetryPolicy, RunOptions,
+    RunResult, Runner,
 };
 
 use crate::operations::{
-    OperationError, OperationStore, Params, PromoteParams, RunParams, TestParams,
+    ContinueParams, OperationError, OperationStore, Params, PromoteParams, RunParams, TestParams,
 };
 use crate::WorkspaceService;
 
@@ -44,10 +45,84 @@ pub async fn execute(
 ) -> Result<Value, OperationError> {
     match params {
         Params::Run(p) => op_run(&service, &ops, &id, p).await,
+        Params::Resume(p) => op_continue(&service, &ops, &id, p, Continuation::Resume).await,
+        Params::RetryFailed(p) => {
+            op_continue(&service, &ops, &id, p, Continuation::RetryFailed).await
+        }
         Params::Test(p) => op_test(&service, &ops, &id, p).await,
         Params::Promote(p) => op_promote(&service, &ops, &id, p).await,
         Params::Reload(_) => op_reload(&service).await,
     }
+}
+
+/// Map a resolution failure to the operation error surface: a configured
+/// Nessie whose candidate catalog cannot be provisioned is `API007` (the
+/// environment claims branch semantics the daemon cannot honour), every
+/// other engine failure is `API011`.
+fn resolution_error(error: EngineError) -> OperationError {
+    let code = match error {
+        EngineError::NotConfigured(_) => "API007",
+        _ => "API011",
+    };
+    op_error(code, error.to_string())
+}
+
+/// The compilation an environment-targeted operation must plan and execute
+/// against, resolved through the shared environment context in `Ensure`
+/// mode: a candidate environment provisions its Nessie branch and catalog,
+/// then the workspace recompiles retargeted at it — so the run physically
+/// writes to the environment it claims.
+///
+/// With no Nessie client the environment can only ever be a state-record
+/// label — local mode is truthful and the shared snapshot is used. Once a
+/// Nessie client is in play a named environment claims branch semantics:
+/// if the daemon cannot provision branch isolation the operation fails
+/// closed rather than run against the default target and bind its evidence
+/// to the candidate's head.
+async fn target_for(
+    service: &Arc<WorkspaceService>,
+    environment: Option<&str>,
+    base_ref: &str,
+) -> Result<Arc<Compilation>, OperationError> {
+    let target = service
+        .environment_context()
+        .resolve(environment, base_ref, EnvironmentMode::Ensure)
+        .await
+        .map_err(resolution_error)?;
+    match target.compilation {
+        Some(compilation) => Ok(Arc::new(compilation)),
+        None => Ok(service.snapshot()),
+    }
+}
+
+/// Bind a passed run to its environment's post-run Nessie head — the
+/// commit its writes produced, not the pre-run snapshot. An unbound run
+/// cannot later promote. The run's own environment label is used, so
+/// `resume`/`retry_failed` bind the environment the original run targeted.
+async fn bind_run_reference(
+    service: &Arc<WorkspaceService>,
+    result: &RunResult,
+) -> Result<(), OperationError> {
+    if result.status != ExecutionStatus::Passed {
+        return Ok(());
+    }
+    let (Some(state), Some(environment), Some(nessie)) = (
+        service.state(),
+        result.environment.as_deref(),
+        service.nessie(),
+    ) else {
+        return Ok(());
+    };
+    let Some(head) = nessie
+        .get_reference(environment)
+        .await
+        .map_err(|error| op_error("API011", error.to_string()))?
+    else {
+        return Ok(());
+    };
+    state
+        .bind_run_reference_hash(&result.run_id, &head.hash)
+        .map_err(|error| op_error("API011", error.to_string()))
 }
 
 async fn op_run(
@@ -57,14 +132,15 @@ async fn op_run(
     params: RunParams,
 ) -> Result<Value, OperationError> {
     let adapter = service.adapter().ok_or_else(|| not_configured("adapter"))?;
-    let compilation = service.snapshot();
+    let environment = params
+        .environment
+        .or_else(|| service.default_environment().map(str::to_string));
+    let base_ref = params.base.clone().unwrap_or_else(|| "main".to_string());
+    let compilation = target_for(service, environment.as_deref(), &base_ref).await?;
     let set = SelectorSet::parse(&params.selectors, &[], &[], false, false)
         .map_err(|error| op_error("API006", error.to_string()))?;
     let selection = resolve_selection(&compilation, &set, None)
         .map_err(|error| op_error("API006", error.to_string()))?;
-    let environment = params
-        .environment
-        .or_else(|| service.default_environment().map(str::to_string));
     let planner = Planner::new(adapter.clone(), service.state());
     let plan = planner
         .plan(
@@ -96,31 +172,89 @@ async fn op_run(
         .apply(&compilation, &plan, &options)
         .await
         .map_err(|error| op_error("API011", error.to_string()))?;
-    // Bind a passed run to the environment's post-run Nessie head — the
-    // commit its writes produced, not the pre-run snapshot. An unbound run
-    // cannot later promote.
-    if result.status == ExecutionStatus::Passed {
-        if let (Some(state), Some(environment), Some(nessie)) = (
-            service.state(),
-            result.environment.as_deref(),
-            service.nessie(),
-        ) {
-            let head = nessie
-                .get_reference(environment)
-                .await
-                .map_err(|error| op_error("API011", error.to_string()))?;
-            if let Some(head) = head {
-                state
-                    .bind_run_reference_hash(&result.run_id, &head.hash)
-                    .map_err(|error| op_error("API011", error.to_string()))?;
-            }
-        }
-    }
+    bind_run_reference(service, &result).await?;
     writer
         .write_run(&result)
         .map_err(|error| op_error("API011", error.to_string()))?;
     // The runner's cancel signal IS this op's CancelHandle: when it reports
     // cancelled, finish() marks the record cancelled automatically.
+    Ok(serde_json::to_value(&result).expect("run report serialises"))
+}
+
+/// Which continuation an operation runs: `resume` continues an interrupted
+/// run under its original id; `retry_failed` starts a new run over the
+/// failed portion of a finished one.
+enum Continuation {
+    Resume,
+    RetryFailed,
+}
+
+/// `resume` and `retry_failed`: the stored run's environment is
+/// authoritative — the continuation provisions and retargets whatever
+/// environment the original run targeted, exactly like the CLI's
+/// `run --resume/--retry-failed --ref <env>`.
+async fn op_continue(
+    service: &Arc<WorkspaceService>,
+    ops: &Arc<OperationStore>,
+    id: &str,
+    params: ContinueParams,
+    continuation: Continuation,
+) -> Result<Value, OperationError> {
+    let adapter = service.adapter().ok_or_else(|| not_configured("adapter"))?;
+    let state = service.state().ok_or_else(|| not_configured("state"))?;
+    let matches = state
+        .find_runs(&params.run)
+        .map_err(|error| op_error("API011", error.to_string()))?;
+    let environment = match matches.as_slice() {
+        [only] => only.environment.clone(),
+        [] => {
+            return Err(op_error(
+                "API013",
+                format!("no run matches `{}`", params.run),
+            ))
+        }
+        _ => {
+            return Err(op_error(
+                "API014",
+                format!(
+                    "`{}` matches {} runs — give a longer prefix",
+                    params.run,
+                    matches.len()
+                ),
+            ))
+        }
+    };
+    // Provision against the base the environment was cut from when that is
+    // recorded, else the conventional `main`.
+    let base_ref = environment
+        .as_deref()
+        .and_then(|env| read_environment_for(service.root(), env))
+        .map(|setup| setup.base.name)
+        .unwrap_or_else(|| "main".to_string());
+    let compilation = target_for(service, environment.as_deref(), &base_ref).await?;
+    let options = RunOptions {
+        environment,
+        run_tests: true,
+        cancel: ops.cancel_handle(id),
+        retry: RetryPolicy::default(),
+        ..RunOptions::default()
+    };
+    let runner = Runner::new(adapter, service.state());
+    let result = match continuation {
+        Continuation::Resume => runner.resume(&compilation, &params.run, &options).await,
+        Continuation::RetryFailed => {
+            runner
+                .retry_failed(&compilation, &params.run, &options)
+                .await
+        }
+    }
+    .map_err(|error| op_error("API011", error.to_string()))?;
+    bind_run_reference(service, &result).await?;
+    let writer = ArtifactWriter::for_workspace(service.root());
+    writer
+        .write_project(&compilation)
+        .and_then(|_| writer.write_run(&result))
+        .map_err(|error| op_error("API011", error.to_string()))?;
     Ok(serde_json::to_value(&result).expect("run report serialises"))
 }
 
@@ -363,18 +497,21 @@ async fn op_promote(
 }
 
 /// Drop the candidate's catalog and branch after a merge — every failure is
-/// reported, never silent (same contract as the CLI's cleanup).
+/// reported, never silent (same contract as the CLI's cleanup). Only a
+/// catalog phlo provably created (`CatalogStatus::Created` in the recorded
+/// evidence) is dropped: an adopted or unmanaged catalog belongs to
+/// someone else, and without evidence the name is only a guess.
 async fn cleanup_candidate(
     service: &Arc<WorkspaceService>,
     candidate: &str,
     environment: Option<&phlo_transform_engine::EnvironmentSetup>,
 ) -> Result<(), String> {
-    let catalog = environment
-        .map(|setup| setup.catalog.clone())
-        .unwrap_or_else(|| catalog_name(candidate));
     let mut failures = Vec::new();
-    match service.adapter() {
-        Some(adapter) => {
+    let drop_catalog = environment
+        .filter(|setup| setup.catalog_status == CatalogStatus::Created)
+        .map(|setup| setup.catalog.clone());
+    match (drop_catalog, service.adapter()) {
+        (Some(catalog), Some(adapter)) => {
             if let Err(error) = adapter
                 .execute(&format!("DROP CATALOG IF EXISTS {}", catalog))
                 .await
@@ -382,9 +519,10 @@ async fn cleanup_candidate(
                 failures.push(format!("drop catalog `{catalog}`: {error}"));
             }
         }
-        None => {
+        (Some(catalog), None) => {
             failures.push(format!("no adapter configured to drop catalog `{catalog}`"));
         }
+        (None, _) => {}
     }
     if let Some(nessie) = service.nessie() {
         if let Err(error) = nessie.delete_branch(candidate).await {
