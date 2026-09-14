@@ -29,8 +29,18 @@ pub struct EnvironmentSpec {
 /// The provisioned environment.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnvironmentSetup {
+    /// The base reference as resolved at provisioning time — informational:
+    /// it says which ref `base_ref` named, not what the candidate was cut
+    /// from. Provenance lives in `created_from`.
     pub base: ReferenceInfo,
     pub candidate: ReferenceInfo,
+    /// Immutable provenance: the reference (and commit) the candidate branch
+    /// was actually created from. Recorded only when provable — when this
+    /// call created the branch, or a prior artifact recorded it. `None` for
+    /// a pre-existing branch with no recorded origin: promotion must never
+    /// silently redefine an existing branch's base as today's target.
+    #[serde(default)]
+    pub created_from: Option<ReferenceInfo>,
     pub created_branch: bool,
     pub catalog: String,
 }
@@ -67,6 +77,15 @@ pub async fn ensure_environment(
             ),
         }
     };
+    // Provenance is recorded only when it is provable: a branch we just
+    // created is by construction cut from `base`; a pre-existing branch's
+    // origin is unknown here — the caller may preserve a prior artifact's
+    // `created_from`, but this function must not guess.
+    let created_from = if created_branch || candidate.name == base.name {
+        Some(base.clone())
+    } else {
+        None
+    };
 
     adapter
         .ensure_catalog(&CatalogRequest {
@@ -81,6 +100,7 @@ pub async fn ensure_environment(
     Ok(EnvironmentSetup {
         base,
         candidate,
+        created_from,
         created_branch,
         catalog: spec.catalog.clone(),
     })

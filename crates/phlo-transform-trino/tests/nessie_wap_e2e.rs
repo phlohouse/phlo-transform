@@ -20,6 +20,7 @@ use phlo_transform_engine::{
     branch_diff, diff, ensure_environment, evaluate_gates, promote, Adapter, BranchDiffRequest,
     CatalogRequest, DatasetStatus, DiffPolicy, DiffRequest, DiffStrategy, EnvironmentSpec,
     ExecutionStatus, GateInput, PlanOptions, Planner, PromotionRequest, RunOptions, Runner,
+    SqliteStateStore, StateStore,
 };
 use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -74,9 +75,10 @@ async fn apply(
     adapter: Arc<TrinoAdapter>,
     compilation: &Compilation,
     environment: &str,
+    state: Option<Arc<dyn phlo_transform_engine::StateStore>>,
 ) -> phlo_transform_engine::RunResult {
     let selected = Selection::all(compilation);
-    let plan = Planner::new(adapter.clone(), None)
+    let plan = Planner::new(adapter.clone(), state.clone())
         .plan(
             compilation,
             &selected,
@@ -85,7 +87,7 @@ async fn apply(
         )
         .await
         .expect("plan");
-    Runner::new(adapter, None)
+    Runner::new(adapter, state)
         .apply(
             compilation,
             &plan,
@@ -155,10 +157,14 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
         .await
         .expect("main catalog");
 
+    // Runs record against a real state store so promotion gates evaluate
+    // stored evidence — not hand-constructed inputs.
+    let state: Arc<dyn StateStore> = Arc::new(SqliteStateStore::in_memory().expect("state"));
+
     // Seed base state on `main` before branching, so the candidate starts from
     // the audited base and promotion is a clean fast-forward-style merge.
     let base = compile(&project("phlo_main", 10));
-    let base_run = apply(adapter.clone(), &base, "main").await;
+    let base_run = apply(adapter.clone(), &base, "main", Some(state.clone())).await;
     assert_eq!(base_run.status, ExecutionStatus::Passed);
 
     // Provision the candidate branch and its catalog from the seeded `main`.
@@ -176,15 +182,42 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
     .await
     .expect("environment provisioned");
     assert!(setup.created_branch);
+    // The branch was just created: its cut-from provenance is provable.
+    assert_eq!(
+        setup.created_from.as_ref().map(|base| base.name.as_str()),
+        Some("main")
+    );
 
     // Write changed data to the candidate.
     let candidate = compile(&project("phlo_ci_pr_1", 25));
-    let candidate_run = apply(adapter.clone(), &candidate, "ci/pr-1").await;
+    let candidate_run = apply(adapter.clone(), &candidate, "ci/pr-1", Some(state.clone())).await;
     assert_eq!(
         candidate_run.status,
         ExecutionStatus::Passed,
         "{:?}",
         candidate_run.models
+    );
+
+    // Orchestration binding: a passed run is bound to the branch's post-run
+    // head — the commit its writes produced, not the provisioning snapshot.
+    // The stored run is what promotion later evaluates.
+    let post_run_head = nessie_client
+        .get_reference("ci/pr-1")
+        .await
+        .expect("candidate")
+        .expect("candidate exists")
+        .hash;
+    state
+        .bind_run_reference_hash(&candidate_run.run_id, &post_run_head)
+        .expect("bind run reference");
+    let stored_run = state
+        .latest_run(Some("ci/pr-1"))
+        .expect("latest run")
+        .expect("run recorded");
+    assert_eq!(
+        stored_run.reference_hash.as_deref(),
+        Some(post_run_head.as_str()),
+        "the stored run must carry the post-run candidate head"
     );
 
     // Main is unchanged; candidate has the new value.
@@ -223,7 +256,20 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
     assert!(report.passed);
 
     // Branch-level diff: the candidate rewrote both models — snapshot ids
-    // differ from the base's even without shared state records.
+    // differ from the base's even without shared state records. The resolved
+    // heads bind the report to the exact commits it audited.
+    let candidate_head = nessie_client
+        .get_reference("ci/pr-1")
+        .await
+        .expect("candidate")
+        .expect("candidate exists")
+        .hash;
+    let base_head = nessie_client
+        .get_reference("main")
+        .await
+        .expect("base")
+        .expect("main exists")
+        .hash;
     let branch = branch_diff(
         adapter.clone(),
         None,
@@ -235,6 +281,8 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
             base_catalog: Some("phlo_main".to_string()),
             deep: false,
             default_schema: None,
+            candidate_hash: Some(candidate_head.clone()),
+            base_hash: Some(base_head.clone()),
         },
     )
     .await
@@ -258,19 +306,25 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
     assert_eq!(rows.base_rows, Some(1));
     assert_eq!(rows.candidate_rows, Some(1));
 
-    // Gate evaluation against real Nessie state: the base hash matches the
-    // provisioned target and the merge check is clean — every gate that has
-    // evidence passes; run/tests/blocked fail for lack of a state store.
+    // Gate evaluation against real Nessie state and the stored run record:
+    // the run gate sees the run bound to the head being promoted, the base
+    // hash matches the provisioned target, and the merge check is clean.
     let target_now = nessie_client
         .get_reference("main")
         .await
         .expect("target")
         .expect("main exists");
     let gates = evaluate_gates(&GateInput {
+        run: state.latest_run(Some("ci/pr-1")).expect("latest run"),
+        model_runs: state.model_runs(&stored_run.run_id).expect("model runs"),
+        seed_runs: state.seed_runs(&stored_run.run_id).expect("seed runs"),
+        test_runs: state.test_runs(&stored_run.run_id).expect("test runs"),
         require_diff: true,
         diff_passed: Some(report.passed),
         expected_target_hash: Some(setup.base.hash.clone()),
         actual_target_hash: Some(target_now.hash.clone()),
+        actual_candidate_hash: Some(candidate_head.clone()),
+        schema_audited: true,
         merge_check: Some(
             nessie_client
                 .can_merge("ci/pr-1", "main")
@@ -289,7 +343,13 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
     assert!(gate("base").passed, "{}", gate("base").detail);
     assert!(gate("data_diff").passed);
     assert!(gate("conflicts").passed, "{}", gate("conflicts").detail);
-    assert!(!gates.passed, "no recorded run must fail the gates");
+    // The stored run is bound to the head being promoted — the run gate now
+    // passes on real evidence, not a constructed input.
+    assert!(gate("run").passed, "{}", gate("run").detail);
+    assert!(gate("tests").passed, "{}", gate("tests").detail);
+    assert!(gate("blocked").passed, "{}", gate("blocked").detail);
+    assert!(gate("schema").passed, "{}", gate("schema").detail);
+    assert!(gates.passed, "every gate has real evidence and passes");
 
     // Reference management: both refs resolve, sorted by name.
     let refs = nessie_client.list_references().await.expect("list refs");
@@ -317,8 +377,8 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
             target_ref: "main".to_string(),
             candidate_hash: Some(audited_candidate.clone()),
             expected_target_hash: Some(setup.base.hash.clone()),
-            plan_id: None,
-            run_id: None,
+            plan_id: Some(stored_run.plan_id.clone()),
+            run_id: Some(stored_run.run_id.clone()),
             quality_gates_passed: true,
             diff_passed: Some(report.passed),
             require_diff: true,
@@ -351,8 +411,8 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
             target_ref: "main".to_string(),
             candidate_hash: Some(audited_candidate),
             expected_target_hash: Some(setup.base.hash.clone()),
-            plan_id: None,
-            run_id: None,
+            plan_id: Some(stored_run.plan_id.clone()),
+            run_id: Some(stored_run.run_id.clone()),
             quality_gates_passed: true,
             diff_passed: Some(true),
             require_diff: true,

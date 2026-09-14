@@ -70,6 +70,12 @@ environment — plus a per-candidate copy named
 survives another being provisioned and similarly-named refs never share a
 file. Both are removed when the branch is deleted.
 
+Each artifact records the commit the candidate was *provably* cut from as
+`created_from` — set when `ref create` or provisioning creates the branch,
+and preserved across later re-provisioning. A branch Phlo did not create has
+unrecorded provenance unless an earlier artifact captured it; `promote`
+refuses such candidates rather than treat today's target as their base.
+
 A failed run or audit leaves the candidate isolated and does not advance
 `main`. The live `nessie_wap_e2e` test exercises candidate isolation, branch
 diff, gate evaluation, promotion, stale-promotion rejection and branch cleanup
@@ -102,36 +108,50 @@ Promotion is authorised by named gates, printed and emitted identically in
 JSON:
 
 ```text
-PASS run        — run ba168bc5 passed
+PASS run        — run ba168bc5 passed candidate@3f8c…
 PASS tests      — 3 tests passed
 PASS blocked    — no blocked or cancelled work
 PASS schema     — no breaking schema changes
 PASS data_diff  — data diff passed
-PASS base       — target unchanged since planning
+PASS base       — target unchanged since the evidence base was recorded
 PASS conflicts  — candidate merges cleanly
 ```
 
-- `run` — the candidate's latest recorded run finished fully passed.
+- `run` — the candidate's latest recorded run finished fully passed **and**
+  validated the exact commit being promoted: a passed run is bound to the
+  candidate branch's **post-run** head (`reference_hash`), since a Nessie
+  branch advances with every write the run makes. A branch that advanced
+  since its run — or a run recorded before commit binding — fails this
+  gate.
 - `tests` — no test in that run failed.
 - `blocked` — no model, seed or test was left blocked or cancelled.
-- `schema` — the audited diff found no breaking schema changes, or they were
-  waived with `--allow-breaking-schema`.
+- `schema` — a fresh audited diff inspected this pair at these commits and
+  found no breaking schema changes, or they were waived with
+  `--allow-breaking-schema`. Without an audited artifact the gate fails
+  closed: "no evidence" never reads as "no changes". The waiver covers the
+  schema gate only — it does not waive provenance or run binding.
 - `data_diff` — only evaluated with `--require-diff`; the audited diff
-  (`branch_diff.json` from a `--full` branch diff, or `diff.json` for a
-  single model) must exist, pass its policies, cover this exact
-  candidate→target pair, and still be fresh (its recorded versions match
-  both sides' current materialisations). A shallow branch diff — schema and
-  row counts only, no value-level policies — or a diff that compared a
-  relation to itself does not satisfy it.
-- `base` — the target's hash still equals the hash recorded when the
-  candidate was provisioned from that same target (a candidate provisioned
-  off a different ref has no recorded view of this target's freshness). A
-  target that advanced fails this gate; the merge itself asserts the hash
-  the gates were evaluated against (the recorded base hash, or the hash
-  resolved at promotion time when none was recorded) so a racing commit is
-  rejected by Nessie rather than silently merged. The same holds on the
-  candidate side: a branch that advanced between gate evaluation and merge
-  is refused rather than promoted unaudited.
+  (`branch_diff.json` from a `--full` branch diff) must exist, pass its
+  policies, cover this exact candidate→target pair **at the commits being
+  promoted** (the artifact records both refs' resolved heads; an artifact
+  bound to older heads, or to none, is rejected), and still be fresh (its
+  recorded versions match both sides' current materialisations). A shallow
+  branch diff — schema and row counts only, no value-level policies — or a
+  diff that compared a relation to itself does not satisfy it. A
+  single-model `diff.json` is never promotion evidence: it examined one
+  model and cannot certify a branch.
+- `base` — the target's hash still equals the commit the evidence was
+  established against: the hash-bound diff artifact's recorded base, or
+  failing that the immutable `created_from` provenance recorded when the
+  candidate branch was cut. A candidate whose origin is unrecorded and which
+  was never audited against this target fails this gate — its base is never
+  silently redefined as today's head. A target that advanced fails too; the
+  merge itself asserts the hash the gates were evaluated against (the
+  evidence hash, or the hash resolved at promotion time when none was
+  recorded) so a racing commit is rejected by Nessie rather than silently
+  merged. The same holds on the candidate side: a branch that advanced
+  between gate evaluation and merge is refused rather than promoted
+  unaudited.
 - `conflicts` — a non-destructive merge check reported no conflicts. Against
   a real Nessie this is the server's `dryRun` merge: the same conflict
   detection the merge performs, without committing anything.

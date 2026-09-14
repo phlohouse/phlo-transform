@@ -115,6 +115,12 @@ pub struct BranchDiffRequest {
     pub deep: bool,
     /// Fallback schema for seed targets that have no recorded load.
     pub default_schema: Option<String>,
+    /// The commit the candidate reference resolved to when the diff ran —
+    /// binds this evidence to an exact branch head. `None` leaves the
+    /// report name-bound only, which promotion cannot audit.
+    pub candidate_hash: Option<String>,
+    /// Same for the base side.
+    pub base_hash: Option<String>,
 }
 
 /// A structured branch comparison.
@@ -122,6 +128,12 @@ pub struct BranchDiffRequest {
 pub struct BranchDiffReport {
     pub candidate_ref: String,
     pub base_ref: String,
+    /// The commits the refs resolved to when the diff ran — `None` when the
+    /// diff ran without a Nessie client (name-bound evidence only).
+    #[serde(default)]
+    pub candidate_hash: Option<String>,
+    #[serde(default)]
+    pub base_hash: Option<String>,
     /// Every dataset in the union of the workspace and recorded
     /// materialisations, sorted by name.
     pub datasets: Vec<DatasetDiff>,
@@ -432,6 +444,8 @@ pub async fn branch_diff(
     Ok(BranchDiffReport {
         candidate_ref: request.candidate_ref.clone(),
         base_ref: request.base_ref.clone(),
+        candidate_hash: request.candidate_hash.clone(),
+        base_hash: request.base_hash.clone(),
         datasets,
         schema_changes,
         rows,

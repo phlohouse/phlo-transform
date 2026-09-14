@@ -21,6 +21,11 @@ pub struct RunRecord {
     pub run_id: String,
     pub plan_id: String,
     pub environment: Option<String>,
+    /// The Nessie commit the environment reference resolved to when the run
+    /// started — the commit this run's evidence actually validated. `None`
+    /// for runs outside a Nessie reference flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_hash: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
     pub status: ExecutionStatus,
@@ -136,6 +141,9 @@ pub struct TestRunRecord {
 pub struct RunSummary {
     pub run_id: String,
     pub plan_id: String,
+    /// The Nessie commit this run validated, when the run was bound to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_hash: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
     pub status: ExecutionStatus,
@@ -187,6 +195,14 @@ pub trait StateStore: Send + Sync {
     /// Re-open an interrupted run for continuation (`--resume`): status back
     /// to `running`, `finished_at` cleared, original `started_at` kept.
     fn reopen_run(&self, run_id: &str) -> Result<(), EngineError>;
+    /// Bind the run to the reference head it validated. Recorded by the
+    /// caller after a run completes — the post-run head, never the pre-run
+    /// snapshot, since a Nessie candidate advances with every write.
+    fn bind_run_reference_hash(
+        &self,
+        run_id: &str,
+        reference_hash: &str,
+    ) -> Result<(), EngineError>;
     fn finish_run(
         &self,
         run_id: &str,
@@ -412,6 +428,8 @@ impl SqliteStateStore {
         );
         // Run-progress columns added for resumable runs.
         let _ = connection.execute("ALTER TABLE runs ADD COLUMN plan_json TEXT", []);
+        // The Nessie commit a run validated — added for promotion provenance.
+        let _ = connection.execute("ALTER TABLE runs ADD COLUMN reference_hash TEXT", []);
         for column in [
             "ALTER TABLE model_runs ADD COLUMN action TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE model_runs ADD COLUMN desired_version TEXT NOT NULL DEFAULT ''",
@@ -486,8 +504,8 @@ impl StateStore for SqliteStateStore {
         let connection = self.lock()?;
         connection
             .execute(
-                "INSERT INTO runs (run_id, plan_id, environment, started_at, finished_at, status, model_count, failed_count, plan_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO runs (run_id, plan_id, environment, started_at, finished_at, status, model_count, failed_count, plan_json, reference_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     run.run_id,
                     run.plan_id,
@@ -498,6 +516,7 @@ impl StateStore for SqliteStateStore {
                     run.model_count as i64,
                     run.failed_count as i64,
                     plan_json,
+                    run.reference_hash,
                 ],
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
@@ -510,6 +529,21 @@ impl StateStore for SqliteStateStore {
             .execute(
                 "UPDATE runs SET status = 'running', finished_at = NULL WHERE run_id = ?1",
                 rusqlite::params![run_id],
+            )
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        Ok(())
+    }
+
+    fn bind_run_reference_hash(
+        &self,
+        run_id: &str,
+        reference_hash: &str,
+    ) -> Result<(), EngineError> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "UPDATE runs SET reference_hash = ?2 WHERE run_id = ?1",
+                rusqlite::params![run_id, reference_hash],
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
         Ok(())
@@ -614,7 +648,7 @@ impl StateStore for SqliteStateStore {
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
-                "SELECT run_id, plan_id, started_at, finished_at, status, model_count, failed_count
+                "SELECT run_id, plan_id, started_at, finished_at, status, model_count, failed_count, reference_hash
                  FROM runs ORDER BY started_at DESC, rowid DESC",
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
@@ -624,6 +658,7 @@ impl StateStore for SqliteStateStore {
                 Ok(RunSummary {
                     run_id: row.get(0)?,
                     plan_id: row.get(1)?,
+                    reference_hash: row.get(7)?,
                     started_at: row.get(2)?,
                     finished_at: row.get(3)?,
                     status: parse_status(&status),
@@ -640,7 +675,7 @@ impl StateStore for SqliteStateStore {
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
-                "SELECT run_id, plan_id, started_at, finished_at, status, model_count, failed_count
+                "SELECT run_id, plan_id, started_at, finished_at, status, model_count, failed_count, reference_hash
                  FROM runs WHERE environment = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1",
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
@@ -657,6 +692,7 @@ impl StateStore for SqliteStateStore {
                 Ok(Some(RunSummary {
                     run_id: row.get(0).map_err(map)?,
                     plan_id: row.get(1).map_err(map)?,
+                    reference_hash: row.get(7).map_err(map)?,
                     started_at: row.get(2).map_err(map)?,
                     finished_at: row.get(3).map_err(map)?,
                     status: parse_status(&status),
@@ -672,7 +708,7 @@ impl StateStore for SqliteStateStore {
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
-                "SELECT run_id, plan_id, environment, started_at, finished_at, status, model_count, failed_count, plan_json
+                "SELECT run_id, plan_id, environment, started_at, finished_at, status, model_count, failed_count, plan_json, reference_hash
                  FROM runs WHERE run_id = ?1",
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
@@ -694,6 +730,7 @@ impl StateStore for SqliteStateStore {
                 run_id: row.get(0).map_err(map)?,
                 plan_id: row.get(1).map_err(map)?,
                 environment: environment.filter(|value| !value.is_empty()),
+                reference_hash: row.get(9).map_err(map)?,
                 started_at: row.get(3).map_err(map)?,
                 finished_at: row.get(4).map_err(map)?,
                 status: parse_status(&status),
@@ -708,7 +745,7 @@ impl StateStore for SqliteStateStore {
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
-                "SELECT run_id, plan_id, started_at, finished_at, status, model_count, failed_count
+                "SELECT run_id, plan_id, started_at, finished_at, status, model_count, failed_count, reference_hash
                  FROM runs WHERE run_id LIKE ?1 || '%' ORDER BY started_at DESC, rowid DESC",
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
@@ -718,6 +755,7 @@ impl StateStore for SqliteStateStore {
                 Ok(RunSummary {
                     run_id: row.get(0)?,
                     plan_id: row.get(1)?,
+                    reference_hash: row.get(7)?,
                     started_at: row.get(2)?,
                     finished_at: row.get(3)?,
                     status: parse_status(&status),
@@ -1154,6 +1192,7 @@ mod tests {
                     status: ExecutionStatus::Running,
                     model_count: 2,
                     failed_count: 0,
+                    reference_hash: None,
                 },
                 &stored_plan,
             )

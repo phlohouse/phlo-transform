@@ -923,10 +923,25 @@ async fn provision_environment(cli: &Cli) -> Result<Option<EnvironmentSetup>, St
         warehouse: cli.warehouse.clone(),
         catalog,
     };
-    ensure_environment(nessie.as_ref(), adapter.as_ref(), &spec)
+    let mut setup = ensure_environment(nessie.as_ref(), adapter.as_ref(), &spec)
         .await
-        .map(Some)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if setup.created_from.is_none() {
+        // The branch pre-existed: never redefine its base as today's `base`.
+        // Preserve whatever an earlier artifact recorded — if nothing did,
+        // provenance is unknown and `promote` will refuse this candidate.
+        setup.created_from =
+            read_environment_for(cli, &setup.candidate.name).and_then(|prior| prior.created_from);
+        if setup.created_from.is_none() && !cli.json {
+            eprintln!(
+                "warning: candidate branch `{}` already exists with unrecorded base \
+                 provenance — `promote` will refuse it; recreate the branch with \
+                 `ref delete` + `ref create` to record where it was cut from",
+                setup.candidate.name
+            );
+        }
+    }
+    Ok(Some(setup))
 }
 
 fn catalog_name(reference: &str) -> String {
@@ -1099,18 +1114,29 @@ async fn run_promote(
     };
 
     let environment = read_environment_for(cli, candidate);
-    let (diff_passed, diff_rejected, breaking_schema_changes) =
-        audited_diff(cli, state.as_deref(), candidate, to);
+    let audit = audited_diff(
+        cli,
+        state.as_deref(),
+        candidate,
+        to,
+        Some(&candidate_reference.hash),
+        Some(&target.hash),
+    );
     let merge_check = nessie.can_merge(candidate, to).await.ok();
 
-    // The recorded provisioning base pins the target state the candidate was
-    // planned and audited against — only when it describes this candidate
-    // branched from this target. A candidate provisioned off a different ref
-    // has no recorded view of this target's freshness.
-    let expected_target_hash = environment
-        .as_ref()
-        .filter(|setup| setup.candidate.name == candidate && setup.base.name == to)
-        .map(|setup| setup.base.hash.clone());
+    // The `base` gate needs a target commit the evidence was established
+    // against. Two sources, freshest first: a hash-bound diff artifact that
+    // audited this exact target, else the recorded commit the candidate was
+    // provably created from. A candidate whose origin is unknown and which
+    // was never audited against this target has no evidence — the gate must
+    // fail rather than redefine its base as today's head.
+    let expected_target_hash = audit.audited_base_hash.clone().or_else(|| {
+        environment
+            .as_ref()
+            .filter(|setup| setup.candidate.name == candidate && setup.base.name == to)
+            .and_then(|setup| setup.created_from.as_ref())
+            .map(|base| base.hash.clone())
+    });
 
     let input = GateInput {
         run: run.clone(),
@@ -1118,12 +1144,14 @@ async fn run_promote(
         seed_runs,
         test_runs,
         require_diff,
-        diff_passed,
-        diff_rejected,
-        breaking_schema_changes,
+        diff_passed: audit.diff_passed,
+        diff_rejected: audit.diff_rejected.clone(),
+        breaking_schema_changes: audit.breaking_schema_changes.clone(),
         allow_breaking_schema,
         expected_target_hash: expected_target_hash.clone(),
         actual_target_hash: Some(target.hash.clone()),
+        actual_candidate_hash: Some(candidate_reference.hash.clone()),
+        schema_audited: audit.schema_audited,
         merge_check,
     };
     let report = evaluate_gates(&input);
@@ -1161,7 +1189,7 @@ async fn run_promote(
         plan_id: run.as_ref().map(|run| run.plan_id.clone()),
         run_id: run.as_ref().map(|run| run.run_id.clone()),
         quality_gates_passed: true,
-        diff_passed,
+        diff_passed: audit.diff_passed,
         require_diff,
         breaking_schema_changes: input.breaking_schema_changes,
         allow_breaking_schema,
@@ -1229,43 +1257,98 @@ async fn run_promote(
     }
 }
 
+/// What the persisted diff artifacts prove for this promotion.
+#[derive(Clone, Debug, Default)]
+struct AuditEvidence {
+    /// The audited diff's verdict, when an applicable artifact was inspected.
+    diff_passed: Option<bool>,
+    /// Why the artifact cannot stand as evidence, when rejected.
+    diff_rejected: Option<String>,
+    /// Breaking schema changes the audit recorded.
+    breaking_schema_changes: Vec<String>,
+    /// The base commit the artifact audited — a second provenance source for
+    /// the `base` gate when branch-cut provenance is unavailable.
+    audited_base_hash: Option<String>,
+    /// A fresh, ref-and-commit-bound audit actually inspected this pair.
+    /// `false` means "no evidence", which must never read as "no changes".
+    schema_audited: bool,
+}
+
 /// Read the audited diff artifact (`branch_diff.json` preferred, single-model
-/// `diff.json` as fallback) and derive: the diff verdict, why the artifact
-/// was rejected, and the breaking schema changes it recorded.
+/// `diff.json` as fallback) and derive the evidence it carries for this
+/// promotion: the diff verdict, why the artifact cannot be used, the breaking
+/// schema changes it recorded, and whether a schema audit genuinely ran.
 ///
-/// The artifact only authorises the pair it was produced for: it must name
-/// this candidate and target, still be fresh, and — for the `data_diff`
-/// gate — carry value-level diffs (`diff --full`).
+/// The artifact only counts when it was produced for this candidate against
+/// this target at the commits being promoted — a diff of another pair, of an
+/// older head, or one that went stale since is rejected with a reason naming
+/// the rerun. `candidate_hash`/`base_hash` are the refs' current heads; a
+/// hash-bound artifact must match them exactly.
 fn audited_diff(
     cli: &Cli,
     state: Option<&dyn StateStore>,
     candidate: &str,
     to: &str,
-) -> (Option<bool>, Option<String>, Vec<String>) {
+    candidate_hash: Option<&str>,
+    base_hash: Option<&str>,
+) -> AuditEvidence {
     let Some(state) = state else {
-        return (None, None, Vec::new());
+        return AuditEvidence::default();
     };
     if let Some(report) = read_branch_diff(cli) {
         // An audit of another candidate, or against another target, is not
         // evidence for this promotion.
         if report.candidate_ref != candidate || report.base_ref != to {
-            return (
-                None,
-                Some(format!(
+            return AuditEvidence {
+                diff_rejected: Some(format!(
                     "branch diff covers `{}` -> `{}`, not `{candidate}` -> `{to}`; \
                      rerun `diff --from {candidate} --to {to} --full`",
                     report.candidate_ref, report.base_ref
                 )),
-                Vec::new(),
-            );
+                ..AuditEvidence::default()
+            };
         }
         let mut rejected = None;
+        let mut reject = |reason: String| {
+            rejected.get_or_insert(reason);
+        };
+        // Whether the artifact inspected this pair at these commits and still
+        // applies — binding and freshness failures revoke the schema audit;
+        // shallowness does not (the schema pass ran either way).
+        let mut fresh = true;
+        let mut stale = |reason: String| {
+            fresh = false;
+            reject(reason);
+        };
         let mut breaking = Vec::new();
         for change in &report.schema_changes {
             for item in &change.changes {
                 if matches!(item.safety.as_str(), "error" | "full_rebuild_required") {
                     breaking.push(format!("{}.{}: {}", change.model, item.column, item.detail));
                 }
+            }
+        }
+        // Commit binding: the artifact must name the exact heads being
+        // promoted. An unbound artifact cannot prove what it audited.
+        for (label, recorded, expected) in [
+            (
+                "candidate",
+                report.candidate_hash.as_deref(),
+                candidate_hash,
+            ),
+            ("base", report.base_hash.as_deref(), base_hash),
+        ] {
+            let Some(expected) = expected else { continue };
+            match recorded {
+                Some(recorded) if recorded == expected => {}
+                Some(recorded) => stale(format!(
+                    "branch diff audited {label}@{recorded}, not current {label}@{expected}; \
+                     rerun `diff --from {candidate} --to {to} --full`"
+                )),
+                None => stale(format!(
+                    "branch diff does not record the {label} commit it audited; \
+                     rerun `diff --from {candidate} --to {to} --full`"
+                )),
             }
         }
         // The artifact is stale when a dataset's recorded version no longer
@@ -1297,13 +1380,13 @@ fn audited_diff(
                 ),
             };
             if current_candidate != dataset.candidate_version {
-                rejected = Some(format!(
+                stale(format!(
                     "branch diff is stale: `{}` changed on the candidate since the diff",
                     dataset.dataset
                 ));
             }
             if current_base != dataset.base_version {
-                rejected = Some(format!(
+                stale(format!(
                     "branch diff is stale: `{}` changed on `{to}` since the diff",
                     dataset.dataset
                 ));
@@ -1322,7 +1405,7 @@ fn audited_diff(
             .chain(candidate_seeds.keys().map(|name| (name, DatasetKind::Seed)))
         {
             if !covered.contains(&(name.as_str(), kind)) {
-                rejected = Some(format!(
+                stale(format!(
                     "branch diff is stale: `{name}` materialised on the candidate after the diff"
                 ));
             }
@@ -1333,7 +1416,7 @@ fn audited_diff(
             .chain(base_seeds.keys().map(|name| (name, DatasetKind::Seed)))
         {
             if !covered.contains(&(name.as_str(), kind)) {
-                rejected = Some(format!(
+                stale(format!(
                     "branch diff is stale: `{name}` materialised on `{to}` after the diff"
                 ));
             }
@@ -1345,168 +1428,53 @@ fn audited_diff(
             .iter()
             .any(|diff| diff.candidate_relation == diff.base_relation)
         {
-            rejected = Some(
+            stale(
                 "branch diff compared a relation to itself; rerun against distinct \
                  candidate and base relations"
                     .to_string(),
             );
         }
         // A shallow diff compared schema and row counts only — no data-diff
-        // policies were evaluated, so it cannot satisfy a required audit.
-        // (`diffs` non-empty also proves `--full`, for pre-`deep`-field
-        // artifacts.)
-        if !report.deep && report.diffs.is_empty() {
-            return (
-                None,
-                Some(rejected.unwrap_or_else(|| {
-                    format!(
-                        "branch diff ran without `--full`; rerun \
-                         `diff --from {candidate} --to {to} --full` for a value-level audit"
-                    )
-                })),
-                breaking,
-            );
+        // policies were evaluated, so it carries no verdict and cannot
+        // satisfy a required audit. (`diffs` non-empty also proves `--full`,
+        // for pre-`deep`-field artifacts.) The schema audit it did run still
+        // stands.
+        let shallow = !report.deep && report.diffs.is_empty();
+        if shallow {
+            reject(format!(
+                "branch diff ran without `--full`; rerun \
+                 `diff --from {candidate} --to {to} --full` for a value-level audit"
+            ));
         }
-        return (Some(report.passed), rejected, breaking);
+        return AuditEvidence {
+            diff_passed: (!shallow).then_some(report.passed),
+            diff_rejected: rejected,
+            breaking_schema_changes: breaking,
+            audited_base_hash: report.base_hash.clone(),
+            schema_audited: fresh,
+        };
     }
 
-    let Some(value) = read_diff(cli) else {
-        return (None, None, Vec::new());
-    };
-    // Same binding for the single-model artifact: the diff must have run on
-    // this candidate and, when a base label was recorded, against this target.
-    let audited_candidate = value
-        .get("diff")
-        .and_then(|diff| diff.get("candidate_ref"))
-        .and_then(|reference| reference.as_str());
-    if audited_candidate != Some(candidate) {
-        return (
-            None,
-            Some(format!(
-                "model diff covers candidate `{}`, not `{candidate}`; \
-                 rerun the diff under `--ref {candidate}`",
-                audited_candidate.unwrap_or("<unlabeled>")
+    // The single-model `diff.json` is not promotion evidence: it examined
+    // one model, so it cannot certify a branch's schema. Its presence means
+    // someone audited a model, not the branch — say so rather than a bare
+    // "no evidence".
+    if read_diff(cli).is_some() {
+        return AuditEvidence {
+            diff_rejected: Some(format!(
+                "a single-model diff cannot audit a branch; \
+                 run `diff --from {candidate} --to {to} --full`"
             )),
-            Vec::new(),
-        );
+            ..AuditEvidence::default()
+        };
     }
-    if let Some(audited_base) = value
-        .get("diff")
-        .and_then(|diff| diff.get("base_ref"))
-        .and_then(|reference| reference.as_str())
-    {
-        if audited_base != to {
-            return (
-                None,
-                Some(format!(
-                    "model diff was audited against `{audited_base}`, not `{to}`"
-                )),
-                Vec::new(),
-            );
-        }
-    }
-    // A diff that compared a relation to itself measured nothing — it cannot
-    // back a required audit however green it looks.
-    let vacuous = match (
-        value
-            .get("diff")
-            .and_then(|diff| diff.get("candidate_relation"))
-            .and_then(|relation| relation.as_str()),
-        value
-            .get("diff")
-            .and_then(|diff| diff.get("base_relation"))
-            .and_then(|relation| relation.as_str()),
-    ) {
-        (Some(candidate_relation), Some(base_relation)) => candidate_relation == base_relation,
-        _ => false,
-    };
-    let passed = value
-        .get("diff")
-        .and_then(|diff| diff.get("passed"))
-        .and_then(|passed| passed.as_bool());
-    let rejected = if vacuous {
-        Some(
-            "model diff compared a relation to itself; rerun under `--ref`/`--base` against \
-             distinct candidate and base relations"
-                .to_string(),
-        )
-    } else {
-        diff_is_stale_with(state, candidate, to, &value)
-    };
-    let breaking: Vec<String> = value
-        .get("diff")
-        .and_then(|diff| diff.get("schema_changes"))
-        .and_then(|changes| changes.as_array())
-        .map(|changes| {
-            changes
-                .iter()
-                .filter(|change| {
-                    matches!(
-                        change.get("safety").and_then(|safety| safety.as_str()),
-                        Some("error" | "full_rebuild_required")
-                    )
-                })
-                .map(|change| {
-                    format!(
-                        "{} ({})",
-                        change
-                            .get("column")
-                            .and_then(|column| column.as_str())
-                            .unwrap_or("*"),
-                        change
-                            .get("detail")
-                            .and_then(|detail| detail.as_str())
-                            .unwrap_or("schema change")
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    (passed, rejected, breaking)
+    AuditEvidence::default()
 }
 
 fn read_branch_diff(cli: &Cli) -> Option<BranchDiffReport> {
     let text = std::fs::read_to_string(artifact_path(cli, "branch_diff.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     serde_json::from_value(value.get("diff")?.clone()).ok()
-}
-
-/// A model diff is stale once the recorded versions on either side no
-/// longer match the current materialisations. `main` folds in the default
-/// environment, matching how the diff resolved relations.
-fn diff_is_stale_with(
-    state: &dyn StateStore,
-    candidate: &str,
-    to: &str,
-    diff: &serde_json::Value,
-) -> Option<String> {
-    let diff = diff.get("diff")?;
-    let model = diff.get("model")?.as_str()?;
-    let recorded_candidate = diff
-        .get("candidate_version")
-        .and_then(|version| version.as_str());
-    let current_candidate = materialized_for_environment(state, candidate)
-        .unwrap_or_default()
-        .remove(model)
-        .map(|record| record.version.hash);
-    if current_candidate.as_deref() != recorded_candidate {
-        return Some(format!(
-            "diff artifact for `{model}` is stale: candidate data changed since the diff"
-        ));
-    }
-    let recorded_base = diff
-        .get("base_version")
-        .and_then(|version| version.as_str());
-    let current_base = materialized_for_environment(state, to)
-        .unwrap_or_default()
-        .remove(model)
-        .map(|record| record.version.hash);
-    if current_base.as_deref() != recorded_base {
-        return Some(format!(
-            "diff artifact for `{model}` is stale: base data changed since the diff"
-        ));
-    }
-    None
 }
 
 fn print_gates_human(report: &phlo_transform_engine::GateReport) {
@@ -1608,6 +1576,19 @@ async fn run_ref(cli: &Cli, action: &RefAction) -> Result<ExitCode, String> {
                 .create_branch(name, &base)
                 .await
                 .map_err(|error| error.to_string())?;
+            // The branch was just provably cut from `base` — record that
+            // provenance now so a later `promote` can trust it even before
+            // the candidate is first provisioned for a run.
+            write_environment_artifacts(
+                cli,
+                &EnvironmentSetup {
+                    base: base.clone(),
+                    candidate: reference.clone(),
+                    created_from: Some(base.clone()),
+                    created_branch: true,
+                    catalog: cli.catalog.clone().unwrap_or_else(|| catalog_name(name)),
+                },
+            )?;
             if cli.json {
                 print_json(&reference)?;
             } else {
@@ -1713,6 +1694,39 @@ async fn run_plan(
     })
 }
 
+/// Bind a completed run to its environment's post-run Nessie head. A run
+/// advances a candidate branch with every write, so the head captured at
+/// provisioning cannot vouch for the commit the run actually validated —
+/// the binding is recorded only on a fully passed run, and only when the
+/// run's environment resolves to a real Nessie reference.
+async fn bind_run_reference(
+    cli: &Cli,
+    state: &Arc<dyn StateStore>,
+    result: &RunResult,
+) -> Result<(), String> {
+    if result.status != ExecutionStatus::Passed || nessie_endpoint(cli).is_none() {
+        return Ok(());
+    }
+    // The run's own environment label — for `--resume`/`--retry-failed` that
+    // is the stored run's, not this invocation's flags.
+    let Some(environment) = result.environment.clone() else {
+        return Ok(());
+    };
+    let nessie = build_nessie(cli)?;
+    // An environment label that is not a Nessie reference leaves the run
+    // unbound — it simply cannot promote a commit-bound candidate.
+    let Some(head) = nessie
+        .get_reference(&environment)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    state
+        .bind_run_reference_hash(&result.run_id, &head.hash)
+        .map_err(|error| error.to_string())
+}
+
 async fn run_apply(
     cli: &Cli,
     compilation: &Compilation,
@@ -1735,7 +1749,7 @@ async fn run_apply(
         let adapter = build_adapter(cli)?;
         let cancel = CancelHandle::default();
         spawn_ctrl_c_listener(cancel.clone());
-        let runner = Runner::new(adapter, state);
+        let runner = Runner::new(adapter, state.clone());
         let options = run_options(cli, cancel);
         let result = match (&cli.resume, &cli.retry_failed) {
             (Some(_), Some(_)) => {
@@ -1748,6 +1762,9 @@ async fn run_apply(
             _ => unreachable!(),
         }
         .map_err(|error| error.to_string())?;
+        if let Some(state) = &state {
+            bind_run_reference(cli, state, &result).await?;
+        }
         let writer = ArtifactWriter::for_workspace(&cli.root);
         writer
             .write_project(compilation)
@@ -1783,12 +1800,15 @@ async fn run_apply(
     let adapter = build_adapter(cli)?;
     let cancel = CancelHandle::default();
     spawn_ctrl_c_listener(cancel.clone());
-    let runner = Runner::new(adapter, state);
+    let runner = Runner::new(adapter, state.clone());
     let options = run_options(cli, cancel);
     let result = runner
         .apply(compilation, &plan, &options)
         .await
         .map_err(|error| error.to_string())?;
+    if let Some(state) = &state {
+        bind_run_reference(cli, state, &result).await?;
+    }
     writer
         .write_run(&result)
         .map_err(|error| error.to_string())?;
@@ -3086,16 +3106,24 @@ async fn run_branch_diff(
 
     // When Nessie is configured both sides must be real references — a
     // typo'd ref should error, not produce a plausible all-`removed` report.
+    // The resolved heads are recorded on the report so promotion can verify
+    // the audit covered exactly the commits being merged.
+    let mut candidate_hash = None;
+    let mut base_hash = None;
     if nessie_endpoint(cli).is_some() {
         let nessie = build_nessie(cli)?;
-        for name in [&candidate_ref, &base_ref] {
-            nessie
+        for (name, slot) in [
+            (&candidate_ref, &mut candidate_hash),
+            (&base_ref, &mut base_hash),
+        ] {
+            let reference = nessie
                 .get_reference(name)
                 .await
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| {
                     format!("reference `{name}` was not found — see `phlo-transform ref list`")
                 })?;
+            *slot = Some(reference.hash);
         }
     }
 
@@ -3130,6 +3158,8 @@ async fn run_branch_diff(
             base_catalog,
             deep: full,
             default_schema: cli.trino_schema.clone(),
+            candidate_hash,
+            base_hash,
         },
     )
     .await
@@ -3825,6 +3855,8 @@ mod tests {
         BranchDiffReport {
             candidate_ref: candidate.to_string(),
             base_ref: base.to_string(),
+            candidate_hash: None,
+            base_hash: None,
             datasets: Vec::new(),
             schema_changes: Vec::new(),
             rows: Vec::new(),
@@ -3895,7 +3927,12 @@ mod tests {
         });
         write_branch_diff(&cli, &report);
 
-        let (passed, rejected, breaking) = audited_diff(&cli, Some(&state), "ci/x", "main");
+        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        let (passed, rejected, breaking) = (
+            evidence.diff_passed,
+            evidence.diff_rejected,
+            evidence.breaking_schema_changes,
+        );
         assert_eq!(passed, None);
         let reason = rejected.expect("other-ref artifact must be rejected");
         assert!(reason.contains("ci/other"), "{reason}");
@@ -3911,7 +3948,8 @@ mod tests {
         // Audited against `dev`; promoting to `main` must not consume it.
         write_branch_diff(&cli, &branch_report("ci/x", "dev", true));
 
-        let (passed, rejected, _) = audited_diff(&cli, Some(&state), "ci/x", "main");
+        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        let (passed, rejected) = (evidence.diff_passed, evidence.diff_rejected);
         assert_eq!(passed, None);
         let reason = rejected.expect("wrong-target artifact must be rejected");
         assert!(reason.contains("dev"), "{reason}");
@@ -3926,7 +3964,8 @@ mod tests {
         // A shallow (schema + row-count) diff passes no data-diff verdict.
         write_branch_diff(&cli, &branch_report("ci/x", "main", false));
 
-        let (passed, rejected, _) = audited_diff(&cli, Some(&state), "ci/x", "main");
+        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        let (passed, rejected) = (evidence.diff_passed, evidence.diff_rejected);
         assert_eq!(passed, None);
         let reason = rejected.expect("shallow diff must not satisfy require-diff");
         assert!(reason.contains("--full"), "{reason}");
@@ -3940,7 +3979,8 @@ mod tests {
 
         write_branch_diff(&cli, &branch_report("ci/x", "main", true));
 
-        let (passed, rejected, _) = audited_diff(&cli, Some(&state), "ci/x", "main");
+        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        let (passed, rejected) = (evidence.diff_passed, evidence.diff_rejected);
         assert_eq!(passed, Some(true));
         assert_eq!(rejected, None);
     }
@@ -3972,36 +4012,30 @@ mod tests {
             })
             .expect("record materialised");
 
-        let (passed, rejected, _) = audited_diff(&cli, Some(&state), "ci/x", "main");
+        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        let (passed, rejected) = (evidence.diff_passed, evidence.diff_rejected);
         assert_eq!(passed, Some(true));
         let reason = rejected.expect("stale artifact must be rejected");
         assert!(reason.contains("stale"), "{reason}");
     }
 
     #[test]
-    fn audited_diff_rejects_a_model_diff_for_another_candidate() {
+    fn a_single_model_diff_is_not_promotion_evidence() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cli = cli_at(dir.path());
         let state = SqliteStateStore::in_memory().expect("state");
 
-        write_diff_json(&cli, Some("ci/old"), Some("main"));
+        // However well-scoped the model diff was — matching refs, passing
+        // verdict — it examined one model and cannot certify a branch.
+        write_diff_json(&cli, Some("ci/x"), Some("main"));
 
-        let (_, rejected, _) = audited_diff(&cli, Some(&state), "ci/x", "main");
-        let reason = rejected.expect("other-candidate artifact must be rejected");
-        assert!(reason.contains("ci/old"), "{reason}");
-    }
-
-    #[test]
-    fn audited_diff_rejects_a_model_diff_for_another_target() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let cli = cli_at(dir.path());
-        let state = SqliteStateStore::in_memory().expect("state");
-
-        write_diff_json(&cli, Some("ci/x"), Some("dev"));
-
-        let (_, rejected, _) = audited_diff(&cli, Some(&state), "ci/x", "main");
-        let reason = rejected.expect("other-target artifact must be rejected");
-        assert!(reason.contains("dev"), "{reason}");
+        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        assert_eq!(evidence.diff_passed, None);
+        assert!(!evidence.schema_audited);
+        let reason = evidence
+            .diff_rejected
+            .expect("a model diff must be rejected as branch evidence");
+        assert!(reason.contains("single-model"), "{reason}");
     }
 
     fn record(model_id: &str, env: Option<&str>, hash: &str) -> MaterializedRecord {
@@ -4022,39 +4056,6 @@ mod tests {
     }
 
     #[test]
-    fn audited_diff_rejects_a_self_comparing_model_diff() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let cli = cli_at(dir.path());
-        let state = SqliteStateStore::in_memory().expect("state");
-
-        // A diff that compared a relation to itself measured nothing — it
-        // must not satisfy a required audit however green it looks.
-        let directory = cli.root.join(".phlo").join("transform");
-        std::fs::create_dir_all(&directory).expect("artifact dir");
-        std::fs::write(
-            directory.join("diff.json"),
-            serde_json::json!({
-                "schema_version": 1,
-                "diff": {
-                    "model": "m.a",
-                    "candidate_ref": "ci/x",
-                    "base_ref": "main",
-                    "candidate_relation": "cat.m.a",
-                    "base_relation": "cat.m.a",
-                    "candidate_version": "v1",
-                    "passed": true
-                }
-            })
-            .to_string(),
-        )
-        .expect("diff.json writes");
-
-        let (_, rejected, _) = audited_diff(&cli, Some(&state), "ci/x", "main");
-        let reason = rejected.expect("self-comparison must be rejected");
-        assert!(reason.contains("itself"), "{reason}");
-    }
-
-    #[test]
     fn audited_diff_rejects_a_stale_base_version() {
         let dir = tempfile::tempdir().expect("tempdir");
         let cli = cli_at(dir.path());
@@ -4072,7 +4073,8 @@ mod tests {
             .record_materialized(&record("m.a", Some("main"), "v2"))
             .expect("record");
 
-        let (passed, rejected, _) = audited_diff(&cli, Some(&state), "ci/x", "main");
+        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        let (passed, rejected) = (evidence.diff_passed, evidence.diff_rejected);
         assert_eq!(passed, Some(true));
         let reason = rejected.expect("stale base must be rejected");
         assert!(reason.contains("stale"), "{reason}");
@@ -4092,9 +4094,112 @@ mod tests {
             .record_materialized(&record("m.b", Some("ci/x"), "v9"))
             .expect("record");
 
-        let (_, rejected, _) = audited_diff(&cli, Some(&state), "ci/x", "main");
+        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        let rejected = evidence.diff_rejected;
         let reason = rejected.expect("uncovered materialisation must be rejected");
         assert!(reason.contains("materialised on the candidate"), "{reason}");
+    }
+
+    #[test]
+    fn audited_diff_rejects_a_diff_of_an_older_candidate_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        let state = SqliteStateStore::in_memory().expect("state");
+
+        // The artifact audited candidate@c1; the branch has moved to c2.
+        let mut report = branch_report("ci/x", "main", true);
+        report.candidate_hash = Some("c1".to_string());
+        report.base_hash = Some("b1".to_string());
+        write_branch_diff(&cli, &report);
+
+        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", Some("c2"), Some("b1"));
+        let reason = evidence
+            .diff_rejected
+            .expect("stale-commit artifact must be rejected");
+        assert!(reason.contains("c1"), "{reason}");
+        assert!(reason.contains("c2"), "{reason}");
+        assert!(!evidence.schema_audited, "stale evidence audits nothing");
+    }
+
+    #[test]
+    fn audited_diff_rejects_an_artifact_without_commit_binding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        let state = SqliteStateStore::in_memory().expect("state");
+
+        // An artifact written before hash binding cannot prove which commits
+        // it audited — rejected once the heads are known.
+        write_branch_diff(&cli, &branch_report("ci/x", "main", true));
+
+        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", Some("c1"), Some("b1"));
+        let reason = evidence
+            .diff_rejected
+            .expect("unbound artifact must be rejected");
+        assert!(reason.contains("does not record"), "{reason}");
+        assert!(!evidence.schema_audited);
+    }
+
+    #[test]
+    fn audited_diff_accepts_a_commit_bound_artifact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        let state = SqliteStateStore::in_memory().expect("state");
+
+        let mut report = branch_report("ci/x", "main", true);
+        report.candidate_hash = Some("c1".to_string());
+        report.base_hash = Some("b1".to_string());
+        write_branch_diff(&cli, &report);
+
+        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", Some("c1"), Some("b1"));
+        assert_eq!(evidence.diff_rejected, None);
+        assert_eq!(evidence.diff_passed, Some(true));
+        assert!(evidence.schema_audited);
+        // The audited base commit is surfaced as `base`-gate provenance.
+        assert_eq!(evidence.audited_base_hash.as_deref(), Some("b1"));
+    }
+
+    #[test]
+    fn audited_diff_rejects_a_diff_of_an_older_base_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        let state = SqliteStateStore::in_memory().expect("state");
+
+        let mut report = branch_report("ci/x", "main", true);
+        report.candidate_hash = Some("c1".to_string());
+        report.base_hash = Some("b1".to_string());
+        write_branch_diff(&cli, &report);
+
+        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", Some("c1"), Some("b2"));
+        let reason = evidence
+            .diff_rejected
+            .expect("stale-base artifact must be rejected");
+        assert!(reason.contains("b1"), "{reason}");
+        assert!(reason.contains("b2"), "{reason}");
+        // The audited base still reports b1 — the `base` gate compares it
+        // against the live head and fails "target advanced".
+        assert_eq!(evidence.audited_base_hash.as_deref(), Some("b1"));
+    }
+
+    #[test]
+    fn a_fresh_shallow_diff_still_audits_schema() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cli = cli_at(dir.path());
+        let state = SqliteStateStore::in_memory().expect("state");
+
+        // Shallow artifacts are rejected as *data-diff* evidence (no policies
+        // evaluated) but the schema comparison genuinely ran — the schema
+        // gate may still stand on it.
+        let mut report = branch_report("ci/x", "main", false);
+        report.candidate_hash = Some("c1".to_string());
+        report.base_hash = Some("b1".to_string());
+        write_branch_diff(&cli, &report);
+
+        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", Some("c1"), Some("b1"));
+        assert!(
+            evidence.diff_rejected.is_some(),
+            "shallow cannot satisfy require-diff"
+        );
+        assert!(evidence.schema_audited, "the schema pass ran");
     }
 
     #[test]
@@ -4104,6 +4209,7 @@ mod tests {
         let setup = EnvironmentSetup {
             base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
             candidate: phlo_transform_nessie::ReferenceInfo::branch("ci/x", "bbb"),
+            created_from: Some(phlo_transform_nessie::ReferenceInfo::branch("main", "aaa")),
             created_branch: true,
             catalog: "custom_catalog".to_string(),
         };
@@ -4118,6 +4224,7 @@ mod tests {
         let other = EnvironmentSetup {
             base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
             candidate: phlo_transform_nessie::ReferenceInfo::branch("ci/y", "ccc"),
+            created_from: Some(phlo_transform_nessie::ReferenceInfo::branch("main", "aaa")),
             created_branch: true,
             catalog: "phlo_ci_y".to_string(),
         };
