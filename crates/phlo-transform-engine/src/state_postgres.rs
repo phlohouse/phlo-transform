@@ -16,6 +16,7 @@
 //! over a channel and waits on the reply — legal from sync or async callers
 //! alike, and the worker serialises access without a `Mutex<Client>`.
 
+use std::collections::BTreeMap;
 use std::sync::mpsc::{channel, Sender};
 use std::thread::JoinHandle;
 
@@ -874,6 +875,28 @@ impl StateStore for PostgresStateStore {
                 )
                 .map_err(map_error)?;
             Ok(rows.iter().map(materialized_from_row).collect())
+        })
+    }
+
+    fn materialized_by_hashes(
+        &self,
+        version_hashes: &[String],
+    ) -> Result<BTreeMap<String, Vec<MaterializedRecord>>, EngineError> {
+        let hashes = version_hashes.to_vec();
+        self.call(move |client| {
+            let rows = client
+                .query(
+                    &format!(
+                        "SELECT {MATERIALIZED_COLUMNS} FROM model_versions WHERE version_hash = ANY($1)"
+                    ),
+                    &[&hashes],
+                )
+                .map_err(map_error)?;
+            let mut out: BTreeMap<String, Vec<MaterializedRecord>> = BTreeMap::new();
+            for record in rows.iter().map(materialized_from_row) {
+                out.entry(record.version.hash.clone()).or_default().push(record);
+            }
+            Ok(out)
         })
     }
 

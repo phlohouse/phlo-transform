@@ -79,3 +79,6 @@ jobs:
 
       - name: Incremental MERGE integration tests
         run: cargo test -p phlo-transform-trino --test trino_incremental_e2e -- --ignored
+
+      - name: CLI golden-path integration test
+        run: cargo test -p phlo-transform-cli --test golden_path -- --ignored

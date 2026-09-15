@@ -266,7 +266,7 @@ PR opened/updated
       ↓
 create ci/pr-184 from main
       ↓
-phlo transform plan --ref ci/pr-184 --base main
+phlo transform plan --ref ci/pr-184 --from main
       ↓
 apply
       ↓

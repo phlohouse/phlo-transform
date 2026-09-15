@@ -1,10 +1,11 @@
-# Phase 0 compiler architecture
+# Compiler architecture
 
-This document describes the compiler spike that actually exists in the
-repository. It is the implementation companion to
+This document describes the compiler in `phlo-transform-core` (built as the
+Phase 0 spike). It is the implementation companion to
 [`docs/roadmap/00-compiler-spike.md`](roadmap/00-compiler-spike.md); where the
 implementation made a concrete decision that the roadmap left open, that
-decision is recorded here.
+decision is recorded here. The execution side is documented in
+[`engine.md`](engine.md).
 
 Phase 0 proves one claim: a Rust compiler can discover transforms across a
 multi-root workspace, parse ordinary SQL, resolve workspace relations without
@@ -20,9 +21,9 @@ crates/
 └── phlo-transform-cli/         the `phlo-transform` binary
 ```
 
-Crates are intentionally coarse. There is no executor, adapter, state or
-daemon crate yet; those are later phases and adding them now would be
-speculative.
+Crates are intentionally coarse. The executor, adapter, state and daemon
+crates live beside this one — see [`engine.md`](engine.md) for the full
+layout; this document covers only the compiler.
 
 Dependency direction is one-way: `cli → {core, openlineage} → core → sql`.
 The SQL crate knows nothing about workspaces, namespaces or model identity,

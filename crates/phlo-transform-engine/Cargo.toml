@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+futures = { workspace = true }
 postgres = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }

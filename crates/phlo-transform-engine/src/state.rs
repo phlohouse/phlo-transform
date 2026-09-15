@@ -4,6 +4,7 @@
 //! engine of Phase 3. The trait is intentionally small so other backends can
 //! be added later.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -321,6 +322,19 @@ pub trait StateStore: Send + Sync {
         &self,
         version_hash: &str,
     ) -> Result<Vec<MaterializedRecord>, EngineError>;
+    /// All materialisations of any of the given version hashes, keyed by
+    /// hash — one query for what a per-model loop would otherwise fetch in
+    /// N round trips.
+    fn materialized_by_hashes(
+        &self,
+        version_hashes: &[String],
+    ) -> Result<BTreeMap<String, Vec<MaterializedRecord>>, EngineError> {
+        let mut out = BTreeMap::new();
+        for hash in version_hashes {
+            out.insert(hash.clone(), self.materialized_by_hash(hash)?);
+        }
+        Ok(out)
+    }
     /// Every materialised model in an environment — used by branch diffs to
     /// find datasets that exist on a ref but are no longer in the workspace.
     fn materialized_in(
@@ -1120,6 +1134,46 @@ impl StateStore for SqliteStateStore {
             .map_err(|error| EngineError::State(error.to_string()))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| EngineError::State(error.to_string()))
+    }
+
+    fn materialized_by_hashes(
+        &self,
+        version_hashes: &[String],
+    ) -> Result<BTreeMap<String, Vec<MaterializedRecord>>, EngineError> {
+        let mut out: BTreeMap<String, Vec<MaterializedRecord>> = version_hashes
+            .iter()
+            .map(|hash| (hash.clone(), Vec::new()))
+            .collect();
+        if out.is_empty() {
+            return Ok(out);
+        }
+        let connection = self.lock()?;
+        let placeholders = version_hashes
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT {MATERIALIZED_COLUMNS} FROM model_versions WHERE version_hash IN ({placeholders})"
+            ))
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        let params: Vec<&dyn rusqlite::ToSql> = version_hashes
+            .iter()
+            .map(|hash| hash as &dyn rusqlite::ToSql)
+            .collect();
+        let records = statement
+            .query_map(params.as_slice(), materialized_from_row)
+            .map_err(|error| EngineError::State(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        for record in records {
+            out.entry(record.version.hash.clone())
+                .or_default()
+                .push(record);
+        }
+        Ok(out)
     }
 
     fn materialized_in(

@@ -2184,6 +2184,62 @@ async fn execute_op(
     }
 }
 
+/// The outcome of one standalone test execution — the shared report shape
+/// behind the CLI's `test` output and the daemon's test operation.
+#[derive(Clone, Debug, Serialize)]
+pub struct TestOutcome {
+    pub test: String,
+    pub status: ExecutionStatus,
+    pub row_count: u64,
+    pub error: Option<String>,
+}
+
+/// Execute the tests whose targets are all covered by `members` (`None` =
+/// every test) — the shared `test` loop behind the CLI's `test` command
+/// and the daemon's test operation. A test fails closed: errors and
+/// assertion rows are recorded in its outcome, never thrown, so callers
+/// always get the full set. Stops early when `cancel` fires.
+pub async fn execute_tests(
+    adapter: &dyn Adapter,
+    tests: &[phlo_transform_core::CompiledTest],
+    members: Option<&BTreeSet<String>>,
+    cancel: &CancelHandle,
+) -> Vec<TestOutcome> {
+    let mut outcomes = Vec::new();
+    for test in tests {
+        if cancel.is_cancelled() {
+            break;
+        }
+        if let Some(members) = members {
+            let covered = !test.targets.is_empty()
+                && test
+                    .targets
+                    .iter()
+                    .all(|target| members.contains(target.logical_name().as_str()));
+            if !covered {
+                continue;
+            }
+        }
+        let outcome = adapter.execute(&test.compiled_sql).await;
+        let (status, row_count, error) = match outcome {
+            Ok(query) if query.row_count == 0 => (ExecutionStatus::Passed, 0, None),
+            Ok(query) => (
+                ExecutionStatus::Failed,
+                query.row_count,
+                Some(format!("test returned {} row(s)", query.row_count)),
+            ),
+            Err(error) => (ExecutionStatus::Failed, 0, Some(error.to_string())),
+        };
+        outcomes.push(TestOutcome {
+            test: test.id.to_string(),
+            status,
+            row_count,
+            error,
+        });
+    }
+    outcomes
+}
+
 /// Resolve a run id or unique prefix to a full run id.
 fn resolve_run_id(state: &dyn StateStore, id_or_prefix: &str) -> Result<String, EngineError> {
     let matches = state.find_runs(id_or_prefix)?;

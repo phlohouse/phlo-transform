@@ -43,9 +43,9 @@ use phlo_transform_core::{
 };
 use phlo_transform_engine::util::now_rfc3339;
 use phlo_transform_engine::{
-    branch_diff, catalog_name, compiled_catalog, read_environment_for, Adapter, ArtifactWriter,
-    BranchDiffRequest, EngineError, EnvironmentContext, EnvironmentMode, ExecutionStatus,
-    PlanOptions, Planner, RunSummary, StateStore,
+    branch_diff, compiled_catalog, environment_catalog, Adapter, ArtifactWriter, BranchDiffRequest,
+    EngineError, EnvironmentContext, EnvironmentMode, ExecutionStatus, PlanOptions, Planner,
+    RunSummary, StateStore,
 };
 use phlo_transform_nessie::NessieClient;
 
@@ -665,7 +665,11 @@ async fn plan(RawQuery(raw): RawQuery, State(service): State<Arc<WorkspaceServic
     let environment = query
         .environment
         .or_else(|| service.default_environment().map(str::to_string));
-    let base_ref = query.base.clone().unwrap_or_else(|| "main".to_string());
+    let base_ref = phlo_transform_engine::base_ref_for(
+        service.root(),
+        environment.as_deref(),
+        query.base.as_deref(),
+    );
     let target = service
         .environment_context()
         .resolve(environment.as_deref(), &base_ref, EnvironmentMode::ReadOnly)
@@ -829,22 +833,16 @@ async fn diff_branch(
     }
     let compilation = service.snapshot();
     let root = service.root();
-    let candidate_catalog = read_environment_for(root, &candidate_ref)
-        .map(|setup| setup.catalog)
-        .unwrap_or_else(|| catalog_name(&candidate_ref));
-    let base_catalog = if base_ref == "main" {
-        service
-            .config
-            .catalog
-            .clone()
-            .or_else(|| compiled_catalog(&compilation))
-    } else {
-        Some(
-            read_environment_for(root, &base_ref)
-                .map(|setup| setup.catalog)
-                .unwrap_or_else(|| catalog_name(&base_ref)),
-        )
-    };
+    // The shared catalog resolution — the same precedence the CLI's `diff`
+    // applies: candidate through its recorded/generated binding, `main`
+    // through the deployment catalog, other refs through their bindings.
+    let candidate_catalog = environment_catalog(root, &candidate_ref);
+    let base_catalog = phlo_transform_engine::base_catalog(
+        root,
+        &base_ref,
+        service.config.catalog.as_deref(),
+        compiled_catalog(&compilation).as_deref(),
+    );
     let report = branch_diff(
         adapter,
         service.state().as_deref(),
@@ -920,29 +918,19 @@ async fn state_runs(
 /// Resolve a run id or unique prefix to its summary — the CLI's prefix
 /// semantics: `API013` when nothing matches, `API014` when ambiguous.
 fn resolve_run(state: &dyn StateStore, id: &str) -> Result<RunSummary, (StatusCode, Json<Value>)> {
-    let matches = state.find_runs(id).map_err(|error| {
-        api_error(
+    phlo_transform_engine::find_unique_run(state, id).map_err(|error| match error {
+        phlo_transform_engine::EngineError::Ambiguous(_) => {
+            api_error(StatusCode::BAD_REQUEST, "API014", error.to_string())
+        }
+        phlo_transform_engine::EngineError::NotFound(_) => {
+            api_error(StatusCode::NOT_FOUND, "API013", error.to_string())
+        }
+        _ => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "API011",
             error.to_string(),
-        )
-    })?;
-    match matches.as_slice() {
-        [] => Err(api_error(
-            StatusCode::NOT_FOUND,
-            "API013",
-            format!("no run matches `{id}`"),
-        )),
-        [only] => Ok(only.clone()),
-        _ => Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "API014",
-            format!(
-                "`{id}` matches {} runs — give a longer prefix",
-                matches.len()
-            ),
-        )),
-    }
+        ),
+    })
 }
 
 /// `phlo-transform state show <run>` — run record + stored plan + per-item

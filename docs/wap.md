@@ -25,10 +25,19 @@ in-memory client.
 
 ## Environments
 
-`--ref <reference>` (alias `--reference`) selects the environment for
-`plan`/`apply`/`run` and is recorded in plans, runs and state. It defaults to
-`--environment` when set. There is no separate environment abstraction layered
-on top of Nessie.
+`--ref <reference>` (alias `--reference`) and `--environment <name>` name the
+same logical environment for `plan`/`apply`/`run`/`test`; it is recorded in
+plans, runs and state. They are aliases — when both are given they must agree.
+Without a Nessie endpoint an environment is a state-scoping label only; with
+Nessie it maps to the candidate branch and its catalog. There is no separate
+environment abstraction layered on top of Nessie.
+
+Two Nessie addresses exist: `--nessie-endpoint` (or `PHLO_NESSIE_ENDPOINT`) is
+the REST endpoint this process calls, and `--nessie-catalog-uri` (or
+`PHLO_NESSIE_CATALOG_URI`) is the address written into provisioned catalogs —
+the one the warehouse uses. They default to the same value; set the catalog
+URI when Trino reaches Nessie on a different address than the CLI does, e.g. a
+container-network hostname versus a host-mapped port.
 
 ## Reference management
 
@@ -42,9 +51,14 @@ phlo-transform ref delete ci/pr-1
 `list`/`show` are read-only. `create` and `delete` are the only commands that
 mutate Nessie references directly, and they do exactly what they say — nothing
 creates or deletes a branch as a side effect of another operation except the
-explicit provisioning on `plan`/`apply`/`run --ref` and `--cleanup` on
-`promote`. `ref delete main` is refused outright: `main` is every
-environment's default base, not a scratch branch.
+explicit provisioning on `apply`/`run --ref` and `--cleanup` on
+`promote`. `plan`/`test --ref` resolve the same environment read-only — they
+compile against the candidate's catalog when it exists and never create
+anything — and they fail where a run would: when the environment resolves to
+the generated catalog and the adapter cannot provision catalogs, the preview
+fails closed rather than naming a target no run reaches. `ref delete main` is
+refused outright: `main` is every environment's default base, not a scratch
+branch.
 
 ## WAP
 
@@ -66,11 +80,17 @@ readable ref plus 8 hex of its SHA-256, so punctuation-equivalent refs
 (`ci/pr-1`, `ci_pr_1`) can never collide on one physical catalog — and can be
 overridden with `--catalog`; `--warehouse` sets the Iceberg warehouse (for
 example `local:///tmp/phlo-warehouse` or `s3://bucket/wh`). Because a
-catalog's bound Nessie ref cannot be read back over SQL, an existing catalog
-is never adopted on name alone: an `unverified` catalog is accepted only when
-its name is the candidate's own generated convention or a recorded artifact
-binds it to the same ref, and a catalog another candidate's evidence claims is
-refused outright. The provisioning records `catalog_status` (`created`,
+catalog's bound Nessie ref cannot be read back over SQL and the generated
+name is a public convention anyone can mint, an existing catalog is never
+adopted on name alone: an `unverified` catalog is accepted only when a
+recorded artifact binds that catalog to this ref — an artifact that
+vetted the catalog before (recorded with the `catalog_owned_by_phlo`
+ownership flag; a pre-flag `unverified` record may itself have been
+adopted on the name alone and is not evidence), or an explicit
+`ref create --catalog` pin —
+and a catalog another candidate's evidence claims is refused outright.
+Refusal rolls back a just-created candidate branch so a failed
+provisioning attempt leaves no stray ref. The provisioning records `catalog_status` (`created`,
 `unverified`, `unmanaged`) so cleanup drops only catalogs Phlo provably
 created. Provisioning is recorded in
 `.phlo/transform/environment.json` — the workspace's current

@@ -8,10 +8,10 @@ use serde_json::{json, Value};
 
 use phlo_transform_core::{resolve_selection, Compilation, SelectorSet};
 use phlo_transform_engine::{
-    audited_diff, audited_lineage, contract_breaking_changes, evaluate_gates, read_environment_for,
-    remove_environment_artifacts, ArtifactWriter, CatalogStatus, EngineError, EnvironmentMode,
-    ExecutionStatus, GateInput, PlanOptions, Planner, PromotionRequest, RetryPolicy, RunOptions,
-    RunResult, Runner,
+    base_ref_for, bind_run_reference, cleanup_candidate, evaluate_promotion, execute_tests,
+    find_unique_run, persist_promotion, promote, ArtifactWriter, EngineError, EnvironmentMode,
+    ExecutionStatus, PlanOptions, Planner, PromotionOptions, RetryPolicy, RunOptions, RunResult,
+    Runner,
 };
 
 use crate::operations::{
@@ -62,6 +62,7 @@ pub async fn execute(
 fn resolution_error(error: EngineError) -> OperationError {
     let code = match error {
         EngineError::NotConfigured(_) => "API007",
+        EngineError::NotFound(_) => "API013",
         _ => "API011",
     };
     op_error(code, error.to_string())
@@ -99,29 +100,18 @@ async fn target_for(
 /// commit its writes produced, not the pre-run snapshot. An unbound run
 /// cannot later promote. The run's own environment label is used, so
 /// `resume`/`retry_failed` bind the environment the original run targeted.
-async fn bind_run_reference(
+async fn bind_reference(
     service: &Arc<WorkspaceService>,
     result: &RunResult,
 ) -> Result<(), OperationError> {
     if result.status != ExecutionStatus::Passed {
         return Ok(());
     }
-    let (Some(state), Some(environment), Some(nessie)) = (
-        service.state(),
-        result.environment.as_deref(),
-        service.nessie(),
-    ) else {
+    let (Some(state), Some(nessie)) = (service.state(), service.nessie()) else {
         return Ok(());
     };
-    let Some(head) = nessie
-        .get_reference(environment)
+    bind_run_reference(nessie.as_ref(), state.as_ref(), result)
         .await
-        .map_err(|error| op_error("API011", error.to_string()))?
-    else {
-        return Ok(());
-    };
-    state
-        .bind_run_reference_hash(&result.run_id, &head.hash)
         .map_err(|error| op_error("API011", error.to_string()))
 }
 
@@ -135,7 +125,11 @@ async fn op_run(
     let environment = params
         .environment
         .or_else(|| service.default_environment().map(str::to_string));
-    let base_ref = params.base.clone().unwrap_or_else(|| "main".to_string());
+    let base_ref = base_ref_for(
+        service.root(),
+        environment.as_deref(),
+        params.base.as_deref(),
+    );
     let compilation = target_for(service, environment.as_deref(), &base_ref).await?;
     let set = SelectorSet::parse(&params.selectors, &[], &[], false, false)
         .map_err(|error| op_error("API006", error.to_string()))?;
@@ -172,7 +166,7 @@ async fn op_run(
         .apply(&compilation, &plan, &options)
         .await
         .map_err(|error| op_error("API011", error.to_string()))?;
-    bind_run_reference(service, &result).await?;
+    bind_reference(service, &result).await?;
     writer
         .write_run(&result)
         .map_err(|error| op_error("API011", error.to_string()))?;
@@ -202,35 +196,15 @@ async fn op_continue(
 ) -> Result<Value, OperationError> {
     let adapter = service.adapter().ok_or_else(|| not_configured("adapter"))?;
     let state = service.state().ok_or_else(|| not_configured("state"))?;
-    let matches = state
-        .find_runs(&params.run)
-        .map_err(|error| op_error("API011", error.to_string()))?;
-    let environment = match matches.as_slice() {
-        [only] => only.environment.clone(),
-        [] => {
-            return Err(op_error(
-                "API013",
-                format!("no run matches `{}`", params.run),
-            ))
-        }
-        _ => {
-            return Err(op_error(
-                "API014",
-                format!(
-                    "`{}` matches {} runs — give a longer prefix",
-                    params.run,
-                    matches.len()
-                ),
-            ))
-        }
-    };
+    let environment = find_unique_run(state.as_ref(), &params.run)
+        .map_err(|error| match error {
+            EngineError::Ambiguous(_) => op_error("API014", error.to_string()),
+            _ => op_error("API013", error.to_string()),
+        })?
+        .environment;
     // Provision against the base the environment was cut from when that is
     // recorded, else the conventional `main`.
-    let base_ref = environment
-        .as_deref()
-        .and_then(|env| read_environment_for(service.root(), env))
-        .map(|setup| setup.base.name)
-        .unwrap_or_else(|| "main".to_string());
+    let base_ref = base_ref_for(service.root(), environment.as_deref(), None);
     let compilation = target_for(service, environment.as_deref(), &base_ref).await?;
     let options = RunOptions {
         environment,
@@ -249,7 +223,7 @@ async fn op_continue(
         }
     }
     .map_err(|error| op_error("API011", error.to_string()))?;
-    bind_run_reference(service, &result).await?;
+    bind_reference(service, &result).await?;
     let writer = ArtifactWriter::for_workspace(service.root());
     writer
         .write_project(&compilation)
@@ -265,7 +239,33 @@ async fn op_test(
     params: TestParams,
 ) -> Result<Value, OperationError> {
     let adapter = service.adapter().ok_or_else(|| not_configured("adapter"))?;
-    let compilation = service.snapshot();
+    // Tests only read, so the environment resolves without provisioning —
+    // `ReadOnly` gives the same catalog a run would target, and an
+    // unprovisioned environment's queries fail honestly instead of
+    // silently running on the default catalog. Like `run`, an operation
+    // without an explicit environment inherits the daemon's configured one.
+    let environment = params
+        .environment
+        .or_else(|| service.default_environment().map(str::to_string));
+    let base_ref = base_ref_for(
+        service.root(),
+        environment.as_deref(),
+        params.base.as_deref(),
+    );
+    let compilation = match environment.as_deref() {
+        Some(environment) => {
+            let target = service
+                .environment_context()
+                .resolve(Some(environment), &base_ref, EnvironmentMode::ReadOnly)
+                .await
+                .map_err(resolution_error)?;
+            match target.compilation {
+                Some(compilation) => Arc::new(compilation),
+                None => service.snapshot(),
+            }
+        }
+        None => service.snapshot(),
+    };
     // Same rule as the CLI: a test runs when every model it reads is
     // selected; tests that only read sources run under unrestricted
     // selection.
@@ -284,46 +284,19 @@ async fn op_test(
                 .collect(),
         )
     };
-    let mut results = Vec::new();
-    let mut failed = false;
-    for test in &compilation.tests {
-        if ops.is_cancelled(id) {
-            break;
-        }
-        if let Some(members) = &members {
-            let covered = !test.targets.is_empty()
-                && test
-                    .targets
-                    .iter()
-                    .all(|target| members.contains(target.logical_name().as_str()));
-            if !covered {
-                continue;
-            }
-        }
-        let outcome = adapter.execute(&test.compiled_sql).await;
-        let (status, row_count, error) = match outcome {
-            Ok(query) if query.row_count == 0 => (ExecutionStatus::Passed, 0, None),
-            Ok(query) => (
-                ExecutionStatus::Failed,
-                query.row_count,
-                Some(format!("test returned {} row(s)", query.row_count)),
-            ),
-            Err(error) => (ExecutionStatus::Failed, 0, Some(error.to_string())),
-        };
-        if status == ExecutionStatus::Failed {
-            failed = true;
-        }
-        results.push(json!({
-            "test": test.id.to_string(),
-            "status": status,
-            "row_count": row_count,
-            "error": error,
-        }));
-    }
+    let results = execute_tests(
+        adapter.as_ref(),
+        &compilation.tests,
+        members.as_ref(),
+        &ops.cancel_handle(id),
+    )
+    .await;
+    let failed = results
+        .iter()
+        .any(|outcome| outcome.status == ExecutionStatus::Failed);
     Ok(json!({ "tests": results, "failed": failed }))
 }
 
-#[allow(clippy::too_many_lines)]
 async fn op_promote(
     service: &Arc<WorkspaceService>,
     ops: &Arc<OperationStore>,
@@ -336,108 +309,29 @@ async fn op_promote(
     let compilation = service.snapshot();
     let candidate = params.candidate.as_str();
     let to = params.to.as_str();
-
-    let candidate_reference = nessie
-        .get_reference(candidate)
-        .await
-        .map_err(|error| op_error("API011", error.to_string()))?
-        .ok_or_else(|| {
-            op_error(
-                "API013",
-                format!("candidate reference `{candidate}` was not found"),
-            )
-        })?;
-    let target = nessie
-        .get_reference(to)
-        .await
-        .map_err(|error| op_error("API011", error.to_string()))?
-        .ok_or_else(|| op_error("API013", format!("target reference `{to}` was not found")))?;
-
-    let run = match &state {
-        Some(state) => state
-            .latest_run(Some(candidate))
-            .map_err(|error| op_error("API011", error.to_string()))?,
-        None => None,
-    };
-    let (model_runs, seed_runs, test_runs) = match (&state, &run) {
-        (Some(state), Some(run)) => (
-            state
-                .model_runs(&run.run_id)
-                .map_err(|error| op_error("API011", error.to_string()))?,
-            state
-                .seed_runs(&run.run_id)
-                .map_err(|error| op_error("API011", error.to_string()))?,
-            state
-                .test_runs(&run.run_id)
-                .map_err(|error| op_error("API011", error.to_string()))?,
-        ),
-        _ => (Vec::new(), Vec::new(), Vec::new()),
-    };
-
-    let environment = read_environment_for(&root, candidate);
-    let mut audit = audited_diff(
-        &root,
-        state.as_deref(),
-        candidate,
-        to,
-        Some(&candidate_reference.hash),
-        Some(&target.hash),
-    );
-    // Contract breaks are computed live — the workspace's desired contracts
-    // against what the target environment last recorded — so a contract
-    // edited after `diff` cannot sneak a break past the gate on a stale
-    // artifact's analysis.
-    // The recorded base contracts are promotion evidence — a store error
-    // fails the operation rather than reading as "no contracts recorded".
-    audit.breaking_schema_changes.extend(
-        contract_breaking_changes(state.as_deref(), &compilation, to)
-            .map_err(|error| op_error("API011", error.to_string()))?,
-    );
-    let merge_check = nessie.can_merge(candidate, to).await.ok();
-    // Lineage evidence: the artifact only speaks for this promotion when
-    // the identities it was produced against still hold — including the
-    // candidate's compiled lineage fingerprint — stale or unbound reports
-    // are surfaced as such, never silently as "no changes".
-    let lineage = audited_lineage(
-        &root,
-        candidate,
-        to,
-        &candidate_reference.hash,
-        &target.hash,
-        Some(&compilation.lineage.fingerprint()),
-    );
-
-    // The `base` gate needs a target commit the evidence was established
-    // against. Two sources, freshest first: a hash-bound diff artifact that
-    // audited this exact target, else the recorded commit the candidate was
-    // provably created from. A candidate whose origin is unknown and which
-    // was never audited against this target has no evidence — the gate must
-    // fail rather than redefine its base as today's head.
-    let expected_target_hash = audit.audited_base_hash.clone().or_else(|| {
-        environment
-            .as_ref()
-            .filter(|setup| setup.candidate.name == candidate && setup.base.name == to)
-            .and_then(|setup| setup.created_from.as_ref())
-            .map(|base| base.hash.clone())
-    });
-
-    let input = GateInput {
-        run: run.clone(),
-        model_runs,
-        seed_runs,
-        test_runs,
+    let options = PromotionOptions {
         require_diff: params.require_diff,
-        diff_passed: audit.diff_passed,
-        diff_rejected: audit.diff_rejected.clone(),
-        breaking_schema_changes: audit.breaking_schema_changes.clone(),
         allow_breaking_schema: params.allow_breaking_schema,
-        expected_target_hash: expected_target_hash.clone(),
-        actual_target_hash: Some(target.hash.clone()),
-        actual_candidate_hash: Some(candidate_reference.hash.clone()),
-        schema_audited: audit.schema_audited,
-        merge_check,
     };
-    let report = evaluate_gates(&input);
+
+    // The shared pre-merge audit: both control surfaces authorise a merge
+    // under identical rules — a missing candidate/target reads as the
+    // caller's not-found surface.
+    let evaluation = evaluate_promotion(
+        &root,
+        nessie.as_ref(),
+        state.as_deref(),
+        &compilation,
+        candidate,
+        to,
+        &options,
+    )
+    .await
+    .map_err(|error| match error {
+        EngineError::NotFound(message) => op_error("API013", message),
+        error => op_error("API011", error.to_string()),
+    })?;
+    let report = &evaluation.gates;
 
     if !report.passed || params.check {
         return Ok(json!({
@@ -446,95 +340,42 @@ async fn op_promote(
             "target_ref": to,
             "check_only": params.check,
             "gates": report.results,
-            "lineage": lineage,
+            "lineage": evaluation.lineage,
         }));
     }
     if ops.is_cancelled(id) {
         return Err(op_error("cancelled", "cancelled before merge".into()));
     }
 
-    let request = PromotionRequest {
-        candidate_ref: candidate.to_string(),
-        target_ref: to.to_string(),
-        candidate_hash: Some(candidate_reference.hash.clone()),
-        expected_target_hash: expected_target_hash.or_else(|| Some(target.hash.clone())),
-        plan_id: run.as_ref().map(|run| run.plan_id.clone()),
-        run_id: run.as_ref().map(|run| run.run_id.clone()),
-        quality_gates_passed: true,
-        diff_passed: audit.diff_passed,
-        require_diff: params.require_diff,
-        breaking_schema_changes: input.breaking_schema_changes,
-        allow_breaking_schema: params.allow_breaking_schema,
-        dry_run: false,
-        actor: params.actor,
-        gates: report.results.clone(),
-    };
-    let record = phlo_transform_engine::promote(nessie.as_ref(), &request)
+    let request = evaluation.request(&options, params.actor);
+    let record = promote(nessie.as_ref(), &request)
         .await
+        .map_err(|error| match error {
+            EngineError::NotFound(message) => op_error("API013", message),
+            error => op_error("API011", error.to_string()),
+        })?;
+    persist_promotion(&root, state.as_deref(), &record)
         .map_err(|error| op_error("API011", error.to_string()))?;
-    ArtifactWriter::for_workspace(&root)
-        .write_promotion(&record)
-        .map_err(|error| op_error("API011", error.to_string()))?;
-    if let Some(state) = &state {
-        state
-            .record_promotion(&record)
-            .map_err(|error| op_error("API011", error.to_string()))?;
-    }
     let cleanup_error = if params.cleanup && record.merged {
-        cleanup_candidate(service, candidate, environment.as_ref())
-            .await
-            .err()
+        cleanup_candidate(
+            &root,
+            service.adapter().as_deref(),
+            nessie.as_ref(),
+            candidate,
+            evaluation.environment.as_ref(),
+        )
+        .await
+        .err()
     } else {
         None
     };
     Ok(json!({
         "ok": cleanup_error.is_none(),
         "gates": report.results,
-        "lineage": lineage,
+        "lineage": evaluation.lineage,
         "promotion": record,
         "cleanup_error": cleanup_error,
     }))
-}
-
-/// Drop the candidate's catalog and branch after a merge — every failure is
-/// reported, never silent (same contract as the CLI's cleanup). Only a
-/// catalog phlo provably created (`CatalogStatus::Created` in the recorded
-/// evidence) is dropped: an adopted or unmanaged catalog belongs to
-/// someone else, and without evidence the name is only a guess.
-async fn cleanup_candidate(
-    service: &Arc<WorkspaceService>,
-    candidate: &str,
-    environment: Option<&phlo_transform_engine::EnvironmentSetup>,
-) -> Result<(), String> {
-    let mut failures = Vec::new();
-    let drop_catalog = environment
-        .filter(|setup| setup.catalog_status == CatalogStatus::Created)
-        .map(|setup| setup.catalog.clone());
-    match (drop_catalog, service.adapter()) {
-        (Some(catalog), Some(adapter)) => {
-            if let Err(error) = adapter
-                .execute(&format!("DROP CATALOG IF EXISTS {}", catalog))
-                .await
-            {
-                failures.push(format!("drop catalog `{catalog}`: {error}"));
-            }
-        }
-        (Some(catalog), None) => {
-            failures.push(format!("no adapter configured to drop catalog `{catalog}`"));
-        }
-        (None, _) => {}
-    }
-    if let Some(nessie) = service.nessie() {
-        if let Err(error) = nessie.delete_branch(candidate).await {
-            failures.push(format!("delete branch `{candidate}`: {error}"));
-        }
-    }
-    if failures.is_empty() {
-        remove_environment_artifacts(service.root(), candidate);
-        Ok(())
-    } else {
-        Err(failures.join("; "))
-    }
 }
 
 async fn op_reload(service: &Arc<WorkspaceService>) -> Result<Value, OperationError> {

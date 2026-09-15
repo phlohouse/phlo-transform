@@ -72,6 +72,18 @@ pub trait Adapter: Send + Sync {
 
     async fn relation_exists(&self, relation: &Relation) -> Result<bool, AdapterError>;
 
+    /// Existence probes for a batch of relations — positions in the result
+    /// match `relations`. Adapters that can answer from catalog metadata
+    /// (Trino's `information_schema`) override this to collapse N probes
+    /// into a handful of queries; the default is the honest serial loop.
+    async fn relations_exist(&self, relations: &[Relation]) -> Result<Vec<bool>, AdapterError> {
+        let mut out = Vec::with_capacity(relations.len());
+        for relation in relations {
+            out.push(self.relation_exists(relation).await?);
+        }
+        Ok(out)
+    }
+
     async fn execute(&self, sql: &str) -> Result<QueryResult, AdapterError>;
 
     async fn create_or_replace_view(
@@ -127,6 +139,32 @@ pub trait Adapter: Send + Sync {
     /// Read column metadata for an existing relation.
     async fn relation_columns(&self, relation: &Relation) -> Result<Vec<ColumnInfo>, AdapterError>;
 
+    /// Column metadata for a batch of relations — per-relation results, so
+    /// one unreadable relation does not sink the batch (the planner treats
+    /// unknown columns as absent evidence, not a failure). Adapters with a
+    /// queryable catalog (Trino's `information_schema.columns`) override to
+    /// collapse the probes; the default probes serially.
+    async fn relation_columns_many(
+        &self,
+        relations: &[Relation],
+    ) -> Vec<Result<Vec<ColumnInfo>, AdapterError>> {
+        let mut out = Vec::with_capacity(relations.len());
+        for relation in relations {
+            out.push(self.relation_columns(relation).await);
+        }
+        out
+    }
+
+    /// Whether `ensure_catalog` can provision a catalog bound to a Nessie
+    /// reference (dynamic catalog management). `false` — the default — is
+    /// the honest answer for adapters without it. Environment resolution
+    /// reads this to fail a read-only preview whose generated catalog the
+    /// adapter could never create, instead of previewing a target a run
+    /// would refuse.
+    fn supports_catalog_provisioning(&self) -> bool {
+        false
+    }
+
     /// Ensure a catalog exists for a Nessie reference, reporting what was
     /// established — see [`CatalogStatus`]. Adapters that do not support
     /// catalog provisioning return [`CatalogStatus::Unmanaged`]. An adapter
@@ -135,6 +173,19 @@ pub trait Adapter: Send + Sync {
     /// decides from recorded evidence.
     async fn ensure_catalog(&self, request: &CatalogRequest)
         -> Result<CatalogStatus, AdapterError>;
+
+    /// Drop a catalog the caller has proven phlo owns. Identifier quoting
+    /// is the adapter's business — the engine never builds catalog names
+    /// into raw SQL. Adapters that cannot drop catalogs report
+    /// `UNSUPPORTED`; cleanup records that as a failure rather than
+    /// staying silent about a leftover catalog.
+    async fn drop_catalog(&self, catalog: &str) -> Result<(), AdapterError> {
+        let _ = catalog;
+        Err(AdapterError::new(
+            "UNSUPPORTED",
+            format!("{} does not drop catalogs", self.name()),
+        ))
+    }
 
     /// Ensure the schema/namespace containing a relation exists.
     async fn ensure_schema(&self, relation: &Relation) -> Result<(), AdapterError>;

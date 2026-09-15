@@ -51,6 +51,14 @@ pub enum EngineError {
     /// their "not configured" error surface (CLI message, API007).
     #[error("not configured: {0}")]
     NotConfigured(String),
+    /// A named object did not resolve — callers map this to their
+    /// not-found error surface (CLI message, API013).
+    #[error("{0}")]
+    NotFound(String),
+    /// A partial identifier matched more than one object — callers map
+    /// this to their ambiguity error surface (CLI message, API014).
+    #[error("{0}")]
+    Ambiguous(String),
     #[error("state store error: {0}")]
     State(String),
     #[error("artifact error: {0}")]

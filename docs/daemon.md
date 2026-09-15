@@ -11,7 +11,8 @@ report DTOs as the CLI's `--json` output.
 ```bash
 phlo-transform daemon --root <workspace> --port 7070 \
     [--adapter duckdb|trino ...] [--state <path-or-url>] \
-    [--nessie-endpoint <uri>] [--environment <label>]
+    [--nessie-endpoint <uri>] [--nessie-catalog-uri <uri>] \
+    [--environment <label>]
 ```
 
 The daemon binds `127.0.0.1` by default and needs no authentication for local
@@ -65,7 +66,7 @@ Response: `{"operation": {...}, "replayed": false}`.
 | `run` | `run [selectors] --ref --from --force` | `selectors`, `environment`, `base`, `force`, `run_tests` | adapter |
 | `resume` | `run --resume <run>` | `run` | adapter + state |
 | `retry_failed` | `run --retry-failed <run>` | `run` | adapter + state |
-| `test` | `test [selectors]` | `selectors` | adapter |
+| `test` | `test [selectors] --ref --from` | `selectors`, `environment`, `base` | adapter |
 | `promote` | `promote <ref> --to <ref> [--check] [--require-diff] [--allow-breaking-schema] [--cleanup]` | `candidate`, `to`, `check`, `require_diff`, `allow_breaking_schema`, `cleanup`, `actor` | nessie |
 | `reload` | — | — | — |
 
@@ -77,7 +78,11 @@ The submission body may also spread params at the top level
 
 `params.environment` is the candidate Nessie reference (the CLI's `--ref`),
 and `params.base` the ref a new candidate is cut from (the CLI's `--from`,
-default `main`). When the daemon was launched with `--nessie-endpoint`, a
+default `main`). A `run` or `test` op without `environment` — and the
+`plan`/state reads without `environment=` — inherits the daemon's
+launch-time `--environment` label, so a daemon scoped to a candidate
+environment runs and reads inside it consistently. When the daemon was
+launched with `--nessie-endpoint`, a
 `run`/`resume`/`retry_failed` against an environment other than the base
 ref runs the full provisioning step the CLI runs: the Nessie branch is
 created (or reused), a branch-scoped Iceberg catalog is provisioned, and
@@ -91,22 +96,29 @@ The provisioned catalog is named `phlo_<sanitised-ref>_<hash>` — the
 readable ref plus 8 hex of the ref's SHA-256 — so refs that fold to the
 same readable name (`ci/pr-1`, `ci_pr_1`, `ci-pr-1`) can never share one
 physical catalog. An existing catalog is never adopted on name alone:
-Trino cannot read a catalog's configured Nessie ref back over SQL, so the
-engine records how each catalog was established (`created` /
-`unverified` / `unmanaged`) and accepts a pre-existing catalog only when
-the binding is provable — the generated self-named convention, or a
-recorded `environment_<ref>.json` binding. An unverifiable foreign
-catalog, or one another candidate already claims, fails the operation
-rather than write into it.
+Trino cannot read a catalog's configured Nessie ref back over SQL, and the
+generated name is a public convention anyone can mint, so the engine
+records how each catalog was established (`created` / `unverified` /
+`unmanaged`) and accepts a pre-existing catalog only on a recorded
+`environment_<ref>.json` binding for that exact ref and catalog — an
+artifact that vetted the catalog before (recorded with the
+`catalog_owned_by_phlo` ownership flag; a pre-flag `unverified` record
+cannot vouch), or an explicit `ref create --catalog` pin. An unverifiable foreign catalog, or one
+another candidate already claims, fails the operation rather than write
+into it.
 
 When the daemon has no Nessie client at all the environment can only ever
 be a state-record label — local mode is truthful and the run proceeds.
 But once Nessie is configured a named environment claims branch semantics:
-a non-base environment it cannot provision (no adapter, or no
-catalog-facing `nessie_uri`) fails with `API007` rather than execute on
-the default target and bind its evidence to a head it did not produce.
-Running against the base ref itself (`environment == base`) is not a
-candidate and uses the compiled default target.
+a non-base environment it cannot provision fails with `API007` rather
+than execute on the default target and bind its evidence to a head it did
+not produce — no adapter, no catalog-facing `nessie_uri`, or an adapter
+without catalog provisioning (`supports_catalog_provisioning`) when the
+environment would resolve to the generated catalog. Read-only
+`plan`/`test` resolution applies the same check, so a preview never names
+a target a run would refuse; an explicit or recorded catalog pin is the
+escape hatch. Running against the base ref itself (`environment == base`)
+is not a candidate and uses the compiled default target.
 
 `GET /v1/plan?environment=` resolves through the *same* environment
 resolution — in read-only mode: the physical catalog is computed (override

@@ -4,11 +4,17 @@
 //! promoted to a target reference. Promotion validates quality gates and
 //! target staleness before merging, and records a reproducible artifact.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
-use phlo_transform_nessie::{Conflict, NessieClient};
+use phlo_transform_core::Compilation;
+use phlo_transform_nessie::{Conflict, NessieClient, ReferenceInfo};
 
+use crate::environment::EnvironmentSetup;
 use crate::error::EngineError;
+use crate::gates::{evaluate_gates, GateReport};
+use crate::state::RunSummary;
 use crate::util::now_rfc3339;
 
 /// A promotion request.
@@ -92,7 +98,7 @@ pub async fn promote(
         .await
         .map_err(|error| EngineError::Promotion(error.to_string()))?
         .ok_or_else(|| {
-            EngineError::Promotion(format!(
+            EngineError::NotFound(format!(
                 "candidate reference `{}` was not found",
                 request.candidate_ref
             ))
@@ -103,7 +109,7 @@ pub async fn promote(
         .await
         .map_err(|error| EngineError::Promotion(error.to_string()))?
         .ok_or_else(|| {
-            EngineError::Promotion(format!(
+            EngineError::NotFound(format!(
                 "target reference `{}` was not found",
                 request.target_ref
             ))
@@ -190,6 +196,303 @@ pub async fn promote(
     record.merged = true;
     record.target_hash_after = merge.hash;
     Ok(record)
+}
+
+/// Gate-policy switches a caller passes through.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PromotionOptions {
+    /// Require a passing data diff before promotion.
+    pub require_diff: bool,
+    /// Waive breaking schema changes found by the audit.
+    pub allow_breaking_schema: bool,
+}
+
+/// Everything a promotion decision is made from — the evidence gathered,
+/// the gate verdict over it, and the resolved references. Shared by the
+/// CLI's `promote` and the daemon's promote operation so both surfaces
+/// authorise a merge under identical rules.
+pub struct PromotionEvaluation {
+    /// The candidate reference as Nessie currently resolves it.
+    pub candidate: ReferenceInfo,
+    /// The target reference as Nessie currently resolves it.
+    pub target: ReferenceInfo,
+    /// The latest run recorded under the candidate's environment label.
+    pub run: Option<RunSummary>,
+    /// What the persisted diff artifact proves for this promotion.
+    pub audit: crate::audit::AuditEvidence,
+    /// The lineage artifact's standing under the gates (advisory context).
+    pub lineage: Option<crate::audit::LineageEvidence>,
+    /// The environment provisioning record for the candidate, when known —
+    /// callers use it for cleanup decisions after a merge.
+    pub environment: Option<EnvironmentSetup>,
+    /// The base commit the evidence was established against — the hash the
+    /// merge asserts on.
+    pub expected_target_hash: Option<String>,
+    /// The gate verdict.
+    pub gates: GateReport,
+}
+
+impl PromotionEvaluation {
+    /// The promotion request this evaluation authorises — only meaningful
+    /// when `gates.passed`. The target hash is asserted at merge time: when
+    /// no evidence base was recorded, the just-resolved head is pinned so a
+    /// commit racing the promotion is rejected rather than merged over.
+    pub fn request(&self, options: &PromotionOptions, actor: Option<String>) -> PromotionRequest {
+        PromotionRequest {
+            candidate_ref: self.candidate.name.clone(),
+            target_ref: self.target.name.clone(),
+            candidate_hash: Some(self.candidate.hash.clone()),
+            expected_target_hash: self
+                .expected_target_hash
+                .clone()
+                .or_else(|| Some(self.target.hash.clone())),
+            plan_id: self.run.as_ref().map(|run| run.plan_id.clone()),
+            run_id: self.run.as_ref().map(|run| run.run_id.clone()),
+            quality_gates_passed: true,
+            diff_passed: self.audit.diff_passed,
+            require_diff: options.require_diff,
+            breaking_schema_changes: self.audit.breaking_schema_changes.clone(),
+            allow_breaking_schema: options.allow_breaking_schema,
+            dry_run: false,
+            actor,
+            gates: self.gates.results.clone(),
+        }
+    }
+}
+
+/// Gather the evidence for a `candidate` → `to` promotion and evaluate the
+/// gates over it — the shared pre-merge audit both control surfaces run.
+/// Reads the workspace's evidence artifacts (`branch_diff.json`,
+/// `lineage_diff.json`, `environment*.json`) and the state store's run
+/// history; computes contract breaks live so an edit after `diff` cannot
+/// sneak a break past the gate on a stale artifact's analysis.
+pub async fn evaluate_promotion(
+    workspace_root: &Path,
+    nessie: &dyn NessieClient,
+    state: Option<&dyn crate::state::StateStore>,
+    compilation: &Compilation,
+    candidate: &str,
+    to: &str,
+    options: &PromotionOptions,
+) -> Result<PromotionEvaluation, EngineError> {
+    let candidate_reference = nessie
+        .get_reference(candidate)
+        .await
+        .map_err(|error| EngineError::Promotion(error.to_string()))?
+        .ok_or_else(|| {
+            EngineError::NotFound(format!("candidate reference `{candidate}` was not found"))
+        })?;
+    let target = nessie
+        .get_reference(to)
+        .await
+        .map_err(|error| EngineError::Promotion(error.to_string()))?
+        .ok_or_else(|| EngineError::NotFound(format!("target reference `{to}` was not found")))?;
+
+    let run = match state {
+        Some(state) => state
+            .latest_run(Some(candidate))
+            .map_err(|error| EngineError::Promotion(error.to_string()))?,
+        None => None,
+    };
+    let (model_runs, seed_runs, test_runs) = match (state, &run) {
+        (Some(state), Some(run)) => (
+            state
+                .model_runs(&run.run_id)
+                .map_err(|error| EngineError::Promotion(error.to_string()))?,
+            state
+                .seed_runs(&run.run_id)
+                .map_err(|error| EngineError::Promotion(error.to_string()))?,
+            state
+                .test_runs(&run.run_id)
+                .map_err(|error| EngineError::Promotion(error.to_string()))?,
+        ),
+        _ => (Vec::new(), Vec::new(), Vec::new()),
+    };
+
+    let environment = crate::audit::read_environment_for(workspace_root, candidate);
+    let mut audit = crate::audit::audited_diff(
+        workspace_root,
+        state,
+        candidate,
+        to,
+        Some(&candidate_reference.hash),
+        Some(&target.hash),
+    );
+    // Contract breaks are computed live — the workspace's desired contracts
+    // against what the target environment last recorded — so a contract
+    // edited after `diff` cannot sneak a break past the gate on a stale
+    // artifact's analysis. The recorded contracts are promotion evidence —
+    // a store error fails rather than reading as "no contracts recorded".
+    audit
+        .breaking_schema_changes
+        .extend(crate::audit::contract_breaking_changes(
+            state,
+            compilation,
+            to,
+        )?);
+    let merge_check = nessie.can_merge(candidate, to).await.ok();
+    // Lineage evidence: the artifact only speaks for this promotion when
+    // the identities it was produced against still hold — including the
+    // candidate's compiled lineage fingerprint.
+    let lineage = crate::audit::audited_lineage(
+        workspace_root,
+        candidate,
+        to,
+        &candidate_reference.hash,
+        &target.hash,
+        Some(&compilation.lineage.fingerprint()),
+    );
+
+    // The `base` gate needs a target commit the evidence was established
+    // against. Two sources, freshest first: a hash-bound diff artifact that
+    // audited this exact target, else the recorded commit the candidate was
+    // provably created from. A candidate whose origin is unknown and which
+    // was never audited against this target has no evidence — the gate must
+    // fail rather than redefine its base as today's head.
+    let expected_target_hash = audit.audited_base_hash.clone().or_else(|| {
+        environment
+            .as_ref()
+            .filter(|setup| setup.candidate.name == candidate && setup.base.name == to)
+            .and_then(|setup| setup.created_from.as_ref())
+            .map(|base| base.hash.clone())
+    });
+
+    let gates = evaluate_gates(&crate::gates::GateInput {
+        run: run.clone(),
+        model_runs,
+        seed_runs,
+        test_runs,
+        require_diff: options.require_diff,
+        diff_passed: audit.diff_passed,
+        diff_rejected: audit.diff_rejected.clone(),
+        breaking_schema_changes: audit.breaking_schema_changes.clone(),
+        allow_breaking_schema: options.allow_breaking_schema,
+        expected_target_hash: expected_target_hash.clone(),
+        actual_target_hash: Some(target.hash.clone()),
+        actual_candidate_hash: Some(candidate_reference.hash.clone()),
+        schema_audited: audit.schema_audited,
+        merge_check,
+    });
+
+    Ok(PromotionEvaluation {
+        candidate: candidate_reference,
+        target,
+        run,
+        audit,
+        lineage,
+        environment,
+        expected_target_hash,
+        gates,
+    })
+}
+
+/// Record a completed promotion: the workspace artifact plus the shared
+/// state row. The artifact is the human-readable export; the state row is
+/// what audit reads back.
+pub fn persist_promotion(
+    workspace_root: &Path,
+    state: Option<&dyn crate::state::StateStore>,
+    record: &PromotionRecord,
+) -> Result<(), EngineError> {
+    crate::artifacts::ArtifactWriter::for_workspace(workspace_root)
+        .write_promotion(record)
+        .map_err(|error| EngineError::Artifact(error.to_string()))?;
+    if let Some(state) = state {
+        state
+            .record_promotion(record)
+            .map_err(|error| EngineError::Promotion(error.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Removal of a promoted candidate's catalog and branch. Every failure is
+/// reported — the merge already happened, so a leftover catalog or branch
+/// must never be silent. Only a catalog phlo provably owns is dropped: an
+/// adopted or unmanaged catalog belongs to someone else, and without
+/// recorded ownership the name is only a guess.
+pub async fn cleanup_candidate(
+    workspace_root: &Path,
+    adapter: Option<&dyn crate::adapter::Adapter>,
+    nessie: &dyn NessieClient,
+    candidate: &str,
+    environment: Option<&EnvironmentSetup>,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    let drop_catalog = environment
+        .filter(|setup| setup.owns_catalog())
+        .map(|setup| setup.catalog.clone());
+    match (drop_catalog, adapter) {
+        (Some(catalog), Some(adapter)) => {
+            if let Err(error) = adapter.drop_catalog(&catalog).await {
+                failures.push(format!("drop catalog `{catalog}`: {error}"));
+            }
+        }
+        (Some(catalog), None) => {
+            failures.push(format!("no adapter configured to drop catalog `{catalog}`"));
+        }
+        (None, _) => {}
+    }
+    if let Err(error) = nessie.delete_branch(candidate).await {
+        failures.push(format!("delete branch `{candidate}`: {error}"));
+    }
+    if failures.is_empty() {
+        // The branch and catalog are gone; the provisioning record is stale.
+        crate::audit::remove_environment_artifacts(workspace_root, candidate);
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Bind a passed run to its environment's post-run Nessie head — the
+/// commit its writes produced, not the pre-run snapshot. An unbound run
+/// cannot later promote. The run's own environment label is used, so
+/// `resume`/`retry_failed` bind the environment the original run targeted.
+/// A no-op when the run did not pass, has no environment, or the
+/// environment ref no longer exists.
+pub async fn bind_run_reference(
+    nessie: &dyn NessieClient,
+    state: &dyn crate::state::StateStore,
+    result: &crate::run::RunResult,
+) -> Result<(), EngineError> {
+    if result.status != crate::events::ExecutionStatus::Passed {
+        return Ok(());
+    }
+    let Some(environment) = result.environment.as_deref() else {
+        return Ok(());
+    };
+    let Some(head) = nessie
+        .get_reference(environment)
+        .await
+        .map_err(|error| EngineError::Promotion(error.to_string()))?
+    else {
+        return Ok(());
+    };
+    state
+        .bind_run_reference_hash(&result.run_id, &head.hash)
+        .map_err(|error| EngineError::Promotion(error.to_string()))
+}
+
+/// Resolve a run id or unique prefix to its summary — the shared lookup
+/// behind `state show`, daemon `resume`/`retry_failed`, and anywhere else
+/// a user supplies a partial id.
+pub fn find_unique_run(
+    state: &dyn crate::state::StateStore,
+    id_or_prefix: &str,
+) -> Result<RunSummary, EngineError> {
+    let matches = state
+        .find_runs(id_or_prefix)
+        .map_err(|error| EngineError::State(error.to_string()))?;
+    match matches.as_slice() {
+        [only] => Ok(only.clone()),
+        [] => Err(EngineError::NotFound(format!(
+            "no run matches `{id_or_prefix}`"
+        ))),
+        _ => Err(EngineError::Ambiguous(format!(
+            "`{id_or_prefix}` matches {} runs — give a longer prefix",
+            matches.len()
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -315,6 +618,28 @@ mod tests {
         assert_eq!(
             nessie.get_reference("main").await.unwrap().unwrap().hash,
             "aaa"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_reference_is_a_typed_not_found() {
+        // Callers key the not-found surface off the variant, not the text.
+        let nessie = InMemoryNessie::new();
+        nessie.seed("main", "aaa");
+
+        let missing_candidate = promote(&nessie, &request(false)).await.unwrap_err();
+        assert!(
+            matches!(missing_candidate, EngineError::NotFound(_)),
+            "{missing_candidate}"
+        );
+
+        nessie.seed("ci/pr-1", "bbb");
+        let mut request = request(false);
+        request.target_ref = "ghost".to_string();
+        let missing_target = promote(&nessie, &request).await.unwrap_err();
+        assert!(
+            matches!(missing_target, EngineError::NotFound(_)),
+            "{missing_target}"
         );
     }
 }

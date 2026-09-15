@@ -693,7 +693,7 @@ fn breaking_impact(
 /// The default (unlabeled) environment — `apply`/`run` with no `--ref`
 /// records under it while physically writing the default catalog, which is
 /// `main`'s view. When `main` is asked for, its records count too.
-fn includes_default_environment(environment: &str) -> bool {
+pub(crate) fn includes_default_environment(environment: &str) -> bool {
     environment == "main"
 }
 
