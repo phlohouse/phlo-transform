@@ -141,6 +141,8 @@ pub struct TestRunRecord {
 pub struct RunSummary {
     pub run_id: String,
     pub plan_id: String,
+    /// Environment label the run was recorded under (`None` = default).
+    pub environment: Option<String>,
     /// The Nessie commit this run validated, when the run was bound to one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_hash: Option<String>,
@@ -167,6 +169,19 @@ pub struct MaterializedRecord {
     pub incremental_strategy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incremental_key: Option<String>,
+    /// The adapter that produced the materialisation — execution semantics
+    /// differ across adapters, so a version hash alone is not proof the same
+    /// bytes are there. `None` for rows recorded before adapter identity was
+    /// tracked; such rows cannot back a cross-environment cache hit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+    /// The strong physical identity of `target` captured right after the
+    /// write — the adapter's `output_identity` (an Iceberg snapshot id, or a
+    /// comparable provable identity). `None` for legacy rows or adapters
+    /// that cannot prove physical identity; such rows cannot back a
+    /// cross-environment cache hit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_identity: Option<String>,
     pub run_id: String,
     pub materialized_at: String,
 }
@@ -229,6 +244,9 @@ pub trait StateStore: Send + Sync {
     fn test_runs(&self, run_id: &str) -> Result<Vec<TestRunRecord>, EngineError>;
 
     /// Record the version attached to a successful materialisation.
+    /// Ordered by `materialized_at`: a record older than the stored one is
+    /// dropped, so concurrent runs completing out of order cannot regress
+    /// shared state.
     fn record_materialized(&self, record: &MaterializedRecord) -> Result<(), EngineError>;
     /// The materialised version for a model in an environment.
     fn materialized_version(
@@ -257,6 +275,8 @@ pub trait StateStore: Send + Sync {
     fn promotions(&self) -> Result<Vec<crate::promotion::PromotionRecord>, EngineError>;
 
     /// Record a successful time-window watermark. Only called on success.
+    /// Ordered by run generation: a later-started run's observation
+    /// supersedes an earlier run's, whatever order the writes land in.
     fn set_watermark(
         &self,
         model_id: &str,
@@ -272,7 +292,8 @@ pub trait StateStore: Send + Sync {
         environment: Option<&str>,
     ) -> Result<Option<String>, EngineError>;
 
-    /// Record a successful seed load.
+    /// Record a successful seed load. Ordered by `loaded_at`, like
+    /// `record_materialized`.
     fn record_seed(&self, record: &SeedRecord) -> Result<(), EngineError>;
 
     /// The latest seed load for an environment.
@@ -310,6 +331,11 @@ impl SqliteStateStore {
     }
 
     fn from_connection(connection: Connection) -> Result<Self, EngineError> {
+        // Two writers on one database file should contend, not corrupt:
+        // wait for the lock rather than failing the run with SQLITE_BUSY.
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| EngineError::State(error.to_string()))?;
         connection
             .execute_batch(
                 "
@@ -322,7 +348,8 @@ impl SqliteStateStore {
                     status TEXT NOT NULL,
                     model_count INTEGER NOT NULL,
                     failed_count INTEGER NOT NULL,
-                    plan_json TEXT
+                    plan_json TEXT,
+                    reference_hash TEXT
                 );
                 CREATE TABLE IF NOT EXISTS model_runs (
                     run_id TEXT NOT NULL,
@@ -382,6 +409,8 @@ impl SqliteStateStore {
                     incremental_strategy TEXT,
                     incremental_key TEXT,
                     version_detail TEXT,
+                    adapter TEXT,
+                    output_identity TEXT,
                     PRIMARY KEY (model_id, environment)
                 );
                 CREATE TABLE IF NOT EXISTS incremental_state (
@@ -426,6 +455,11 @@ impl SqliteStateStore {
             "ALTER TABLE model_versions ADD COLUMN version_detail TEXT",
             [],
         );
+        let _ = connection.execute("ALTER TABLE model_versions ADD COLUMN adapter TEXT", []);
+        let _ = connection.execute(
+            "ALTER TABLE model_versions ADD COLUMN output_identity TEXT",
+            [],
+        );
         // Run-progress columns added for resumable runs.
         let _ = connection.execute("ALTER TABLE runs ADD COLUMN plan_json TEXT", []);
         // The Nessie commit a run validated — added for promotion provenance.
@@ -451,7 +485,7 @@ impl SqliteStateStore {
     }
 }
 
-fn status_str(status: ExecutionStatus) -> &'static str {
+pub(crate) fn status_str(status: ExecutionStatus) -> &'static str {
     status.label()
 }
 
@@ -648,22 +682,28 @@ impl StateStore for SqliteStateStore {
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
-                "SELECT run_id, plan_id, started_at, finished_at, status, model_count, failed_count, reference_hash
+                "SELECT run_id, plan_id, environment, started_at, finished_at, status, model_count, failed_count, reference_hash
                  FROM runs ORDER BY started_at DESC, rowid DESC",
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
         let rows = statement
             .query_map([], |row| {
-                let status: String = row.get(4)?;
+                let status: String = row.get(5)?;
+                let environment: String = row.get(2)?;
                 Ok(RunSummary {
                     run_id: row.get(0)?,
                     plan_id: row.get(1)?,
-                    reference_hash: row.get(7)?,
-                    started_at: row.get(2)?,
-                    finished_at: row.get(3)?,
+                    environment: if environment.is_empty() {
+                        None
+                    } else {
+                        Some(environment)
+                    },
+                    reference_hash: row.get(8)?,
+                    started_at: row.get(3)?,
+                    finished_at: row.get(4)?,
                     status: parse_status(&status),
-                    model_count: row.get::<_, i64>(5)? as usize,
-                    failed_count: row.get::<_, i64>(6)? as usize,
+                    model_count: row.get::<_, i64>(6)? as usize,
+                    failed_count: row.get::<_, i64>(7)? as usize,
                 })
             })
             .map_err(|error| EngineError::State(error.to_string()))?;
@@ -675,7 +715,7 @@ impl StateStore for SqliteStateStore {
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
-                "SELECT run_id, plan_id, started_at, finished_at, status, model_count, failed_count, reference_hash
+                "SELECT run_id, plan_id, environment, started_at, finished_at, status, model_count, failed_count, reference_hash
                  FROM runs WHERE environment = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1",
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
@@ -688,16 +728,22 @@ impl StateStore for SqliteStateStore {
         {
             Some(row) => {
                 let map = |error: rusqlite::Error| EngineError::State(error.to_string());
-                let status: String = row.get(4).map_err(map)?;
+                let status: String = row.get(5).map_err(map)?;
+                let environment: String = row.get(2).map_err(map)?;
                 Ok(Some(RunSummary {
                     run_id: row.get(0).map_err(map)?,
                     plan_id: row.get(1).map_err(map)?,
-                    reference_hash: row.get(7).map_err(map)?,
-                    started_at: row.get(2).map_err(map)?,
-                    finished_at: row.get(3).map_err(map)?,
+                    environment: if environment.is_empty() {
+                        None
+                    } else {
+                        Some(environment)
+                    },
+                    reference_hash: row.get(8).map_err(map)?,
+                    started_at: row.get(3).map_err(map)?,
+                    finished_at: row.get(4).map_err(map)?,
                     status: parse_status(&status),
-                    model_count: row.get::<_, i64>(5).map_err(map)? as usize,
-                    failed_count: row.get::<_, i64>(6).map_err(map)? as usize,
+                    model_count: row.get::<_, i64>(6).map_err(map)? as usize,
+                    failed_count: row.get::<_, i64>(7).map_err(map)? as usize,
                 }))
             }
             None => Ok(None),
@@ -745,22 +791,28 @@ impl StateStore for SqliteStateStore {
         let connection = self.lock()?;
         let mut statement = connection
             .prepare(
-                "SELECT run_id, plan_id, started_at, finished_at, status, model_count, failed_count, reference_hash
+                "SELECT run_id, plan_id, environment, started_at, finished_at, status, model_count, failed_count, reference_hash
                  FROM runs WHERE run_id LIKE ?1 || '%' ORDER BY started_at DESC, rowid DESC",
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
         let rows = statement
             .query_map(rusqlite::params![prefix], |row| {
-                let status: String = row.get(4)?;
+                let status: String = row.get(5)?;
+                let environment: String = row.get(2)?;
                 Ok(RunSummary {
                     run_id: row.get(0)?,
                     plan_id: row.get(1)?,
-                    reference_hash: row.get(7)?,
-                    started_at: row.get(2)?,
-                    finished_at: row.get(3)?,
+                    environment: if environment.is_empty() {
+                        None
+                    } else {
+                        Some(environment)
+                    },
+                    reference_hash: row.get(8)?,
+                    started_at: row.get(3)?,
+                    finished_at: row.get(4)?,
                     status: parse_status(&status),
-                    model_count: row.get::<_, i64>(5)? as usize,
-                    failed_count: row.get::<_, i64>(6)? as usize,
+                    model_count: row.get::<_, i64>(6)? as usize,
+                    failed_count: row.get::<_, i64>(7)? as usize,
                 })
             })
             .map_err(|error| EngineError::State(error.to_string()))?;
@@ -847,13 +899,37 @@ impl StateStore for SqliteStateStore {
             .detail
             .as_ref()
             .map(|detail| serde_json::to_string(detail).unwrap_or_default());
+        // Ordered upsert: a record is only applied when it is not older than
+        // what is already stored. Two concurrent runs can finish out of
+        // order — the run that materialised later physically overwrote the
+        // table, so its record must win. Equal timestamps (idempotent
+        // re-records) are allowed; the row lands as one coherent record.
         connection
             .execute(
-                "INSERT OR REPLACE INTO model_versions
+                "INSERT INTO model_versions
                  (model_id, environment, version_hash, sql_hash, config_hash, contract_hash,
                   dependency_hash, source_state_hash, compiler_version, target_hash, target,
-                  run_id, materialized_at, incremental_strategy, incremental_key, version_detail)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                  run_id, materialized_at, incremental_strategy, incremental_key, version_detail,
+                  adapter, output_identity)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                 ON CONFLICT (model_id, environment) DO UPDATE SET
+                    version_hash = excluded.version_hash,
+                    sql_hash = excluded.sql_hash,
+                    config_hash = excluded.config_hash,
+                    contract_hash = excluded.contract_hash,
+                    dependency_hash = excluded.dependency_hash,
+                    source_state_hash = excluded.source_state_hash,
+                    compiler_version = excluded.compiler_version,
+                    target_hash = excluded.target_hash,
+                    target = excluded.target,
+                    run_id = excluded.run_id,
+                    materialized_at = excluded.materialized_at,
+                    incremental_strategy = excluded.incremental_strategy,
+                    incremental_key = excluded.incremental_key,
+                    version_detail = excluded.version_detail,
+                    adapter = excluded.adapter,
+                    output_identity = excluded.output_identity
+                 WHERE excluded.materialized_at >= model_versions.materialized_at",
                 rusqlite::params![
                     record.model_id,
                     record.environment.clone().unwrap_or_default(),
@@ -871,6 +947,8 @@ impl StateStore for SqliteStateStore {
                     record.incremental_strategy,
                     record.incremental_key,
                     detail,
+                    record.adapter,
+                    record.output_identity,
                 ],
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
@@ -990,11 +1068,27 @@ impl StateStore for SqliteStateStore {
         run_id: &str,
     ) -> Result<(), EngineError> {
         let connection = self.lock()?;
+        // Ordered by run generation, not wall-clock write order: a watermark
+        // is an observation made by a run, so the later-started run's value
+        // supersedes. Runs without a `runs` row fall back to update order
+        // (legacy/manual writes), and a stored run that no longer resolves
+        // loses to any identifiable writer.
         connection
             .execute(
-                "INSERT OR REPLACE INTO incremental_state
+                "INSERT INTO incremental_state
                  (model_id, environment, last_value, run_id, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (model_id, environment) DO UPDATE SET
+                    last_value = excluded.last_value,
+                    run_id = excluded.run_id,
+                    updated_at = excluded.updated_at
+                 WHERE COALESCE(
+                           (SELECT started_at FROM runs WHERE run_id = excluded.run_id),
+                           excluded.updated_at
+                       ) >= COALESCE(
+                           (SELECT started_at FROM runs WHERE run_id = incremental_state.run_id),
+                           ''
+                       )",
                 rusqlite::params![
                     model_id,
                     environment.unwrap_or(""),
@@ -1036,9 +1130,15 @@ impl StateStore for SqliteStateStore {
         let connection = self.lock()?;
         connection
             .execute(
-                "INSERT OR REPLACE INTO seed_loads
+                "INSERT INTO seed_loads
                  (name, environment, content_hash, target, run_id, loaded_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (name, environment) DO UPDATE SET
+                    content_hash = excluded.content_hash,
+                    target = excluded.target,
+                    run_id = excluded.run_id,
+                    loaded_at = excluded.loaded_at
+                 WHERE excluded.loaded_at >= seed_loads.loaded_at",
                 rusqlite::params![
                     record.name,
                     record.environment.clone().unwrap_or_default(),
@@ -1126,7 +1226,8 @@ impl StateStore for SqliteStateStore {
 
 const MATERIALIZED_COLUMNS: &str = "model_id, environment, version_hash, sql_hash, config_hash, \
      contract_hash, dependency_hash, source_state_hash, compiler_version, target_hash, target, \
-     run_id, materialized_at, incremental_strategy, incremental_key, version_detail";
+     run_id, materialized_at, incremental_strategy, incremental_key, version_detail, adapter, \
+     output_identity";
 
 fn materialized_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MaterializedRecord> {
     let environment: String = row.get(1)?;
@@ -1153,6 +1254,8 @@ fn materialized_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Materializ
         target: row.get(10)?,
         incremental_strategy: row.get(13)?,
         incremental_key: row.get(14)?,
+        adapter: row.get(16)?,
+        output_identity: row.get(17)?,
         run_id: row.get(11)?,
         materialized_at: row.get(12)?,
     })
@@ -1232,5 +1335,157 @@ mod tests {
         assert_eq!(models[0].desired_version, "v1");
         assert_eq!(store.find_runs("run").unwrap().len(), 1);
         assert!(store.find_runs("nope").unwrap().is_empty());
+    }
+
+    fn materialized(model_id: &str, hash: &str, at: &str, run_id: &str) -> MaterializedRecord {
+        MaterializedRecord {
+            model_id: model_id.to_string(),
+            environment: Some("prod".to_string()),
+            version: ModelVersion {
+                hash: hash.to_string(),
+                ..Default::default()
+            },
+            detail: None,
+            target: "cat.assay.results".to_string(),
+            incremental_strategy: None,
+            incremental_key: None,
+            adapter: Some("trino".to_string()),
+            output_identity: Some(format!("snap:{hash}")),
+            run_id: run_id.to_string(),
+            materialized_at: at.to_string(),
+        }
+    }
+
+    /// Two writers on one database file, same model+environment, completing
+    /// out of order: the record from the *earlier* materialisation must not
+    /// overwrite the later one.
+    #[test]
+    fn out_of_order_materialized_writes_do_not_regress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let writer_a = SqliteStateStore::open(&path).unwrap();
+        let writer_b = SqliteStateStore::open(&path).unwrap();
+
+        writer_b
+            .record_materialized(&materialized(
+                "assay.results",
+                "v2",
+                "2026-01-01T00:00:02Z",
+                "run-b",
+            ))
+            .unwrap();
+        writer_a
+            .record_materialized(&materialized(
+                "assay.results",
+                "v1",
+                "2026-01-01T00:00:01Z",
+                "run-a",
+            ))
+            .unwrap();
+        let record = writer_a
+            .materialized_version("assay.results", Some("prod"))
+            .unwrap()
+            .expect("record");
+        assert_eq!(record.version.hash, "v2", "the stale write must lose");
+        assert_eq!(record.run_id, "run-b");
+
+        // An equal or later timestamp still applies — same-run re-records
+        // and genuinely newer writes are unaffected.
+        writer_a
+            .record_materialized(&materialized(
+                "assay.results",
+                "v3",
+                "2026-01-01T00:00:03Z",
+                "run-a",
+            ))
+            .unwrap();
+        let record = writer_b
+            .materialized_version("assay.results", Some("prod"))
+            .unwrap()
+            .expect("record");
+        assert_eq!(record.version.hash, "v3");
+    }
+
+    #[test]
+    fn out_of_order_seed_writes_do_not_regress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let writer_a = SqliteStateStore::open(&path).unwrap();
+        let writer_b = SqliteStateStore::open(&path).unwrap();
+        let seed = |hash: &str, at: &str, run_id: &str| SeedRecord {
+            name: "raw.events".to_string(),
+            environment: Some("prod".to_string()),
+            content_hash: hash.to_string(),
+            target: "cat.raw.events".to_string(),
+            run_id: run_id.to_string(),
+            loaded_at: at.to_string(),
+        };
+
+        writer_b
+            .record_seed(&seed("h2", "2026-01-01T00:00:02Z", "run-b"))
+            .unwrap();
+        writer_a
+            .record_seed(&seed("h1", "2026-01-01T00:00:01Z", "run-a"))
+            .unwrap();
+        let record = writer_a
+            .seed_state("raw.events", Some("prod"))
+            .unwrap()
+            .expect("seed");
+        assert_eq!(record.content_hash, "h2");
+    }
+
+    /// Watermarks order by run generation, not write order: a watermark is
+    /// an observation a run made, so the later-started run supersedes even
+    /// when it finishes first.
+    #[test]
+    fn watermarks_follow_run_generation() {
+        let store = SqliteStateStore::in_memory().unwrap();
+        let run = |run_id: &str, started_at: &str| {
+            store
+                .start_run(
+                    &RunRecord {
+                        run_id: run_id.to_string(),
+                        plan_id: "plan".to_string(),
+                        environment: Some("prod".to_string()),
+                        started_at: started_at.to_string(),
+                        finished_at: None,
+                        status: ExecutionStatus::Running,
+                        model_count: 1,
+                        failed_count: 0,
+                        reference_hash: None,
+                    },
+                    &StoredPlan {
+                        plan_id: "plan".to_string(),
+                        environment: Some("prod".to_string()),
+                        models: Vec::new(),
+                        seeds: Vec::new(),
+                        tests: Vec::new(),
+                    },
+                )
+                .unwrap();
+        };
+        run("run-old", "2026-01-01T00:00:01Z");
+        run("run-new", "2026-01-01T00:00:02Z");
+
+        store
+            .set_watermark("assay.results", Some("prod"), "2026-06-01", "run-new")
+            .unwrap();
+        // The older run's observation arrives late — it must not rewind the
+        // newer run's mark.
+        store
+            .set_watermark("assay.results", Some("prod"), "2026-01-01", "run-old")
+            .unwrap();
+        assert_eq!(
+            store.watermark("assay.results", Some("prod")).unwrap(),
+            Some("2026-06-01".to_string())
+        );
+        // The newer generation still advances.
+        store
+            .set_watermark("assay.results", Some("prod"), "2026-12-01", "run-new")
+            .unwrap();
+        assert_eq!(
+            store.watermark("assay.results", Some("prod")).unwrap(),
+            Some("2026-12-01".to_string())
+        );
     }
 }

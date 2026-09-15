@@ -22,6 +22,7 @@ pub mod promotion;
 pub mod run;
 pub mod source_state;
 pub mod state;
+pub mod state_postgres;
 pub mod util;
 
 pub use adapter::{Adapter, CatalogRequest, ColumnInfo, QueryResult};
@@ -59,3 +60,4 @@ pub use state::{
     MaterializedRecord, ModelRunRecord, RunRecord, RunSummary, SeedRecord, SeedRunRecord,
     SqliteStateStore, StateStore, StoredPlan, StoredRun, TestRunRecord,
 };
+pub use state_postgres::PostgresStateStore;

@@ -96,6 +96,13 @@ pub struct ModelResult {
     pub finished_at: Option<String>,
     pub duration_ms: u64,
     pub sql_hash: String,
+    /// The strong physical identity of `target` captured right after the
+    /// build — the adapter's `output_identity`. Verified again before the
+    /// materialised version is recorded, so a concurrent writer's output is
+    /// never claimed as this run's. `None` when the adapter cannot prove
+    /// physical identity.
+    #[serde(skip)]
+    pub output_identity: Option<String>,
 }
 
 /// The outcome of a single seed load.
@@ -1346,6 +1353,12 @@ impl Runner {
                     });
                     let result = ModelResult {
                         query_id: query.query_id,
+                        output_identity: self
+                            .adapter
+                            .output_identity(&model.target)
+                            .await
+                            .ok()
+                            .flatten(),
                         ..model_result(
                             model,
                             ExecutionStatus::Passed,
@@ -1497,6 +1510,12 @@ impl Runner {
                     Ok(query) => (
                         ModelResult {
                             query_id: query.query_id.clone(),
+                            output_identity: self
+                                .adapter
+                                .output_identity(&model.target)
+                                .await
+                                .ok()
+                                .flatten(),
                             ..model_result(
                                 model,
                                 ExecutionStatus::Passed,
@@ -1656,6 +1675,27 @@ impl Runner {
                 if result.status == ExecutionStatus::Passed {
                     if let Ok(id) = ModelId::parse(&result.model) {
                         if let Some(model) = compilation.model(&id) {
+                            // Output-identity verification: the relation
+                            // must still hold what this run wrote. If another
+                            // writer overwrote it between build and record,
+                            // recording our version would poison the shared
+                            // cache — the newer writer's record stands.
+                            if let Some(captured) = &result.output_identity {
+                                let live = self
+                                    .adapter
+                                    .output_identity(&model.target)
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                if live.as_deref() != Some(captured.as_str()) {
+                                    warnings.push(format!(
+                                        "materialisation for {} not recorded: {} changed after \
+                                         the build (a concurrent writer owns it now)",
+                                        result.model, result.target
+                                    ));
+                                    continue;
+                                }
+                            }
                             state.record_materialized(&MaterializedRecord {
                                 model_id: result.model.clone(),
                                 environment: options.environment.clone(),
@@ -1673,6 +1713,8 @@ impl Runner {
                                     .as_ref()
                                     .map(|strategy| strategy.columns().join(","))
                                     .filter(|key| !key.is_empty()),
+                                adapter: Some(self.adapter.name().to_string()),
+                                output_identity: result.output_identity.clone(),
                                 run_id: run_id.clone(),
                                 materialized_at: finished_at.clone(),
                             })?;
@@ -2256,6 +2298,7 @@ fn model_result(
         finished_at,
         duration_ms,
         sql_hash: sha256_hex(&model.compiled_sql),
+        output_identity: None,
     }
 }
 

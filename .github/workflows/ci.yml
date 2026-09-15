@@ -17,6 +17,24 @@ jobs:
   test:
     name: fmt, clippy and tests
     runs-on: ubuntu-latest
+    services:
+      # Shared-state backend: the Postgres `StateStore` integration test
+      # runs against this service via PHLO_TEST_POSTGRES_URL.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: phlo
+          POSTGRES_PASSWORD: phlo
+          POSTGRES_DB: phlo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U phlo -d phlo_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PHLO_TEST_POSTGRES_URL: postgres://phlo:phlo@localhost:5432/phlo_test
     steps:
       - uses: actions/checkout@v4
 

@@ -117,6 +117,17 @@ pub trait Adapter: Send + Sync {
     /// the latest snapshot id; for other relations it may be `None`.
     async fn source_state(&self, relation: &Relation) -> Result<Option<String>, AdapterError>;
 
+    /// A strong physical identity of the relation's contents: if this value
+    /// is unchanged, the physical materialisation is provably the same
+    /// output (for example an Iceberg snapshot id). This is what
+    /// cross-environment cache reuse keys on — a weaker fingerprint such as
+    /// a schema hash does not prove the bytes are still there. `None` means
+    /// the adapter cannot prove physical identity; the default fails closed.
+    async fn output_identity(&self, relation: &Relation) -> Result<Option<String>, AdapterError> {
+        let _ = relation;
+        Ok(None)
+    }
+
     /// Per-partition record counts from metadata, when the adapter supports it
     /// (for example Iceberg `$partitions`). `None` means unsupported.
     async fn partition_counts(

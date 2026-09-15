@@ -41,6 +41,7 @@ globset = "0.4"
 libc = "0.2"
 petgraph = "0.8"
 reqwest = { version = "0.13", features = ["json"] }
+postgres = "0.19.10"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

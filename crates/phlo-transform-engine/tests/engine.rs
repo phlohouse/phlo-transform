@@ -61,6 +61,10 @@ struct FakeAdapter {
     loaded_csvs: Arc<Mutex<Vec<String>>>,
     fail_loads: Arc<Mutex<BTreeSet<String>>>,
     source_states: Arc<Mutex<BTreeMap<String, String>>>,
+    /// Strong output identities per relation — simulates an adapter that can
+    /// prove physical contents (Iceberg-style snapshot ids). Relations
+    /// absent from this map report `None`, like a non-Iceberg Trino table.
+    output_identities: Arc<Mutex<BTreeMap<String, String>>>,
     max_value: Arc<Mutex<Option<String>>>,
     test_rows: Arc<Mutex<u64>>,
     delay_ms: u64,
@@ -147,6 +151,13 @@ impl FakeAdapter {
             .insert(relation.to_string(), state.to_string());
     }
 
+    fn set_output_identity(&self, relation: &str, identity: &str) {
+        self.output_identities
+            .lock()
+            .unwrap()
+            .insert(relation.to_string(), identity.to_string());
+    }
+
     fn set_columns(&self, columns: Vec<ColumnInfo>) {
         *self.columns.lock().unwrap() = columns;
     }
@@ -196,6 +207,7 @@ impl FakeAdapter {
             loaded_csvs: self.loaded_csvs.clone(),
             fail_loads: self.fail_loads.clone(),
             source_states: self.source_states.clone(),
+            output_identities: self.output_identities.clone(),
             max_value: self.max_value.clone(),
             test_rows: self.test_rows.clone(),
             delay_ms: self.delay_ms,
@@ -454,6 +466,15 @@ impl Adapter for FakeAdapter {
     async fn source_state(&self, relation: &Relation) -> Result<Option<String>, AdapterError> {
         Ok(self
             .source_states
+            .lock()
+            .unwrap()
+            .get(&relation.display())
+            .cloned())
+    }
+
+    async fn output_identity(&self, relation: &Relation) -> Result<Option<String>, AdapterError> {
+        Ok(self
+            .output_identities
             .lock()
             .unwrap()
             .get(&relation.display())
@@ -984,6 +1005,11 @@ async fn cache_reuse_across_environments_is_reported_as_cached() {
     let compilation = project_with_tests();
     let adapter = Arc::new(FakeAdapter::default());
     adapter.set_test_rows(0);
+    // A physical fingerprint per output — a cache hit needs the relation to
+    // still hold what the other environment wrote.
+    for model in &compilation.models {
+        adapter.set_output_identity(&model.target.display(), "snap:1");
+    }
     let state = Arc::new(SqliteStateStore::in_memory().unwrap());
     let selected = Selection::all(&compilation);
 
@@ -1030,6 +1056,465 @@ async fn cache_reuse_across_environments_is_reported_as_cached() {
             .map(|model| (model.id.as_str(), model.action))
             .collect::<Vec<_>>()
     );
+}
+
+/// Materialise a single-model project under `dev` on the fake adapter, then
+/// hand back the recorded version so tests can vary the record.
+async fn dev_materialised(
+    adapter: Arc<FakeAdapter>,
+    state: Arc<SqliteStateStore>,
+) -> (Compilation, phlo_transform_core::ModelVersion, String) {
+    let project = SemanticProject::in_memory(vec![model("assay.results", "select 1 as id")]);
+    let compilation = compile(&project);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+    for model in &compilation.models {
+        adapter.set_output_identity(&model.target.display(), "snap:dev");
+    }
+    let selected = Selection::all(&compilation);
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(
+            &compilation,
+            &selected,
+            Some("dev".to_string()),
+            &PlanOptions::default(),
+        )
+        .await
+        .unwrap();
+    Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &compilation,
+            &plan,
+            &RunOptions {
+                environment: Some("dev".to_string()),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let record = state
+        .materialized_version("assay.results", Some("dev"))
+        .unwrap()
+        .expect("dev record");
+    (compilation, record.version, record.target)
+}
+
+/// Re-record `version` under `dev` with a different physical target, adapter
+/// or output fingerprint, then plan `prod` and return the planned
+/// action/reason.
+async fn plan_prod_after(
+    adapter: Arc<FakeAdapter>,
+    state: Arc<SqliteStateStore>,
+    compilation: &Compilation,
+    version: phlo_transform_core::ModelVersion,
+    target: &str,
+    record_adapter: Option<&str>,
+    output_identity: Option<&str>,
+) -> Plan {
+    state
+        .record_materialized(&MaterializedRecord {
+            model_id: "assay.results".to_string(),
+            environment: Some("dev".to_string()),
+            version,
+            detail: None,
+            target: target.to_string(),
+            incremental_strategy: None,
+            incremental_key: None,
+            adapter: record_adapter.map(str::to_string),
+            output_identity: output_identity.map(str::to_string),
+            run_id: "run-dev".to_string(),
+            materialized_at: "t".to_string(),
+        })
+        .unwrap();
+    plan_all_with_state(compilation, adapter, state, Some("prod".to_string())).await
+}
+
+#[tokio::test]
+async fn cache_reuse_requires_same_physical_target() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let (compilation, version, _target) = dev_materialised(adapter.clone(), state.clone()).await;
+
+    // The identical version is recorded — but for a different relation, so
+    // nothing proves the bytes live at this environment's target.
+    let plan = plan_prod_after(
+        adapter,
+        state,
+        &compilation,
+        version,
+        "other_catalog.assay.results",
+        Some("fake"),
+        Some("snap:dev"),
+    )
+    .await;
+    let model = &plan.models[0];
+    assert_eq!(model.action, PlanAction::Build, "{:?}", model.reasons);
+    assert!(model
+        .reasons
+        .iter()
+        .any(|reason| reason.kind == ReasonKind::CacheMiss));
+}
+
+#[tokio::test]
+async fn cache_reuse_requires_same_adapter() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let (compilation, version, target) = dev_materialised(adapter.clone(), state.clone()).await;
+
+    let plan = plan_prod_after(
+        adapter,
+        state,
+        &compilation,
+        version,
+        &target,
+        Some("trino"),
+        Some("snap:dev"),
+    )
+    .await;
+    let model = &plan.models[0];
+    assert_eq!(model.action, PlanAction::Build, "{:?}", model.reasons);
+    assert!(model
+        .reasons
+        .iter()
+        .any(|reason| reason.kind == ReasonKind::CacheMiss));
+}
+
+#[tokio::test]
+async fn cache_reuse_rejects_unrecorded_adapter() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let (compilation, version, target) = dev_materialised(adapter.clone(), state.clone()).await;
+
+    // A legacy row without adapter metadata cannot vouch for reuse either.
+    let plan = plan_prod_after(
+        adapter,
+        state,
+        &compilation,
+        version,
+        &target,
+        None,
+        Some("snap:dev"),
+    )
+    .await;
+    let model = &plan.models[0];
+    assert_eq!(model.action, PlanAction::Build, "{:?}", model.reasons);
+    assert!(model
+        .reasons
+        .iter()
+        .any(|reason| reason.kind == ReasonKind::CacheMiss));
+}
+
+#[tokio::test]
+async fn materialisation_by_another_adapter_rebuilds() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let (compilation, version, target) = dev_materialised(adapter.clone(), state.clone()).await;
+
+    // The current environment's own record was produced by a different
+    // engine: same bits recorded, different execution semantics.
+    state
+        .record_materialized(&MaterializedRecord {
+            model_id: "assay.results".to_string(),
+            environment: Some("prod".to_string()),
+            version,
+            detail: None,
+            target,
+            incremental_strategy: None,
+            incremental_key: None,
+            adapter: Some("trino".to_string()),
+            output_identity: None,
+            run_id: "run-prod".to_string(),
+            materialized_at: "t".to_string(),
+        })
+        .unwrap();
+    let plan = plan_all_with_state(&compilation, adapter, state, Some("prod".to_string())).await;
+    let model = &plan.models[0];
+    assert_eq!(model.action, PlanAction::Build, "{:?}", model.reasons);
+    assert!(model
+        .reasons
+        .iter()
+        .any(|reason| reason.kind == ReasonKind::AdapterChange));
+}
+
+#[tokio::test]
+async fn materialisation_by_an_unrecorded_adapter_rebuilds() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let (compilation, version, target) = dev_materialised(adapter.clone(), state.clone()).await;
+
+    // A legacy row carries no adapter identity: the version hash alone
+    // cannot prove this engine produced the bytes — fail closed.
+    state
+        .record_materialized(&MaterializedRecord {
+            model_id: "assay.results".to_string(),
+            environment: Some("prod".to_string()),
+            version,
+            detail: None,
+            target,
+            incremental_strategy: None,
+            incremental_key: None,
+            adapter: None,
+            output_identity: Some("snap:dev".to_string()),
+            run_id: "run-prod".to_string(),
+            materialized_at: "t".to_string(),
+        })
+        .unwrap();
+    let plan = plan_all_with_state(&compilation, adapter, state, Some("prod".to_string())).await;
+    let model = &plan.models[0];
+    assert_eq!(model.action, PlanAction::Build, "{:?}", model.reasons);
+    assert!(model
+        .reasons
+        .iter()
+        .any(|reason| reason.kind == ReasonKind::AdapterChange));
+}
+
+/// The reviewer's scenario: `dev` records v1 on a shared target, a later
+/// `qa` run physically overwrites it with v2, and `prod` must not treat the
+/// stale v1 record as a cache hit.
+#[tokio::test]
+async fn cache_hit_requires_the_relation_to_still_hold_the_recorded_output() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let (compilation, _version, target) = dev_materialised(adapter.clone(), state.clone()).await;
+
+    // qa overwrote the table: the recorded `snap:dev` no longer describes
+    // what is physically there.
+    adapter.set_output_identity(&target, "snap:qa");
+    let plan = plan_all_with_state(&compilation, adapter, state, Some("prod".to_string())).await;
+    let model = &plan.models[0];
+    assert_eq!(model.action, PlanAction::Build, "{:?}", model.reasons);
+    assert!(model
+        .reasons
+        .iter()
+        .any(|reason| reason.kind == ReasonKind::CacheMiss));
+}
+
+#[tokio::test]
+async fn cache_hit_rejects_records_without_an_output_fingerprint() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let (compilation, version, target) = dev_materialised(adapter.clone(), state.clone()).await;
+
+    // Same version, same target, same adapter — but the record never proved
+    // what the write produced. Metadata alone is not cache evidence.
+    let plan = plan_prod_after(
+        adapter,
+        state,
+        &compilation,
+        version,
+        &target,
+        Some("fake"),
+        None,
+    )
+    .await;
+    let model = &plan.models[0];
+    assert_eq!(model.action, PlanAction::Build, "{:?}", model.reasons);
+    assert!(model
+        .reasons
+        .iter()
+        .any(|reason| reason.kind == ReasonKind::CacheMiss));
+}
+
+/// A schema/row-count `source_state` is not a content identity: an adapter
+/// that cannot prove physical output (non-Iceberg Trino, DuckDB) reports no
+/// `output_identity`, so its records can never authorise a cross-env hit —
+/// even when the weak fingerprint happens to match.
+#[tokio::test]
+async fn a_weak_source_fingerprint_is_not_cache_evidence() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let project = SemanticProject::in_memory(vec![model("assay.results", "select 1 as id")]);
+    let compilation = compile(&project);
+    // The adapter reports a weak source_state but proves no output identity.
+    for model in &compilation.models {
+        adapter.set_source_state(&model.target.display(), "schema:abc");
+    }
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+    let selected = Selection::all(&compilation);
+    let dev = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(
+            &compilation,
+            &selected,
+            Some("dev".to_string()),
+            &PlanOptions::default(),
+        )
+        .await
+        .unwrap();
+    Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &compilation,
+            &dev,
+            &RunOptions {
+                environment: Some("dev".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let plan = plan_all_with_state(&compilation, adapter, state, Some("prod".to_string())).await;
+    let model = &plan.models[0];
+    assert_eq!(model.action, PlanAction::Build, "{:?}", model.reasons);
+    assert!(model
+        .reasons
+        .iter()
+        .any(|reason| reason.kind == ReasonKind::CacheMiss));
+}
+
+/// The same adapter's own current-environment record is unaffected: without
+/// a recorded identity there is nothing to drift-check against, so a
+/// matching version still skips on normal state semantics.
+#[tokio::test]
+async fn a_record_without_output_identity_keeps_normal_state_semantics() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let project = SemanticProject::in_memory(vec![model("assay.results", "select 1 as id")]);
+    let compilation = compile(&project);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+    let selected = Selection::all(&compilation);
+    let dev = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(
+            &compilation,
+            &selected,
+            Some("dev".to_string()),
+            &PlanOptions::default(),
+        )
+        .await
+        .unwrap();
+    Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &compilation,
+            &dev,
+            &RunOptions {
+                environment: Some("dev".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        state
+            .materialized_version("assay.results", Some("dev"))
+            .unwrap()
+            .and_then(|record| record.output_identity),
+        None,
+        "the fake adapter proves no identity"
+    );
+
+    let plan = plan_all_with_state(&compilation, adapter, state, Some("dev".to_string())).await;
+    assert_eq!(plan.models[0].action, PlanAction::Skip);
+}
+
+/// Same-environment variant: the record claims this relation holds the
+/// version, but the physical fingerprint moved — another writer owns it.
+#[tokio::test]
+async fn output_drift_invalidates_the_current_environments_record() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let (compilation, _version, target) = dev_materialised(adapter.clone(), state.clone()).await;
+
+    adapter.set_output_identity(&target, "snap:someone-else");
+    let plan = plan_all_with_state(&compilation, adapter, state, Some("dev".to_string())).await;
+    let model = &plan.models[0];
+    assert_eq!(model.action, PlanAction::Build, "{:?}", model.reasons);
+    assert!(model
+        .reasons
+        .iter()
+        .any(|reason| reason.kind == ReasonKind::OutputDrift));
+}
+
+/// A run records the version it built only while the relation still holds
+/// it. A concurrent writer's overwrite mid-run must not be claimed.
+#[tokio::test]
+async fn a_concurrent_write_between_build_and_record_is_not_claimed() {
+    let compilation = compile(&SemanticProject::in_memory(vec![
+        model("main.a", "select 1 as id"),
+        model("main.b", "select 2 as id"),
+    ]));
+    assert!(compilation.is_ok());
+    let adapter = Arc::new(FakeAdapter::default());
+    for model in &compilation.models {
+        adapter.set_output_identity(&model.target.display(), "snap:ours");
+    }
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let target_a = compilation
+        .model(&ModelId::parse("main.a").unwrap())
+        .unwrap()
+        .target
+        .display();
+
+    // `main.b` builds slowly while a "concurrent writer" overwrites `main.a`.
+    adapter.slow_target("main.b", 400);
+    let writer = adapter.clone();
+    let target_a_moved = target_a.clone();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(120));
+        writer.set_output_identity(&target_a_moved, "snap:theirs");
+    });
+
+    let result = Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &compilation,
+            &plan_all_with_state(&compilation, adapter.clone(), state.clone(), None).await,
+            &RunOptions::default(),
+        )
+        .await
+        .unwrap();
+    handle.join().unwrap();
+
+    assert_eq!(result.status, ExecutionStatus::Passed);
+    assert!(
+        state
+            .materialized_version("main.a", None)
+            .unwrap()
+            .is_none(),
+        "a drifted output must not be recorded as ours"
+    );
+    assert!(result
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("main.a")));
+    // The undisturbed model records normally.
+    assert!(state
+        .materialized_version("main.b", None)
+        .unwrap()
+        .is_some());
+}
+
+/// Two open stores on the same state file write in interleaved loops; the
+/// busy timeout must carry them through lock contention rather than erroring.
+#[test]
+fn concurrent_sqlite_writers_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let writer = |path: PathBuf, prefix: &'static str| {
+        std::thread::spawn(move || {
+            let store = SqliteStateStore::open(&path).unwrap();
+            for index in 0..50 {
+                store
+                    .record_materialized(&MaterializedRecord {
+                        model_id: format!("{prefix}.{index}"),
+                        environment: None,
+                        version: version(&format!("v{index}")),
+                        detail: None,
+                        target: "cat.s.t".to_string(),
+                        incremental_strategy: None,
+                        incremental_key: None,
+                        adapter: Some("fake".to_string()),
+                        output_identity: None,
+                        run_id: format!("{prefix}-run"),
+                        materialized_at: "t".to_string(),
+                    })
+                    .unwrap();
+            }
+        })
+    };
+    let a = writer(path.clone(), "a");
+    let b = writer(path.clone(), "b");
+    a.join().unwrap();
+    b.join().unwrap();
+    let store = SqliteStateStore::open(&path).unwrap();
+    assert_eq!(store.materialized_in(None).unwrap().len(), 100);
 }
 
 #[tokio::test]
@@ -2955,6 +3440,9 @@ async fn resume_replans_a_model_cached_in_the_interrupted_run() {
         "select 2 as id from external.b",
     );
     let adapter = Arc::new(FakeAdapter::default());
+    for model in &v1.models {
+        adapter.set_output_identity(&model.target.display(), "snap:1");
+    }
     let state = Arc::new(SqliteStateStore::in_memory().unwrap());
     let runner = Runner::new(adapter.clone(), Some(state.clone()));
     let dev = RunOptions {
@@ -3799,6 +4287,8 @@ fn materialized_at(
         target: target.display(),
         incremental_strategy: None,
         incremental_key: None,
+        adapter: Some("fake".to_string()),
+        output_identity: None,
         run_id: "run-1".to_string(),
         materialized_at: at.to_string(),
     }
@@ -4241,6 +4731,7 @@ fn passed_run() -> RunSummary {
     RunSummary {
         run_id: "run-1".to_string(),
         plan_id: "plan-1".to_string(),
+        environment: None,
         started_at: "t".to_string(),
         finished_at: Some("t".to_string()),
         status: ExecutionStatus::Passed,

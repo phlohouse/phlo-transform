@@ -49,16 +49,54 @@ versions and produces a `source_change` build reason.
 ## Cached reuse
 
 `Planner` classifies a model as `cached` when its desired version is not
-materialised in the current environment but exists for another environment in
-the same state store. This is covered by
-`cache_reuse_across_environments_is_reported_as_cached`.
+materialised in the current environment but a record for another environment
+vouches for the same physical output. A version hash alone is *not* enough:
+the record must also
+
+- name the same physical target relation — the bytes must actually be where
+  this plan would read them;
+- have been produced by the same adapter — execution semantics differ across
+  engines, so another adapter's output cannot be assumed byte-identical; and
+- carry a strong `output_identity` that still matches the relation's current
+  `output_identity` — the record is historical, so without proof the
+  relation still holds what was written, a version hash is metadata, not
+  evidence (a later writer may have overwritten it).
+
+`output_identity` is the adapter's strong physical identity: an unchanged
+value proves the same materialised output (Trino reports the Iceberg
+snapshot id; a non-Iceberg relation — or DuckDB, whose schema+row-count
+`source_state` cannot detect in-place updates — reports `None`). Adapters
+without provable identity cannot authorise cross-environment reuse. The
+broader `source_state` fingerprint remains for source-change detection;
+only `output_identity` is cache evidence.
+
+A same-version record that fails any check yields `build` with a
+`cache_miss` reason (the detail names the mismatch: different relation,
+foreign adapter, stale or absent output identity). Records written
+before adapter or output-identity tracking cannot authorise reuse. When the
+*current* environment's recorded materialisation was produced by a
+different adapter — or predates adapter tracking entirely — the plan
+rebuilds with an `adapter_change` reason; when its recorded output
+identity no longer matches the physical relation, it rebuilds with
+`output_drift`.
+
+This is covered by `cache_reuse_across_environments_is_reported_as_cached`,
+`cache_reuse_requires_same_physical_target`,
+`cache_reuse_requires_same_adapter`,
+`cache_reuse_rejects_unrecorded_adapter`,
+`cache_hit_requires_the_relation_to_still_hold_the_recorded_output`,
+`cache_hit_rejects_records_without_an_output_fingerprint`,
+`materialisation_by_another_adapter_rebuilds`,
+`materialisation_by_an_unrecorded_adapter_rebuilds` and
+`output_drift_invalidates_the_current_environments_record`.
 
 ## Materialised state
 
-The SQLite state store gains a `model_versions` table recording, per model and
+The state store gains a `model_versions` table recording, per model and
 environment, the `ModelVersion` attached to the most recent successful
-materialisation (plus target, run id, timestamp, incremental strategy/key and
-`version_detail`). API:
+materialisation (plus target, run id, timestamp, incremental strategy/key,
+`version_detail`, the producing `adapter`, and the strong `output_identity`
+the adapter observed on the relation right after writing). API:
 
 ```text
 record_materialized(record)
@@ -66,7 +104,22 @@ materialized_version(model_id, environment)
 materialized_by_hash(version_hash)
 ```
 
-The runner records a materialisation after each `passed` build.
+The runner records a materialisation after each `passed` build — but only
+while the relation still holds what the run wrote: the post-build
+`source_state` is re-read at record time, and a drifted output is skipped
+with a warning rather than claimed (a concurrent writer's version stands).
+
+Because the store is shared, same-key writes are ordered rather than
+last-writer-wins:
+
+- `model_versions` applies only a record whose `materialized_at` is not
+  older than the stored one — an earlier run finishing later cannot regress
+  the row;
+- `seed_loads` orders identically on `loaded_at`;
+- `incremental_state` orders by *run generation* — the watermark a
+  later-started run observed supersedes an earlier run's, whatever order
+  the writes land in. Writers without a `runs` row fall back to update
+  order.
 
 `version_detail` is a `VersionDetail`: the named inputs behind the opaque
 component hashes — each dependency's logical name → version hash and each
@@ -165,15 +218,45 @@ version differs from the current compile.
 `inspect` shows desired/current versions and `status` (`new`/`changed`/
 `unchanged`); JSON exposes the component hashes and state.
 
+`phlo-transform state` inspects the store directly (read-only):
+
+- `state runs` — recorded runs, newest first, with environment
+  (`--environment` filters);
+- `state show <run-id-or-prefix>` — one run's model, seed and test records;
+- `state model <name>` — the recorded materialised version for the
+  effective environment: version components, target, adapter, run;
+- `state promotions` — promotion history.
+
+All four honour `--json`.
+
+## Shared and concurrent state
+
+`StateStore` has two backends:
+
+- **SQLite** (default) at `.phlo/transform/state.db`, or an explicit file
+  path via `--state <path>`/`PHLO_STATE_URL`. A five-second `busy_timeout`
+  lets concurrent writers (parallel `phlo-transform` processes sharing one
+  state file) wait out lock contention instead of erroring.
+- **PostgreSQL** via `--state postgres://…`/`--state postgresql://…` (or
+  `PHLO_STATE_URL`) — the shared backend: CI jobs and developers can record
+  into one store, so materialised versions and watermarks are visible
+  across machines. The schema mirrors SQLite's; upserts keep writes atomic
+  and an identity column preserves deterministic newest-first ordering.
+  An unreachable `--state` location is a hard error — it never falls back
+  to local state silently, and credentials embedded in the URL are stripped
+  before it appears in errors or `doctor` output.
+
 ## Tests
 
 - canonical hash equivalence (formatting/comments);
 - SQL, config, materialisation and upstream-change invalidation;
 - owner/tag changes do not rebuild;
 - first run builds, unchanged second run skips (fake adapter + SQLite);
-- stale plan rejection.
+- stale plan rejection;
+- cache reuse gated on same target + same adapter;
+- concurrent SQLite writers on a shared state file;
+- Postgres backend round-trip (opt-in via `PHLO_TEST_POSTGRES_URL`).
 
 ## Deferred
 
-Cross-environment cache reuse (beyond the `cached` classification), advanced
-SQL equivalence, incremental strategies, Nessie promotion and data diff.
+Advanced SQL equivalence.

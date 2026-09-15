@@ -26,9 +26,9 @@ use phlo_transform_engine::{
     relation_for_source, retarget, seeds_for_environment, Adapter, ArtifactWriter,
     BranchDiffReport, BranchDiffRequest, CancelHandle, DatasetKind, DiffPolicy, DiffRequest,
     DiffStrategy, EnvironmentArtifact, EnvironmentSetup, EnvironmentSpec, ExecutionStatus,
-    GateInput, Membership, Plan, PlanAction, PlanOptions, PlanReason, Planner, PromotionRequest,
-    ReasonKind, RetryPolicy, RunOptions, RunResult, Runner, SqliteStateStore, StateStore,
-    SCHEMA_VERSION,
+    GateInput, Membership, Plan, PlanAction, PlanOptions, PlanReason, Planner, PostgresStateStore,
+    PromotionRequest, ReasonKind, RetryPolicy, RunOptions, RunResult, Runner, SqliteStateStore,
+    StateStore, SCHEMA_VERSION,
 };
 use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -163,6 +163,12 @@ struct Cli {
     #[arg(long, global = true)]
     catalog: Option<String>,
 
+    /// State store location: a `postgres://`/`postgresql://` URL for a shared
+    /// backend, or a filesystem path for a local SQLite database
+    /// (default `.phlo/transform/state.db`; `PHLO_STATE_URL` also honoured).
+    #[arg(long, global = true)]
+    state: Option<String>,
+
     /// Nessie endpoint, e.g. http://localhost:19120.
     #[arg(long, global = true)]
     nessie_endpoint: Option<String>,
@@ -210,6 +216,27 @@ enum RefAction {
         /// Branch name to delete.
         name: String,
     },
+}
+
+/// State-store inspection (`phlo-transform state ...`).
+#[derive(Debug, Subcommand)]
+enum StateAction {
+    /// List recorded runs, newest first (`--environment` filters).
+    Runs,
+    /// Show one run: its record plus model, seed and test executions.
+    /// Accepts a unique run-id prefix.
+    Show {
+        /// Run id or unique prefix.
+        run: String,
+    },
+    /// Show the materialised version recorded for a model in the effective
+    /// environment (`--environment`/`--ref`, else the default).
+    Model {
+        /// Model name (`assay.results`).
+        model: String,
+    },
+    /// List recorded promotions, newest first.
+    Promotions,
 }
 
 #[derive(Debug, Subcommand)]
@@ -341,6 +368,12 @@ enum Command {
         /// Model name (`assay.results`) or URI (`model://assay/results`).
         model: String,
     },
+    /// Inspect the state store: run history, one run's records, recorded
+    /// materialisations and promotions. Read-only.
+    State {
+        #[command(subcommand)]
+        action: StateAction,
+    },
     /// Diagnose the workspace and execution environment.
     Doctor,
     /// Scaffold a new Phlo workspace at `--root`.
@@ -401,6 +434,7 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
         Command::Doctor => return run_doctor(cli).await,
         Command::Manifest => return run_manifest(cli),
         Command::Ref { action } => return run_ref(cli, action).await,
+        Command::State { action } => return run_state(cli, action),
         _ => {}
     }
 
@@ -492,7 +526,8 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
         | Command::Doctor
         | Command::Init
         | Command::Manifest
-        | Command::Ref { .. } => unreachable!("handled before workspace load"),
+        | Command::Ref { .. }
+        | Command::State { .. } => unreachable!("handled before workspace load"),
         Command::Promote {
             candidate,
             to,
@@ -624,7 +659,7 @@ fn run_inspect(cli: &Cli, compilation: &Compilation, model: &str) -> Result<Exit
         Some(report) => {
             let diagnostics = model_diagnostics(compilation, &report);
             let desired = report.model.version.clone();
-            let current = open_state(cli).and_then(|state| {
+            let current = open_state(cli)?.and_then(|state| {
                 state
                     .materialized_version(&id.logical_name(), environment(cli).as_deref())
                     .ok()
@@ -788,7 +823,7 @@ fn resolve(
         match git {
             Some(git) => Some(git.changed_model_ids()),
             None => {
-                let state = open_state(cli);
+                let state = open_state(cli)?;
                 Some(
                     changed_models(compilation, state.as_ref(), environment(cli).as_deref())
                         .map_err(|error| error.to_string())?,
@@ -846,10 +881,47 @@ async fn build_plan(
     Ok((plan, ArtifactWriter::for_workspace(&cli.root)))
 }
 
-fn open_state(cli: &Cli) -> Option<Arc<dyn StateStore>> {
-    SqliteStateStore::open(&state_path(cli))
-        .ok()
-        .map(|store| Arc::new(store) as Arc<dyn StateStore>)
+/// Open the state store: an explicit `--state`/`PHLO_STATE_URL` location
+/// selects a shared Postgres backend or a SQLite file path; otherwise the
+/// default `.phlo/transform/state.db` is opened best-effort (a workspace
+/// without state degrades to rebuild-everything, so its failure is silent).
+/// An explicitly configured location must work — silently falling back to
+/// local state would record runs where nobody looks for them.
+fn open_state(cli: &Cli) -> Result<Option<Arc<dyn StateStore>>, String> {
+    let location = cli
+        .state
+        .clone()
+        .or_else(|| std::env::var("PHLO_STATE_URL").ok());
+    match location.as_deref() {
+        Some(url) if url.starts_with("postgres://") || url.starts_with("postgresql://") => {
+            PostgresStateStore::connect(url)
+                .map(|store| Some(Arc::new(store) as Arc<dyn StateStore>))
+                .map_err(|error| {
+                    format!(
+                        "could not connect to state store {}: {error}",
+                        state_location_display(url)
+                    )
+                })
+        }
+        Some(path) => SqliteStateStore::open(std::path::Path::new(path))
+            .map(|store| Some(Arc::new(store) as Arc<dyn StateStore>))
+            .map_err(|error| format!("could not open state store {path}: {error}")),
+        None => Ok(SqliteStateStore::open(&state_path(cli))
+            .ok()
+            .map(|store| Arc::new(store) as Arc<dyn StateStore>)),
+    }
+}
+
+/// Display form of a state location: credentials embedded in a Postgres URL
+/// are stripped before the string can reach errors or doctor output.
+fn state_location_display(location: &str) -> String {
+    for scheme in ["postgres://", "postgresql://"] {
+        if let Some(rest) = location.strip_prefix(scheme) {
+            let host_part = rest.rsplit('@').next().unwrap_or(rest);
+            return format!("{scheme}{host_part}");
+        }
+    }
+    location.to_string()
 }
 
 /// The effective environment: `--environment`, else `--ref`.
@@ -1076,7 +1148,7 @@ async fn run_promote(
         })?,
     };
     let nessie = build_nessie(cli)?;
-    let state = open_state(cli);
+    let state = open_state(cli)?;
 
     // Resolve both references up front: promotion needs both to exist.
     let candidate_reference = nessie
@@ -1615,6 +1687,196 @@ async fn run_ref(cli: &Cli, action: &RefAction) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Show a recognisable prefix of an id or hash.
+fn short(value: &str, len: usize) -> String {
+    if value.len() <= len {
+        value.to_string()
+    } else {
+        format!("{}…", &value[..len])
+    }
+}
+
+/// `phlo-transform state ...` — read-only inspection of the state store.
+fn run_state(cli: &Cli, action: &StateAction) -> Result<ExitCode, String> {
+    let state = open_state(cli)?.ok_or_else(|| {
+        format!(
+            "no state store at {} — nothing has been recorded",
+            state_path(cli).display()
+        )
+    })?;
+    match action {
+        StateAction::Runs => {
+            let env = environment(cli);
+            let runs = state
+                .runs()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter(|run| {
+                    env.as_deref()
+                        .map(|env| run.environment.as_deref() == Some(env))
+                        .unwrap_or(true)
+                })
+                .collect::<Vec<_>>();
+            if cli.json {
+                print_json(&runs)?;
+            } else if runs.is_empty() {
+                println!("No runs recorded");
+            } else {
+                for run in &runs {
+                    println!(
+                        "{:<14} {:<10} {:<20} {:>3} models {:>3} failed  {}",
+                        short(&run.run_id, 12),
+                        run.status.label(),
+                        run.environment.as_deref().unwrap_or("-"),
+                        run.model_count,
+                        run.failed_count,
+                        run.started_at,
+                    );
+                }
+            }
+        }
+        StateAction::Show { run } => {
+            let matches = state.find_runs(run).map_err(|error| error.to_string())?;
+            let summary = match matches.as_slice() {
+                [] => return Err(format!("no run matches `{run}`")),
+                [only] => only,
+                _ => {
+                    return Err(format!(
+                        "`{run}` matches {} runs — give a longer prefix",
+                        matches.len()
+                    ))
+                }
+            };
+            let stored = state
+                .run(&summary.run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("run `{}` was not found", summary.run_id))?;
+            let models = state
+                .model_runs(&summary.run_id)
+                .map_err(|error| error.to_string())?;
+            let seeds = state
+                .seed_runs(&summary.run_id)
+                .map_err(|error| error.to_string())?;
+            let tests = state
+                .test_runs(&summary.run_id)
+                .map_err(|error| error.to_string())?;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "run": stored.record,
+                    "plan": stored.plan,
+                    "models": models,
+                    "seeds": seeds,
+                    "tests": tests,
+                }))?;
+            } else {
+                println!(
+                    "Run {} — {} ({} models, {} failed, env {})",
+                    stored.record.run_id,
+                    stored.record.status.label(),
+                    stored.record.model_count,
+                    stored.record.failed_count,
+                    stored.record.environment.as_deref().unwrap_or("-"),
+                );
+                for model in &models {
+                    println!(
+                        "  {:<10} {:<40} {:<14} {}",
+                        model.status.label(),
+                        model.model_id,
+                        model.action,
+                        model.error.as_deref().unwrap_or("")
+                    );
+                }
+                for seed in &seeds {
+                    println!(
+                        "  {:<10} {:<40} seed          {}",
+                        seed.status.label(),
+                        seed.name,
+                        seed.error.as_deref().unwrap_or("")
+                    );
+                }
+                for test in &tests {
+                    println!(
+                        "  {:<10} {:<40} test          {}",
+                        test.status.label(),
+                        test.test_id,
+                        test.error.as_deref().unwrap_or("")
+                    );
+                }
+            }
+        }
+        StateAction::Model { model } => {
+            let id = ModelId::parse(model)
+                .map_err(|error| format!("invalid model reference `{model}`: {error}"))?;
+            let record = state
+                .materialized_version(&id.logical_name(), environment(cli).as_deref())
+                .map_err(|error| error.to_string())?;
+            match record {
+                None => {
+                    return Err(format!(
+                        "no materialisation recorded for {} in environment {}",
+                        id.logical_name(),
+                        environment(cli).unwrap_or_else(|| "<default>".to_string()),
+                    ))
+                }
+                Some(record) => {
+                    if cli.json {
+                        print_json(&record)?;
+                    } else {
+                        println!("Model:         {}", record.model_id);
+                        println!(
+                            "Environment:   {}",
+                            record.environment.as_deref().unwrap_or("-")
+                        );
+                        println!("Version:       {}", record.version.short());
+                        println!("Target:        {}", record.target);
+                        println!(
+                            "Adapter:       {}",
+                            record.adapter.as_deref().unwrap_or("<unrecorded>")
+                        );
+                        println!("Run:           {}", short(&record.run_id, 12));
+                        println!("Materialised:  {}", record.materialized_at);
+                        if let Some(strategy) = &record.incremental_strategy {
+                            println!(
+                                "Incremental:   {strategy} ({})",
+                                record.incremental_key.as_deref().unwrap_or("-")
+                            );
+                        }
+                        println!("Components:");
+                        println!("  sql:      {}", record.version.sql_hash);
+                        println!("  config:   {}", record.version.config_hash);
+                        println!("  contract: {}", record.version.contract_hash);
+                        println!("  deps:     {}", record.version.dependency_hash);
+                        println!("  sources:  {}", record.version.source_state_hash);
+                        println!("  compiler: {}", record.version.compiler_version);
+                        println!("  target:   {}", record.version.target_hash);
+                    }
+                }
+            }
+        }
+        StateAction::Promotions => {
+            let promotions = state.promotions().map_err(|error| error.to_string())?;
+            if cli.json {
+                print_json(&promotions)?;
+            } else if promotions.is_empty() {
+                println!("No promotions recorded");
+            } else {
+                for promotion in &promotions {
+                    println!(
+                        "{:<14} {} -> {}  merged={} dry_run={}  {}",
+                        short(&promotion.promotion_id, 12),
+                        promotion.candidate_ref,
+                        promotion.target_ref,
+                        promotion.merged,
+                        promotion.dry_run,
+                        promotion.timestamp,
+                    );
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 async fn run_rollback(cli: &Cli, to: &str) -> Result<ExitCode, String> {
     let nessie = build_nessie(cli)?;
     let name = environment(cli).ok_or_else(|| "rollback requires --ref <reference>".to_string())?;
@@ -1669,7 +1931,7 @@ async fn run_plan(
     set: &SelectorSet,
     git: Option<&GitChanges>,
 ) -> Result<ExitCode, String> {
-    let (plan, writer) = build_plan(cli, compilation, set, open_state(cli), git).await?;
+    let (plan, writer) = build_plan(cli, compilation, set, open_state(cli)?, git).await?;
     writer
         .write_project(compilation)
         .and_then(|_| writer.write_plan(&plan))
@@ -1734,7 +1996,7 @@ async fn run_apply(
     git: Option<&GitChanges>,
     convenience_run: bool,
 ) -> Result<ExitCode, String> {
-    let state = open_state(cli);
+    let state = open_state(cli)?;
 
     // `--resume` / `--retry-failed` continue a prior run: their work comes
     // from the stored run, not from CLI selection.
@@ -2922,7 +3184,7 @@ async fn run_diff(
         .ok_or_else(|| format!("no such model: {}", id.logical_name()))?;
 
     let adapter = build_adapter(cli)?;
-    let state = open_state(cli);
+    let state = open_state(cli)?;
     let candidate_ref = environment(cli);
     // `main` is the physical base when `--base` names nothing else.
     let base_ref = base.clone().unwrap_or_else(|| "main".to_string());
@@ -3146,7 +3408,7 @@ async fn run_branch_diff(
     };
 
     let adapter = build_adapter(cli)?;
-    let state = open_state(cli);
+    let state = open_state(cli)?;
     let report = branch_diff(
         adapter,
         state.as_deref(),
@@ -3608,16 +3870,32 @@ async fn run_doctor(cli: &Cli) -> Result<ExitCode, String> {
     }
 
     // 4. State store.
-    match SqliteStateStore::open(&state_path(cli)) {
-        Ok(_) => record(DoctorCheck {
+    match open_state(cli) {
+        Ok(Some(_)) => {
+            let location = cli
+                .state
+                .clone()
+                .or_else(|| std::env::var("PHLO_STATE_URL").ok())
+                .map(|location| state_location_display(&location))
+                .unwrap_or_else(|| state_path(cli).display().to_string());
+            record(DoctorCheck {
+                name: "state",
+                status: "ok",
+                detail: location,
+            })
+        }
+        Ok(None) => record(DoctorCheck {
             name: "state",
-            status: "ok",
-            detail: state_path(cli).display().to_string(),
+            status: "warn",
+            detail: format!(
+                "could not open {} (runs will not be recorded)",
+                state_path(cli).display()
+            ),
         }),
         Err(error) => record(DoctorCheck {
             name: "state",
             status: "fail",
-            detail: format!("could not open state store: {error}"),
+            detail: error,
         }),
     }
 
@@ -3702,7 +3980,7 @@ async fn run_explain(
     let diagnostics = model_diagnostics(compilation, &report);
     let compiled = compilation.model(&id).expect("inspect report exists");
 
-    let state = open_state(cli);
+    let state = open_state(cli)?;
     let env = environment(cli);
     let current = state.as_ref().and_then(|state| {
         state
@@ -4007,6 +4285,8 @@ mod tests {
                 target: "cat.m.a".to_string(),
                 incremental_strategy: None,
                 incremental_key: None,
+                adapter: None,
+                output_identity: None,
                 run_id: "run-1".to_string(),
                 materialized_at: "t".to_string(),
             })
@@ -4050,6 +4330,8 @@ mod tests {
             target: "cat.m.a".to_string(),
             incremental_strategy: None,
             incremental_key: None,
+            adapter: None,
+            output_identity: None,
             run_id: "run-1".to_string(),
             materialized_at: "t".to_string(),
         }
