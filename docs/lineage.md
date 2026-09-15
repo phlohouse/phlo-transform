@@ -141,6 +141,8 @@ phlo-transform lineage assay.results.titre      # column: direct/indirect/transi
 phlo-transform lineage --format graph           # canonical document (JSON)
 phlo-transform lineage assay.results --format graph        # scoped document
 phlo-transform lineage --format openlineage     # OpenLineage export
+phlo-transform lineage --diff main              # semantic diff vs merge-base(main, HEAD)
+phlo-transform lineage --diff main feature/foo  # exact ref → ref comparison
 phlo-transform impact assay.results             # downstream models/tests
 phlo-transform impact assay.results.titre       # downstream columns/models/tests
 phlo-transform impact external.samples.volume   # source-column impact
@@ -151,6 +153,77 @@ Human column output prints `Confidence:` when it is not `exact` and lists
 `Indirect:` inputs separately from `Direct:` ones. `--format` output is JSON
 regardless of `--json`; selector terms scope it the same way they scope
 `plan`/`run`.
+
+## Diffing lineage across refs
+
+`lineage --diff <git-ref>` answers "what does this branch change about the
+graph itself" — the semantic complement to `branch_diff`'s data comparison.
+One ref uses the same merge-base semantics as `--since`: the base is
+`merge-base(ref, HEAD)`, so a feature branch is compared against where it
+diverged — never against the other ref's current head. Two refs
+(`lineage --diff main feature/foo`) compare the exact refs with no worktree
+involved. The base side is compiled for real: the workspace subtree at the
+baseline commit is materialised into a temporary directory (`git ls-tree` +
+`cat-file`, never a worktree, so the checkout is untouched), discovered and
+compiled with the same options, then the two `LineageGraph`s are compared
+node-for-node and edge-for-edge. Edges are a multiset — parallel edges
+between the same two nodes (say, a column that is both selected and
+filtered on) are compared by their full metadata, not collapsed:
+
+- `nodes_added` / `nodes_removed` — models, datasets, columns and tests
+  that exist on only one side;
+- `nodes_changed` — the field-level delta (`version`, `materialization`,
+  `target`, `type`, `path`, …) for nodes present on both sides;
+- `edges_added` / `edges_removed` — dependency structure: a model that
+  started (or stopped) reading a dataset is a changed `input` edge, not
+  just a changed file;
+- `edges_changed` — column-level `derives` edges whose `transformation`,
+  `directness`, `confidence` or `expression` moved;
+- `impacts` — for every removed node, the base-side consumers it orphans
+  (the models and tests that were reading it);
+- `edge_impacts` — for every removed or metadata-moved edge, the base-side
+  downstream that loses or alters that lineage path, so dropping a
+  dependency while both nodes survive still reports impact.
+
+```text
+Lineage diff vs main (merge-base 1a2b3c4d5e6f)
+
+Removed
+  - assay.legacy (model)
+  - assay.legacy (dataset)
+
+Changed
+  ~ assay.results (model)
+      version: 3f2a1c9d… -> 9be21f7a…
+
+Edges
+  + dataset://assay/clean --input-> model://assay/results
+  - dataset://assay/legacy --input-> model://assay/results
+
+Impacts
+  model://assay/legacy orphans: assay.report, test://legacy_range
+```
+
+The report is written to `.phlo/transform/lineage_diff.json`; `--json`
+prints the same document. Beyond the diff itself the artifact binds its
+provenance: `base_kind` (`merge-base` or `ref`), the resolved `base_commit`,
+the candidate's git head and worktree state, a `lineage_hash` fingerprint
+of the candidate's canonical graph, and — when `--ref`/`--from`
+names a Nessie environment that resolves — the candidate and target branch
+hashes it was produced for. `promote` reads that binding: a lineage artifact
+covering this candidate and target at their current commits *and* whose
+fingerprint still matches the compiled workspace reports
+`current`; one produced for another pair, before either side moved, before
+the candidate's definitions changed, or naming refs that no longer resolve,
+reports `stale` with the reason rather than standing as evidence; an
+unbound artifact is advisory only. A base ref that fails to load or compile
+reports its diagnostics and exits non-zero rather than diffing a partial
+graph.
+
+In the branch workflow this is the code-side review step: `branch_diff`
+proves what the data would look like after promotion, `lineage --diff`
+proves what the *definitions* would look like — new dependencies, dropped
+models, orphaned consumers — before `promote` merges the data branch.
 
 ## OpenLineage export
 

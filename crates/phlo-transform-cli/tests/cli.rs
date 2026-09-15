@@ -1033,6 +1033,155 @@ fn plan_since_marks_modified_model() {
     assert!(!body.contains("BUILD  assay.results"), "{body}");
 }
 
+/// `lineage --diff` on a clean repo reports no changes.
+#[test]
+fn lineage_diff_clean_repo_reports_nothing() {
+    let dir = git_workspace();
+    let output = plan_since(dir.path(), &["lineage", "--diff", "main"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    assert!(
+        stdout(&output).contains("No lineage changes"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+/// A deleted model shows as removed and names the consumer it orphans.
+#[test]
+fn lineage_diff_reports_removed_model_and_orphans() {
+    let dir = git_workspace();
+    std::fs::remove_file(dir.path().join("transforms/assay/raw.sql")).expect("delete");
+    let output = plan_since(dir.path(), &["lineage", "--diff", "main"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("- assay.raw (model)"), "{body}");
+    assert!(body.contains("orphans"), "{body}");
+    assert!(body.contains("assay.results"), "{body}");
+}
+
+/// An edited model shows as changed with its version delta.
+#[test]
+fn lineage_diff_reports_changed_model() {
+    let dir = git_workspace();
+    std::fs::write(
+        dir.path().join("transforms/assay/results.sql"),
+        "select id, id + 1 as extra from assay.raw\n",
+    )
+    .expect("edit");
+    let output = plan_since(dir.path(), &["lineage", "--diff", "main", "--json"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let changed = json["nodes_changed"].as_array().expect("nodes_changed");
+    assert!(
+        changed.iter().any(|node| node["name"] == "assay.results"),
+        "{body}"
+    );
+}
+
+/// `lineage --diff` writes the `lineage_diff.json` artifact.
+#[test]
+fn lineage_diff_writes_artifact() {
+    let dir = git_workspace();
+    let output = plan_since(dir.path(), &["lineage", "--diff", "main"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let artifact = dir.path().join(".phlo/transform/lineage_diff.json");
+    let text = std::fs::read_to_string(&artifact).expect("artifact written");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("artifact json");
+    assert_eq!(json["base_ref"], "main");
+    assert!(json["base_commit"].is_string(), "{text}");
+    // Provenance: the base is the merge-base, and the candidate records the
+    // git head + worktree state the diff was produced against.
+    assert_eq!(json["base_kind"], "merge-base", "{text}");
+    let head = String::from_utf8_lossy(
+        &std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git rev-parse")
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(json["candidate"]["head"], head, "{text}");
+    assert_eq!(json["candidate"]["dirty"], false, "{text}");
+    // The candidate's lineage fingerprint binds the artifact to these
+    // definitions — promotion audits it against the compiled workspace.
+    assert!(json["candidate"]["lineage_hash"].is_string(), "{text}");
+    assert!(
+        json["candidate"]["model_versions"]["assay.raw"].is_string(),
+        "{text}"
+    );
+}
+
+/// `lineage --diff main` uses merge-base semantics: work committed on
+/// `main` after the branch diverged is not part of the comparison.
+#[test]
+fn lineage_diff_uses_merge_base_not_ref_head() {
+    let dir = git_workspace();
+    let root = dir.path();
+    // A ── feature; then main advances to B with a model the feature
+    // never had.
+    git(root, &["checkout", "-q", "-b", "feature"]);
+    git(root, &["checkout", "-q", "main"]);
+    std::fs::write(
+        root.join("transforms/assay/main_only.sql"),
+        "select 1 as id\n",
+    )
+    .expect("main-only model");
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "main moves on"]);
+    git(root, &["checkout", "-q", "feature"]);
+    // The feature's own change, uncommitted in the worktree.
+    std::fs::write(
+        root.join("transforms/assay/results.sql"),
+        "select id, id + 1 as extra from assay.raw\n",
+    )
+    .expect("edit");
+
+    let output = plan_since(root, &["lineage", "--diff", "main"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    // merge-base(main, feature) = A: `main_only` is on neither side — with
+    // direct `main^{commit}` semantics it would report as removed.
+    assert!(!body.contains("main_only"), "{body}");
+    // The feature's real change still reports, labelled as a merge-base diff.
+    assert!(body.contains("assay.results"), "{body}");
+    assert!(body.contains("merge-base"), "{body}");
+}
+
+/// `--diff base candidate` compares the exact refs — the dirty worktree
+/// is not part of either side.
+#[test]
+fn lineage_diff_two_refs_compares_exactly() {
+    let dir = git_workspace();
+    let root = dir.path();
+    git(root, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(
+        root.join("transforms/assay/feature_only.sql"),
+        "select 1 as id\n",
+    )
+    .expect("feature model");
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "feature work"]);
+    // An uncommitted model — invisible to an exact ref comparison.
+    std::fs::write(root.join("transforms/assay/dirty.sql"), "select 1 as id\n")
+        .expect("uncommitted model");
+
+    let output = plan_since(root, &["lineage", "--diff", "main", "feature"]);
+    assert!(output.status.success(), "{}", stdout(&output));
+    let body = stdout(&output);
+    assert!(body.contains("+ assay.feature_only (model)"), "{body}");
+    assert!(!body.contains("dirty"), "{body}");
+    // Exact refs name the resolved head, not a merge-base.
+    let artifact = root.join(".phlo/transform/lineage_diff.json");
+    let text = std::fs::read_to_string(&artifact).expect("artifact written");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("artifact json");
+    assert_eq!(json["base_kind"], "ref", "{text}");
+    assert_eq!(json["candidate"]["git_ref"], "feature", "{text}");
+}
+
 /// `changed+` expands the Git change set downstream through the graph.
 #[test]
 fn plan_since_changed_plus_expands_downstream() {

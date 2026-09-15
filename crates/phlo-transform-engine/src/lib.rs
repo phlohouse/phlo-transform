@@ -28,9 +28,9 @@ pub mod util;
 
 pub use adapter::{Adapter, CatalogRequest, ColumnInfo, QueryResult};
 pub use artifacts::{
-    ArtifactWriter, DiffArtifact, EnvironmentArtifact, GraphArtifactFile, LineageArtifact,
-    ManifestArtifact, OpenLineageArtifact, PlanArtifact, PromotionArtifact, RunArtifact,
-    SCHEMA_VERSION,
+    ArtifactWriter, CandidateProvenance, DiffArtifact, EnvironmentArtifact, GraphArtifactFile,
+    LineageArtifact, LineageDiffArtifact, LineageEnvironment, ManifestArtifact,
+    OpenLineageArtifact, PlanArtifact, PromotionArtifact, RunArtifact, SCHEMA_VERSION,
 };
 pub use branch_diff::{
     branch_diff, materialized_for_environment, model_keys, retarget, seeds_for_environment,

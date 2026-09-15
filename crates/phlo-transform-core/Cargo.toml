@@ -11,8 +11,10 @@ rust-version.workspace = true
 globset = { workspace = true }
 petgraph = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlparser = { workspace = true }
+tempfile = "3"
 thiserror = { workspace = true }
 toml = { workspace = true }
 walkdir = { workspace = true }
@@ -20,5 +22,3 @@ phlo-transform-sql = { workspace = true }
 
 [dev-dependencies]
 insta = { version = "1", features = ["json"] }
-serde_json = { workspace = true }
-tempfile = "3"
