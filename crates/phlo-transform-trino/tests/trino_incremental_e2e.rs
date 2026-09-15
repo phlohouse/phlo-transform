@@ -233,6 +233,7 @@ async fn incremental_key_merges_on_trino_iceberg() {
             },
             policy: DiffPolicy::default(),
             sample_fraction: None,
+            renames: Default::default(),
         },
     )
     .await

@@ -1715,6 +1715,13 @@ impl Runner {
                                     .filter(|key| !key.is_empty()),
                                 adapter: Some(self.adapter.name().to_string()),
                                 output_identity: result.output_identity.clone(),
+                                contract: model.contract.clone(),
+                                // Always a definite value: `Some([])` records
+                                // "materialised keyless", distinguishing it
+                                // from a legacy row's NULL (unknown).
+                                effective_key: Some(
+                                    crate::contracts::effective_key(model).unwrap_or_default(),
+                                ),
                                 run_id: run_id.clone(),
                                 materialized_at: finished_at.clone(),
                             })?;

@@ -811,6 +811,15 @@ type = "DOUBLE"
 nullable = false
 ```
 
+Column renames are declared alongside the contract so diffs can classify a
+removed+added pair as a named rename — a breaking change for consumers
+still selecting the old name — rather than an unexplained removal:
+
+```toml
+[model.assay_results.renames]
+result = "legacy_result"
+```
+
 Explicit contract files remain optional.
 
 ## 32. Inferred tests
@@ -1072,7 +1081,7 @@ phlo transform promote feature/new-assay --to main
 phlo transform promote --from feature/new-assay --to main
 ```
 
-Promotion is authorised by named gates, reported identically in human and JSON output: `run` (latest candidate run passed and validated the exact commit being promoted — a passed run is bound to the candidate head **after** its writes land, and a candidate that advanced since its run, or a run recorded before commit binding, fails), `tests` (no failed tests), `blocked` (no blocked/cancelled model, seed or test work), `schema` (a fresh audited diff inspected this pair at these commits and found no unwaived breaking changes — absent or stale evidence fails closed, never reading "no evidence" as "no changes"), `data_diff` (when `--require-diff` is set: a passing `--full` audited diff bound to this candidate→target pair at the commits being promoted — the artifact records both refs' resolved heads and is rejected when they no longer match — still fresh per recorded versions, and never a self-comparison; a single-model `diff.json` is never promotion evidence), `base` (the target still equals the commit the evidence was established against — the hash-bound artifact's recorded base, else the candidate's `created_from` provenance; unknown provenance fails rather than redefining the base as the current head, and the merge asserts the evaluated target hash) and `conflicts` (the merge check is clean). A candidate that advanced between gate evaluation and merge is refused rather than promoted unaudited. `--check` evaluates gates without merging; a passing promotion merges and persists a `PromotionRecord` (refs, hashes, plan/run ids, gate results, timestamp) in the state store.
+Promotion is authorised by named gates, reported identically in human and JSON output: `run` (latest candidate run passed and validated the exact commit being promoted — a passed run is bound to the candidate head **after** its writes land, and a candidate that advanced since its run, or a run recorded before commit binding, fails), `tests` (no failed tests), `blocked` (no blocked/cancelled model, seed or test work), `schema` (a fresh audited diff inspected this pair at these commits and found no unwaived breaking changes — physical breaks come from the audited diff; contract breaks are computed live from the workspace's desired contracts against the target's recorded contracts, so a post-`diff` contract edit cannot slip past — and absent or stale evidence fails closed, never reading "no evidence" as "no changes"), `data_diff` (when `--require-diff` is set: a passing `--full` audited diff bound to this candidate→target pair at the commits being promoted — the artifact records both refs' resolved heads and is rejected when they no longer match — still fresh per recorded versions, and never a self-comparison; a single-model `diff.json` is never promotion evidence), `base` (the target still equals the commit the evidence was established against — the hash-bound artifact's recorded base, else the candidate's `created_from` provenance; unknown provenance fails rather than redefining the base as the current head, and the merge asserts the evaluated target hash) and `conflicts` (the merge check is clean). A candidate that advanced between gate evaluation and merge is refused rather than promoted unaudited. `--check` evaluates gates without merging; a passing promotion merges and persists a `PromotionRecord` (refs, hashes, plan/run ids, gate results, timestamp) in the state store.
 
 Preconditions may include successful plan, successful execution, required tests passing, no blocking schema changes, no stale state and optional approval.
 

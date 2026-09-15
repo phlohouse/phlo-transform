@@ -7,7 +7,7 @@
 use crate::identity::{ModelId, SourceId};
 
 /// A SQL scalar or nested type as understood by the compiler.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DataType {
     Boolean,
     TinyInt,
@@ -176,7 +176,7 @@ impl std::fmt::Display for DataType {
 }
 
 /// Nullability of a column. `Unknown` is distinct from `Nullable`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Nullability {
     NotNull,
     Nullable,
@@ -392,7 +392,7 @@ impl Assertion {
 }
 
 /// An explicit column-level contract.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ColumnContract {
     pub name: String,
     pub data_type: Option<DataType>,
@@ -400,10 +400,15 @@ pub struct ColumnContract {
 }
 
 /// An explicit model contract.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelContract {
     pub enforced: bool,
     pub columns: Vec<ColumnContract>,
+    /// Column renames the model declares (`new name` → `old name`), from
+    /// `[model.<name>.renames]`: a removed+added pair that is a declared
+    /// rename classifies as a rename, not a breaking removal.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub renames: std::collections::BTreeMap<String, String>,
 }
 
 /// Numeric tolerance for a diffed column.

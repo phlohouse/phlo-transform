@@ -45,6 +45,11 @@ The report also carries:
 
 - **schema** — per-model added/removed columns, type changes and nullability
   changes, each with a safety classification;
+- **contracts** — per-model contract changes: the workspace's declared
+  contract against what the base environment last recorded, classified
+  `safe`/`review`/`breaking` (see *Contract diff* below);
+- **impacts** — for every breaking schema or contract change, the downstream
+  models and tests lineage says it would break;
 - **rows** — `count(*)` per side plus the delta;
 - **diffs** — with `--full`, a keyed value diff per changed model that
   declares keys, plus an aggregate diff for any changed model that declares
@@ -122,9 +127,60 @@ relative_tolerance = 1e-6
 
 `schema_changes` is populated from the candidate and base relation schemas:
 added, removed (`full_rebuild_required`), changed (`review` for numeric
-widening, `error` otherwise) and nullability (`safe` when widening to
-nullable, `review` when narrowing to not-null) columns appear alongside the
-row-level result.
+widening, `error` otherwise) and nullability (`error` when relaxing to
+nullable — it removes a guarantee consumers may rely on — `review` when
+tightening to not-null) columns appear alongside the row-level result.
+
+A column rename declared in `phlo.toml` turns an unexplained breaking
+removal into an explicit `renamed` entry — still a breaking change for
+consumers selecting the old name, so promotion gates on it — and lets the
+diff compare the new column against its predecessor's type:
+
+```toml
+[model."assay.results".renames]
+result_value = "concentration"
+```
+
+## Contract diff
+
+`contract_changes` compares each model's declared contract (`contract_hash`
+made legible) against the contract the base environment last materialised
+with — contracts are persisted on materialisation records, so the report
+describes what promotion would actually change rather than a hash that
+moved:
+
+```text
+contract_added       contract declared where none was recorded   safe
+contract_removed     contract dropped                            breaking
+enforcement_changed  enforcement toggled                         review (on) / breaking (off)
+added                contract column added                       safe
+removed              contract column removed                     breaking
+renamed              declared rename (new in desired, old in base) breaking
+rename_ambiguous     several new names claim one old name          review
+type_changed         numeric widening `review`, else             breaking
+nullability_changed  relaxed (lost NOT NULL guarantee)           breaking
+                     tightened                                   review
+key_changed          effective key changed                       breaking
+key_removed          effective key dropped                       breaking
+key_added            effective key declared                      review
+```
+
+The effective key is the union of a `key` incremental strategy's columns
+and unique-assertion columns — the same identity concept from either
+source — compared against the key the base environment recorded at
+materialisation time.
+
+A stale rename declaration — one whose new or old name is absent from the
+contracts — resolves nothing: the underlying removal or addition reports
+normally. Rename declarations must be one-to-one: when several new names
+claim the same old name, none resolve — the old column reports `removed`,
+every new column reports `added`, and `rename_ambiguous` explains why. The
+`impacts` section resolves every `breaking` entry through the column
+lineage graph into the downstream models and tests that consume it.
+
+At promotion time the same comparison runs live (workspace contract against
+the target's recorded contract), so a contract edited after `diff` cannot
+reach `promote` on the artifact's stale analysis.
 
 ## Policies
 

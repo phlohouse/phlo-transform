@@ -126,10 +126,18 @@ PASS conflicts  — candidate merges cleanly
 - `tests` — no test in that run failed.
 - `blocked` — no model, seed or test was left blocked or cancelled.
 - `schema` — a fresh audited diff inspected this pair at these commits and
-  found no breaking schema changes, or they were waived with
-  `--allow-breaking-schema`. Without an audited artifact the gate fails
-  closed: "no evidence" never reads as "no changes". The waiver covers the
-  schema gate only — it does not waive provenance or run binding.
+  found no breaking schema or contract changes, or they were waived with
+  `--allow-breaking-schema`. Physical schema breaks come from the audited
+  diff; contract breaks (a dropped contract column, a removed contract,
+  enforcement turned off, an incompatible type change, a relaxed
+  nullability guarantee, a declared rename, a changed or dropped effective
+  key) are computed live at promotion time — the workspace's desired
+  contracts against the contracts the target environment last recorded —
+  so editing a contract after `diff` cannot bypass the gate on a stale
+  artifact. A state-store error fails promotion rather than reading as "no
+  contracts recorded". Without an audited artifact the gate fails closed:
+  "no evidence" never reads as "no changes". The waiver covers the schema
+  gate only — it does not waive provenance or run binding.
 - `data_diff` — only evaluated with `--require-diff`; the audited diff
   (`branch_diff.json` from a `--full` branch diff) must exist, pass its
   policies, cover this exact candidate→target pair **at the commits being

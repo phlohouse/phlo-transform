@@ -1,0 +1,12 @@
+[transform]
+default_catalog = "memory"
+default_schema = "default"
+
+[model."assay.results".contract]
+enforced = true
+
+[model."assay.results".columns.result_value]
+type = "DOUBLE"
+
+[model."assay.results".renames]
+result_value = "concentration"

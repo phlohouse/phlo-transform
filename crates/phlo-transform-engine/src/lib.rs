@@ -11,6 +11,7 @@ pub mod artifacts;
 pub mod branch_diff;
 pub mod cancel;
 pub mod changed;
+pub mod contracts;
 pub mod diff;
 pub mod environment;
 pub mod error;
@@ -33,11 +34,15 @@ pub use artifacts::{
 };
 pub use branch_diff::{
     branch_diff, materialized_for_environment, model_keys, retarget, seeds_for_environment,
-    BranchDiffReport, BranchDiffRequest, DatasetDiff, DatasetKind, DatasetStatus, ModelRowDiff,
-    ModelSchemaDiff,
+    BranchDiffReport, BranchDiffRequest, DatasetDiff, DatasetKind, DatasetStatus,
+    ModelContractDiff, ModelRowDiff, ModelSchemaDiff,
 };
 pub use cancel::CancelHandle;
 pub use changed::changed_models;
+pub use contracts::{
+    breaking_contract_changes, contract_diff, effective_key, key_change, ContractChange,
+    ContractSafety, RecordedKey,
+};
 pub use diff::{
     diff, DiffPolicy, DiffReport, DiffRequest, DiffStrategy, PolicyResult, RowSummary, SchemaChange,
 };

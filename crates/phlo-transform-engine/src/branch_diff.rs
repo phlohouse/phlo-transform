@@ -36,6 +36,9 @@ use crate::error::{AdapterError, EngineError};
 use crate::state::{MaterializedRecord, SeedRecord, StateStore};
 use crate::util::now_rfc3339;
 
+/// Empty rename map shared by datasets whose model declares no renames.
+static EMPTY_RENAMES: BTreeMap<String, String> = BTreeMap::new();
+
 /// What a dataset is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -84,6 +87,32 @@ pub struct DatasetDiff {
 pub struct ModelSchemaDiff {
     pub model: String,
     pub changes: Vec<SchemaChange>,
+}
+
+/// Contract-level changes for one model — what promotion would apply to
+/// the base environment's recorded contract.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelContractDiff {
+    pub model: String,
+    pub changes: Vec<crate::contracts::ContractChange>,
+}
+
+/// The lineage impact of one breaking change — which downstream models and
+/// tests consume the thing that breaks.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BreakingImpact {
+    pub model: String,
+    /// The broken column; `None` for model-level breaks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+    /// What changed, in the schema/contract diff's own words.
+    pub change: String,
+    /// Where the break came from: `schema` or `contract`.
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub downstream_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tests: Vec<String>,
 }
 
 /// Row-count comparison for one dataset.
@@ -140,6 +169,13 @@ pub struct BranchDiffReport {
     /// Column-level changes for datasets present on at least one side.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub schema_changes: Vec<ModelSchemaDiff>,
+    /// Contract changes each model would promote onto the base
+    /// environment's recorded contract — declared-rename aware.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contract_changes: Vec<ModelContractDiff>,
+    /// Lineage impact for every breaking schema or contract change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub impacts: Vec<BreakingImpact>,
     /// Row counts for datasets present on at least one side.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rows: Vec<ModelRowDiff>,
@@ -350,7 +386,15 @@ pub async fn branch_diff(
             (Some(relation), true) => adapter.relation_columns(relation).await.unwrap_or_default(),
             _ => Vec::new(),
         };
-        let changes = compare_column_lists(&candidate_columns, &base_columns);
+        let renames = compilation
+            .model_by_name(&dataset.dataset)
+            .and_then(|model| model.contract.as_ref())
+            .map(|contract| &contract.renames);
+        let changes = compare_column_lists(
+            &candidate_columns,
+            &base_columns,
+            renames.unwrap_or(&EMPTY_RENAMES),
+        );
         if !changes.is_empty() {
             schema_changes.push(ModelSchemaDiff {
                 model: dataset.dataset.clone(),
@@ -432,6 +476,11 @@ pub async fn branch_diff(
                         strategy: DiffStrategy::Keyed,
                         policy: diff_policy(model.config.diff.as_ref()),
                         sample_fraction: None,
+                        renames: model
+                            .contract
+                            .as_ref()
+                            .map(|contract| contract.renames.clone())
+                            .unwrap_or_default(),
                     },
                 )
                 .await?,
@@ -441,6 +490,69 @@ pub async fn branch_diff(
     diffs.sort_by(|left, right| left.model.cmp(&right.model));
     let passed = diffs.iter().all(|report| report.passed);
 
+    // Contract diffs: the workspace's declared contract against what the
+    // base environment last recorded. A model without a base record reports
+    // its contract as newly declared; a model whose base record predates
+    // contract persistence compares against `None` the same way.
+    let mut contract_changes = Vec::new();
+    for model in &compilation.models {
+        let name = model.id.logical_name();
+        let record = base_records.get(&name);
+        let mut changes = crate::contracts::contract_diff(
+            record.and_then(|record| record.contract.as_ref()),
+            model.contract.as_ref(),
+        );
+        // The effective key collapses incremental `key` columns and
+        // unique-assertion columns onto one identity concept; compare the
+        // workspace's against the key the base materialisation persisted.
+        // A model never materialised on the base has no key to protect; a
+        // record that predates key persistence fails closed.
+        if let Some(change) = crate::contracts::key_change(
+            &record
+                .map(|record| record.recorded_key())
+                .unwrap_or(crate::contracts::RecordedKey::Known(None)),
+            crate::contracts::effective_key(model).as_deref(),
+        ) {
+            changes.push(change);
+        }
+        if !changes.is_empty() {
+            contract_changes.push(ModelContractDiff {
+                model: name,
+                changes,
+            });
+        }
+    }
+
+    // Lineage impact of every breaking change — what promoting this branch
+    // would break downstream.
+    let mut impacts = Vec::new();
+    for schema_diff in &schema_changes {
+        for change in &schema_diff.changes {
+            if matches!(change.safety.as_str(), "error" | "full_rebuild_required") {
+                impacts.push(breaking_impact(
+                    compilation,
+                    &schema_diff.model,
+                    Some(change.column.as_str()),
+                    "schema",
+                    &change.detail,
+                ));
+            }
+        }
+    }
+    for contract_diff in &contract_changes {
+        for change in &contract_diff.changes {
+            if change.safety == crate::contracts::ContractSafety::Breaking {
+                impacts.push(breaking_impact(
+                    compilation,
+                    &contract_diff.model,
+                    (!change.column.is_empty()).then_some(change.column.as_str()),
+                    "contract",
+                    &change.detail,
+                ));
+            }
+        }
+    }
+
     Ok(BranchDiffReport {
         candidate_ref: request.candidate_ref.clone(),
         base_ref: request.base_ref.clone(),
@@ -448,6 +560,8 @@ pub async fn branch_diff(
         base_hash: request.base_hash.clone(),
         datasets,
         schema_changes,
+        contract_changes,
+        impacts,
         rows,
         diffs,
         deep: request.deep,
@@ -523,6 +637,56 @@ async fn snapshot(adapter: &dyn Adapter, relation: Option<&Relation>) -> Option<
     match relation {
         Some(relation) => adapter.source_state(relation).await.ok().flatten(),
         None => None,
+    }
+}
+
+/// Resolve one breaking change's downstream blast radius through the
+/// lineage graph: column-level breaks use the column impact walk,
+/// model-level breaks report the whole model's downstream.
+fn breaking_impact(
+    compilation: &Compilation,
+    model_name: &str,
+    column: Option<&str>,
+    source: &str,
+    detail: &str,
+) -> BreakingImpact {
+    let (downstream_models, tests) = match compilation.model_by_name(model_name) {
+        Some(model) => match column {
+            Some(column) => {
+                let report = compilation.impact_report(
+                    &phlo_transform_core::semantic::ColumnRef::model(model.id.clone(), column),
+                );
+                (report.downstream_models, report.tests)
+            }
+            None => {
+                let mut models = Vec::new();
+                for node in compilation.lineage.downstream_transitive(
+                    &phlo_transform_core::lineage::LineageNode::Model(model.id.clone()),
+                ) {
+                    if let phlo_transform_core::lineage::LineageNode::Model(id) = node {
+                        models.push(id.logical_name());
+                    }
+                }
+                let tests = compilation
+                    .lineage
+                    .tests_for_dataset(&phlo_transform_core::lineage::DatasetId::model(&model.id))
+                    .into_iter()
+                    .map(|test| test.to_string())
+                    .collect();
+                (models, tests)
+            }
+        },
+        // The breaking dataset is not a compiled model (a seed, or a model
+        // dropped from the workspace) — no lineage to walk.
+        None => (Vec::new(), Vec::new()),
+    };
+    BreakingImpact {
+        model: model_name.to_string(),
+        column: column.map(str::to_string),
+        change: detail.to_string(),
+        source: source.to_string(),
+        downstream_models,
+        tests,
     }
 }
 

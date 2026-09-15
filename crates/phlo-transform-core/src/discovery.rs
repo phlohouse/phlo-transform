@@ -206,7 +206,7 @@ fn normalized_sections(config: &PhloConfig) -> BTreeMap<String, ModelContractCon
 }
 
 fn contract_from_section(section: &ModelContractConfig) -> Option<ModelContract> {
-    if !section.contract.enforced && section.columns.is_empty() {
+    if !section.contract.enforced && section.columns.is_empty() && section.renames.is_empty() {
         return None;
     }
     Some(ModelContract {
@@ -223,6 +223,7 @@ fn contract_from_section(section: &ModelContractConfig) -> Option<ModelContract>
                 nullable: column.nullable,
             })
             .collect(),
+        renames: section.renames.clone(),
     })
 }
 

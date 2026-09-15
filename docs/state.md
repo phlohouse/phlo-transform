@@ -95,8 +95,16 @@ This is covered by `cache_reuse_across_environments_is_reported_as_cached`,
 The state store gains a `model_versions` table recording, per model and
 environment, the `ModelVersion` attached to the most recent successful
 materialisation (plus target, run id, timestamp, incremental strategy/key,
-`version_detail`, the producing `adapter`, and the strong `output_identity`
-the adapter observed on the relation right after writing). API:
+`version_detail`, the producing `adapter`, the strong `output_identity`
+the adapter observed on the relation right after writing, the declared
+`contract`, and the `effective_key` — the row-identity key the model
+materialised with, persisted so later comparisons need not reconstruct it).
+`effective_key` is tri-state: a recorded set of claims, an empty set
+(recorded "no key"), or NULL for rows that predate the column. Opening the
+database backfills legacy rows that recorded an incremental `key` strategy;
+rows with no surviving key evidence read as *unknown* — promotion treats an
+unverifiable key as a breaking change, not as proof the base was keyless.
+API:
 
 ```text
 record_materialized(record)
@@ -224,7 +232,8 @@ version differs from the current compile.
   (`--environment` filters);
 - `state show <run-id-or-prefix>` — one run's model, seed and test records;
 - `state model <name>` — the recorded materialised version for the
-  effective environment: version components, target, adapter, run;
+  effective environment: version components, target, adapter, contract
+  summary, run;
 - `state promotions` — promotion history.
 
 All four honour `--json`.

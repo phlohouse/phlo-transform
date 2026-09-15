@@ -484,6 +484,25 @@ fn discovery_attaches_contracts_and_generates_tests() {
     }));
 }
 
+/// `[model.<name>.renames]` lands on the contract so schema and contract
+/// diffs can classify a remove+add pair as a rename.
+#[test]
+fn discovery_attaches_declared_renames() {
+    let compilation = compile_fixture("contract-renames");
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+
+    let contract = compilation
+        .model(&ModelId::parse("assay.results").unwrap())
+        .expect("model")
+        .contract
+        .as_ref()
+        .expect("contract attached");
+    assert_eq!(
+        contract.renames.get("result_value").map(String::as_str),
+        Some("concentration")
+    );
+}
+
 #[test]
 fn models_expose_workflow_ownership() {
     let compilation = compile_fixture("cross-workflow");
