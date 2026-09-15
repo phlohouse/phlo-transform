@@ -84,7 +84,10 @@ catalog's bound Nessie ref cannot be read back over SQL and the generated
 name is a public convention anyone can mint, an existing catalog is never
 adopted on name alone: an `unverified` catalog is accepted only when a
 recorded artifact binds that catalog to this ref — an artifact that
-observed the catalog before, or an explicit `ref create --catalog` pin —
+vetted the catalog before (recorded with the `catalog_owned_by_phlo`
+ownership flag; a pre-flag `unverified` record may itself have been
+adopted on the name alone and is not evidence), or an explicit
+`ref create --catalog` pin —
 and a catalog another candidate's evidence claims is refused outright.
 Refusal rolls back a just-created candidate branch so a failed
 provisioning attempt leaves no stray ref. The provisioning records `catalog_status` (`created`,

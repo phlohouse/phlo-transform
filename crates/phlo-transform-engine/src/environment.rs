@@ -64,7 +64,10 @@ pub struct EnvironmentSetup {
     /// at provisioning and stays sticky, while verification status reports
     /// what the *current* call could prove — a catalog phlo created keeps
     /// `owns_catalog()` true even when a later run can only observe it as
-    /// `Unverified`.
+    /// `Unverified`. The flag's presence also dates the artifact: it was
+    /// introduced together with recorded-binding vetting, so an
+    /// `Unverified` record lacking it predates that check and cannot
+    /// vouch for the binding.
     #[serde(default)]
     pub catalog_owned_by_phlo: Option<bool>,
 }
@@ -202,15 +205,22 @@ fn resolve_catalog(spec: &EnvironmentSpec, prior: Option<&EnvironmentSetup>) -> 
 }
 
 /// Whether a recorded artifact attests a *binding* between the candidate
-/// and a catalog — not merely intent. An artifact that observed the
-/// catalog (`Created`, or `Unverified` already vetted by an earlier
-/// ensure) attests it; so does a non-conventional recorded name, which is
-/// a `ref create --catalog` pin the workspace stands behind. A plain
+/// and a catalog — not merely intent. `Created` attests it outright. An
+/// `Unverified` record attests it only when the ownership flag was
+/// written alongside: the flag did not exist when `Unverified` catalogs
+/// could still be adopted on the generated name alone, so a flagless
+/// `Unverified` record may have been adopted on name only and cannot
+/// vouch for the binding. A non-conventional recorded name is a
+/// `ref create --catalog` pin the workspace stands behind; a plain
 /// `ref create` artifact's conventional name is intent only: it was
 /// written before the catalog existed and cannot vouch for a catalog that
 /// appeared later.
 fn prior_records_binding(prior: &EnvironmentSetup, candidate_ref: &str) -> bool {
-    prior.catalog_status != CatalogStatus::Unmanaged || prior.catalog != catalog_name(candidate_ref)
+    match prior.catalog_status {
+        CatalogStatus::Created => true,
+        CatalogStatus::Unverified => prior.catalog_owned_by_phlo.is_some(),
+        CatalogStatus::Unmanaged => prior.catalog != catalog_name(candidate_ref),
+    }
 }
 
 /// Whether the resolved catalog is a pin — an explicit override or a
@@ -270,7 +280,7 @@ pub async fn ensure_candidate(
         // name is no proof either: `phlo_<ref>_<hash>` is a public
         // convention anyone can mint pointed at another ref. Accept the
         // catalog only when this workspace recorded the binding for this
-        // exact ref and catalog — an artifact that observed it before, or
+        // exact ref and catalog — an artifact that vetted it before, or
         // an explicit `ref create --catalog` pin.
         let recorded = prior.as_ref().is_some_and(|prior| {
             prior.catalog == setup.catalog && prior_records_binding(prior, &spec.candidate_ref)

@@ -21,14 +21,15 @@ use phlo_transform_core::{
 };
 use phlo_transform_engine::{
     branch_diff, catalog_name, changed_models, cleanup_candidate, collect_source_states,
-    ensure_candidate, ensure_environment, evaluate_promotion, materialized_for_environment,
-    read_environment_for, write_environment_artifacts, Adapter, AdapterError, ArtifactWriter,
-    BranchDiffRequest, CancelHandle, CatalogRequest, CatalogStatus, ColumnInfo, ContractSafety,
-    DatasetStatus, EngineError, EngineEvent, EnvironmentContext, EnvironmentMode, EnvironmentSetup,
-    EnvironmentSpec, ExecutionStatus, FailureCategory, MaterializedRecord, Membership, ModelResult,
-    ModelRunRecord, Plan, PlanAction, PlanOptions, Planner, PromotionOptions, PromotionRecord,
-    QueryResult, ReasonKind, RetryPolicy, RunOptions, RunRecord, RunResult, RunSummary, Runner,
-    SeedRecord, SeedRunRecord, SqliteStateStore, StateStore, StoredPlan, StoredRun, TestRunRecord,
+    ensure_candidate, ensure_environment, environment_artifact_name, evaluate_promotion,
+    materialized_for_environment, read_environment_for, write_environment_artifacts, Adapter,
+    AdapterError, ArtifactWriter, BranchDiffRequest, CancelHandle, CatalogRequest, CatalogStatus,
+    ColumnInfo, ContractSafety, DatasetStatus, EngineError, EngineEvent, EnvironmentContext,
+    EnvironmentMode, EnvironmentSetup, EnvironmentSpec, ExecutionStatus, FailureCategory,
+    MaterializedRecord, Membership, ModelResult, ModelRunRecord, Plan, PlanAction, PlanOptions,
+    Planner, PromotionOptions, PromotionRecord, QueryResult, ReasonKind, RetryPolicy, RunOptions,
+    RunRecord, RunResult, RunSummary, Runner, SeedRecord, SeedRunRecord, SqliteStateStore,
+    StateStore, StoredPlan, StoredRun, TestRunRecord,
 };
 
 /// How a target should fail: the error to return, and how many attempts it
@@ -5719,6 +5720,63 @@ async fn an_unverified_generated_catalog_with_no_artifact_is_refused() {
     assert!(
         read_environment_for(dir.path(), "ci/x").is_none(),
         "no artifact claims a refused binding"
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_unverified_artifact_does_not_vouch_for_a_generated_catalog() {
+    // Artifacts written before `catalog_owned_by_phlo` existed can carry
+    // `unverified` for a catalog adopted on the generated name alone —
+    // the rule then in force trusted the name. The flag's absence marks
+    // the record as unvetted: it cannot vouch for the binding, so
+    // provisioning must refuse and roll back the branch it just created.
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let adapter = FakeAdapter::default();
+    adapter
+        .catalogs
+        .lock()
+        .unwrap()
+        .insert(catalog_name("ci/x"));
+    let dir = tempfile::tempdir().unwrap();
+    // Written the way the pre-flag build wrote it: no
+    // `catalog_owned_by_phlo` key at all.
+    let writer = ArtifactWriter::for_workspace(dir.path());
+    let artifacts = writer.directory().to_path_buf();
+    std::fs::create_dir_all(&artifacts).expect("artifact dir");
+    std::fs::write(
+        artifacts.join(environment_artifact_name("ci/x")),
+        serde_json::json!({
+            "schema_version": 1,
+            "environment": {
+                "base": {"name": "main", "hash": "aaa", "kind": "branch"},
+                "candidate": {"name": "ci/x", "hash": "bbb", "kind": "branch"},
+                "created_from": {"name": "main", "hash": "aaa", "kind": "branch"},
+                "created_branch": true,
+                "catalog": catalog_name("ci/x"),
+                "catalog_status": "unverified"
+            }
+        })
+        .to_string(),
+    )
+    .expect("legacy artifact");
+
+    let error = ensure_candidate(
+        dir.path(),
+        &nessie,
+        &adapter,
+        &EnvironmentSpec {
+            catalog: None,
+            ..environment_spec("ci/x")
+        },
+    )
+    .await
+    .expect_err("a flagless `unverified` record cannot vouch for the binding");
+
+    assert!(error.to_string().contains("cannot be verified"), "{error}");
+    assert!(
+        nessie.get_reference("ci/x").await.unwrap().is_none(),
+        "the branch created for a rejected catalog is rolled back"
     );
 }
 

@@ -101,8 +101,9 @@ generated name is a public convention anyone can mint, so the engine
 records how each catalog was established (`created` / `unverified` /
 `unmanaged`) and accepts a pre-existing catalog only on a recorded
 `environment_<ref>.json` binding for that exact ref and catalog — an
-artifact that observed the catalog before, or an explicit
-`ref create --catalog` pin. An unverifiable foreign catalog, or one
+artifact that vetted the catalog before (recorded with the
+`catalog_owned_by_phlo` ownership flag; a pre-flag `unverified` record
+cannot vouch), or an explicit `ref create --catalog` pin. An unverifiable foreign catalog, or one
 another candidate already claims, fails the operation rather than write
 into it.
 

@@ -75,10 +75,13 @@ Provisioning records how each catalog was established
 A pre-existing catalog is accepted only on a recorded binding — the
 generated name is a public convention anyone can mint, so it proves
 nothing on its own, and a `ref create` intent record cannot vouch for a
-catalog that appeared later. A catalog another candidate claims is
-refused; an `unmanaged` generated name fails closed; a refused
-`unverified` catalog rolls back a just-created branch so a failed
-provisioning attempt leaves nothing behind. `cleanup_candidate` drops only
+catalog that appeared later. Nor can a legacy `unverified` record: the
+`catalog_owned_by_phlo` flag was introduced with the vetting rule, so a
+record lacking it may have been adopted on the name alone and is not
+binding evidence. A catalog another candidate claims is refused; an
+`unmanaged` generated name fails closed; a refused `unverified` catalog
+rolls back a just-created branch so a failed provisioning attempt leaves
+nothing behind. `cleanup_candidate` drops only
 catalogs Phlo owns — including legacy `created` records predating the
 ownership flag — and reports every failure rather than leaving silent
 leftovers. Environment artifacts are removed only after the branch and
@@ -196,27 +199,28 @@ is a leaf client. No splits were needed — the fix was moving orchestration
 
 ## Maturity
 
-Levels: **prototype** — the happy path works; failure modes unexplored.
-**functional** — works end to end with documented gaps. **hardened** —
-failure modes handled deliberately and covered by tests; fails closed
-where safety demands. **production** — hardened *and* operationally
-complete; nothing here is there yet.
+Levels: **Mature** — hardened *and* operationally complete; nothing here
+is there yet. **Strong** — failure modes handled deliberately and covered
+by tests; fails closed where safety demands. **Production-credible** —
+works end to end with documented gaps. **Needs hardening** — the happy
+path works; failure modes unexplored. **Experimental** — a stub or
+sketch, present but not exercised.
 
 | area | level | evidence / remaining gap |
 |---|---|---|
-| compiler + diagnostics | hardened | typed IR, deterministic DAG, stable IDs, contracts; unsupported SQL degrades to `Unknown` honestly rather than guessing |
-| dbt translator | functional | 100% of jaffle_shop/canvas-exemplar convert CLEAN; dynamic Jinja/macros, exposures, metrics are REVIEW/UNSUPPORTED by design |
-| lineage + impact | functional | canonical graph, OpenLineage export, `--diff` across refs; offline column lineage needs catalog schemas; unsupported SQL → `Unknown` |
-| planner + state/cache | hardened | batched warehouse+state evidence, synchronous `decide`, cache reuse requires same-relation + same-adapter + strong output identity; `cached` still classifies — reuse is not executed |
-| execution runner | hardened | bounded concurrency, `--retries` backoff on retryable adapter failures, timeouts, cancellation, `--resume`/`--retry-failed`; DuckDB has no remote cancel |
-| incremental models | functional | append/merge/partition/window strategies, watermarks, schema-change rebuilds; Trino `MERGE` verified live; partition replace is a column-list delete, and watermark coverage is not per-adapter |
-| state store | hardened | env-scoped records, `main`↔default fold, SQLite/Postgres parity tested; watermarks deliberately do not fold |
-| environments + provisioning | hardened | one resolve path, fail-closed, recorded bindings, ownership-aware cleanup, branch rollback on rejected catalogs |
-| WAP + promotion | hardened | hash-bound evidence, provenance-required base, merge-time hash recheck, gates fail closed, live golden-path E2E; artifacts are file-local (portability is the top debt) |
-| data diff | functional | keyed/tolerance/partition/sampled diff live-tested; no distribution summaries, no example-value redaction |
-| daemon API | functional | versioned ops API, idempotency, cancellation, coherent snapshots; reload is a full recompile and progress is polled |
-| CLI | hardened | every surface shares engine orchestration; JSON output everywhere; `--environment`/`--ref` agreement enforced |
-| workflow integration | prototype | ownership + `quality_gate` exist; host workflow tasks, run correlation and gating APIs are Phase 7 debt |
+| compiler + diagnostics | Strong | typed IR, deterministic DAG, stable IDs, contracts; unsupported SQL degrades to `Unknown` honestly rather than guessing |
+| dbt translator | Production-credible | 100% of jaffle_shop/canvas-exemplar convert CLEAN; dynamic Jinja/macros, exposures, metrics are REVIEW/UNSUPPORTED by design |
+| lineage + impact | Production-credible | canonical graph, OpenLineage export, `--diff` across refs; offline column lineage needs catalog schemas; unsupported SQL → `Unknown` |
+| planner + state/cache | Strong | batched warehouse+state evidence, synchronous `decide`, cache reuse requires same-relation + same-adapter + strong output identity; `cached` still classifies — reuse is not executed |
+| execution runner | Strong | bounded concurrency, `--retries` backoff on retryable adapter failures, timeouts, cancellation, `--resume`/`--retry-failed`; DuckDB has no remote cancel |
+| incremental models | Production-credible | append/merge/partition/window strategies, watermarks, schema-change rebuilds; Trino `MERGE` verified live; partition replace is a column-list delete, and watermark coverage is not per-adapter |
+| state store | Strong | env-scoped records, `main`↔default fold, SQLite/Postgres parity tested; watermarks deliberately do not fold |
+| environments + provisioning | Strong | one resolve path, fail-closed, recorded bindings, ownership-aware cleanup, branch rollback on rejected catalogs |
+| WAP + promotion | Strong | hash-bound evidence, provenance-required base, merge-time hash recheck, gates fail closed, live golden-path E2E; artifacts are file-local (portability is the top debt) |
+| data diff | Production-credible | keyed/tolerance/partition/sampled diff live-tested; no distribution summaries, no example-value redaction |
+| daemon API | Production-credible | versioned ops API, idempotency, cancellation, coherent snapshots; reload is a full recompile and progress is polled |
+| CLI | Strong | every surface shares engine orchestration; JSON output everywhere; `--environment`/`--ref` agreement enforced |
+| workflow integration | Needs hardening | ownership + `quality_gate` exist; host workflow tasks, run correlation and gating APIs are Phase 7 debt |
 
 The model now holds together: one environment resolution path, one
 promotion audit, one ownership story, one state scope — and every surface
