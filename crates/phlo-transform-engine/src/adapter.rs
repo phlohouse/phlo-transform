@@ -43,6 +43,27 @@ pub struct CatalogRequest {
     pub warehouse: Option<String>,
 }
 
+/// What `ensure_catalog` established about the requested catalog.
+///
+/// The distinction matters for branch isolation: a candidate catalog is
+/// expected to be bound to the candidate's Nessie reference, but no adapter
+/// can introspect an existing catalog's configured ref over SQL — so
+/// "the catalog exists" must never silently mean "the catalog is correct".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogStatus {
+    /// The catalog was created by this call, bound to `request.reference`.
+    Created,
+    /// The catalog already existed; the adapter could not prove which
+    /// Nessie reference it serves. The caller must establish the binding
+    /// from recorded evidence — or refuse to use it.
+    #[default]
+    Unverified,
+    /// The adapter does not provision catalogs (or no reference/URI was
+    /// supplied) — there is nothing to verify.
+    Unmanaged,
+}
+
 /// A SQL execution target (Trino, or a fake adapter in tests).
 #[async_trait]
 pub trait Adapter: Send + Sync {
@@ -106,9 +127,14 @@ pub trait Adapter: Send + Sync {
     /// Read column metadata for an existing relation.
     async fn relation_columns(&self, relation: &Relation) -> Result<Vec<ColumnInfo>, AdapterError>;
 
-    /// Ensure a catalog exists for a Nessie reference. Adapters that do not
-    /// support catalog provisioning treat this as a no-op.
-    async fn ensure_catalog(&self, request: &CatalogRequest) -> Result<(), AdapterError>;
+    /// Ensure a catalog exists for a Nessie reference, reporting what was
+    /// established — see [`CatalogStatus`]. Adapters that do not support
+    /// catalog provisioning return [`CatalogStatus::Unmanaged`]. An adapter
+    /// must never report an existing catalog as correct when it cannot
+    /// prove the binding; it reports `Unverified` instead and the caller
+    /// decides from recorded evidence.
+    async fn ensure_catalog(&self, request: &CatalogRequest)
+        -> Result<CatalogStatus, AdapterError>;
 
     /// Ensure the schema/namespace containing a relation exists.
     async fn ensure_schema(&self, relation: &Relation) -> Result<(), AdapterError>;

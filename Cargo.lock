@@ -2576,12 +2576,18 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "phlo-transform-core",
+ "phlo-transform-duckdb",
  "phlo-transform-engine",
+ "phlo-transform-nessie",
+ "phlo-transform-trino",
  "reqwest",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "tempfile",
+ "testcontainers",
  "tokio",
+ "uuid",
  "walkdir",
 ]
 

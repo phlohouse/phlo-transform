@@ -1038,7 +1038,9 @@ A Git branch may map automatically or explicitly to a Nessie reference. Explicit
 phlo transform --ref feature/new-assay plan
 ```
 
-References are managed explicitly — `ref list`, `ref show`, `ref create --from <base>` and `ref delete` — and no command creates or deletes a branch as a side effect, except explicit candidate provisioning on `plan`/`apply`/`run --ref` and `--cleanup` on `promote`. `ref delete main` is refused: `main` is the default base, not a scratch branch. Provisioning is recorded per candidate in `environment_<sanitised ref>_<hash>.json` (plus the single-slot `environment.json`), and deleted with the branch. Each artifact carries `created_from` — the reference and commit the candidate was provably created from, recorded at `ref create` or first provisioning and preserved across re-provisioning. A pre-existing branch Phlo did not create has unrecorded provenance; promotion refuses it rather than redefine its base as the current target head.
+References are managed explicitly — `ref list`, `ref show`, `ref create --from <base>` and `ref delete` — and no command creates or deletes a branch as a side effect, except explicit candidate provisioning on `plan`/`apply`/`run --ref` and `--cleanup` on `promote`. `ref delete main` is refused: `main` is the default base, not a scratch branch. Provisioning is recorded per candidate in `environment_<sanitised ref>_<hash>.json` (plus the single-slot `environment.json`), and deleted with the branch. Each artifact carries `created_from` — the reference and commit the candidate was provably created from, recorded at `ref create` or first provisioning and preserved across re-provisioning — and the physical `catalog` plus a `catalog_status` (`created` / `unverified` / `unmanaged`). A pre-existing branch Phlo did not create has unrecorded provenance; promotion refuses it rather than redefine its base as the current target head.
+
+Candidate catalogs are named `phlo_<sanitised-ref>_<hash>` — the readable ref plus 8 hex of its SHA-256 — so punctuation-equivalent refs (`ci/pr-1`, `ci_pr_1`) can never collide on one physical catalog. Because a catalog's bound Nessie ref cannot be read back over SQL, an existing catalog is never adopted on name alone: `unverified` catalogs are accepted only when the name is the candidate's own generated convention or a recorded artifact binds it to the same ref, and a catalog another candidate's evidence claims is refused outright.
 
 ## 46. Write-Audit-Publish
 
@@ -1832,13 +1834,24 @@ without manually parsing source files.
 
 ## 85. Transform daemon
 
-A later phase should introduce:
-
 ```bash
 phlo transform daemon
 ```
 
-The daemon maintains an incremental in-memory workspace representation containing parsed ASTs, typed ASTs, dependency graph, catalogue schemas, lineage, hashes, filesystem state and compiled plans.
+The daemon maintains an in-memory workspace representation containing parsed ASTs, typed ASTs, dependency graph, catalogue schemas, lineage, hashes, filesystem state and compiled plans, published as an immutable `Arc<Compilation>` snapshot so readers never observe partial updates.
+
+It serves a versioned local HTTP API (see `docs/daemon.md`) with two planes:
+
+- **Reads** (`GET /v1/...`): check, models, inspect, lineage (document, model, column), impact (model, column, selection), graph, plan, branch/lineage diffs, and state inspection (runs, run detail, run failures, materialisations, promotions) — the same report DTOs as `--json` output.
+- **Operations** (`POST /v1/operations`): `run`, `resume`, `retry_failed`, `test`, `promote`, `reload` with a stable `queued → running → succeeded|failed|cancelled` lifecycle, live progress read back from the state store, cooperative cancellation via `CancelHandle`, request-bound idempotent replay (`idempotency_key` / `Idempotency-Key` header; keys are global to the endpoint — the same key under different params or a different kind is `API016`), and a single-mutating-operation gate (`API008`). The idempotency reservation is journaled to `.phlo/transform/operations.jsonl` before the operation is acknowledged, so a restart can never execute a keyed submission twice; an operation in flight at shutdown is restored as `failed` (`interrupted`).
+
+Environment-targeted operations run the same provisioning the CLI applies for `--ref`: with a catalog-facing Nessie URI configured, `run`/`resume`/`retry_failed` ensure the candidate branch and its branch-scoped catalog, recompile the workspace retargeted at it, and bind a passed run to the environment's post-run Nessie head — `main` is never written. When Nessie is configured but branch isolation cannot be provisioned (no catalog-facing URI or adapter), a non-base environment run fails with `API007` rather than recording falsely-labelled evidence; without any Nessie client the environment is an honest state label. A continuation targets the stored run's environment, not a requested one.
+
+Operations and reads share one environment resolution path (`EnvironmentContext::resolve`). Mutating work resolves in `Ensure` mode — provision, then compile retargeted. `GET /v1/plan?environment=&base=` resolves in `ReadOnly` mode — the same physical catalog (override → recorded binding → generated `phlo_<ref>_<hash>` name) and a retargeted compile, but no branch created and no evidence written. The plan it previews names exactly the targets a run against that environment executes.
+
+Promotion through the API uses the same audited evidence path as the CLI (`phlo_transform_engine::audit`): the gate reads the diff artifacts (`branch_diff.json` preferred, bound to both refs' resolved heads), the recorded provisioning environment (`created_from` provenance), live contract diffs against the target's recorded contracts, the lineage-diff artifact's provenance (including the candidate's lineage fingerprint), and the Nessie merge check — so CLI and API cannot drift apart on what counts as evidence. An unbound run cannot promote a commit-bound candidate.
+
+Errors are `{"error": {"code", "message"}}` with stable `API0xx` codes. `daemon --token <secret>` requires `Authorization: Bearer` on every endpoint except `/status` (`API015`).
 
 ## 86. Daemon consumers
 

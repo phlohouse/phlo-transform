@@ -15,7 +15,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use phlo_transform_core::Relation;
-use phlo_transform_engine::{Adapter, AdapterError, CatalogRequest, ColumnInfo, QueryResult};
+use phlo_transform_engine::{
+    Adapter, AdapterError, CatalogRequest, CatalogStatus, ColumnInfo, QueryResult,
+};
 
 /// Configuration for a Trino connection.
 #[derive(Clone, Debug)]
@@ -401,36 +403,53 @@ impl Adapter for TrinoAdapter {
             .collect())
     }
 
-    async fn ensure_catalog(&self, request: &CatalogRequest) -> Result<(), AdapterError> {
+    async fn ensure_catalog(
+        &self,
+        request: &CatalogRequest,
+    ) -> Result<CatalogStatus, AdapterError> {
         let (Some(reference), Some(nessie_uri)) = (&request.reference, &request.nessie_uri) else {
-            return Ok(());
+            return Ok(CatalogStatus::Unmanaged);
         };
-        if self.catalog_exists(&request.catalog).await? {
-            return Ok(());
+        match self.catalog_connector(&request.catalog).await? {
+            // An existing catalog is NOT accepted on name alone: the ref it
+            // is bound to cannot be read back over SQL, so the caller must
+            // prove the binding from recorded evidence — or refuse it. A
+            // non-Iceberg catalog under the name is never acceptable.
+            Some(connector) if connector != "iceberg" => Err(AdapterError::new(
+                "CATALOG_CONFLICT",
+                format!(
+                    "catalog `{}` already exists as a `{connector}` catalog, not an \
+                     Iceberg/Nessie catalog bound to `{reference}`",
+                    request.catalog
+                ),
+            )),
+            Some(_) => Ok(CatalogStatus::Unverified),
+            None => {
+                let warehouse = request
+                    .warehouse
+                    .clone()
+                    .unwrap_or_else(|| "local:///tmp/phlo-warehouse".to_string());
+                let mut properties = vec![
+                    "\"iceberg.catalog.type\"='nessie'".to_string(),
+                    format!(
+                        "\"iceberg.nessie-catalog.uri\"='{}/api/v2'",
+                        nessie_uri.trim_end_matches('/')
+                    ),
+                    format!("\"iceberg.nessie-catalog.ref\"='{reference}'"),
+                    format!("\"iceberg.nessie-catalog.default-warehouse-dir\"='{warehouse}'"),
+                ];
+                if warehouse.starts_with("local://") || warehouse.starts_with('/') {
+                    properties.push("\"fs.local.enabled\"='true'".to_string());
+                }
+                self.run(&format!(
+                    "CREATE CATALOG {} USING iceberg WITH ({})",
+                    quote(&request.catalog),
+                    properties.join(", ")
+                ))
+                .await?;
+                Ok(CatalogStatus::Created)
+            }
         }
-        let warehouse = request
-            .warehouse
-            .clone()
-            .unwrap_or_else(|| "local:///tmp/phlo-warehouse".to_string());
-        let mut properties = vec![
-            "\"iceberg.catalog.type\"='nessie'".to_string(),
-            format!(
-                "\"iceberg.nessie-catalog.uri\"='{}/api/v2'",
-                nessie_uri.trim_end_matches('/')
-            ),
-            format!("\"iceberg.nessie-catalog.ref\"='{reference}'"),
-            format!("\"iceberg.nessie-catalog.default-warehouse-dir\"='{warehouse}'"),
-        ];
-        if warehouse.starts_with("local://") || warehouse.starts_with('/') {
-            properties.push("\"fs.local.enabled\"='true'".to_string());
-        }
-        self.run(&format!(
-            "CREATE CATALOG {} USING iceberg WITH ({})",
-            quote(&request.catalog),
-            properties.join(", ")
-        ))
-        .await?;
-        Ok(())
     }
 
     async fn ensure_schema(&self, relation: &Relation) -> Result<(), AdapterError> {
@@ -505,12 +524,19 @@ impl Adapter for TrinoAdapter {
 }
 
 impl TrinoAdapter {
-    async fn catalog_exists(&self, catalog: &str) -> Result<bool, AdapterError> {
-        let result = self.run("SHOW CATALOGS").await?;
-        Ok(result
-            .rows
-            .iter()
-            .any(|row| row.first().map(String::as_str) == Some(catalog)))
+    /// The connector behind a catalog name (`iceberg`, `memory`, ...) —
+    /// `None` when no catalog of that name exists. Trino's
+    /// `system.metadata.catalogs` does not expose the catalog's configured
+    /// Nessie ref, so existence plus connector is the strongest claim SQL
+    /// can make; the engine treats that as [`CatalogStatus::Unverified`]
+    /// rather than proof of binding.
+    async fn catalog_connector(&self, catalog: &str) -> Result<Option<String>, AdapterError> {
+        let query = format!(
+            "SELECT connector_name FROM system.metadata.catalogs WHERE catalog_name = '{}'",
+            catalog.replace('\'', "''")
+        );
+        let result = self.run(&query).await?;
+        Ok(result.rows.first().and_then(|row| row.first()).cloned())
     }
 }
 

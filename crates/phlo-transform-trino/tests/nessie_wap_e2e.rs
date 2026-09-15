@@ -17,10 +17,10 @@ use phlo_transform_core::{
     SemanticModel, SemanticProject, SemanticTest, TestId, WorkspaceDefaults,
 };
 use phlo_transform_engine::{
-    branch_diff, diff, ensure_environment, evaluate_gates, promote, Adapter, BranchDiffRequest,
-    CatalogRequest, DatasetStatus, DiffPolicy, DiffRequest, DiffStrategy, EnvironmentSpec,
-    ExecutionStatus, GateInput, PlanOptions, Planner, PromotionRequest, RunOptions, Runner,
-    SqliteStateStore, StateStore,
+    branch_diff, catalog_name, diff, ensure_environment, evaluate_gates, promote, Adapter,
+    BranchDiffRequest, CatalogRequest, CatalogStatus, DatasetStatus, DiffPolicy, DiffRequest,
+    DiffStrategy, EnvironmentSpec, ExecutionStatus, GateInput, PlanOptions, Planner,
+    PromotionRequest, RunOptions, Runner, SqliteStateStore, StateStore,
 };
 use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -168,6 +168,9 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
     assert_eq!(base_run.status, ExecutionStatus::Passed);
 
     // Provision the candidate branch and its catalog from the seeded `main`.
+    // `catalog: None` resolves the generated convention — a readable prefix
+    // plus the ref's hash, so `ci/pr-1` and `ci_pr_1` can never share one
+    // physical catalog.
     let setup = ensure_environment(
         &nessie_client,
         adapter.as_ref(),
@@ -176,12 +179,19 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
             candidate_ref: "ci/pr-1".to_string(),
             nessie_uri: Some(nessie_internal.clone()),
             warehouse: Some(WAREHOUSE.to_string()),
-            catalog: "phlo_ci_pr_1".to_string(),
+            catalog: None,
         },
     )
     .await
     .expect("environment provisioned");
     assert!(setup.created_branch);
+    assert_eq!(setup.catalog_status, CatalogStatus::Created);
+    assert_eq!(setup.catalog, catalog_name("ci/pr-1"));
+    assert_ne!(
+        setup.catalog,
+        catalog_name("ci_pr_1"),
+        "punctuation-equivalent refs must not collide on one catalog"
+    );
     // The branch was just created: its cut-from provenance is provable.
     assert_eq!(
         setup.created_from.as_ref().map(|base| base.name.as_str()),
@@ -189,7 +199,8 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
     );
 
     // Write changed data to the candidate.
-    let candidate = compile(&project("phlo_ci_pr_1", 25));
+    let candidate_catalog = setup.catalog.clone();
+    let candidate = compile(&project(&candidate_catalog, 25));
     let candidate_run = apply(adapter.clone(), &candidate, "ci/pr-1", Some(state.clone())).await;
     assert_eq!(
         candidate_run.status,
@@ -222,7 +233,9 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
 
     // Main is unchanged; candidate has the new value.
     let candidate_value = adapter
-        .execute("SELECT value FROM phlo_ci_pr_1.default.assay__results")
+        .execute(&format!(
+            "SELECT value FROM {candidate_catalog}.default.assay__results"
+        ))
         .await
         .expect("candidate read");
     assert_eq!(candidate_value.rows[0][0], "25");
@@ -237,7 +250,7 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
         adapter.clone(),
         &DiffRequest {
             model: "assay.results".to_string(),
-            candidate_relation: relation("phlo_ci_pr_1", "assay__results"),
+            candidate_relation: relation(&candidate_catalog, "assay__results"),
             base_relation: relation("phlo_main", "assay__results"),
             candidate_ref: Some("ci/pr-1".to_string()),
             base_ref: Some("main".to_string()),
@@ -278,7 +291,7 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
         &BranchDiffRequest {
             candidate_ref: "ci/pr-1".to_string(),
             base_ref: "main".to_string(),
-            candidate_catalog: Some("phlo_ci_pr_1".to_string()),
+            candidate_catalog: Some(candidate_catalog.clone()),
             base_catalog: Some("phlo_main".to_string()),
             deep: false,
             default_schema: None,

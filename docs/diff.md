@@ -20,10 +20,11 @@ Nessie references — `--from`, `--ref` or `--environment` names the candidate
 configured both references must exist; a typo errors rather than producing a
 misleading report. Candidate relations resolve through the provisioned
 catalog recorded in `environment_<ref>.json` (per-candidate, falling back
-to the `phlo_<ref>` convention); the base resolves through the workspace
-catalog for `main` or the same convention for other refs. Recorded
-materialisation targets take precedence over both — and for `main`,
-records from runs with no `--ref` (the default environment) count too.
+to the `phlo_<ref>_<hash>` convention); the base resolves through the
+workspace catalog for `main` or the same convention for other refs.
+Recorded materialisation targets take precedence over both — and for
+`main`, records from runs with no `--ref` (the default environment) count
+too.
 
 Every dataset in the union of the workspace and recorded materialisations is
 classified:

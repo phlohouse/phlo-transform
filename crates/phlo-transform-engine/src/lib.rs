@@ -8,6 +8,7 @@
 
 pub mod adapter;
 pub mod artifacts;
+pub mod audit;
 pub mod branch_diff;
 pub mod cancel;
 pub mod changed;
@@ -18,6 +19,7 @@ pub mod error;
 pub mod events;
 pub mod failure;
 pub mod gates;
+pub mod lineage_diff;
 pub mod plan;
 pub mod promotion;
 pub mod run;
@@ -26,11 +28,16 @@ pub mod state;
 pub mod state_postgres;
 pub mod util;
 
-pub use adapter::{Adapter, CatalogRequest, ColumnInfo, QueryResult};
+pub use adapter::{Adapter, CatalogRequest, CatalogStatus, ColumnInfo, QueryResult};
 pub use artifacts::{
     ArtifactWriter, CandidateProvenance, DiffArtifact, EnvironmentArtifact, GraphArtifactFile,
     LineageArtifact, LineageDiffArtifact, LineageEnvironment, ManifestArtifact,
     OpenLineageArtifact, PlanArtifact, PromotionArtifact, RunArtifact, SCHEMA_VERSION,
+};
+pub use audit::{
+    audited_diff, audited_lineage, compiled_catalog, contract_breaking_changes,
+    environment_artifact_name, read_branch_diff, read_diff, read_environment, read_environment_for,
+    remove_environment_artifacts, write_environment_artifacts, AuditEvidence, LineageEvidence,
 };
 pub use branch_diff::{
     branch_diff, materialized_for_environment, model_keys, retarget, seeds_for_environment,
@@ -46,11 +53,16 @@ pub use contracts::{
 pub use diff::{
     diff, DiffPolicy, DiffReport, DiffRequest, DiffStrategy, PolicyResult, RowSummary, SchemaChange,
 };
-pub use environment::{ensure_environment, EnvironmentSetup, EnvironmentSpec};
+pub use environment::{
+    catalog_name, compile_for_catalog, enrich_sources, ensure_candidate, ensure_environment,
+    provision_candidate, CandidateWorkspace, EnvironmentContext, EnvironmentMode, EnvironmentSetup,
+    EnvironmentSpec, EnvironmentTarget,
+};
 pub use error::{AdapterError, EngineError};
 pub use events::{EngineEvent, ExecutionStatus};
 pub use failure::{Attempt, Failure, FailureCategory, RetryPolicy};
 pub use gates::{evaluate_gates, GateInput, GateReport, GateResult};
+pub use lineage_diff::LineageDiffContext;
 pub use plan::{
     dependency_closure, diff_reasons, Membership, Plan, PlanAction, PlanOptions, PlanReason,
     PlanSelection, PlannedModel, PlannedSeed, PlannedTest, Planner, ReasonKind,
