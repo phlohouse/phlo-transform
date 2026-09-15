@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,15 +20,15 @@ use phlo_transform_core::{
     TestId,
 };
 use phlo_transform_engine::{
-    branch_diff, catalog_name, changed_models, collect_source_states, ensure_candidate,
-    ensure_environment, materialized_for_environment, read_environment_for,
-    write_environment_artifacts, Adapter, AdapterError, ArtifactWriter, BranchDiffRequest,
-    CancelHandle, CatalogRequest, CatalogStatus, ColumnInfo, ContractSafety, DatasetStatus,
-    EngineError, EngineEvent, EnvironmentContext, EnvironmentMode, EnvironmentSetup,
+    branch_diff, catalog_name, changed_models, cleanup_candidate, collect_source_states,
+    ensure_candidate, ensure_environment, evaluate_promotion, materialized_for_environment,
+    read_environment_for, write_environment_artifacts, Adapter, AdapterError, ArtifactWriter,
+    BranchDiffRequest, CancelHandle, CatalogRequest, CatalogStatus, ColumnInfo, ContractSafety,
+    DatasetStatus, EngineError, EngineEvent, EnvironmentContext, EnvironmentMode, EnvironmentSetup,
     EnvironmentSpec, ExecutionStatus, FailureCategory, MaterializedRecord, Membership, ModelResult,
-    ModelRunRecord, Plan, PlanAction, PlanOptions, Planner, PromotionRecord, QueryResult,
-    ReasonKind, RetryPolicy, RunOptions, RunRecord, RunResult, RunSummary, Runner, SeedRecord,
-    SeedRunRecord, SqliteStateStore, StateStore, StoredPlan, StoredRun, TestRunRecord,
+    ModelRunRecord, Plan, PlanAction, PlanOptions, Planner, PromotionOptions, PromotionRecord,
+    QueryResult, ReasonKind, RetryPolicy, RunOptions, RunRecord, RunResult, RunSummary, Runner,
+    SeedRecord, SeedRunRecord, SqliteStateStore, StateStore, StoredPlan, StoredRun, TestRunRecord,
 };
 
 /// How a target should fail: the error to return, and how many attempts it
@@ -83,6 +83,16 @@ struct FakeAdapter {
     /// a name reports `Created`, later calls report `Unverified` (the fake
     /// cannot read back the bound ref, like Trino).
     catalogs: Arc<Mutex<BTreeSet<String>>>,
+    /// When set, `ensure_catalog` reports `Unmanaged` regardless — the fake
+    /// plays a non-provisioning adapter like DuckDB.
+    catalogs_unmanaged: Arc<AtomicBool>,
+    /// Raw SQL passed to `execute` — lets tests observe the DDL
+    /// `drop_catalog` sends through it.
+    executed: Arc<Mutex<Vec<String>>>,
+    /// Metadata round trips by method name — `relation_exists`,
+    /// `relation_columns`, `output_identity`, `source_state` — so scaling
+    /// tests can count how many warehouse calls a plan makes.
+    metadata_calls: Arc<Mutex<BTreeMap<String, usize>>>,
 }
 
 impl FakeAdapter {
@@ -149,6 +159,26 @@ impl FakeAdapter {
 
     fn set_test_rows(&self, rows: u64) {
         *self.test_rows.lock().unwrap() = rows;
+    }
+
+    /// Record a metadata round trip and simulate its latency — these are
+    /// the per-relation warehouse calls (`relation_exists` et al.) whose
+    /// serialization the scaling measurements quantify.
+    async fn metadata_probe(&self, method: &str) {
+        *self
+            .metadata_calls
+            .lock()
+            .unwrap()
+            .entry(method.to_string())
+            .or_insert(0) += 1;
+        if self.delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+        }
+    }
+
+    /// Metadata round-trip counts by method name.
+    fn metadata_calls(&self) -> BTreeMap<String, usize> {
+        self.metadata_calls.lock().unwrap().clone()
     }
 
     fn set_source_state(&self, relation: &str, state: &str) {
@@ -223,6 +253,9 @@ impl FakeAdapter {
             in_flight: Arc::new(Mutex::new(BTreeSet::new())),
             cancelled: self.cancelled.clone(),
             catalogs: self.catalogs.clone(),
+            catalogs_unmanaged: self.catalogs_unmanaged.clone(),
+            executed: self.executed.clone(),
+            metadata_calls: self.metadata_calls.clone(),
         }
     }
 
@@ -294,10 +327,26 @@ impl Adapter for FakeAdapter {
     }
 
     async fn relation_exists(&self, relation: &Relation) -> Result<bool, AdapterError> {
+        self.metadata_probe("relation_exists").await;
         Ok(self.existing.lock().unwrap().contains(&relation.display()))
     }
 
+    /// Batch-capable like Trino: one catalog query answers the whole slice,
+    /// so the probe count is one regardless of how many relations arrive.
+    async fn relations_exist(&self, relations: &[Relation]) -> Result<Vec<bool>, AdapterError> {
+        if relations.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.metadata_probe("relations_exist").await;
+        let existing = self.existing.lock().unwrap();
+        Ok(relations
+            .iter()
+            .map(|relation| existing.contains(&relation.display()))
+            .collect())
+    }
+
     async fn execute(&self, sql: &str) -> Result<QueryResult, AdapterError> {
+        self.executed.lock().unwrap().push(sql.to_string());
         if let Some(relation) = sql.strip_prefix("SELECT count(*) FROM ") {
             let rows = self
                 .relation_counts
@@ -451,6 +500,7 @@ impl Adapter for FakeAdapter {
     }
 
     async fn relation_columns(&self, relation: &Relation) -> Result<Vec<ColumnInfo>, AdapterError> {
+        self.metadata_probe("relation_columns").await;
         if let Some(columns) = self
             .relation_columns
             .lock()
@@ -463,11 +513,36 @@ impl Adapter for FakeAdapter {
         Ok(self.columns.lock().unwrap().clone())
     }
 
+    async fn relation_columns_many(
+        &self,
+        relations: &[Relation],
+    ) -> Vec<Result<Vec<ColumnInfo>, AdapterError>> {
+        if relations.is_empty() {
+            return Vec::new();
+        }
+        self.metadata_probe("relation_columns_many").await;
+        relations
+            .iter()
+            .map(|relation| {
+                Ok(self
+                    .relation_columns
+                    .lock()
+                    .unwrap()
+                    .get(&relation.display())
+                    .cloned()
+                    .unwrap_or_else(|| self.columns.lock().unwrap().clone()))
+            })
+            .collect()
+    }
+
     async fn ensure_catalog(
         &self,
         request: &CatalogRequest,
     ) -> Result<CatalogStatus, AdapterError> {
-        if request.reference.is_none() || request.nessie_uri.is_none() {
+        if self.catalogs_unmanaged.load(Ordering::SeqCst)
+            || request.reference.is_none()
+            || request.nessie_uri.is_none()
+        {
             return Ok(CatalogStatus::Unmanaged);
         }
         let mut catalogs = self.catalogs.lock().unwrap();
@@ -476,6 +551,16 @@ impl Adapter for FakeAdapter {
         } else {
             Ok(CatalogStatus::Unverified)
         }
+    }
+
+    async fn drop_catalog(&self, catalog: &str) -> Result<(), AdapterError> {
+        self.catalogs.lock().unwrap().remove(catalog);
+        self.execute(&format!(
+            "DROP CATALOG IF EXISTS \"{}\"",
+            catalog.replace('"', "\"\"")
+        ))
+        .await?;
+        Ok(())
     }
 
     async fn ensure_schema(&self, _relation: &Relation) -> Result<(), AdapterError> {
@@ -492,6 +577,7 @@ impl Adapter for FakeAdapter {
     }
 
     async fn output_identity(&self, relation: &Relation) -> Result<Option<String>, AdapterError> {
+        self.metadata_probe("output_identity").await;
         Ok(self
             .output_identities
             .lock()
@@ -5537,6 +5623,9 @@ async fn an_unverified_catalog_recorded_for_this_ref_is_accepted() {
             created_branch: true,
             catalog: "custom_cat".to_string(),
             catalog_status: CatalogStatus::Created,
+            // A legacy artifact: no ownership flag — `Created` is the only
+            // evidence, so `owns_catalog()` falls back to it.
+            catalog_owned_by_phlo: None,
         },
     )
     .expect("writes");
@@ -5555,6 +5644,9 @@ async fn an_unverified_catalog_recorded_for_this_ref_is_accepted() {
 
     assert_eq!(setup.catalog, "custom_cat");
     assert_eq!(setup.catalog_status, CatalogStatus::Unverified);
+    // The current call could not verify the catalog — but the recorded
+    // evidence proves phlo created it, so ownership survives.
+    assert!(setup.owns_catalog());
 }
 
 #[tokio::test]
@@ -5608,6 +5700,7 @@ async fn a_catalog_claimed_by_another_candidate_is_refused() {
             created_branch: true,
             catalog: "shared".to_string(),
             catalog_status: CatalogStatus::Created,
+            catalog_owned_by_phlo: None,
         },
     )
     .expect("writes");
@@ -5654,6 +5747,7 @@ async fn a_fresh_catalog_name_claimed_by_another_candidate_is_refused() {
             created_branch: true,
             catalog: "claimed".to_string(),
             catalog_status: CatalogStatus::Created,
+            catalog_owned_by_phlo: None,
         },
     )
     .expect("writes");
@@ -5699,6 +5793,269 @@ async fn an_explicit_catalog_created_fresh_is_accepted() {
 
     assert_eq!(setup.catalog, "pinned");
     assert_eq!(setup.catalog_status, CatalogStatus::Created);
+}
+
+#[tokio::test]
+async fn a_ref_create_artifact_does_not_silence_the_unmanaged_fail_closed() {
+    // `ref create` cuts the branch and records the conventional catalog
+    // name with `Unmanaged` status — an intent, not a provisioned binding.
+    // On a non-provisioning adapter a later ensure must still fail closed:
+    // treating the never-created catalog as a pin would silence the check
+    // and the run would retarget to a catalog that does not exist.
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa").seed("ci/x", "bbb");
+    let adapter = FakeAdapter::default();
+    adapter.catalogs_unmanaged.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    write_environment_artifacts(
+        dir.path(),
+        &EnvironmentSetup {
+            base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
+            candidate: phlo_transform_nessie::ReferenceInfo::branch("ci/x", "bbb"),
+            created_from: Some(phlo_transform_nessie::ReferenceInfo::branch("main", "aaa")),
+            created_branch: true,
+            catalog: catalog_name("ci/x"),
+            catalog_status: CatalogStatus::Unmanaged,
+            catalog_owned_by_phlo: None,
+        },
+    )
+    .expect("writes");
+
+    let error = ensure_candidate(
+        dir.path(),
+        &nessie,
+        &adapter,
+        &EnvironmentSpec {
+            catalog: None,
+            ..environment_spec("ci/x")
+        },
+    )
+    .await
+    .expect_err("an unmanaged conventional binding is intent, not a pin");
+
+    assert!(
+        matches!(error, EngineError::NotConfigured(_)),
+        "expected NotConfigured, got {error}"
+    );
+}
+
+#[tokio::test]
+async fn a_recorded_user_named_binding_survives_an_unmanaged_adapter() {
+    // The escape hatch: `ref create --catalog user_pinned` recorded a
+    // user-named binding — the caller named the physical catalog and took
+    // responsibility for it — so a later ensure still targets it even when
+    // the adapter cannot provision (e.g. a manually attached DuckDB
+    // database).
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa").seed("ci/x", "bbb");
+    let adapter = FakeAdapter::default();
+    adapter.catalogs_unmanaged.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    write_environment_artifacts(
+        dir.path(),
+        &EnvironmentSetup {
+            base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
+            candidate: phlo_transform_nessie::ReferenceInfo::branch("ci/x", "bbb"),
+            created_from: Some(phlo_transform_nessie::ReferenceInfo::branch("main", "aaa")),
+            created_branch: true,
+            catalog: "user_pinned".to_string(),
+            catalog_status: CatalogStatus::Unmanaged,
+            catalog_owned_by_phlo: None,
+        },
+    )
+    .expect("writes");
+
+    let setup = ensure_candidate(
+        dir.path(),
+        &nessie,
+        &adapter,
+        &EnvironmentSpec {
+            catalog: None,
+            ..environment_spec("ci/x")
+        },
+    )
+    .await
+    .expect("a recorded user-named pin is honoured");
+
+    assert_eq!(setup.catalog, "user_pinned");
+    assert_eq!(setup.catalog_status, CatalogStatus::Unmanaged);
+    assert!(!setup.owns_catalog());
+}
+
+fn recorded_setup(catalog: &str, status: CatalogStatus, owned: Option<bool>) -> EnvironmentSetup {
+    EnvironmentSetup {
+        base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
+        candidate: phlo_transform_nessie::ReferenceInfo::branch("ci/x", "bbb"),
+        created_from: Some(phlo_transform_nessie::ReferenceInfo::branch("main", "aaa")),
+        created_branch: true,
+        catalog: catalog.to_string(),
+        catalog_status: status,
+        catalog_owned_by_phlo: owned,
+    }
+}
+
+#[tokio::test]
+async fn cleanup_drops_a_catalog_phlo_owns_despite_unverified_status() {
+    // The leak the ownership flag fixes: phlo created the catalog, a later
+    // observation can only report Unverified — ownership was recorded at
+    // provisioning, so cleanup still drops it.
+    let nessie = InMemoryNessie::new();
+    nessie.seed("ci/x", "bbb");
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+    let setup = recorded_setup("cat_x", CatalogStatus::Unverified, Some(true));
+
+    cleanup_candidate(dir.path(), Some(&adapter), &nessie, "ci/x", Some(&setup))
+        .await
+        .expect("cleanup");
+
+    assert!(
+        adapter
+            .executed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|sql| sql == "DROP CATALOG IF EXISTS \"cat_x\""),
+        "an owned catalog is dropped even when its last status is Unverified"
+    );
+    assert!(nessie.get_reference("ci/x").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn cleanup_drops_a_legacy_created_catalog() {
+    // Artifacts written before the ownership flag: `Created` is the only
+    // ownership evidence they carry — enough to prove phlo made it.
+    let nessie = InMemoryNessie::new();
+    nessie.seed("ci/x", "bbb");
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+    let setup = recorded_setup("cat_x", CatalogStatus::Created, None);
+
+    cleanup_candidate(dir.path(), Some(&adapter), &nessie, "ci/x", Some(&setup))
+        .await
+        .expect("cleanup");
+
+    assert!(adapter
+        .executed
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|sql| sql == "DROP CATALOG IF EXISTS \"cat_x\""));
+}
+
+#[tokio::test]
+async fn cleanup_quotes_the_catalog_identifier() {
+    // The catalog name reaches `DROP CATALOG` through the adapter's
+    // identifier quoting — a name containing a quote must not break or
+    // alter the statement.
+    let nessie = InMemoryNessie::new();
+    nessie.seed("ci/x", "bbb");
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+    let setup = recorded_setup("odd\"cat", CatalogStatus::Created, None);
+
+    cleanup_candidate(dir.path(), Some(&adapter), &nessie, "ci/x", Some(&setup))
+        .await
+        .expect("cleanup");
+
+    assert!(adapter
+        .executed
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|sql| sql == "DROP CATALOG IF EXISTS \"odd\"\"cat\""));
+}
+
+#[tokio::test]
+async fn a_missing_candidate_or_target_is_a_typed_not_found() {
+    // Callers key the not-found surface (API013 / CLI not-found) off the
+    // typed variant — not the message text.
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let dir = tempfile::tempdir().unwrap();
+    let compilation = compile(&SemanticProject::in_memory(vec![]));
+
+    let missing_candidate = evaluate_promotion(
+        dir.path(),
+        &nessie,
+        None,
+        &compilation,
+        "ghost",
+        "main",
+        &PromotionOptions::default(),
+    )
+    .await
+    .err()
+    .expect("a missing candidate is not-found");
+    assert!(
+        matches!(missing_candidate, EngineError::NotFound(_)),
+        "{missing_candidate}"
+    );
+
+    let missing_target = evaluate_promotion(
+        dir.path(),
+        &nessie,
+        None,
+        &compilation,
+        "main",
+        "ghost",
+        &PromotionOptions::default(),
+    )
+    .await
+    .err()
+    .expect("a missing target is not-found");
+    assert!(
+        matches!(missing_target, EngineError::NotFound(_)),
+        "{missing_target}"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_never_drops_a_catalog_phlo_does_not_own() {
+    let nessie = InMemoryNessie::new();
+    nessie.seed("ci/x", "bbb");
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+    // Unverified with no recorded ownership — an adopted catalog; someone
+    // else may be using it.
+    let setup = recorded_setup("foreign", CatalogStatus::Unverified, Some(false));
+
+    cleanup_candidate(dir.path(), Some(&adapter), &nessie, "ci/x", Some(&setup))
+        .await
+        .expect("branch deletion still succeeds");
+
+    assert!(
+        !adapter
+            .executed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|sql| sql.contains("DROP CATALOG")),
+        "a catalog phlo cannot prove it owns is left alone"
+    );
+    assert!(nessie.get_reference("ci/x").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn cleanup_without_environment_evidence_drops_no_catalog() {
+    let nessie = InMemoryNessie::new();
+    nessie.seed("ci/x", "bbb");
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+
+    cleanup_candidate(dir.path(), Some(&adapter), &nessie, "ci/x", None)
+        .await
+        .expect("branch deletion");
+
+    assert!(
+        !adapter
+            .executed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|sql| sql.contains("DROP CATALOG")),
+        "no recorded environment, no drop — the name would only be a guess"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -5853,4 +6210,146 @@ async fn the_base_ref_is_not_a_candidate() {
     .expect("base ref");
     assert!(target.compilation.is_none());
     assert!(target.catalog.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Scaling measurement — not a correctness gate. Run with:
+//   cargo test -p phlo-transform-engine --test engine plan_scaling -- \
+//     --ignored --nocapture
+// Simulates warehouse round-trip latency (`delay_ms` per metadata probe) and
+// counts the adapter calls a plan makes, at the workspace sizes the release
+// benchmarks use.
+// ---------------------------------------------------------------------------
+
+/// `count` models across `layers` layers; every model in layer L reads all
+/// of layer L-1's slice it depends on, so dependency depth is real.
+fn scaled_project(count: usize, layers: usize) -> Compilation {
+    let per_layer = count.div_ceil(layers);
+    let mut models = Vec::with_capacity(count);
+    for layer in 0..layers {
+        for i in 0..per_layer {
+            let index = layer * per_layer + i;
+            if index >= count {
+                break;
+            }
+            let sql = if layer == 0 {
+                "select 1 as id".to_string()
+            } else {
+                let parent = (layer - 1) * per_layer + (i % per_layer);
+                format!("select * from m{}.m{}", layer - 1, parent % count)
+            };
+            models.push(model(&format!("m{layer}.m{index}"), &sql));
+        }
+    }
+    let compilation = compile(&SemanticProject::in_memory(models));
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+    compilation
+}
+
+#[derive(Debug, Default)]
+struct ScalingRow {
+    models: usize,
+    scenario: &'static str,
+    millis: u128,
+    calls: BTreeMap<String, usize>,
+}
+
+async fn measure_plan(models: usize, warm_state: bool, delay_ms: u64) -> ScalingRow {
+    let compilation = scaled_project(models, 5);
+    let adapter = Arc::new(FakeAdapter::with_delay(delay_ms));
+    let state = warm_state.then(|| {
+        let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+        for model in &compilation.models {
+            let target = model.target.display();
+            adapter.existing.lock().unwrap().insert(target.clone());
+            adapter.set_output_identity(&target, "snap:live");
+            state
+                .record_materialized(&MaterializedRecord {
+                    model_id: model.id.logical_name(),
+                    environment: None,
+                    version: model.version.clone(),
+                    detail: None,
+                    target,
+                    incremental_strategy: None,
+                    incremental_key: None,
+                    adapter: Some("fake".to_string()),
+                    output_identity: Some("snap:live".to_string()),
+                    contract: None,
+                    effective_key: None,
+                    run_id: "run-0".to_string(),
+                    materialized_at: "t".to_string(),
+                })
+                .unwrap();
+        }
+        state
+    });
+    let selected = Selection::all(&compilation);
+    let started = std::time::Instant::now();
+    let plan = Planner::new(adapter.clone(), state.map(|s| s as Arc<dyn StateStore>))
+        .plan(&compilation, &selected, None, &PlanOptions::default())
+        .await
+        .expect("plan");
+    let elapsed = started.elapsed();
+    assert_eq!(plan.models.len(), compilation.models.len());
+    ScalingRow {
+        models,
+        scenario: if delay_ms == 0 {
+            "warm/nodelay"
+        } else if warm_state {
+            "warm"
+        } else {
+            "cold"
+        },
+        millis: elapsed.as_millis(),
+        calls: adapter.metadata_calls(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "scaling measurement — run explicitly"]
+async fn plan_scaling_adapter_metadata() {
+    // 5ms per probe approximates a nearby Trino; real latency is often
+    // worse. Cold = nothing exists and no state; warm = every model has a
+    // recorded materialisation with a live output identity (the steady
+    // state of `plan` on an established project).
+    for models in [100usize, 1_000, 5_000] {
+        for (warm, delay) in [(false, 5u64), (true, 5), (true, 0)] {
+            let row = measure_plan(models, warm, delay).await;
+            let total: usize = row.calls.values().sum();
+            eprintln!(
+                "plan scaling: {:>5} models {:>8}  {:>7}ms  {:>6} adapter calls  {:?}",
+                row.models, row.scenario, row.millis, total, row.calls
+            );
+        }
+    }
+}
+
+/// The planner batches warehouse metadata: one `relations_exist` answers
+/// every model's existence probe; per-relation `relation_exists` and
+/// `relation_columns` calls are never made.
+#[tokio::test]
+async fn plan_batches_metadata_round_trips() {
+    let compilation = scaled_project(20, 4);
+    let adapter = Arc::new(FakeAdapter::default());
+    for model in &compilation.models {
+        adapter
+            .existing
+            .lock()
+            .unwrap()
+            .insert(model.target.display());
+    }
+    let selection = Selection::all(&compilation);
+    let plan = Planner::new(adapter.clone(), None)
+        .plan(&compilation, &selection, None, &PlanOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(plan.models.len(), 20);
+    let calls = adapter.metadata_calls();
+    assert_eq!(
+        calls.get("relations_exist").copied().unwrap_or(0),
+        1,
+        "{calls:?}"
+    );
+    assert!(!calls.contains_key("relation_exists"), "{calls:?}");
+    assert!(!calls.contains_key("relation_columns"), "{calls:?}");
 }

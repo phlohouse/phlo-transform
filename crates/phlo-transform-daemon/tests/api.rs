@@ -566,6 +566,7 @@ async fn promote_operation_runs_the_full_gated_merge() {
             // DuckDB cannot provision catalogs — the `memory` pin is an
             // unmanaged binding, recorded as such.
             catalog_status: CatalogStatus::Unmanaged,
+            catalog_owned_by_phlo: Some(false),
         },
     )
     .expect("environment artifacts");
@@ -768,6 +769,48 @@ async fn run_against_an_unprovisionable_nessie_environment_fails_closed() {
     let id = body["operation"]["id"].as_str().unwrap().to_string();
     let done = wait_operation(&client, &base, &id).await;
     assert_eq!(done["operation"]["status"], "succeeded", "{done}");
+}
+
+/// A daemon scoped to an environment resolves `test` against it like
+/// `run` does — an operation without `params.environment` inherits the
+/// configured default, and an environment whose catalog cannot be
+/// provisioned fails closed instead of testing the default catalog's data.
+#[tokio::test]
+async fn test_operation_inherits_the_daemons_default_environment() {
+    use phlo_transform_nessie::InMemoryNessie;
+
+    let dir = duckdb_workspace();
+    let state_path = dir.path().join(".phlo").join("transform").join("state.db");
+    std::fs::create_dir_all(state_path.parent().unwrap()).expect("state dir");
+    let nessie = Arc::new(InMemoryNessie::new());
+    nessie.seed("main", "aaaa").seed("dev", "bbbb");
+    let (base, _service) = start_with_config(
+        dir.path().to_path_buf(),
+        ServiceConfig {
+            adapter: Some(Arc::new(DuckDbAdapter::in_memory().expect("duckdb"))),
+            state: Some(Arc::new(
+                SqliteStateStore::open(&state_path).expect("state"),
+            )),
+            nessie: Some(nessie),
+            nessie_uri: None,
+            environment: Some("dev".to_string()),
+            ..ServiceConfig::default()
+        },
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let (status, body) = post_json(
+        &client,
+        &format!("{base}/v1/operations"),
+        &serde_json::json!({"kind": "test", "params": {}}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["operation"]["id"].as_str().unwrap().to_string();
+    let done = wait_operation(&client, &base, &id).await;
+    assert_eq!(done["operation"]["status"], "failed", "{done}");
+    assert_eq!(done["operation"]["error"]["code"], "API007", "{done}");
 }
 
 /// `GET /v1/plan?environment=X` resolves the same physical catalog a run

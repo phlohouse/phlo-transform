@@ -90,13 +90,15 @@ implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
   Gaps: incremental partition replacement is column-list based (no metadata
   pruning).
 - **Phase 5 — Nessie and WAP: partial.** `NessieClient` (REST + in-memory),
-  environment provisioning (`apply --ref <candidate> --from <base>` creates the
-  branch and a branch-scoped Trino catalog), candidate writes isolated from
-  `main`, audited `promote` with staleness/conflict checks, a diff gate and a
-  breaking-schema gate, candidate `--cleanup`, `rollback`, and a promotion
-  artifact. See [`docs/wap.md`](docs/wap.md). Missing: Iceberg snapshot in the
-  promotion record, automatic rebase; Nessie Iceberg catalogs have no view
-  support. Live Nessie + Iceberg E2E is in CI.
+  environment provisioning (`run --ref <candidate> --from <base>` creates the
+  branch and a branch-scoped Trino catalog; `plan`/`test --ref` resolve it
+  read-only), candidate writes isolated from `main`, catalog-ownership
+  tracking so cleanup drops only catalogs Phlo created, audited `promote`
+  with staleness/conflict checks, a diff gate and a breaking-schema gate,
+  candidate `--cleanup`, `rollback`, and a promotion artifact. See
+  [`docs/wap.md`](docs/wap.md). Missing: Iceberg snapshot in the promotion
+  record, automatic rebase; Nessie Iceberg catalogs have no view support.
+  Live Nessie + Iceberg E2E is in CI.
 - **Phase 6 — native data diff: partial.** Keyed diff with per-column change
   counts, config-driven policies and numeric tolerances, real sampling,
   Iceberg `$partitions` metadata comparison (row-count fallback), populated
@@ -110,7 +112,9 @@ implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
   transform-group invocation API, run correlation, gating API and e2e.
 - **Phase 8 — daemon and agent APIs: partial (local service).** A versioned
   local HTTP/JSON semantic service with a coherent snapshot, file watcher and
-  reload. See [`docs/daemon.md`](docs/daemon.md). Missing: a plan endpoint,
+  reload; `/v1/plan` resolves environments read-only through the same shared
+  logic the CLI uses, and promote/test/diff run the identical engine
+  orchestration. See [`docs/daemon.md`](docs/daemon.md). Missing:
   dependency-aware targeted invalidation (reload is a full recompile), the
   benchmark, and push diagnostics.
 - **dbt migration: implemented.** `translate --from dbt` lowers dbt
@@ -187,14 +191,15 @@ runs a disposable container and is executed explicitly in CI.
 - [Full specification](SPEC.md)
 - [Blog series: what Phlo Transform is, from first principles](docs/blog/README.md)
 - [Implementation roadmap](docs/roadmap/README.md)
-- [Phase 0 compiler architecture](docs/architecture.md)
-- [Phase 1 engine architecture](docs/engine.md)
-- [Phase 2 semantic compiler](docs/semantic.md)
+- [Convergence review](docs/convergence-review.md) — the system model, hardening pass and remaining debt
+- [Compiler architecture](docs/architecture.md)
+- [Engine architecture](docs/engine.md)
+- [Semantic compiler](docs/semantic.md)
 - [Canonical lineage graph and OpenLineage export](docs/lineage.md)
-- [Phase 3 state-aware execution](docs/state.md)
+- [State-aware execution](docs/state.md)
 - [dbt migration](docs/dbt-migration.md) and the [migration guide](docs/dbt-migration-guide.md)
-- [Phase 4 incremental models](docs/incremental.md)
-- [Phase 5 Nessie and WAP](docs/wap.md)
-- [Phase 6 native data diff](docs/diff.md)
-- [Phase 7 workflow integration](docs/workflow.md)
-- [Phase 8 daemon and agent APIs](docs/daemon.md)
+- [Incremental models](docs/incremental.md)
+- [Nessie and WAP](docs/wap.md)
+- [Native data diff](docs/diff.md)
+- [Workflow integration](docs/workflow.md)
+- [Daemon and agent APIs](docs/daemon.md)

@@ -20,12 +20,13 @@ use phlo_transform_core::{
 use phlo_transform_daemon::{serve, spawn_watcher, ServiceConfig, WorkspaceService};
 use phlo_transform_duckdb::DuckDbAdapter;
 use phlo_transform_engine::{
-    branch_diff, changed_models, diff, diff_reasons, evaluate_gates, materialized_for_environment,
-    model_keys, promote, retarget, Adapter, ArtifactWriter, AuditEvidence, BranchDiffReport,
-    BranchDiffRequest, CancelHandle, CatalogStatus, DiffPolicy, DiffRequest, DiffStrategy,
-    EnvironmentSetup, EnvironmentSpec, ExecutionStatus, GateInput, LineageEvidence, Membership,
-    Plan, PlanAction, PlanOptions, PlanReason, Planner, PostgresStateStore, PromotionRequest,
-    ReasonKind, RetryPolicy, RunOptions, RunResult, Runner, SqliteStateStore, StateStore,
+    base_ref_for, branch_diff, changed_models, diff, diff_reasons, environment_catalog,
+    materialized_for_environment, model_keys, promote, retarget, Adapter, ArtifactWriter,
+    BranchDiffReport, BranchDiffRequest, CancelHandle, CatalogStatus, DiffPolicy, DiffRequest,
+    DiffStrategy, EnvironmentContext, EnvironmentMode, EnvironmentSetup, ExecutionStatus,
+    LineageEvidence, Membership, Plan, PlanAction, PlanOptions, PlanReason, Planner,
+    PostgresStateStore, PromotionOptions, ReasonKind, RetryPolicy, RunOptions, RunResult, Runner,
+    SqliteStateStore, StateStore,
 };
 use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -105,9 +106,13 @@ struct Cli {
     #[arg(long, global = true)]
     trino_password: Option<String>,
 
+    /// The catalog the Trino connection opens (its session default — not
+    /// the environment's physical catalog; that is provisioned per
+    /// candidate, or overridden by `--catalog`).
     #[arg(long, global = true)]
     trino_catalog: Option<String>,
 
+    /// The schema the Trino connection opens (its session default).
     #[arg(long, global = true)]
     trino_schema: Option<String>,
 
@@ -138,11 +143,16 @@ struct Cli {
     #[arg(long, global = true)]
     retry_failed: Option<String>,
 
-    /// Environment label recorded in plans and run history.
+    /// Logical environment for plan/apply/run/test — recorded in plans and
+    /// run history, and on a Nessie deployment the candidate reference the
+    /// environment maps to (provisioned as a branch plus catalog). Same
+    /// concept as `--ref`; when both are given they must agree.
     #[arg(long, global = true)]
     environment: Option<String>,
 
-    /// Nessie reference (environment) for plan/apply.
+    /// Candidate environment/reference for plan/apply/run/test — on a
+    /// Nessie deployment the branch the environment maps to. An alias of
+    /// `--environment`; when both are given they must agree.
     #[arg(long = "ref", visible_alias = "reference", global = true)]
     reference: Option<String>,
 
@@ -156,7 +166,9 @@ struct Cli {
     #[arg(long, global = true)]
     warehouse: Option<String>,
 
-    /// Physical catalog for model targets (overrides workspace config).
+    /// Physical catalog for model targets (overrides workspace config); on
+    /// a Nessie candidate also overrides the generated environment catalog
+    /// name.
     #[arg(long, global = true)]
     catalog: Option<String>,
 
@@ -169,6 +181,14 @@ struct Cli {
     /// Nessie endpoint, e.g. http://localhost:19120.
     #[arg(long, global = true)]
     nessie_endpoint: Option<String>,
+
+    /// The Nessie URI provisioned catalogs are configured with — the
+    /// address the *warehouse* (Trino's Iceberg connector) uses to reach
+    /// Nessie. Defaults to `--nessie-endpoint`; set it when Trino sees a
+    /// different address than this process does, e.g. a container-network
+    /// hostname.
+    #[arg(long, global = true)]
+    nessie_catalog_uri: Option<String>,
 
     /// Nessie bearer token.
     #[arg(long, global = true)]
@@ -428,6 +448,31 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: &Cli) -> Result<ExitCode, String> {
+    // `--environment` and `--ref` name the same logical environment. When
+    // both are given they must agree — two different names cannot both win.
+    if let (Some(environment), Some(reference)) = (&cli.environment, &cli.reference) {
+        if environment != reference {
+            return Err(format!(
+                "`--environment {environment}` and `--ref {reference}` name different \
+                 environments — they are the same concept; pass one"
+            ));
+        }
+    }
+
+    // `--resume`/`--retry-failed` continue a stored run — they only apply
+    // to `run`/`apply`. Anywhere else they would silently do nothing, or
+    // worse: `plan`/`test` would retarget the compilation to the stored
+    // run's environment while state scoping and labels still came from the
+    // flags.
+    if (cli.resume.is_some() || cli.retry_failed.is_some())
+        && !matches!(cli.command, Command::Apply { .. } | Command::Run { .. })
+    {
+        return Err(
+            "--resume/--retry-failed continue a stored run; they apply to `run`/`apply` only"
+                .to_string(),
+        );
+    }
+
     // Commands that do not need a valid Phlo workspace at --root.
     match &cli.command {
         Command::Daemon {
@@ -470,35 +515,80 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
     let set = selector_set(cli)?;
     let wants_changed = set.uses_changed();
 
-    let environment = match &cli.command {
-        Command::Plan { .. } | Command::Apply { .. } | Command::Run { .. } => {
-            provision_environment(cli).await?
-        }
+    // Environment resolution — the same `EnvironmentContext` the daemon's
+    // operations use, so a CLI run and an API run land on the same physical
+    // target. `apply`/`run` provision the candidate (`Ensure`); `plan` and
+    // `test` only resolve the would-be catalog (`ReadOnly`) — a preview
+    // never mutates Nessie or the warehouse. The label is
+    // `--environment`/`--ref`; a `--resume`/`--retry-failed` continuation
+    // inherits the environment the stored run targeted.
+    let environment_mode = match &cli.command {
+        Command::Apply { .. } | Command::Run { .. } => Some(EnvironmentMode::Ensure),
+        Command::Plan { .. } | Command::Test { .. } => Some(EnvironmentMode::ReadOnly),
         _ => None,
     };
-    if let Some(catalog) = cli
-        .catalog
-        .clone()
-        .or_else(|| environment.as_ref().map(|setup| setup.catalog.clone()))
-    {
-        project.defaults.catalog = Some(catalog);
+    let mut environment_setup = None;
+    let mut environment_compilation = None;
+    if let Some(mode) = environment_mode {
+        if let Some(label) = run_environment(cli)? {
+            if let Some(nessie_uri) = nessie_catalog_uri(cli) {
+                let nessie = build_nessie(cli)?;
+                let adapter = build_adapter(cli)?;
+                let base = base_ref_for(&cli.root, Some(&label), cli.from.as_deref());
+                let target = EnvironmentContext {
+                    root: &cli.root,
+                    nessie: Some(nessie.as_ref()),
+                    adapter: Some(adapter.as_ref()),
+                    nessie_uri: Some(&nessie_uri),
+                    warehouse: cli.warehouse.as_deref(),
+                    catalog: cli.catalog.as_deref(),
+                }
+                .resolve(Some(&label), &base, mode)
+                .await
+                .map_err(|error| error.to_string())?;
+                environment_setup = target.setup.clone();
+                environment_compilation = target.compilation;
+            } else if !cli.json {
+                eprintln!(
+                    "note: no Nessie configured — environment `{label}` is a state label \
+                     only; the run targets the default catalog"
+                );
+            }
+        }
     }
-    // `ensure_candidate` already persisted the provisioning artifacts.
+    if let Some(setup) = &environment_setup {
+        if setup.created_from.is_none() && !cli.json {
+            eprintln!(
+                "warning: candidate branch `{}` already exists with unrecorded base \
+                 provenance — `promote` will refuse it; recreate the branch with \
+                 `ref delete` + `ref create` to record where it was cut from",
+                setup.candidate.name
+            );
+        }
+    }
 
-    let compilation = {
-        let base = compile(&project);
-        if should_enrich(cli) || wants_changed {
-            enrich(
-                cli,
-                &project,
-                original_catalog.as_deref(),
-                original_schema.as_deref(),
-                &base,
-            )
-            .await
-            .unwrap_or(base)
-        } else {
-            base
+    let compilation = match environment_compilation {
+        // The environment resolution already compiled the workspace
+        // retargeted at the candidate's catalog (and enriched it).
+        Some(compilation) => compilation,
+        None => {
+            if let Some(catalog) = cli.catalog.clone() {
+                project.defaults.catalog = Some(catalog);
+            }
+            let base = compile(&project);
+            if should_enrich(cli) || wants_changed {
+                enrich(
+                    cli,
+                    &project,
+                    original_catalog.as_deref(),
+                    original_schema.as_deref(),
+                    &base,
+                )
+                .await
+                .unwrap_or(base)
+            } else {
+                base
+            }
         }
     };
 
@@ -942,9 +1032,41 @@ fn state_location_display(location: &str) -> String {
     location.to_string()
 }
 
-/// The effective environment: `--environment`, else `--ref`.
+/// The effective environment label: `--environment`, else `--ref`. The two
+/// flags name the same concept — `run()` rejects an invocation where both
+/// are given and disagree, so this precedence is safe.
 fn environment(cli: &Cli) -> Option<String> {
     cli.environment.clone().or_else(|| cli.reference.clone())
+}
+
+/// The environment a plan/apply/run/test targets: `--environment`/`--ref`
+/// when given; for a `--resume`/`--retry-failed` continuation — only
+/// reachable from `run`/`apply`, the commands that can continue a stored
+/// run — the environment the stored run targeted.
+///
+/// The stored run is resolved here rather than left for the runner: an
+/// explicit flag that disagrees with the stored run's environment is
+/// refused before `run()` can provision the wrong branch in `Ensure`
+/// mode, and an unknown or ambiguous id fails with the lookup's own
+/// error instead of provisioning a fresh environment first.
+fn run_environment(cli: &Cli) -> Result<Option<String>, String> {
+    let explicit = environment(cli);
+    let Some(id) = cli.resume.as_deref().or(cli.retry_failed.as_deref()) else {
+        return Ok(explicit);
+    };
+    let Some(state) = open_state(cli)? else {
+        return Ok(explicit);
+    };
+    let stored = phlo_transform_engine::find_unique_run(state.as_ref(), id)
+        .map_err(|error| error.to_string())?
+        .environment;
+    match explicit {
+        Some(explicit) if stored.as_deref() != Some(explicit.as_str()) => Err(format!(
+            "run `{id}` targeted environment {stored:?}; refusing to continue into `{explicit}`"
+        )),
+        Some(explicit) => Ok(Some(explicit)),
+        None => Ok(stored),
+    }
 }
 
 /// Parse `--model-timeout` values: `30s`, `5m`, `1h`, or bare seconds.
@@ -987,52 +1109,14 @@ fn nessie_endpoint(cli: &Cli) -> Option<String> {
         .or_else(|| std::env::var("PHLO_NESSIE_ENDPOINT").ok())
 }
 
-/// Provision a candidate Nessie branch and its Trino catalog when `--ref`
-/// names a candidate environment and a Nessie endpoint is configured.
-async fn provision_environment(cli: &Cli) -> Result<Option<EnvironmentSetup>, String> {
-    let Some(candidate) = cli.reference.clone() else {
-        return Ok(None);
-    };
-    let base = cli.from.clone().unwrap_or_else(|| "main".to_string());
-    if candidate == base {
-        return Ok(None);
-    }
-    let Some(nessie_uri) = nessie_endpoint(cli) else {
-        return Ok(None);
-    };
-    let nessie = build_nessie(cli)?;
-    let adapter = build_adapter(cli)?;
-    let spec = EnvironmentSpec {
-        base_ref: base,
-        candidate_ref: candidate,
-        nessie_uri: Some(nessie_uri),
-        warehouse: cli.warehouse.clone(),
-        // `ensure_candidate` resolves the physical catalog itself: an
-        // explicit override, the recorded binding, then the generated
-        // hash-suffixed convention — the same precedence a read-only
-        // `EnvironmentContext::resolve` applies.
-        catalog: cli.catalog.clone(),
-    };
-    // `ensure_candidate` provisions branch + catalog, preserves recorded
-    // cut-from provenance, and writes the environment artifacts — the same
-    // step the daemon's environment-targeted operations run.
-    let setup = phlo_transform_engine::ensure_candidate(
-        &cli.root,
-        nessie.as_ref(),
-        adapter.as_ref(),
-        &spec,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    if setup.created_from.is_none() && !cli.json {
-        eprintln!(
-            "warning: candidate branch `{}` already exists with unrecorded base \
-             provenance — `promote` will refuse it; recreate the branch with \
-             `ref delete` + `ref create` to record where it was cut from",
-            setup.candidate.name
-        );
-    }
-    Ok(Some(setup))
+/// The URI catalogs are provisioned against — the address Trino's Iceberg
+/// connector uses, which may differ from the client-facing endpoint.
+/// Defaults to `--nessie-endpoint`.
+fn nessie_catalog_uri(cli: &Cli) -> Option<String> {
+    cli.nessie_catalog_uri
+        .clone()
+        .or_else(|| std::env::var("PHLO_NESSIE_CATALOG_URI").ok())
+        .or_else(|| nessie_endpoint(cli))
 }
 
 fn catalog_name(reference: &str) -> String {
@@ -1056,10 +1140,6 @@ fn environment_artifact_name(reference: &str) -> String {
 
 fn write_environment_artifacts(cli: &Cli, setup: &EnvironmentSetup) -> Result<(), String> {
     phlo_transform_engine::write_environment_artifacts(&cli.root, setup)
-}
-
-fn read_environment_for(cli: &Cli, candidate: &str) -> Option<EnvironmentSetup> {
-    phlo_transform_engine::read_environment_for(&cli.root, candidate)
 }
 
 fn remove_environment_artifacts(cli: &Cli, candidate: &str) {
@@ -1106,108 +1186,26 @@ async fn run_promote(
     };
     let nessie = build_nessie(cli)?;
     let state = open_state(cli)?;
-
-    // Resolve both references up front: promotion needs both to exist.
-    let candidate_reference = nessie
-        .get_reference(candidate)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("candidate reference `{candidate}` was not found"))?;
-    let target = nessie
-        .get_reference(to)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("target reference `{to}` was not found"))?;
-
-    // Gather gate evidence: run history, the audited diff artifact, the
-    // recorded provisioning base and a non-destructive merge check.
-    let run = match &state {
-        Some(state) => state
-            .latest_run(Some(candidate))
-            .map_err(|error| error.to_string())?,
-        None => None,
-    };
-    let (model_runs, seed_runs, test_runs) = match (&state, &run) {
-        (Some(state), Some(run)) => (
-            state
-                .model_runs(&run.run_id)
-                .map_err(|error| error.to_string())?,
-            state
-                .seed_runs(&run.run_id)
-                .map_err(|error| error.to_string())?,
-            state
-                .test_runs(&run.run_id)
-                .map_err(|error| error.to_string())?,
-        ),
-        _ => (Vec::new(), Vec::new(), Vec::new()),
-    };
-
-    let environment = read_environment_for(cli, candidate);
-    let mut audit = audited_diff(
-        cli,
-        state.as_deref(),
-        candidate,
-        to,
-        Some(&candidate_reference.hash),
-        Some(&target.hash),
-    );
-    // Contract breaks are computed live — the workspace's desired contracts
-    // against what the target environment last recorded — so a contract
-    // edited after `diff` cannot sneak a break past the gate on a stale
-    // artifact's analysis.
-    audit
-        .breaking_schema_changes
-        .extend(contract_breaking_changes(
-            state.as_deref(),
-            compilation,
-            to,
-        )?);
-    let merge_check = nessie.can_merge(candidate, to).await.ok();
-    // Lineage evidence: the artifact only speaks for this promotion when
-    // the identities it was produced against still hold — including the
-    // candidate's compiled lineage fingerprint — stale or unbound reports
-    // are surfaced as such, never silently as "no changes".
-    let current_lineage_hash = compilation.lineage.fingerprint();
-    let lineage = phlo_transform_engine::audited_lineage(
-        &cli.root,
-        candidate,
-        to,
-        &candidate_reference.hash,
-        &target.hash,
-        Some(&current_lineage_hash),
-    );
-
-    // The `base` gate needs a target commit the evidence was established
-    // against. Two sources, freshest first: a hash-bound diff artifact that
-    // audited this exact target, else the recorded commit the candidate was
-    // provably created from. A candidate whose origin is unknown and which
-    // was never audited against this target has no evidence — the gate must
-    // fail rather than redefine its base as today's head.
-    let expected_target_hash = audit.audited_base_hash.clone().or_else(|| {
-        environment
-            .as_ref()
-            .filter(|setup| setup.candidate.name == candidate && setup.base.name == to)
-            .and_then(|setup| setup.created_from.as_ref())
-            .map(|base| base.hash.clone())
-    });
-
-    let input = GateInput {
-        run: run.clone(),
-        model_runs,
-        seed_runs,
-        test_runs,
+    let options = PromotionOptions {
         require_diff,
-        diff_passed: audit.diff_passed,
-        diff_rejected: audit.diff_rejected.clone(),
-        breaking_schema_changes: audit.breaking_schema_changes.clone(),
         allow_breaking_schema,
-        expected_target_hash: expected_target_hash.clone(),
-        actual_target_hash: Some(target.hash.clone()),
-        actual_candidate_hash: Some(candidate_reference.hash.clone()),
-        schema_audited: audit.schema_audited,
-        merge_check,
     };
-    let report = evaluate_gates(&input);
+
+    // The shared pre-merge audit — the daemon's promote operation runs the
+    // identical evaluation, so both surfaces authorise a merge under the
+    // same rules.
+    let evaluation = phlo_transform_engine::evaluate_promotion(
+        &cli.root,
+        nessie.as_ref(),
+        state.as_deref(),
+        compilation,
+        candidate,
+        to,
+        &options,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let report = &evaluation.gates;
 
     if !report.passed || check {
         if cli.json {
@@ -1217,11 +1215,11 @@ async fn run_promote(
                 "target_ref": to,
                 "check_only": check,
                 "gates": report.results,
-                "lineage": lineage,
+                "lineage": evaluation.lineage,
             }))?;
         } else {
-            print_gates_human(&report);
-            print_lineage_evidence(&lineage);
+            print_gates_human(report);
+            print_lineage_evidence(&evaluation.lineage);
             if check && report.passed {
                 println!("Candidate `{candidate}` can be promoted to `{to}` (check only).");
             }
@@ -1233,42 +1231,25 @@ async fn run_promote(
         });
     }
 
-    let request = PromotionRequest {
-        candidate_ref: candidate.to_string(),
-        target_ref: to.to_string(),
-        candidate_hash: Some(candidate_reference.hash.clone()),
-        // Assert the target hash the gates were evaluated against: when no
-        // provisioning base was recorded, pin the just-resolved hash so a
-        // commit racing this promotion is rejected rather than merged over.
-        expected_target_hash: expected_target_hash.or_else(|| Some(target.hash.clone())),
-        plan_id: run.as_ref().map(|run| run.plan_id.clone()),
-        run_id: run.as_ref().map(|run| run.run_id.clone()),
-        quality_gates_passed: true,
-        diff_passed: audit.diff_passed,
-        require_diff,
-        breaking_schema_changes: input.breaking_schema_changes,
-        allow_breaking_schema,
-        dry_run: false,
-        actor: None,
-        gates: report.results.clone(),
-    };
+    let request = evaluation.request(&options, None);
     match promote(nessie.as_ref(), &request).await {
         Ok(record) => {
-            ArtifactWriter::for_workspace(&cli.root)
-                .write_promotion(&record)
+            phlo_transform_engine::persist_promotion(&cli.root, state.as_deref(), &record)
                 .map_err(|error| error.to_string())?;
-            if let Some(state) = &state {
-                state
-                    .record_promotion(&record)
-                    .map_err(|error| error.to_string())?;
-            }
             // Cleanup is part of what the caller asked for; a failure is
             // reported and fails the command — the merge record already
             // persisted shows the promotion itself succeeded.
             let cleanup_error = if cleanup && record.merged {
-                cleanup_candidate(cli, &nessie, candidate, environment.as_ref())
-                    .await
-                    .err()
+                let adapter = build_adapter(cli).ok();
+                phlo_transform_engine::cleanup_candidate(
+                    &cli.root,
+                    adapter.as_deref(),
+                    nessie.as_ref(),
+                    candidate,
+                    evaluation.environment.as_ref(),
+                )
+                .await
+                .err()
             } else {
                 None
             };
@@ -1276,13 +1257,13 @@ async fn run_promote(
                 print_json(&serde_json::json!({
                     "ok": cleanup_error.is_none(),
                     "gates": report.results,
-                    "lineage": lineage,
+                    "lineage": evaluation.lineage,
                     "promotion": record,
                     "cleanup_error": cleanup_error,
                 }))?;
             } else {
-                print_gates_human(&report);
-                print_lineage_evidence(&lineage);
+                print_gates_human(report);
+                print_lineage_evidence(&evaluation.lineage);
                 print_promotion_human(&record);
                 if let Some(error) = &cleanup_error {
                     eprintln!(
@@ -1306,46 +1287,12 @@ async fn run_promote(
                     "error": message,
                 }))?;
             } else {
-                print_gates_human(&report);
+                print_gates_human(report);
                 eprintln!("error: {message}");
             }
             Ok(ExitCode::FAILURE)
         }
     }
-}
-
-/// Live contract analysis for the promotion gate: the workspace's desired
-/// contracts against the contracts the target environment last recorded.
-/// Returns the breaking subset in the same `model.column: detail` shape as
-/// physical schema breaks.
-fn contract_breaking_changes(
-    state: Option<&dyn StateStore>,
-    compilation: &Compilation,
-    to: &str,
-) -> Result<Vec<String>, String> {
-    phlo_transform_engine::contract_breaking_changes(state, compilation, to)
-        .map_err(|error| error.to_string())
-}
-
-/// Read the audited diff artifact (`branch_diff.json` — a single-model
-/// `diff.json` is never promotion evidence) and derive what it proves for this
-/// promotion: the diff verdict, why the artifact cannot be used, the breaking
-/// schema changes it recorded, and whether a schema audit genuinely ran.
-///
-/// The artifact only counts when it was produced for this candidate against
-/// this target at the commits being promoted — a diff of another pair, of an
-/// older head, or one that went stale since is rejected with a reason naming
-/// the rerun. `candidate_hash`/`base_hash` are the refs' current heads; a
-/// hash-bound artifact must match them exactly.
-fn audited_diff(
-    cli: &Cli,
-    state: Option<&dyn StateStore>,
-    candidate: &str,
-    to: &str,
-    candidate_hash: Option<&str>,
-    base_hash: Option<&str>,
-) -> AuditEvidence {
-    phlo_transform_engine::audited_diff(&cli.root, state, candidate, to, candidate_hash, base_hash)
 }
 
 fn print_gates_human(report: &phlo_transform_engine::GateReport) {
@@ -1373,51 +1320,6 @@ fn print_lineage_evidence(lineage: &Option<LineageEvidence>) {
             "Lineage: {} change(s) vs {} (advisory — not bound to this environment)\n",
             lineage.changes, lineage.base
         ),
-    }
-}
-
-/// Removal of a promoted candidate's catalog and branch. Every failure is
-/// reported — the merge already happened, so a leftover catalog or branch
-/// must never be silent.
-async fn cleanup_candidate(
-    cli: &Cli,
-    nessie: &Arc<dyn NessieClient>,
-    candidate: &str,
-    environment: Option<&EnvironmentSetup>,
-) -> Result<(), String> {
-    let mut failures = Vec::new();
-    // Only a catalog phlo provably created is phlo's to drop — an adopted
-    // or unmanaged catalog belongs to someone else, and without recorded
-    // evidence the name is only a guess.
-    let drop_catalog = environment
-        .filter(|setup| setup.catalog_status == CatalogStatus::Created)
-        .map(|setup| setup.catalog.clone());
-    if let Some(catalog) = drop_catalog {
-        match build_adapter(cli) {
-            Ok(adapter) => {
-                if let Err(error) = adapter
-                    .execute(&format!("DROP CATALOG IF EXISTS {}", catalog))
-                    .await
-                {
-                    failures.push(format!("drop catalog `{catalog}`: {error}"));
-                }
-            }
-            Err(error) => {
-                failures.push(format!(
-                    "open the adapter to drop catalog `{catalog}`: {error}"
-                ));
-            }
-        }
-    }
-    if let Err(error) = nessie.delete_branch(candidate).await {
-        failures.push(format!("delete branch `{candidate}`: {error}"));
-    }
-    if failures.is_empty() {
-        // The branch and catalog are gone; the provisioning record is stale.
-        remove_environment_artifacts(cli, candidate);
-        Ok(())
-    } else {
-        Err(failures.join("; "))
     }
 }
 
@@ -1485,6 +1387,7 @@ async fn run_ref(cli: &Cli, action: &RefAction) -> Result<ExitCode, String> {
                     catalog: cli.catalog.clone().unwrap_or_else(|| catalog_name(name)),
                     // No catalog exists yet — the branch alone was cut.
                     catalog_status: CatalogStatus::Unmanaged,
+                    catalog_owned_by_phlo: None,
                 },
             )?;
             if cli.json {
@@ -1562,17 +1465,8 @@ fn run_state(cli: &Cli, action: &StateAction) -> Result<ExitCode, String> {
             }
         }
         StateAction::Show { run } => {
-            let matches = state.find_runs(run).map_err(|error| error.to_string())?;
-            let summary = match matches.as_slice() {
-                [] => return Err(format!("no run matches `{run}`")),
-                [only] => only,
-                _ => {
-                    return Err(format!(
-                        "`{run}` matches {} runs — give a longer prefix",
-                        matches.len()
-                    ))
-                }
-            };
+            let summary = phlo_transform_engine::find_unique_run(state.as_ref(), run)
+                .map_err(|error| error.to_string())?;
             let stored = state
                 .run(&summary.run_id)
                 .map_err(|error| error.to_string())?
@@ -1804,9 +1698,10 @@ async fn run_plan(
     })
 }
 
-/// Bind a completed run to its environment's post-run Nessie head. A run
-/// advances a candidate branch with every write, so the head captured at
-/// provisioning cannot vouch for the commit the run actually validated —
+/// Bind a completed run to its environment's post-run Nessie head — the
+/// shared engine helper, a no-op without a configured Nessie endpoint.
+/// A run advances a candidate branch with every write, so the head captured
+/// at provisioning cannot vouch for the commit the run actually validated:
 /// the binding is recorded only on a fully passed run, and only when the
 /// run's environment resolves to a real Nessie reference.
 async fn bind_run_reference(
@@ -1814,26 +1709,12 @@ async fn bind_run_reference(
     state: &Arc<dyn StateStore>,
     result: &RunResult,
 ) -> Result<(), String> {
-    if result.status != ExecutionStatus::Passed || nessie_endpoint(cli).is_none() {
+    if nessie_endpoint(cli).is_none() {
         return Ok(());
     }
-    // The run's own environment label — for `--resume`/`--retry-failed` that
-    // is the stored run's, not this invocation's flags.
-    let Some(environment) = result.environment.clone() else {
-        return Ok(());
-    };
     let nessie = build_nessie(cli)?;
-    // An environment label that is not a Nessie reference leaves the run
-    // unbound — it simply cannot promote a commit-bound candidate.
-    let Some(head) = nessie
-        .get_reference(&environment)
+    phlo_transform_engine::bind_run_reference(nessie.as_ref(), state.as_ref(), result)
         .await
-        .map_err(|error| error.to_string())?
-    else {
-        return Ok(());
-    };
-    state
-        .bind_run_reference_hash(&result.run_id, &head.hash)
         .map_err(|error| error.to_string())
 }
 
@@ -1860,7 +1741,10 @@ async fn run_apply(
         let cancel = CancelHandle::default();
         spawn_ctrl_c_listener(cancel.clone());
         let runner = Runner::new(adapter, state.clone());
-        let options = run_options(cli, cancel);
+        let mut options = run_options(cli, cancel);
+        // A continuation inherits the environment the stored run targeted —
+        // the runner still refuses an explicit flag that disagrees.
+        options.environment = run_environment(cli)?;
         let result = match (&cli.resume, &cli.retry_failed) {
             (Some(_), Some(_)) => {
                 return Err(
@@ -1947,7 +1831,8 @@ async fn run_test(
 ) -> Result<ExitCode, String> {
     let adapter = build_adapter(cli)?;
     // A test runs when every model it reads is selected; tests that only
-    // read sources are left to unrestricted runs.
+    // read sources are left to unrestricted runs. The execution loop is
+    // shared with the daemon's test operation.
     let members: Option<std::collections::BTreeSet<String>> = if set.is_unrestricted() {
         None
     } else {
@@ -1960,39 +1845,18 @@ async fn run_test(
                 .collect(),
         )
     };
-    let mut results = Vec::new();
-    let mut failed = false;
-    for test in &compilation.tests {
-        if let Some(members) = &members {
-            let covered = !test.targets.is_empty()
-                && test
-                    .targets
-                    .iter()
-                    .all(|target| members.contains(target.logical_name().as_str()));
-            if !covered {
-                continue;
-            }
-        }
-        let outcome = adapter.execute(&test.compiled_sql).await;
-        let (status, row_count, error) = match outcome {
-            Ok(query) if query.row_count == 0 => (ExecutionStatus::Passed, 0, None),
-            Ok(query) => (
-                ExecutionStatus::Failed,
-                query.row_count,
-                Some(format!("test returned {} row(s)", query.row_count)),
-            ),
-            Err(error) => (ExecutionStatus::Failed, 0, Some(error.to_string())),
-        };
-        if status == ExecutionStatus::Failed {
-            failed = true;
-        }
-        results.push(TestOutcome {
-            test: test.id.to_string(),
-            status,
-            row_count,
-            error,
-        });
-    }
+    let cancel = CancelHandle::default();
+    spawn_ctrl_c_listener(cancel.clone());
+    let results = phlo_transform_engine::execute_tests(
+        adapter.as_ref(),
+        &compilation.tests,
+        members.as_ref(),
+        &cancel,
+    )
+    .await;
+    let failed = results
+        .iter()
+        .any(|result| result.status == ExecutionStatus::Failed);
 
     if cli.json {
         print_json(&TestReport { tests: results })?;
@@ -2579,13 +2443,9 @@ struct TestReport {
     tests: Vec<TestOutcome>,
 }
 
-#[derive(serde::Serialize)]
-struct TestOutcome {
-    test: String,
-    status: ExecutionStatus,
-    row_count: u64,
-    error: Option<String>,
-}
+/// The shared standalone-test outcome (`phlo_transform_engine::TestOutcome`)
+/// — the daemon's test operation emits the same shape.
+type TestOutcome = phlo_transform_engine::TestOutcome;
 
 fn build_adapter(cli: &Cli) -> Result<Arc<dyn Adapter>, String> {
     match cli.adapter.as_deref() {
@@ -2694,14 +2554,16 @@ async fn enrich(
     base: &Compilation,
 ) -> Option<Compilation> {
     let adapter = build_adapter(cli).ok()?;
-    phlo_transform_engine::enrich_sources(
-        adapter.as_ref(),
-        project,
-        default_catalog,
-        default_schema,
-        base,
+    Some(
+        phlo_transform_engine::enrich_sources(
+            adapter.as_ref(),
+            project,
+            default_catalog,
+            default_schema,
+            base,
+        )
+        .await,
     )
-    .await
 }
 
 /// Forward Ctrl-C to the running plan as a cooperative cancellation.
@@ -3185,25 +3047,23 @@ async fn run_diff(
         .as_deref()
         .and_then(|state| materialized_for_environment(state, &base_ref).ok())
         .and_then(|mut records| records.remove(&id.logical_name()));
-    let candidate_catalog = candidate_ref.as_deref().and_then(|reference| {
-        nessie_backed.then(|| {
-            read_environment_for(cli, reference)
-                .map(|setup| setup.catalog)
-                .unwrap_or_else(|| catalog_name(reference))
+    // Shared catalog resolution — the same precedence the daemon's
+    // branch diff and the environment provisioner apply: a ref resolves
+    // through its recorded/generated binding, `main` through the
+    // configured or compiled catalog.
+    let candidate_catalog = candidate_ref
+        .as_deref()
+        .and_then(|reference| nessie_backed.then(|| environment_catalog(&cli.root, reference)));
+    let base_catalog = nessie_backed
+        .then(|| {
+            phlo_transform_engine::base_catalog(
+                &cli.root,
+                &base_ref,
+                cli.catalog.as_deref(),
+                compilation_model_catalog(compilation).as_deref(),
+            )
         })
-    });
-    let base_catalog = nessie_backed.then(|| {
-        if base_ref == "main" {
-            cli.catalog
-                .clone()
-                .or_else(|| compilation_model_catalog(compilation))
-                .unwrap_or_else(|| catalog_name(&base_ref))
-        } else {
-            read_environment_for(cli, &base_ref)
-                .map(|setup| setup.catalog)
-                .unwrap_or_else(|| catalog_name(&base_ref))
-        }
-    });
+        .flatten();
     let candidate_relation = match candidate_record
         .as_ref()
         .map(|record| Relation::parse(&record.target))
@@ -3361,23 +3221,16 @@ async fn run_branch_diff(
         }
     }
 
-    let candidate_catalog = read_environment_for(cli, &candidate_ref)
-        .map(|setup| setup.catalog)
-        .unwrap_or_else(|| catalog_name(&candidate_ref));
-    // `main` (and any ref that was never provisioned as a candidate) resolves
-    // through the configured catalog; other refs use the provisioned catalog
-    // or the `phlo_<ref>` convention.
-    let base_catalog = if base_ref == "main" {
-        cli.catalog
-            .clone()
-            .or_else(|| compilation_model_catalog(compilation))
-    } else {
-        Some(
-            read_environment_for(cli, &base_ref)
-                .map(|setup| setup.catalog)
-                .unwrap_or_else(|| catalog_name(&base_ref)),
-        )
-    };
+    // Shared catalog resolution — identical to the daemon's branch diff:
+    // the candidate through its recorded/generated binding, `main` through
+    // the configured or compiled catalog, other refs through their own.
+    let candidate_catalog = environment_catalog(&cli.root, &candidate_ref);
+    let base_catalog = phlo_transform_engine::base_catalog(
+        &cli.root,
+        &base_ref,
+        cli.catalog.as_deref(),
+        compilation_model_catalog(compilation).as_deref(),
+    );
 
     let adapter = build_adapter(cli)?;
     let state = open_state(cli)?;
@@ -3605,7 +3458,7 @@ async fn run_daemon(
             environment: environment(cli),
             catalog: cli.catalog.clone(),
             default_schema: cli.trino_schema.clone(),
-            nessie_uri: nessie_endpoint(cli),
+            nessie_uri: nessie_catalog_uri(cli),
             warehouse: cli.warehouse.clone(),
             token,
         },
@@ -3933,6 +3786,43 @@ async fn run_doctor(cli: &Cli) -> Result<ExitCode, String> {
         }),
     }
 
+    // 5. Nessie: environments, references, promotion.
+    match nessie_endpoint(cli) {
+        Some(endpoint) => match build_nessie(cli) {
+            Ok(nessie) => match nessie.list_references().await {
+                Ok(references) => {
+                    let mut detail =
+                        format!("{endpoint} reachable ({} references)", references.len());
+                    match nessie_catalog_uri(cli) {
+                        Some(catalog_uri) if catalog_uri != endpoint => detail
+                            .push_str(&format!("; catalogs are provisioned with {catalog_uri}")),
+                        _ => {}
+                    }
+                    record(DoctorCheck {
+                        name: "nessie",
+                        status: "ok",
+                        detail,
+                    });
+                }
+                Err(error) => record(DoctorCheck {
+                    name: "nessie",
+                    status: "fail",
+                    detail: format!("{endpoint} unreachable: {error}"),
+                }),
+            },
+            Err(error) => record(DoctorCheck {
+                name: "nessie",
+                status: "fail",
+                detail: error,
+            }),
+        },
+        None => record(DoctorCheck {
+            name: "nessie",
+            status: "warn",
+            detail: "not configured (only needed for environments, refs and promote)".to_string(),
+        }),
+    }
+
     if cli.json {
         print_json(&serde_json::json!({ "ok": !failed, "checks": checks }))?;
     } else {
@@ -4149,9 +4039,10 @@ async fn run_explain(
 mod tests {
     use super::*;
     use phlo_transform_engine::{
-        BranchDiffReport, CandidateProvenance, DatasetDiff, DatasetKind, DatasetStatus,
-        EngineError, LineageDiffArtifact, LineageEnvironment, MaterializedRecord, ModelSchemaDiff,
-        SchemaChange, SqliteStateStore, SCHEMA_VERSION,
+        audited_diff, contract_breaking_changes, read_environment_for, BranchDiffReport,
+        CandidateProvenance, DatasetDiff, DatasetKind, DatasetStatus, EngineError,
+        LineageDiffArtifact, LineageEnvironment, MaterializedRecord, ModelSchemaDiff, SchemaChange,
+        SqliteStateStore, SCHEMA_VERSION,
     };
 
     fn cli_at(root: &std::path::Path) -> Cli {
@@ -4242,7 +4133,7 @@ mod tests {
         });
         write_branch_diff(&cli, &report);
 
-        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        let evidence = audited_diff(&cli.root, Some(&state), "ci/x", "main", None, None);
         let (passed, rejected, breaking) = (
             evidence.diff_passed,
             evidence.diff_rejected,
@@ -4263,7 +4154,7 @@ mod tests {
         // Audited against `dev`; promoting to `main` must not consume it.
         write_branch_diff(&cli, &branch_report("ci/x", "dev", true));
 
-        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        let evidence = audited_diff(&cli.root, Some(&state), "ci/x", "main", None, None);
         let (passed, rejected) = (evidence.diff_passed, evidence.diff_rejected);
         assert_eq!(passed, None);
         let reason = rejected.expect("wrong-target artifact must be rejected");
@@ -4279,7 +4170,7 @@ mod tests {
         // A shallow (schema + row-count) diff passes no data-diff verdict.
         write_branch_diff(&cli, &branch_report("ci/x", "main", false));
 
-        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        let evidence = audited_diff(&cli.root, Some(&state), "ci/x", "main", None, None);
         let (passed, rejected) = (evidence.diff_passed, evidence.diff_rejected);
         assert_eq!(passed, None);
         let reason = rejected.expect("shallow diff must not satisfy require-diff");
@@ -4294,7 +4185,7 @@ mod tests {
 
         write_branch_diff(&cli, &branch_report("ci/x", "main", true));
 
-        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        let evidence = audited_diff(&cli.root, Some(&state), "ci/x", "main", None, None);
         let (passed, rejected) = (evidence.diff_passed, evidence.diff_rejected);
         assert_eq!(passed, Some(true));
         assert_eq!(rejected, None);
@@ -4331,7 +4222,7 @@ mod tests {
             })
             .expect("record materialised");
 
-        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        let evidence = audited_diff(&cli.root, Some(&state), "ci/x", "main", None, None);
         let (passed, rejected) = (evidence.diff_passed, evidence.diff_rejected);
         assert_eq!(passed, Some(true));
         let reason = rejected.expect("stale artifact must be rejected");
@@ -4348,7 +4239,7 @@ mod tests {
         // verdict — it examined one model and cannot certify a branch.
         write_diff_json(&cli, Some("ci/x"), Some("main"));
 
-        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        let evidence = audited_diff(&cli.root, Some(&state), "ci/x", "main", None, None);
         assert_eq!(evidence.diff_passed, None);
         assert!(!evidence.schema_audited);
         let reason = evidence
@@ -4397,7 +4288,7 @@ mod tests {
             .record_materialized(&record("m.a", Some("main"), "v2"))
             .expect("record");
 
-        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        let evidence = audited_diff(&cli.root, Some(&state), "ci/x", "main", None, None);
         let (passed, rejected) = (evidence.diff_passed, evidence.diff_rejected);
         assert_eq!(passed, Some(true));
         let reason = rejected.expect("stale base must be rejected");
@@ -4418,7 +4309,7 @@ mod tests {
             .record_materialized(&record("m.b", Some("ci/x"), "v9"))
             .expect("record");
 
-        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", None, None);
+        let evidence = audited_diff(&cli.root, Some(&state), "ci/x", "main", None, None);
         let rejected = evidence.diff_rejected;
         let reason = rejected.expect("uncovered materialisation must be rejected");
         assert!(reason.contains("materialised on the candidate"), "{reason}");
@@ -4436,7 +4327,14 @@ mod tests {
         report.base_hash = Some("b1".to_string());
         write_branch_diff(&cli, &report);
 
-        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", Some("c2"), Some("b1"));
+        let evidence = audited_diff(
+            &cli.root,
+            Some(&state),
+            "ci/x",
+            "main",
+            Some("c2"),
+            Some("b1"),
+        );
         let reason = evidence
             .diff_rejected
             .expect("stale-commit artifact must be rejected");
@@ -4455,7 +4353,14 @@ mod tests {
         // it audited — rejected once the heads are known.
         write_branch_diff(&cli, &branch_report("ci/x", "main", true));
 
-        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", Some("c1"), Some("b1"));
+        let evidence = audited_diff(
+            &cli.root,
+            Some(&state),
+            "ci/x",
+            "main",
+            Some("c1"),
+            Some("b1"),
+        );
         let reason = evidence
             .diff_rejected
             .expect("unbound artifact must be rejected");
@@ -4474,7 +4379,14 @@ mod tests {
         report.base_hash = Some("b1".to_string());
         write_branch_diff(&cli, &report);
 
-        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", Some("c1"), Some("b1"));
+        let evidence = audited_diff(
+            &cli.root,
+            Some(&state),
+            "ci/x",
+            "main",
+            Some("c1"),
+            Some("b1"),
+        );
         assert_eq!(evidence.diff_rejected, None);
         assert_eq!(evidence.diff_passed, Some(true));
         assert!(evidence.schema_audited);
@@ -4493,7 +4405,14 @@ mod tests {
         report.base_hash = Some("b1".to_string());
         write_branch_diff(&cli, &report);
 
-        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", Some("c1"), Some("b2"));
+        let evidence = audited_diff(
+            &cli.root,
+            Some(&state),
+            "ci/x",
+            "main",
+            Some("c1"),
+            Some("b2"),
+        );
         let reason = evidence
             .diff_rejected
             .expect("stale-base artifact must be rejected");
@@ -4518,7 +4437,14 @@ mod tests {
         report.base_hash = Some("b1".to_string());
         write_branch_diff(&cli, &report);
 
-        let evidence = audited_diff(&cli, Some(&state), "ci/x", "main", Some("c1"), Some("b1"));
+        let evidence = audited_diff(
+            &cli.root,
+            Some(&state),
+            "ci/x",
+            "main",
+            Some("c1"),
+            Some("b1"),
+        );
         assert!(
             evidence.diff_rejected.is_some(),
             "shallow cannot satisfy require-diff"
@@ -4537,6 +4463,7 @@ mod tests {
             created_branch: true,
             catalog: "custom_catalog".to_string(),
             catalog_status: CatalogStatus::Unverified,
+            catalog_owned_by_phlo: None,
         };
         write_environment_artifacts(&cli, &setup).expect("writes");
 
@@ -4553,15 +4480,16 @@ mod tests {
             created_branch: true,
             catalog: "phlo_ci_y".to_string(),
             catalog_status: CatalogStatus::Created,
+            catalog_owned_by_phlo: None,
         };
         write_environment_artifacts(&cli, &other).expect("writes");
 
-        let found = read_environment_for(&cli, "ci/x").expect("ci/x evidence");
+        let found = read_environment_for(&cli.root, "ci/x").expect("ci/x evidence");
         assert_eq!(found.catalog, "custom_catalog");
         assert_eq!(found.candidate.hash, "bbb");
-        let found = read_environment_for(&cli, "ci/y").expect("ci/y evidence");
+        let found = read_environment_for(&cli.root, "ci/y").expect("ci/y evidence");
         assert_eq!(found.catalog, "phlo_ci_y");
-        assert!(read_environment_for(&cli, "ci/unknown").is_none());
+        assert!(read_environment_for(&cli.root, "ci/unknown").is_none());
     }
 
     #[test]
@@ -4794,7 +4722,7 @@ mod tests {
         ]));
         let result = contract_breaking_changes(Some(&FailingStore), &compilation, "main");
         let error = result.expect_err("a state error must fail promotion");
-        assert!(error.contains("unreachable"), "{error}");
+        assert!(error.to_string().contains("unreachable"), "{error}");
     }
 
     #[test]

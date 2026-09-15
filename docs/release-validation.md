@@ -21,7 +21,7 @@ phlo-transform init / check / plan --adapter duckdb / run --adapter duckdb
 phlo-transform explain example.daily_events / phlo-transform doctor
 ```
 
-All succeed; `doctor` reports workspace/compile/adapter/state health and
+All succeed; `doctor` reports workspace/compile/adapter/state/nessie health and
 warns (correctly, exit 0) when no adapter is configured for a command that
 does not need one.
 

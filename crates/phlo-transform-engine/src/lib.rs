@@ -54,9 +54,10 @@ pub use diff::{
     diff, DiffPolicy, DiffReport, DiffRequest, DiffStrategy, PolicyResult, RowSummary, SchemaChange,
 };
 pub use environment::{
-    catalog_name, compile_for_catalog, enrich_sources, ensure_candidate, ensure_environment,
-    provision_candidate, CandidateWorkspace, EnvironmentContext, EnvironmentMode, EnvironmentSetup,
-    EnvironmentSpec, EnvironmentTarget,
+    base_catalog, base_ref_for, catalog_name, compile_for_catalog, enrich_sources,
+    ensure_candidate, ensure_environment, environment_catalog, provision_candidate,
+    CandidateWorkspace, EnvironmentContext, EnvironmentMode, EnvironmentSetup, EnvironmentSpec,
+    EnvironmentTarget,
 };
 pub use error::{AdapterError, EngineError};
 pub use events::{EngineEvent, ExecutionStatus};
@@ -67,8 +68,14 @@ pub use plan::{
     dependency_closure, diff_reasons, Membership, Plan, PlanAction, PlanOptions, PlanReason,
     PlanSelection, PlannedModel, PlannedSeed, PlannedTest, Planner, ReasonKind,
 };
-pub use promotion::{promote, PromotionRecord, PromotionRequest};
-pub use run::{ModelResult, RunCounts, RunOptions, RunResult, Runner, SeedResult, TestResult};
+pub use promotion::{
+    bind_run_reference, cleanup_candidate, evaluate_promotion, find_unique_run, persist_promotion,
+    promote, PromotionEvaluation, PromotionOptions, PromotionRecord, PromotionRequest,
+};
+pub use run::{
+    execute_tests, ModelResult, RunCounts, RunOptions, RunResult, Runner, SeedResult, TestOutcome,
+    TestResult,
+};
 pub use source_state::{
     adapter_default_schema, collect_source_states, relation_for_source, seed_for_relation,
     seed_relation,

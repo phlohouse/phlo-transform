@@ -2549,6 +2549,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "testcontainers",
  "tokio",
 ]
 
@@ -2625,6 +2626,7 @@ name = "phlo-transform-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
  "phlo-transform-core",
  "phlo-transform-nessie",
  "phlo-transform-openlineage",

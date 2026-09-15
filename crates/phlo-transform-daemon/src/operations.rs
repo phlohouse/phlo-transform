@@ -146,6 +146,13 @@ pub struct ContinueParams {
 pub struct TestParams {
     #[serde(default)]
     pub selectors: Vec<String>,
+    /// The environment whose catalog the tests run against — the CLI's
+    /// `--environment`/`--ref`. Resolved through the shared environment
+    /// context like a run: with Nessie handles the workspace compiles
+    /// against the candidate's catalog; without them it is a label only.
+    pub environment: Option<String>,
+    /// The base ref the environment resolves against (the CLI's `--from`).
+    pub base: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,7 +212,11 @@ impl Params {
                 "run_tests": p.run_tests,
             }),
             Params::Resume(p) | Params::RetryFailed(p) => json!({ "run": p.run }),
-            Params::Test(p) => json!({ "selectors": p.selectors }),
+            Params::Test(p) => json!({
+                "selectors": p.selectors,
+                "environment": p.environment,
+                "base": p.base,
+            }),
             Params::Promote(p) => json!({
                 "candidate": p.candidate,
                 "to": p.to,

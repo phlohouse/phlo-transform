@@ -242,6 +242,65 @@ impl Adapter for TrinoAdapter {
         }
     }
 
+    /// Existence from `information_schema.tables` — one query per
+    /// catalog/schema group instead of one analyzed `SELECT` per relation.
+    /// Relations without an explicit catalog cannot be placed in a catalog's
+    /// information_schema; they keep the per-relation probe. A failed group
+    /// query falls back to probing that group serially.
+    async fn relations_exist(&self, relations: &[Relation]) -> Result<Vec<bool>, AdapterError> {
+        let mut found = vec![false; relations.len()];
+        let mut groups: std::collections::BTreeMap<(&str, &str), Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (index, relation) in relations.iter().enumerate() {
+            if let Some(catalog) = &relation.catalog {
+                groups
+                    .entry((catalog.as_str(), relation.schema.as_str()))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut probed = vec![false; relations.len()];
+        for ((catalog, schema), indexes) in &groups {
+            let names = indexes
+                .iter()
+                .map(|index| literal(&relations[*index].table))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT table_name FROM {}.information_schema.tables \
+                 WHERE table_schema = {} AND table_name IN ({names})",
+                quote(catalog),
+                literal(schema),
+            );
+            match self.run(&sql).await {
+                Ok(result) => {
+                    let present: BTreeSet<&str> = result
+                        .rows
+                        .iter()
+                        .filter_map(|row| row.first().map(String::as_str))
+                        .collect();
+                    for &index in indexes {
+                        probed[index] = true;
+                        found[index] = present.contains(relations[index].table.as_str());
+                    }
+                }
+                Err(_) => {
+                    for &index in indexes {
+                        found[index] = self.relation_exists(&relations[index]).await?;
+                        probed[index] = true;
+                    }
+                }
+            }
+        }
+        for (index, relation) in relations.iter().enumerate() {
+            if probed[index] {
+                continue;
+            }
+            found[index] = self.relation_exists(relation).await?;
+        }
+        Ok(found)
+    }
+
     async fn execute(&self, sql: &str) -> Result<QueryResult, AdapterError> {
         self.run(sql).await
     }
@@ -403,6 +462,80 @@ impl Adapter for TrinoAdapter {
             .collect())
     }
 
+    /// Column metadata from `information_schema.columns` — one query per
+    /// catalog/schema group instead of a `DESCRIBE` per relation. A failed
+    /// group query falls back to serial `DESCRIBE`; relations without an
+    /// explicit catalog always describe serially.
+    async fn relation_columns_many(
+        &self,
+        relations: &[Relation],
+    ) -> Vec<Result<Vec<ColumnInfo>, AdapterError>> {
+        let mut out: Vec<Result<Vec<ColumnInfo>, AdapterError>> = relations
+            .iter()
+            .map(|_| Err(AdapterError::new("UNPROBED", "not probed")))
+            .collect();
+        let mut groups: std::collections::BTreeMap<(&str, &str), Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (index, relation) in relations.iter().enumerate() {
+            if let Some(catalog) = &relation.catalog {
+                groups
+                    .entry((catalog.as_str(), relation.schema.as_str()))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut probed = vec![false; relations.len()];
+        for ((catalog, schema), indexes) in &groups {
+            let names = indexes
+                .iter()
+                .map(|index| literal(&relations[*index].table))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT table_name, column_name, data_type \
+                 FROM {}.information_schema.columns \
+                 WHERE table_schema = {} AND table_name IN ({names}) \
+                 ORDER BY table_name, ordinal_position",
+                quote(catalog),
+                literal(schema),
+            );
+            if let Ok(result) = self.run(&sql).await {
+                let mut by_table: std::collections::BTreeMap<String, Vec<ColumnInfo>> =
+                    std::collections::BTreeMap::new();
+                for row in &result.rows {
+                    let (Some(table), Some(name)) = (row.first(), row.get(1)) else {
+                        continue;
+                    };
+                    by_table.entry(table.clone()).or_default().push(ColumnInfo {
+                        name: name.clone(),
+                        data_type: row.get(2).cloned().unwrap_or_default(),
+                        nullable: true,
+                    });
+                }
+                for &index in indexes {
+                    // A table absent from the result does not exist (Trino
+                    // tables always have columns) — mirror `DESCRIBE`'s
+                    // not-found error rather than reporting empty columns.
+                    out[index] = match by_table.remove(&relations[index].table) {
+                        Some(columns) => Ok(columns),
+                        None => Err(AdapterError::new(
+                            "TABLE_NOT_FOUND",
+                            format!("{} does not exist", relations[index].display()),
+                        )),
+                    };
+                    probed[index] = true;
+                }
+            }
+        }
+        for (index, relation) in relations.iter().enumerate() {
+            if probed[index] {
+                continue;
+            }
+            out[index] = self.relation_columns(relation).await;
+        }
+        out
+    }
+
     async fn ensure_catalog(
         &self,
         request: &CatalogRequest,
@@ -432,11 +565,14 @@ impl Adapter for TrinoAdapter {
                 let mut properties = vec![
                     "\"iceberg.catalog.type\"='nessie'".to_string(),
                     format!(
-                        "\"iceberg.nessie-catalog.uri\"='{}/api/v2'",
-                        nessie_uri.trim_end_matches('/')
+                        "\"iceberg.nessie-catalog.uri\"={}",
+                        literal(&format!("{}/api/v2", nessie_uri.trim_end_matches('/')))
                     ),
-                    format!("\"iceberg.nessie-catalog.ref\"='{reference}'"),
-                    format!("\"iceberg.nessie-catalog.default-warehouse-dir\"='{warehouse}'"),
+                    format!("\"iceberg.nessie-catalog.ref\"={}", literal(reference)),
+                    format!(
+                        "\"iceberg.nessie-catalog.default-warehouse-dir\"={}",
+                        literal(&warehouse)
+                    ),
                 ];
                 if warehouse.starts_with("local://") || warehouse.starts_with('/') {
                     properties.push("\"fs.local.enabled\"='true'".to_string());
@@ -450,6 +586,12 @@ impl Adapter for TrinoAdapter {
                 Ok(CatalogStatus::Created)
             }
         }
+    }
+
+    async fn drop_catalog(&self, catalog: &str) -> Result<(), AdapterError> {
+        self.run(&format!("DROP CATALOG IF EXISTS {}", quote(catalog)))
+            .await?;
+        Ok(())
     }
 
     async fn ensure_schema(&self, relation: &Relation) -> Result<(), AdapterError> {
@@ -542,6 +684,11 @@ impl TrinoAdapter {
 
 fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// A SQL string literal — single quotes doubled per the SQL standard.
+fn literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 /// Deterministic FNV-1a fingerprint of a sequence of strings.

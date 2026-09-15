@@ -59,6 +59,25 @@ pub struct EnvironmentSetup {
     /// audit can tell a catalog phlo created from one it adopted.
     #[serde(default)]
     pub catalog_status: crate::adapter::CatalogStatus,
+    /// Whether phlo owns this catalog and may drop it during candidate
+    /// cleanup. Separate from `catalog_status`: ownership is recorded once
+    /// at provisioning and stays sticky, while verification status reports
+    /// what the *current* call could prove — a catalog phlo created keeps
+    /// `owns_catalog()` true even when a later run can only observe it as
+    /// `Unverified`.
+    #[serde(default)]
+    pub catalog_owned_by_phlo: Option<bool>,
+}
+
+impl EnvironmentSetup {
+    /// Whether phlo may drop the candidate's catalog during cleanup.
+    /// `catalog_owned_by_phlo` is authoritative for records this build
+    /// wrote; artifacts written before the flag existed fall back to
+    /// `catalog_status == Created` — the only ownership they could prove.
+    pub fn owns_catalog(&self) -> bool {
+        self.catalog_owned_by_phlo
+            .unwrap_or(matches!(self.catalog_status, CatalogStatus::Created))
+    }
 }
 
 /// Ensure the candidate branch and its catalog exist.
@@ -79,7 +98,7 @@ pub async fn ensure_environment(
         .await
         .map_err(|error| EngineError::Environment(error.to_string()))?
         .ok_or_else(|| {
-            EngineError::Environment(format!("base reference `{}` was not found", spec.base_ref))
+            EngineError::NotFound(format!("base reference `{}` was not found", spec.base_ref))
         })?;
 
     let (candidate, created_branch) = if spec.candidate_ref == spec.base_ref {
@@ -127,6 +146,26 @@ pub async fn ensure_environment(
         .await
         .map_err(EngineError::Adapter)?;
 
+    // A Nessie-bound environment whose adapter cannot provision the
+    // generated catalog would run on the default target while evidence
+    // claims the candidate — fail closed. The branch just created is rolled
+    // back best-effort. An explicit `catalog` pin is the escape hatch: the
+    // caller named the physical binding and takes responsibility for it.
+    if catalog_status == CatalogStatus::Unmanaged
+        && spec.nessie_uri.is_some()
+        && spec.catalog.is_none()
+    {
+        if created_branch {
+            let _ = nessie.delete_branch(&spec.candidate_ref).await;
+        }
+        return Err(EngineError::NotConfigured(format!(
+            "adapter `{}` cannot provision a catalog bound to Nessie ref `{}` — \
+             the environment claims branch isolation it cannot honour",
+            adapter.name(),
+            spec.candidate_ref
+        )));
+    }
+
     Ok(EnvironmentSetup {
         base,
         candidate,
@@ -134,6 +173,7 @@ pub async fn ensure_environment(
         created_branch,
         catalog,
         catalog_status,
+        catalog_owned_by_phlo: None,
     })
 }
 
@@ -178,8 +218,20 @@ pub async fn ensure_candidate(
              choose a different `--catalog` or remove the other candidate's artifacts",
         )));
     }
+    // Keep `spec.catalog == None` honest into `ensure_environment`: a
+    // generated name means phlo must provision the catalog, so an
+    // `Unmanaged` answer fails closed there. The pin is an explicit
+    // override or a recorded binding the workspace stands behind — a bare
+    // `ref create` artifact records only the conventional name with
+    // `Unmanaged` status, which is an intent, not a binding: pinning it
+    // would silence the fail-closed check on a non-provisioning adapter.
+    let pinned = spec.catalog.is_some()
+        || prior.as_ref().is_some_and(|prior| {
+            prior.catalog_status != CatalogStatus::Unmanaged
+                || prior.catalog != catalog_name(&spec.candidate_ref)
+        });
     let resolved = EnvironmentSpec {
-        catalog: Some(catalog),
+        catalog: pinned.then_some(catalog),
         ..spec.clone()
     };
     let mut setup = ensure_environment(nessie, adapter, &resolved).await?;
@@ -201,6 +253,22 @@ pub async fn ensure_candidate(
             )));
         }
     }
+    // Ownership is decided once, here, so a later `Unverified` status cannot
+    // make a phlo-owned catalog look abandoned. The generated name embeds
+    // the ref's hash — only phlo mints it, and only for this ref — so a
+    // self-named catalog is ours even when the adapter could not re-verify
+    // it. An adopted name keeps whatever ownership an earlier artifact
+    // recorded.
+    let self_named = setup.catalog == catalog_name(&spec.candidate_ref);
+    setup.catalog_owned_by_phlo = Some(match setup.catalog_status {
+        CatalogStatus::Created => true,
+        CatalogStatus::Unverified if self_named => true,
+        CatalogStatus::Unverified => prior
+            .as_ref()
+            .filter(|p| p.catalog == setup.catalog)
+            .is_some_and(|p| p.owns_catalog()),
+        CatalogStatus::Unmanaged => false,
+    });
     if setup.created_from.is_none() {
         // The branch pre-existed: never redefine its base as today's `base`.
         // Preserve whatever an earlier artifact recorded — if nothing did,
@@ -381,15 +449,16 @@ pub async fn compile_for_catalog(
     }
     let base = compile(&project);
     let compiled = match (enrich, adapter) {
-        (true, Some(adapter)) => enrich_sources(
-            adapter,
-            &project,
-            source_catalog.as_deref(),
-            source_schema.as_deref(),
-            &base,
-        )
-        .await
-        .unwrap_or(base),
+        (true, Some(adapter)) => {
+            enrich_sources(
+                adapter,
+                &project,
+                source_catalog.as_deref(),
+                source_schema.as_deref(),
+                &base,
+            )
+            .await
+        }
         _ => base,
     };
     if !compiled.is_ok() {
@@ -406,15 +475,14 @@ pub async fn compile_for_catalog(
 /// the adapter — the catalogue enrichment the CLI applies to compile,
 /// materialised-tree, and retargeted compiles alike. Best-effort per source:
 /// one that does not respond keeps its declared schema; the recompile itself
-/// always runs so callers can fall back to the plain compile with
-/// `unwrap_or`.
+/// always runs.
 pub async fn enrich_sources(
     adapter: &dyn Adapter,
     project: &SemanticProject,
     default_catalog: Option<&str>,
     default_schema: Option<&str>,
     base: &Compilation,
-) -> Option<Compilation> {
+) -> Compilation {
     let sources = base.sources();
     // Unqualified sources resolve through the engine's search path, so a
     // bare `raw_orders` lands in the adapter's own default schema — `main`
@@ -456,7 +524,7 @@ pub async fn enrich_sources(
     )
     .await
     .unwrap_or_default();
-    Some(compile_with_options(project, &provider, &source_states))
+    compile_with_options(project, &provider, &source_states)
 }
 
 /// The conventional catalog name for a candidate environment:
@@ -486,4 +554,53 @@ pub fn catalog_name(reference: &str) -> String {
     let readable = readable.trim_end_matches('_');
     let hash = phlo_transform_core::version::sha256_hex(reference);
     format!("{readable}_{}", &hash[..8])
+}
+
+/// The base ref an environment resolves against: an explicit `--from`/`base`
+/// wins; else the base this workspace's provisioning already recorded for
+/// the environment (resume and continuation must resolve the same base the
+/// original run used); else `main`. Shared so the CLI, the daemon, and
+/// diff/promotion never disagree about a candidate's base.
+pub fn base_ref_for(
+    workspace_root: &Path,
+    environment: Option<&str>,
+    explicit: Option<&str>,
+) -> String {
+    explicit
+        .map(str::to_string)
+        .or_else(|| {
+            environment
+                .and_then(|env| read_environment_for(workspace_root, env))
+                .map(|setup| setup.base.name)
+        })
+        .unwrap_or_else(|| "main".to_string())
+}
+
+/// The physical catalog a reference's environment resolves through: the
+/// recorded binding when this workspace provisioned it, else the generated
+/// `phlo_<ref>` convention — the same precedence provisioning applies, so
+/// evidence readers and provisioners never disagree about where a ref's
+/// data physically lives.
+pub fn environment_catalog(workspace_root: &Path, reference: &str) -> String {
+    read_environment_for(workspace_root, reference)
+        .map(|setup| setup.catalog)
+        .unwrap_or_else(|| catalog_name(reference))
+}
+
+/// The catalog the *base* side of a branch diff resolves through: `main`
+/// is the deployment catalog (the configured `--catalog` override, else
+/// the workspace's own compiled target); any other ref resolves its
+/// recorded or conventional environment catalog. Shared by the CLI's
+/// `diff` and the daemon's branch-diff operation.
+pub fn base_catalog(
+    workspace_root: &Path,
+    base_ref: &str,
+    configured: Option<&str>,
+    compiled: Option<&str>,
+) -> Option<String> {
+    if base_ref == "main" {
+        configured.or(compiled).map(str::to_string)
+    } else {
+        Some(environment_catalog(workspace_root, base_ref))
+    }
 }

@@ -34,7 +34,7 @@ phlo-transform -r <dir> explain / inspect / lineage / manifest
   manual edits. The keyed incremental merged an updated row; the
   time-window incremental appended only rows past its watermark; a third run
   with no upstream change was a full SKIP.
-- `doctor` reports workspace/compile/adapter/state health clearly and exits
+- `doctor` reports workspace/compile/adapter/state/nessie health clearly and exits
   non-zero on problems.
 - Generated tests (`unique`, `not_null`, `accepted_values`, key-folded
   assertions) all executed and passed.

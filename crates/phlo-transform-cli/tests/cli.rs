@@ -1627,6 +1627,94 @@ fn resume_and_retry_failed_reject_selector_flags() {
     assert!(!output.status.success());
 }
 
+#[test]
+fn resume_with_a_mismatched_environment_is_refused_before_provisioning() {
+    let dir = resilience_workspace();
+    // A run recorded under environment label `a` (no Nessie — label only).
+    let mut args = resilience_args(&dir);
+    args.extend(["run".into(), "--environment".into(), "a".into()]);
+    run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    let run_id = last_run_id(&dir);
+
+    // `--environment b` disagrees with the stored run's environment — the
+    // refusal must happen when the environment is resolved, before any
+    // provisioning, not only inside the runner.
+    let mut args = resilience_args(&dir);
+    args.extend([
+        "run".into(),
+        "--resume".into(),
+        run_id[..8].into(),
+        "--environment".into(),
+        "b".into(),
+    ]);
+    let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr.clone()).expect("utf-8 stderr");
+    assert!(stderr.contains("refusing to continue into `b`"), "{stderr}");
+}
+
+#[test]
+fn resume_with_an_unknown_run_id_fails_before_provisioning() {
+    let dir = resilience_workspace();
+    let mut args = resilience_args(&dir);
+    args.push("run".into());
+    run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+
+    let mut args = resilience_args(&dir);
+    args.extend([
+        "run".into(),
+        "--resume".into(),
+        "deadbeef".into(),
+        "--environment".into(),
+        "ci/x".into(),
+    ]);
+    let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr.clone()).expect("utf-8 stderr");
+    assert!(stderr.contains("no run matches"), "{stderr}");
+    // The run-id lookup failed before the environment could provision, so
+    // no provisioning artifact was recorded for `ci/x`.
+    assert!(
+        !dir.path()
+            .join(".phlo/transform")
+            .read_dir()
+            .map(|mut entries| entries.any(|entry| entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with("environment")))
+            .unwrap_or(false),
+        "no environment artifacts should exist"
+    );
+}
+
+#[test]
+fn continuations_only_apply_to_run_and_apply() {
+    let dir = resilience_workspace();
+    let base = resilience_args(&dir);
+    let mut args = base.clone();
+    args.push("run".into());
+    run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    let short = &last_run_id(&dir)[..8];
+
+    // plan/test resolve their environment from --environment/--ref only —
+    // inheriting a stored run's environment would retarget the compilation
+    // while state scoping and labels still came from the flags.
+    for command in ["plan", "test", "diff", "check", "list"] {
+        for flag in ["--resume", "--retry-failed"] {
+            let mut args = base.clone();
+            args.extend([command.into(), flag.into(), short.into()]);
+            let output = run_unchecked(&args.iter().map(String::as_str).collect::<Vec<_>>());
+            assert!(
+                !output.status.success(),
+                "{command} {flag} should be rejected"
+            );
+            let stderr = String::from_utf8(output.stderr.clone()).expect("utf-8 stderr");
+            assert!(stderr.contains("run`/`apply"), "{command} {flag}: {stderr}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bundle 5: refs, branch diff, promotion gates
 // ---------------------------------------------------------------------------

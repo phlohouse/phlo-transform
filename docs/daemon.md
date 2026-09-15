@@ -11,7 +11,8 @@ report DTOs as the CLI's `--json` output.
 ```bash
 phlo-transform daemon --root <workspace> --port 7070 \
     [--adapter duckdb|trino ...] [--state <path-or-url>] \
-    [--nessie-endpoint <uri>] [--environment <label>]
+    [--nessie-endpoint <uri>] [--nessie-catalog-uri <uri>] \
+    [--environment <label>]
 ```
 
 The daemon binds `127.0.0.1` by default and needs no authentication for local
@@ -65,7 +66,7 @@ Response: `{"operation": {...}, "replayed": false}`.
 | `run` | `run [selectors] --ref --from --force` | `selectors`, `environment`, `base`, `force`, `run_tests` | adapter |
 | `resume` | `run --resume <run>` | `run` | adapter + state |
 | `retry_failed` | `run --retry-failed <run>` | `run` | adapter + state |
-| `test` | `test [selectors]` | `selectors` | adapter |
+| `test` | `test [selectors] --ref --from` | `selectors`, `environment`, `base` | adapter |
 | `promote` | `promote <ref> --to <ref> [--check] [--require-diff] [--allow-breaking-schema] [--cleanup]` | `candidate`, `to`, `check`, `require_diff`, `allow_breaking_schema`, `cleanup`, `actor` | nessie |
 | `reload` | — | — | — |
 
@@ -77,7 +78,11 @@ The submission body may also spread params at the top level
 
 `params.environment` is the candidate Nessie reference (the CLI's `--ref`),
 and `params.base` the ref a new candidate is cut from (the CLI's `--from`,
-default `main`). When the daemon was launched with `--nessie-endpoint`, a
+default `main`). A `run` or `test` op without `environment` — and the
+`plan`/state reads without `environment=` — inherits the daemon's
+launch-time `--environment` label, so a daemon scoped to a candidate
+environment runs and reads inside it consistently. When the daemon was
+launched with `--nessie-endpoint`, a
 `run`/`resume`/`retry_failed` against an environment other than the base
 ref runs the full provisioning step the CLI runs: the Nessie branch is
 created (or reused), a branch-scoped Iceberg catalog is provisioned, and

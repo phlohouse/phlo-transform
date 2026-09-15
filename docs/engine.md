@@ -1,8 +1,9 @@
-# Phase 1 engine architecture
+# Engine architecture
 
-This document describes the MVP build engine added in Phase 1. It complements
-[`docs/architecture.md`](architecture.md) (the Phase 0 compiler) and
-[`docs/roadmap/01-mvp-build-engine.md`](roadmap/01-mvp-build-engine.md).
+This document describes the build engine in `phlo-transform-engine`. It
+complements [`docs/architecture.md`](architecture.md) (the compiler) and the
+feature docs [`state.md`](state.md), [`incremental.md`](incremental.md),
+[`wap.md`](wap.md), [`diff.md`](diff.md) and [`daemon.md`](daemon.md).
 
 ## Crate layout
 
@@ -10,9 +11,14 @@ This document describes the MVP build engine added in Phase 1. It complements
 crates/
 ├── phlo-transform-sql/      parser, directives, relation extraction
 ├── phlo-transform-core/     discovery, semantic model, compiler, DAG
-├── phlo-transform-engine/   adapter trait, planner, scheduler, state, artifacts
+├── phlo-transform-engine/   adapter trait, planner, scheduler, execution,
+│                            state, artifacts, environments, audit, promotion
 ├── phlo-transform-trino/    Trino HTTP adapter
+├── phlo-transform-duckdb/   in-process DuckDB adapter
+├── phlo-transform-nessie/   Nessie REST + in-memory clients
 ├── phlo-transform-openlineage/  canonical lineage graph → OpenLineage export
+├── phlo-transform-dbt/      dbt project translator
+├── phlo-transform-daemon/   local HTTP/JSON semantic service
 └── phlo-transform-cli/      `phlo-transform` binary
 ```
 
@@ -83,6 +89,9 @@ model name is never rewritten.
 pub trait Adapter: Send + Sync {
     fn name(&self) -> &str;
     async fn relation_exists(&self, relation: &Relation) -> Result<bool, AdapterError>;
+    /// Batched existence probe; the default calls `relation_exists` per
+    /// relation, adapters with a queryable information schema override it.
+    async fn relations_exist(&self, relations: &[Relation]) -> Result<Vec<bool>, AdapterError>;
     async fn execute(&self, sql: &str) -> Result<QueryResult, AdapterError>;
     async fn create_or_replace_view(&self, relation: &Relation, sql: &str) -> Result<QueryResult, AdapterError>;
     async fn create_or_replace_table(&self, relation: &Relation, sql: &str) -> Result<QueryResult, AdapterError>;
@@ -97,10 +106,22 @@ pub trait Adapter: Send + Sync {
     /// Query ids currently executing through a tracked view (default empty).
     fn in_flight_queries(&self) -> Vec<String> { Vec::new() }
     async fn relation_columns(&self, relation: &Relation) -> Result<Vec<ColumnInfo>, AdapterError>;
-    async fn ensure_catalog(&self, request: &CatalogRequest) -> Result<(), AdapterError>;
+    /// Batched column listing; the default calls `relation_columns` per
+    /// relation. An absent relation yields `Err` — never a silent empty
+    /// schema, which would misclassify every column as added.
+    async fn relation_columns_many(&self, relations: &[Relation])
+        -> Vec<Result<Vec<ColumnInfo>, AdapterError>>;
+    async fn ensure_catalog(&self, request: &CatalogRequest) -> Result<CatalogStatus, AdapterError>;
+    /// Drop a catalog the caller proved phlo owns; quoting is the
+    /// adapter's business (default reports UNSUPPORTED).
+    async fn drop_catalog(&self, catalog: &str) -> Result<(), AdapterError>;
     async fn ensure_schema(&self, relation: &Relation) -> Result<(), AdapterError>;
     async fn source_state(&self, relation: &Relation) -> Result<Option<String>, AdapterError>;
+    /// A content-independent identity for the materialised output (e.g. the
+    /// Iceberg snapshot id) — the evidence cache reuse is gated on.
+    async fn output_identity(&self, relation: &Relation) -> Result<Option<String>, AdapterError>;
     async fn partition_counts(&self, relation: &Relation, partition_columns: &[String]) -> Result<Option<Vec<(String, i64)>>, AdapterError>;
+    async fn load_csv(&self, relation: &Relation, path: &Path) -> Result<QueryResult, AdapterError>;
 }
 ```
 
@@ -383,7 +404,14 @@ stream — terminal output is never the execution API.
   (testcontainers) in `crates/phlo-transform-trino/tests/trino_e2e.rs`. It is
   `#[ignore]`d by default and run explicitly in CI on Docker-enabled runners.
 
-## Deferred
+## Beyond this document
 
-Contracts, content-addressed state, smart skip/caching, incremental
-materialisations, Nessie/WAP, data diff and the daemon remain later phases.
+Later-phase features documented elsewhere:
+
+- contracts and schema-change classification — [`state.md`](state.md);
+- content-addressed versions and cache reuse — [`state.md`](state.md);
+- incremental materialisations — [`incremental.md`](incremental.md);
+- Nessie environments, WAP promotion and catalog ownership —
+  [`wap.md`](wap.md);
+- data diff — [`diff.md`](diff.md);
+- the HTTP/JSON service — [`daemon.md`](daemon.md).

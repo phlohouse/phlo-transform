@@ -25,10 +25,19 @@ in-memory client.
 
 ## Environments
 
-`--ref <reference>` (alias `--reference`) selects the environment for
-`plan`/`apply`/`run` and is recorded in plans, runs and state. It defaults to
-`--environment` when set. There is no separate environment abstraction layered
-on top of Nessie.
+`--ref <reference>` (alias `--reference`) and `--environment <name>` name the
+same logical environment for `plan`/`apply`/`run`/`test`; it is recorded in
+plans, runs and state. They are aliases — when both are given they must agree.
+Without a Nessie endpoint an environment is a state-scoping label only; with
+Nessie it maps to the candidate branch and its catalog. There is no separate
+environment abstraction layered on top of Nessie.
+
+Two Nessie addresses exist: `--nessie-endpoint` (or `PHLO_NESSIE_ENDPOINT`) is
+the REST endpoint this process calls, and `--nessie-catalog-uri` (or
+`PHLO_NESSIE_CATALOG_URI`) is the address written into provisioned catalogs —
+the one the warehouse uses. They default to the same value; set the catalog
+URI when Trino reaches Nessie on a different address than the CLI does, e.g. a
+container-network hostname versus a host-mapped port.
 
 ## Reference management
 
@@ -42,8 +51,10 @@ phlo-transform ref delete ci/pr-1
 `list`/`show` are read-only. `create` and `delete` are the only commands that
 mutate Nessie references directly, and they do exactly what they say — nothing
 creates or deletes a branch as a side effect of another operation except the
-explicit provisioning on `plan`/`apply`/`run --ref` and `--cleanup` on
-`promote`. `ref delete main` is refused outright: `main` is every
+explicit provisioning on `apply`/`run --ref` and `--cleanup` on
+`promote`. `plan`/`test --ref` resolve the same environment read-only — they
+compile against the candidate's catalog when it exists and never create
+anything. `ref delete main` is refused outright: `main` is every
 environment's default base, not a scratch branch.
 
 ## WAP

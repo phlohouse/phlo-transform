@@ -32,3 +32,5 @@ duckdb = { workspace = true }
 insta = "1"
 rusqlite = { workspace = true }
 tempfile = "3"
+testcontainers = "0.28"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -18,13 +18,14 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use futures::StreamExt;
 use serde::Serialize;
 
 use phlo_transform_core::graph::Dependency;
 use phlo_transform_core::{
     classify_schema_change, Compilation, CompiledModel, DataType, Diagnostic, GitChanges,
-    IncrementalStrategy, Materialization, ModelId, Nullability, SchemaChangeSafety, SchemaColumn,
-    Selection, SourceId,
+    IncrementalStrategy, Materialization, ModelId, Nullability, Relation, SchemaChangeSafety,
+    SchemaColumn, SelectedModel, Selection, SourceId,
 };
 
 use crate::adapter::Adapter;
@@ -32,7 +33,7 @@ use crate::error::EngineError;
 use crate::source_state::{
     adapter_default_schema, relation_for_source, seed_for_relation, seed_relation,
 };
-use crate::state::{MaterializedRecord, StateStore};
+use crate::state::{MaterializedRecord, SeedRecord, StateStore};
 use crate::util::{now_rfc3339, sha256_hex};
 
 /// What the planner intends to do to a model's physical relation.
@@ -372,6 +373,16 @@ impl Planner {
         let excluded = selection.excluded_ids();
         let member_ids: BTreeSet<ModelId> = selection.ids().into_iter().collect();
         let planned_ids = dependency_closure_excluding(compilation, &member_ids, &excluded);
+        // `Selection::get` scans members linearly — fine once, quadratic in
+        // this loop. Index by logical name so per-model membership lookups
+        // stay O(log n).
+        let members_by_name: BTreeMap<&str, &SelectedModel> = selection
+            .members
+            .iter()
+            .map(|member| (member.id.as_str(), member))
+            .collect();
+        let member = |id: &ModelId| members_by_name.get(id.logical_name().as_str()).copied();
+        let requiring = requiring_models(compilation, &member_ids);
 
         // Ephemeral models are inlined into their dependents at compile time
         // and never produce a relation, so they are not planned or executed.
@@ -387,43 +398,6 @@ impl Planner {
                     .unwrap_or(false)
             })
             .collect();
-
-        // A model whose dependency was excluded builds against whatever is
-        // already materialised. That is only valid when a materialisation
-        // actually exists — otherwise the plan would schedule a model that
-        // reads a relation that does not exist.
-        let mut warnings = Vec::new();
-        for id in &planned_ids {
-            let Some(model) = compilation.model(id) else {
-                continue;
-            };
-            for dependency in model.model_dependencies() {
-                if !excluded.contains(dependency) {
-                    continue;
-                }
-                let Some(excluded_model) = compilation.model(dependency) else {
-                    continue;
-                };
-                // Ephemeral dependencies are inlined into the dependent's
-                // SQL, so excluding one needs no materialisation at all.
-                if excluded_model.config.materialization == Materialization::Ephemeral {
-                    continue;
-                }
-                if !blocked && !self.adapter.relation_exists(&excluded_model.target).await? {
-                    return Err(EngineError::InvalidPlan(format!(
-                        "{} depends on excluded model {}, and {} has never been materialised",
-                        id.logical_name(),
-                        dependency.logical_name(),
-                        excluded_model.target.display()
-                    )));
-                }
-                warnings.push(format!(
-                    "{} depends on excluded model {}; it will read the existing materialisation",
-                    id.logical_name(),
-                    dependency.logical_name()
-                ));
-            }
-        }
 
         // Seeds are planned for the source relations the selected models
         // read — including ephemeral models: they are filtered out of `order`
@@ -467,6 +441,184 @@ impl Planner {
                 needed_seeds.insert(seed.name.clone(), seed);
             }
         }
+        // Every read the ordered loops make is fetched before they run: one
+        // batched existence probe (adapters with a queryable catalog answer
+        // it in a query per schema, not a round trip per relation), a bulk
+        // scan of the environment's materialisation/seed state, a bulked
+        // version-hash lookup for cache candidates, and bounded-parallel
+        // reads of the live output identities drift checks compare against.
+        // What used to cost N × 1–3 serial warehouse round trips now costs a
+        // handful of queries.
+        let mut probe_relations: Vec<Relation> = Vec::new();
+        if !blocked {
+            // Excluded dependencies a planned model still reads — their
+            // existence decides whether exclusion is safe.
+            for id in &planned_ids {
+                let Some(model) = compilation.model(id) else {
+                    continue;
+                };
+                for dependency in model.model_dependencies() {
+                    if !excluded.contains(dependency) {
+                        continue;
+                    }
+                    let Some(excluded_model) = compilation.model(dependency) else {
+                        continue;
+                    };
+                    // Ephemeral dependencies are inlined into the
+                    // dependent's SQL — excluding one needs no
+                    // materialisation at all.
+                    if excluded_model.config.materialization == Materialization::Ephemeral {
+                        continue;
+                    }
+                    probe_relations.push(excluded_model.target.clone());
+                }
+            }
+            for seed in needed_seeds.values() {
+                probe_relations.push(seed_relation(
+                    seed,
+                    default_catalog,
+                    default_schema,
+                    self.adapter.name(),
+                ));
+            }
+            for id in &order {
+                if let Some(model) = compilation.model(id) {
+                    probe_relations.push(model.target.clone());
+                }
+            }
+        }
+        let exists_map: BTreeMap<String, bool> = {
+            // `display()` is the relation's canonical identity — dedup so
+            // shared targets are probed once.
+            let mut seen = BTreeSet::new();
+            let unique: Vec<Relation> = probe_relations
+                .into_iter()
+                .filter(|relation| seen.insert(relation.display()))
+                .collect();
+            self.adapter
+                .relations_exist(&unique)
+                .await?
+                .into_iter()
+                .zip(unique)
+                .map(|(found, relation)| (relation.display(), found))
+                .collect()
+        };
+
+        // A model whose dependency was excluded builds against whatever is
+        // already materialised. That is only valid when a materialisation
+        // actually exists — otherwise the plan would schedule a model that
+        // reads a relation that does not exist.
+        let mut warnings = Vec::new();
+        for id in &planned_ids {
+            let Some(model) = compilation.model(id) else {
+                continue;
+            };
+            for dependency in model.model_dependencies() {
+                if !excluded.contains(dependency) {
+                    continue;
+                }
+                let Some(excluded_model) = compilation.model(dependency) else {
+                    continue;
+                };
+                if excluded_model.config.materialization == Materialization::Ephemeral {
+                    continue;
+                }
+                if !blocked
+                    && !exists_map
+                        .get(&excluded_model.target.display())
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    return Err(EngineError::InvalidPlan(format!(
+                        "{} depends on excluded model {}, and {} has never been materialised",
+                        id.logical_name(),
+                        dependency.logical_name(),
+                        excluded_model.target.display()
+                    )));
+                }
+                warnings.push(format!(
+                    "{} depends on excluded model {}; it will read the existing materialisation",
+                    id.logical_name(),
+                    dependency.logical_name()
+                ));
+            }
+        }
+
+        // When compilation is blocked every model plans Unknown — no
+        // evidence is read at all, matching the previous behavior of never
+        // touching state or the warehouse on a broken compile.
+        let materialized = match &self.state {
+            Some(state) if !blocked => materialized_scope(state.as_ref(), environment.as_deref())?,
+            _ => BTreeMap::new(),
+        };
+        let recorded_seeds = match &self.state {
+            Some(state) if !blocked => seeds_scope(state.as_ref(), environment.as_deref())?,
+            _ => BTreeMap::new(),
+        };
+        // Cache candidates: version-hash lookups only matter for models with
+        // no record in this environment that nevertheless exist — exactly
+        // the set `decide` would query one by one.
+        let by_hash: BTreeMap<String, Vec<MaterializedRecord>> = match &self.state {
+            Some(state) if !blocked => {
+                let hashes: Vec<String> = order
+                    .iter()
+                    .filter_map(|id| compilation.model(id))
+                    .filter(|model| {
+                        !materialized.contains_key(&model.id.logical_name())
+                            && exists_map
+                                .get(&model.target.display())
+                                .copied()
+                                .unwrap_or(false)
+                    })
+                    .map(|model| model.version.hash.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                state.materialized_by_hashes(&hashes)?
+            }
+            _ => BTreeMap::new(),
+        };
+        // Live output identities for the models `decide` can ask about: a
+        // recorded identity to drift-check, or cache candidates worth a
+        // look. Bounded parallelism — each read is an adapter round trip.
+        let live_outputs: BTreeMap<String, Option<String>> = {
+            let wants: Vec<Relation> = if blocked {
+                Vec::new()
+            } else {
+                order
+                    .iter()
+                    .filter_map(|id| compilation.model(id))
+                    .filter(|model| {
+                        let display = model.target.display();
+                        let recorded_identity = materialized
+                            .get(&model.id.logical_name())
+                            .is_some_and(|record| record.output_identity.is_some());
+                        let cache_candidate = !materialized.contains_key(&model.id.logical_name())
+                            && exists_map.get(&display).copied().unwrap_or(false)
+                            && by_hash.get(&model.version.hash).is_some_and(|records| {
+                                records.iter().any(|record| {
+                                    record.environment.as_deref() != environment.as_deref()
+                                        && record.target == display
+                                        && record.adapter.as_deref() == Some(self.adapter.name())
+                                })
+                            });
+                        recorded_identity || cache_candidate
+                    })
+                    .map(|model| model.target.clone())
+                    .collect()
+            };
+            futures::stream::iter(wants)
+                .map(|relation| async move {
+                    (
+                        relation.display(),
+                        self.adapter.output_identity(&relation).await.ok().flatten(),
+                    )
+                })
+                .buffered(16)
+                .collect()
+                .await
+        };
+
         let mut seeds = Vec::with_capacity(needed_seeds.len());
         for seed in needed_seeds.into_values() {
             let relation =
@@ -474,12 +626,12 @@ impl Planner {
             let (action, reasons) = if blocked {
                 (PlanAction::Unknown, Vec::new())
             } else {
-                let exists = self.adapter.relation_exists(&relation).await?;
-                let current = match &self.state {
-                    Some(state) => state.seed_state(&seed.name, environment.as_deref())?,
-                    None => None,
-                };
-                self.decide_seed(seed, &relation.display(), exists, current.as_ref(), options)
+                let exists = exists_map
+                    .get(&relation.display())
+                    .copied()
+                    .unwrap_or(false);
+                let current = recorded_seeds.get(&seed.name);
+                self.decide_seed(seed, &relation.display(), exists, current, options)
             };
             seeds.push(PlannedSeed {
                 name: seed.name.clone(),
@@ -493,6 +645,10 @@ impl Planner {
 
         let mut models = Vec::with_capacity(order.len());
         let mut will_build: BTreeSet<ModelId> = BTreeSet::new();
+        // Models whose schema-change classification needs the live columns —
+        // (index into `models`, target, compiled model). Batched after the
+        // loop so `relation_columns_many` can answer them together.
+        let mut schema_checks: Vec<(usize, Relation, &CompiledModel)> = Vec::new();
         for id in &order {
             let Some(model) = compilation.model(id) else {
                 continue;
@@ -501,7 +657,7 @@ impl Planner {
 
             // How the model entered the plan — the answer to "why is this
             // here" — comes before the change reasons.
-            let membership = match selection.get(id) {
+            let membership = match member(id) {
                 Some(member) if member.is_direct() => Membership::Selected,
                 Some(_) => Membership::Expanded,
                 None => Membership::Dependency,
@@ -523,8 +679,7 @@ impl Planner {
                             .collect()
                     })
                     .unwrap_or_default(),
-                Membership::Expanded => selection
-                    .get(id)
+                Membership::Expanded => member(id)
                     .map(|member| {
                         member
                             .expanded
@@ -540,7 +695,7 @@ impl Planner {
                     })
                     .unwrap_or_default(),
                 Membership::Dependency => {
-                    vec![match requiring_model(compilation, id, &member_ids) {
+                    vec![match requiring.get(id).cloned() {
                         Some(required_by) => PlanReason::about(
                             ReasonKind::SelectedDependency,
                             format!("required by selected model {required_by}"),
@@ -557,23 +712,18 @@ impl Planner {
             let (action, mut change_reasons, current_record, exists) = if blocked {
                 (PlanAction::Unknown, Vec::new(), None, false)
             } else {
-                let exists = self.adapter.relation_exists(&model.target).await?;
-                let current = match &self.state {
-                    Some(state) => {
-                        state.materialized_version(&id.logical_name(), environment.as_deref())?
-                    }
-                    None => None,
+                let evidence = ModelEvidence {
+                    exists: exists_map
+                        .get(&model.target.display())
+                        .copied()
+                        .unwrap_or(false),
+                    current: materialized.get(&id.logical_name()),
+                    elsewhere: by_hash.get(&desired.hash).map(Vec::as_slice).unwrap_or(&[]),
+                    live_output: live_outputs.get(&model.target.display()).cloned().flatten(),
                 };
-                let (action, reasons) = self
-                    .decide(
-                        model,
-                        current.as_ref(),
-                        exists,
-                        environment.as_deref(),
-                        options,
-                    )
-                    .await?;
-                (action, reasons, current, exists)
+                let (action, reasons) =
+                    self.decide(model, &evidence, environment.as_deref(), options)?;
+                (action, reasons, evidence.current, evidence.exists)
             };
             reasons.append(&mut change_reasons);
 
@@ -635,41 +785,12 @@ impl Planner {
                 }
             }
 
-            // Schema-change classification can force a full rebuild.
+            // Schema-change classification can force a full rebuild. The
+            // column reads are deferred to a batch after the loop — the
+            // planner cannot know which models need them until actions are
+            // decided, but the read itself is order-independent.
             if action == PlanAction::Build && exists && model.schema.known {
-                if let Ok(columns) = self.adapter.relation_columns(&model.target).await {
-                    let current_schema: Vec<SchemaColumn> = columns
-                        .iter()
-                        .map(|column| SchemaColumn {
-                            name: column.name.clone(),
-                            data_type: DataType::parse_trino(&column.data_type),
-                            nullability: Nullability::Unknown,
-                        })
-                        .collect();
-                    let desired_schema: Vec<SchemaColumn> = model
-                        .schema
-                        .columns
-                        .iter()
-                        .map(|column| SchemaColumn {
-                            name: column.name.clone(),
-                            data_type: column.data_type.clone(),
-                            nullability: column.nullability,
-                        })
-                        .collect();
-                    let safety = classify_schema_change(&desired_schema, &current_schema);
-                    if safety != SchemaChangeSafety::Safe {
-                        reasons.push(PlanReason::simple(
-                            ReasonKind::SchemaChange,
-                            schema_change_detail(&desired_schema, &current_schema, safety),
-                        ));
-                        if matches!(
-                            safety,
-                            SchemaChangeSafety::FullRebuildRequired | SchemaChangeSafety::Error
-                        ) {
-                            full_rebuild = true;
-                        }
-                    }
-                }
+                schema_checks.push((models.len(), model.target.clone(), model));
             }
 
             // Time-window models resume from the last successful watermark.
@@ -714,6 +835,52 @@ impl Planner {
             });
         }
 
+        // Deferred schema-change classification — one batched column read
+        // for every model whose build decision depends on the live schema.
+        if !schema_checks.is_empty() {
+            let relations: Vec<Relation> = schema_checks
+                .iter()
+                .map(|(_, relation, _)| relation.clone())
+                .collect();
+            let found = self.adapter.relation_columns_many(&relations).await;
+            for ((index, _, model), columns) in schema_checks.iter().zip(found) {
+                let Ok(columns) = columns else {
+                    continue;
+                };
+                let current_schema: Vec<SchemaColumn> = columns
+                    .iter()
+                    .map(|column| SchemaColumn {
+                        name: column.name.clone(),
+                        data_type: DataType::parse_trino(&column.data_type),
+                        nullability: Nullability::Unknown,
+                    })
+                    .collect();
+                let desired_schema: Vec<SchemaColumn> = model
+                    .schema
+                    .columns
+                    .iter()
+                    .map(|column| SchemaColumn {
+                        name: column.name.clone(),
+                        data_type: column.data_type.clone(),
+                        nullability: column.nullability,
+                    })
+                    .collect();
+                let safety = classify_schema_change(&desired_schema, &current_schema);
+                if safety != SchemaChangeSafety::Safe {
+                    models[*index].reasons.push(PlanReason::simple(
+                        ReasonKind::SchemaChange,
+                        schema_change_detail(&desired_schema, &current_schema, safety),
+                    ));
+                    if matches!(
+                        safety,
+                        SchemaChangeSafety::FullRebuildRequired | SchemaChangeSafety::Error
+                    ) {
+                        models[*index].full_rebuild = true;
+                    }
+                }
+            }
+        }
+
         let tests = compilation
             .tests
             .iter()
@@ -743,22 +910,12 @@ impl Planner {
             exclude: selection.exclude_terms.clone(),
             matched: order
                 .iter()
-                .filter(|id| {
-                    selection
-                        .get(id)
-                        .map(|member| member.is_direct())
-                        .unwrap_or(false)
-                })
+                .filter(|id| member(id).is_some_and(|member| member.is_direct()))
                 .map(|id| id.logical_name())
                 .collect(),
             expanded: order
                 .iter()
-                .filter(|id| {
-                    selection
-                        .get(id)
-                        .map(|member| !member.is_direct())
-                        .unwrap_or(false)
-                })
+                .filter(|id| member(id).is_some_and(|member| !member.is_direct()))
                 .map(|id| id.logical_name())
                 .collect(),
             required: order
@@ -844,14 +1001,22 @@ impl Planner {
         }
     }
 
-    async fn decide(
+    /// Decide a single model from already-fetched evidence: the batched
+    /// existence probe, the environment's materialisation record, the
+    /// bulked same-version records from other environments, and the live
+    /// output identity read in the prefetch pass. No adapter or state calls
+    /// happen here — the caller fetched everything this needs.
+    fn decide(
         &self,
         model: &CompiledModel,
-        current: Option<&MaterializedRecord>,
-        exists: bool,
+        evidence: &ModelEvidence<'_>,
         environment: Option<&str>,
         options: &PlanOptions,
     ) -> Result<(PlanAction, Vec<PlanReason>), EngineError> {
+        let exists = evidence.exists;
+        let current = evidence.current;
+        let elsewhere = evidence.elsewhere;
+        let live_output = &evidence.live_output;
         let desired = &model.version;
         if options.force {
             return Ok((
@@ -878,8 +1043,7 @@ impl Planner {
             // whose recorded strong output identity still matches what the
             // relation reports. A record without a verifiable output
             // identity is a version hash, not evidence.
-            if let Some(state) = &self.state {
-                let elsewhere = state.materialized_by_hash(&desired.hash)?;
+            if self.state.is_some() {
                 let elsewhere: Vec<&MaterializedRecord> = elsewhere
                     .iter()
                     .filter(|record| record.environment.as_deref() != environment)
@@ -893,12 +1057,7 @@ impl Planner {
                     .copied()
                     .collect();
                 if !candidates.is_empty() {
-                    let live = self
-                        .adapter
-                        .output_identity(&model.target)
-                        .await
-                        .ok()
-                        .flatten();
+                    let live = live_output.clone();
                     if let Some(hit) = candidates.iter().find(|record| {
                         record.output_identity.is_some() && record.output_identity == live
                     }) {
@@ -1027,12 +1186,7 @@ impl Planner {
         // can prove means another writer overwrote the relation — the record
         // is stale, whatever the version hash says.
         if let Some(recorded_output) = &current.output_identity {
-            let live = self
-                .adapter
-                .output_identity(&model.target)
-                .await
-                .ok()
-                .flatten();
+            let live = live_output;
             if live.as_deref() != Some(recorded_output.as_str()) {
                 return Ok((
                     PlanAction::Build,
@@ -1042,7 +1196,8 @@ impl Planner {
                             "{} no longer holds the recorded output{} — another writer owns \
                              the relation",
                             model.target.display(),
-                            live.map(|live| format!(" (now `{live}`)"))
+                            live.as_ref()
+                                .map(|live| format!(" (now `{live}`)"))
                                 .unwrap_or_default()
                         ),
                     )],
@@ -1341,27 +1496,100 @@ fn dependency_closure_excluding(
     included
 }
 
-/// The selected model that pulls `id` into the plan — the nearest selected
-/// dependent, for "required by X" explanations.
-fn requiring_model(
-    compilation: &Compilation,
-    id: &ModelId,
-    selected: &BTreeSet<ModelId>,
-) -> Option<String> {
-    let mut seen: BTreeSet<ModelId> = BTreeSet::new();
-    let mut frontier: VecDeque<ModelId> = [id.clone()].into_iter().collect();
-    while let Some(current) = frontier.pop_front() {
-        for dependent in compilation.dependents(&current) {
-            if !seen.insert(dependent.clone()) {
-                continue;
+/// The per-model evidence `decide` consumes — every field is fetched in the
+/// planner's batched prefetch pass, so deciding a model costs no round trips.
+struct ModelEvidence<'a> {
+    /// The target relation exists (batched `relations_exist` probe).
+    exists: bool,
+    /// The version recorded for this model in the plan's environment scope.
+    current: Option<&'a MaterializedRecord>,
+    /// Same-version records materialised anywhere — cache-reuse candidates.
+    elsewhere: &'a [MaterializedRecord],
+    /// The relation's live output identity, when one was probed.
+    live_output: Option<String>,
+}
+
+/// The materialisation records a plan consults for `environment`: the
+/// env's own records keyed by model id. `main` and the unlabeled default
+/// share one physical catalog, so each folds the other's records in —
+/// matching the scope `branch_diff` uses — with the latest
+/// `materialized_at` winning when both describe the same model.
+fn materialized_scope(
+    state: &dyn StateStore,
+    environment: Option<&str>,
+) -> Result<BTreeMap<String, MaterializedRecord>, EngineError> {
+    match environment {
+        Some(environment) => crate::branch_diff::materialized_for_environment(state, environment),
+        None => {
+            let mut records: BTreeMap<String, MaterializedRecord> = state
+                .materialized_in(None)?
+                .into_iter()
+                .map(|record| (record.model_id.clone(), record))
+                .collect();
+            for record in state.materialized_in(Some("main"))? {
+                match records.get(&record.model_id) {
+                    Some(existing) if existing.materialized_at >= record.materialized_at => {}
+                    _ => {
+                        records.insert(record.model_id.clone(), record);
+                    }
+                }
             }
-            if selected.contains(&dependent) {
-                return Some(dependent.logical_name());
-            }
-            frontier.push_back(dependent);
+            Ok(records)
         }
     }
-    None
+}
+
+/// The seed records a plan consults for `environment` — the same
+/// default/`main` convention as [`materialized_scope`], latest `loaded_at`
+/// wins.
+fn seeds_scope(
+    state: &dyn StateStore,
+    environment: Option<&str>,
+) -> Result<BTreeMap<String, SeedRecord>, EngineError> {
+    match environment {
+        Some(environment) => crate::branch_diff::seeds_for_environment(state, environment),
+        None => {
+            let mut records: BTreeMap<String, SeedRecord> = state
+                .seeds_in(None)?
+                .into_iter()
+                .map(|record| (record.name.clone(), record))
+                .collect();
+            for record in state.seeds_in(Some("main"))? {
+                match records.get(&record.name) {
+                    Some(existing) if existing.loaded_at >= record.loaded_at => {}
+                    _ => {
+                        records.insert(record.name.clone(), record);
+                    }
+                }
+            }
+            Ok(records)
+        }
+    }
+}
+
+/// For every model the selection pulls in, the nearest selected dependent
+/// that requires it — one multi-source BFS from the selection down the
+/// dependency edges, instead of a per-model walk that costs O(E) each.
+fn requiring_models(
+    compilation: &Compilation,
+    selected: &BTreeSet<ModelId>,
+) -> BTreeMap<ModelId, String> {
+    let mut claims: BTreeMap<ModelId, String> = BTreeMap::new();
+    let mut frontier: VecDeque<(ModelId, ModelId)> =
+        selected.iter().map(|id| (id.clone(), id.clone())).collect();
+    while let Some((current, source)) = frontier.pop_front() {
+        for dependency in compilation.dependencies(&current) {
+            let Dependency::Model(dependency_id) = dependency else {
+                continue;
+            };
+            if selected.contains(&dependency_id) || claims.contains_key(&dependency_id) {
+                continue;
+            }
+            claims.insert(dependency_id.clone(), source.logical_name());
+            frontier.push_back((dependency_id, source.clone()));
+        }
+    }
+    claims
 }
 
 /// Abbreviate a hash/id for display: keep the recognisable prefix.
