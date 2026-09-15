@@ -1,11 +1,11 @@
 # Phlo Transform
 
-**Status:** Proposed  
+**Status:** Implemented  
 **Language:** Rust  
 **Primary execution target:** Trino + Iceberg + Nessie  
 **Secondary targets:** DuckDB, PostgreSQL  
 **Primary host:** Phlo  
-**CLI namespace:** `phlo transform`
+**CLI namespace:** `phlo-transform`
 
 ## 1. Executive summary
 
@@ -519,7 +519,7 @@ materialized = "table"
 Nested folder configuration may be supported. Effective configuration must always be inspectable:
 
 ```bash
-phlo transform inspect assay.results --config
+phlo-transform inspect assay.results --config
 ```
 
 ## 18. Model metadata syntax
@@ -930,7 +930,7 @@ Materialisation records are ordered writes, not last-writer-wins: `model_version
 Planning is a core command:
 
 ```bash
-phlo transform plan
+phlo-transform plan
 ```
 
 Every decided model carries at least one structured reason; the human
@@ -974,13 +974,13 @@ model's `membership` (`selected` / `expanded` / `dependency`).
 ## 41. `apply`
 
 ```bash
-phlo transform apply
+phlo-transform apply
 ```
 
 Ideally, `apply` executes a previously calculated plan:
 
 ```bash
-phlo transform apply <plan-id>
+phlo-transform apply <plan-id>
 ```
 
 This guarantees execution matches the inspected plan unless source state invalidates it.
@@ -994,15 +994,15 @@ A plan becomes stale when relevant conditions change, including source snapshot,
 All planning commands share one selector engine (see §82). Examples:
 
 ```bash
-phlo transform plan assay.results        # one model + its dependencies
-phlo transform plan assay.results+       # …plus transitive dependents
-phlo transform plan +assay.results       # explicit upstream expansion
-phlo transform plan 'assay.*'            # namespace glob
-phlo transform plan source:lims+         # models reading lims + dependents
-phlo transform plan --tag qc             # intersect the selection by tag
-phlo transform plan --changed            # desired version ≠ recorded state
-phlo transform plan --select assay.* --exclude assay.legacy_raw
-phlo transform plan --downstream assay.results
+phlo-transform plan assay.results        # one model + its dependencies
+phlo-transform plan assay.results+       # …plus transitive dependents
+phlo-transform plan +assay.results       # explicit upstream expansion
+phlo-transform plan 'assay.*'            # namespace glob
+phlo-transform plan source:lims+         # models reading lims + dependents
+phlo-transform plan --tag qc             # intersect the selection by tag
+phlo-transform plan --changed            # desired version ≠ recorded state
+phlo-transform plan --select assay.* --exclude assay.legacy_raw
+phlo-transform plan --downstream assay.results
 ```
 
 Positional selector terms and `--select` are equivalent. `--exclude` is
@@ -1035,12 +1035,12 @@ Avoid building a separate environment abstraction when Nessie already provides o
 A Git branch may map automatically or explicitly to a Nessie reference. Explicit form:
 
 ```bash
-phlo transform --ref feature/new-assay plan
+phlo-transform --ref feature/new-assay plan
 ```
 
 References are managed explicitly — `ref list`, `ref show`, `ref create --from <base>` and `ref delete` — and no command creates or deletes a branch as a side effect, except explicit candidate provisioning on `apply`/`run --ref` and `--cleanup` on `promote`. `plan`/`test --ref` resolve the same environment read-only — they compute the physical catalog and compile against it without creating anything. `ref delete main` is refused: `main` is the default base, not a scratch branch. Provisioning is recorded per candidate in `environment_<sanitised ref>_<hash>.json` (plus the single-slot `environment.json`), and deleted with the branch. Each artifact carries `created_from` — the reference and commit the candidate was provably created from, recorded at `ref create` or first provisioning and preserved across re-provisioning — and the physical `catalog` plus a `catalog_status` (`created` / `unverified` / `unmanaged`). A pre-existing branch Phlo did not create has unrecorded provenance; promotion refuses it rather than redefine its base as the current target head.
 
-Candidate catalogs are named `phlo_<sanitised-ref>_<hash>` — the readable ref plus 8 hex of its SHA-256 — so punctuation-equivalent refs (`ci/pr-1`, `ci_pr_1`) can never collide on one physical catalog. Because a catalog's bound Nessie ref cannot be read back over SQL, an existing catalog is never adopted on name alone: `unverified` catalogs are accepted only when the name is the candidate's own generated convention or a recorded artifact binds it to the same ref, and a catalog another candidate's evidence claims is refused outright.
+Candidate catalogs are named `phlo_<sanitised-ref>_<hash>` — the readable ref plus 8 hex of its SHA-256 — so punctuation-equivalent refs (`ci/pr-1`, `ci_pr_1`) can never collide on one physical catalog. Because a catalog's bound Nessie ref cannot be read back over SQL and the generated name is a public convention anyone can mint, an existing catalog is never adopted on name alone: `unverified` catalogs are accepted only when a recorded artifact binds that catalog to this ref (an artifact that observed the catalog, or an explicit `ref create --catalog` pin), and a catalog another candidate's evidence claims is refused outright. A rejected catalog rolls back a just-created candidate branch so a failed provisioning attempt leaves nothing behind.
 
 ## 46. Write-Audit-Publish
 
@@ -1079,8 +1079,8 @@ Transforms should not write directly to canonical production state by default.
 Example:
 
 ```bash
-phlo transform promote feature/new-assay --to main
-phlo transform promote --from feature/new-assay --to main
+phlo-transform promote feature/new-assay --to main
+phlo-transform promote --from feature/new-assay --to main
 ```
 
 Promotion is authorised by named gates, reported identically in human and JSON output: `run` (latest candidate run passed and validated the exact commit being promoted — a passed run is bound to the candidate head **after** its writes land, and a candidate that advanced since its run, or a run recorded before commit binding, fails), `tests` (no failed tests), `blocked` (no blocked/cancelled model, seed or test work), `schema` (a fresh audited diff inspected this pair at these commits and found no unwaived breaking changes — physical breaks come from the audited diff; contract breaks are computed live from the workspace's desired contracts against the target's recorded contracts, so a post-`diff` contract edit cannot slip past — and absent or stale evidence fails closed, never reading "no evidence" as "no changes"), `data_diff` (when `--require-diff` is set: a passing `--full` audited diff bound to this candidate→target pair at the commits being promoted — the artifact records both refs' resolved heads and is rejected when they no longer match — still fresh per recorded versions, and never a self-comparison; a single-model `diff.json` is never promotion evidence), `base` (the target still equals the commit the evidence was established against — the hash-bound artifact's recorded base, else the candidate's `created_from` provenance; unknown provenance fails rather than redefining the base as the current head, and the merge asserts the evaluated target hash) and `conflicts` (the merge check is clean). A candidate that advanced between gate evaluation and merge is refused rather than promoted unaudited. `--check` evaluates gates without merging; a passing promotion merges and persists a `PromotionRecord` (refs, hashes, plan/run ids, gate results, timestamp) in the state store.
@@ -1092,7 +1092,7 @@ Preconditions may include successful plan, successful execution, required tests 
 Because published table state is versioned, rollback is a first-class operation:
 
 ```bash
-phlo transform rollback assay.results --to <version>
+phlo-transform rollback assay.results --to <version>
 ```
 
 or through environment-level Nessie rollback semantics.
@@ -1160,8 +1160,8 @@ This must be available during planning before data is modified.
 Native command:
 
 ```bash
-phlo transform diff assay.results
-phlo transform diff --from feature/new-assay --to main
+phlo-transform diff assay.results
+phlo-transform diff --from feature/new-assay --to main
 ```
 
 With no model argument, `diff` compares two Nessie references: every dataset known to the workspace or recorded in state is classified `added`/`removed`/`changed`/`unchanged`/`absent`, schema and nullability changes are listed per model, row counts come from the catalogs, and `--full` runs keyed value diffs on changed models. `main`'s records include the default (unlabeled) environment, so state from a run with no `--ref` still counts. When Nessie is configured the report records both refs' resolved commit hashes, binding the evidence to exact branch heads. The report is the audit artifact promotion consumes.
@@ -1202,7 +1202,7 @@ full
 Large-table defaults should avoid expensive full comparison.
 
 ```bash
-phlo transform diff assay.results --full
+phlo-transform diff assay.results --full
 ```
 
 ## 54. Diff policies
@@ -1252,7 +1252,7 @@ The graph is indexed and deterministic; `document()` serialises it and
 [`docs/lineage.md`](docs/lineage.md).
 
 ```bash
-phlo transform lineage assay.assay_results
+phlo-transform lineage assay.assay_results
 ```
 
 ```text
@@ -1290,7 +1290,7 @@ audits that provenance and reports the delta as `current`, `advisory`, or
 ## 56. Column lineage
 
 ```bash
-phlo transform lineage assay.assay_results.result
+phlo-transform lineage assay.assay_results.result
 ```
 
 ```text
@@ -1310,8 +1310,8 @@ grouping/sort keys) and prints the column's confidence when it is not
 ## 57. Impact analysis
 
 ```bash
-phlo transform impact assay.results.result
-phlo transform impact external.samples.volume
+phlo-transform impact assay.results.result
+phlo-transform impact external.samples.volume
 ```
 
 Returns downstream columns, models, workflows, tests and registered published
@@ -1589,7 +1589,7 @@ These files are interfaces, not incidental logs.
 Primary interface:
 
 ```text
-phlo transform
+phlo-transform
 ```
 
 ## 77. CLI commands
@@ -1597,21 +1597,21 @@ phlo transform
 Core commands:
 
 ```bash
-phlo transform check
-phlo transform plan
-phlo transform apply
-phlo transform run
-phlo transform test
-phlo transform inspect
-phlo transform explain
-phlo transform lineage
-phlo transform impact
-phlo transform diff
-phlo transform list
-phlo transform promote
-phlo transform rollback
-phlo transform clean
-phlo transform state runs|show|model|promotions
+phlo-transform check
+phlo-transform plan
+phlo-transform apply
+phlo-transform run
+phlo-transform test
+phlo-transform inspect
+phlo-transform explain
+phlo-transform lineage
+phlo-transform impact
+phlo-transform diff
+phlo-transform list
+phlo-transform promote
+phlo-transform rollback
+phlo-transform clean
+phlo-transform state runs|show|model|promotions
 ```
 
 The state backend is selected by `--state`/`PHLO_STATE_URL`: a `postgres://`/`postgresql://` URL selects the shared PostgreSQL store; anything else is a SQLite file path (default `.phlo/transform/state.db`).
@@ -1621,7 +1621,7 @@ The state backend is selected by `--state`/`PHLO_STATE_URL`: a `postgres://`/`po
 Compile and statically validate without planning execution:
 
 ```bash
-phlo transform check
+phlo-transform check
 ```
 
 Output includes SQL parse errors, unresolved relations, ambiguous references, circular dependencies, type mismatches and contract errors.
@@ -1635,12 +1635,12 @@ Convenience command, broadly `plan + apply`, intended for development environmen
 Execution flags apply to `run`/`apply` alike:
 
 ```bash
-phlo transform run --jobs 4              # bounded concurrency
-phlo transform run --retries 2           # transient-failure retries
-phlo transform run --fail-fast           # stop scheduling on first failure
-phlo transform run --model-timeout 30m   # per-attempt timeout
-phlo transform run --resume <run-id>     # continue an interrupted run
-phlo transform run --retry-failed <run-id>  # new run over the failed portion
+phlo-transform run --jobs 4              # bounded concurrency
+phlo-transform run --retries 2           # transient-failure retries
+phlo-transform run --fail-fast           # stop scheduling on first failure
+phlo-transform run --model-timeout 30m   # per-attempt timeout
+phlo-transform run --resume <run-id>     # continue an interrupted run
+phlo-transform run --retry-failed <run-id>  # new run over the failed portion
 ```
 
 `--resume`/`--retry-failed` take a full run id or a unique prefix; selection flags do not apply to them — the prior run defines the work.
@@ -1648,7 +1648,7 @@ phlo transform run --retry-failed <run-id>  # new run over the failed portion
 ## 80. `inspect`
 
 ```bash
-phlo transform inspect assay.results
+phlo-transform inspect assay.results
 ```
 
 Example:
@@ -1683,7 +1683,7 @@ configured the relation-existence check makes the decision identical to
 `plan`):
 
 ```bash
-phlo transform explain assay.results
+phlo-transform explain assay.results
 ```
 
 ```text
@@ -1733,7 +1733,7 @@ than silently widening.
 CLI mapping:
 
 ```bash
-phlo transform plan assay.results 'assay.*'   # positional terms
+phlo-transform plan assay.results 'assay.*'   # positional terms
 --select tag:qc                               # same grammar via flag
 --exclude assay.legacy_raw                    # subtract (applied last)
 --tag qc --workflow assay_ingest              # intersect filters
@@ -1756,10 +1756,10 @@ The `changed` term has two providers answering different questions:
   impact comes from selector expansion (`changed+`), not from the diff.
 
 ```bash
-phlo transform plan --since main            # shorthand for --select changed --since main
-phlo transform plan --since main --select changed+
-phlo transform run --since origin/main
-phlo transform impact --since main          # blast radius of the diff
+phlo-transform plan --since main            # shorthand for --select changed --since main
+phlo-transform plan --since main --select changed+
+phlo-transform run --since origin/main
+phlo-transform impact --since main          # blast radius of the diff
 ```
 
 `--since` compares `merge-base(<ref>, HEAD)` against the working tree —
@@ -1805,10 +1805,10 @@ Phlo Transform must be explicitly designed for machine interaction.
 Examples:
 
 ```bash
-phlo transform inspect assay.results --json
-phlo transform lineage assay.results --json
-phlo transform impact assay.results.result --json
-phlo transform plan --json
+phlo-transform inspect assay.results --json
+phlo-transform lineage assay.results --json
+phlo-transform impact assay.results.result --json
+phlo-transform plan --json
 ```
 
 Agents should query compiler truth directly.
@@ -1835,7 +1835,7 @@ without manually parsing source files.
 ## 85. Transform daemon
 
 ```bash
-phlo transform daemon
+phlo-transform daemon
 ```
 
 The daemon maintains an in-memory workspace representation containing parsed ASTs, typed ASTs, dependency graph, catalogue schemas, lineage, hashes, filesystem state and compiled plans, published as an immutable `Arc<Compilation>` snapshot so readers never observe partial updates.
@@ -1847,7 +1847,7 @@ It serves a versioned local HTTP API (see `docs/daemon.md`) with two planes:
 
 Environment-targeted operations run the same provisioning the CLI applies for `--ref`: with a catalog-facing Nessie URI configured, `run`/`resume`/`retry_failed` ensure the candidate branch and its branch-scoped catalog, recompile the workspace retargeted at it, and bind a passed run to the environment's post-run Nessie head — `main` is never written. When Nessie is configured but branch isolation cannot be provisioned (no catalog-facing URI or adapter), a non-base environment run fails with `API007` rather than recording falsely-labelled evidence; without any Nessie client the environment is an honest state label. A continuation targets the stored run's environment, not a requested one.
 
-Operations and reads share one environment resolution path (`EnvironmentContext::resolve`). Mutating work resolves in `Ensure` mode — provision, then compile retargeted. `GET /v1/plan?environment=&base=` resolves in `ReadOnly` mode — the same physical catalog (override → recorded binding → generated `phlo_<ref>_<hash>` name) and a retargeted compile, but no branch created and no evidence written. The plan it previews names exactly the targets a run against that environment executes.
+Operations and reads share one environment resolution path (`EnvironmentContext::resolve`). Mutating work resolves in `Ensure` mode — provision, then compile retargeted. `GET /v1/plan?environment=&base=` resolves in `ReadOnly` mode — the same physical catalog (override → recorded binding → generated `phlo_<ref>_<hash>` name) and a retargeted compile, but no branch created and no evidence written. The plan it previews names exactly the targets a run against that environment executes — including failure: when resolution lands on the generated catalog and the adapter cannot provision catalogs, `ReadOnly` fails `API007` just as `Ensure` would, rather than preview a target no run reaches. An explicit or recorded catalog pin remains the escape hatch.
 
 Promotion through the API uses the same audited evidence path as the CLI (`phlo_transform_engine::audit`): the gate reads the diff artifacts (`branch_diff.json` preferred, bound to both refs' resolved heads), the recorded provisioning environment (`created_from` provenance), live contract diffs against the target's recorded contracts, the lineage-diff artifact's provenance (including the candidate's lineage fingerprint), and the Nessie merge check — so CLI and API cannot drift apart on what counts as evidence. An unbound run cannot promote a commit-bound candidate.
 
@@ -1884,7 +1884,7 @@ edit SQL
    ↓
 instant static feedback
    ↓
-phlo transform plan
+phlo-transform plan
    ↓
 inspect changes
    ↓
@@ -2193,9 +2193,9 @@ Typical CI:
 ```text
 checkout
    ↓
-phlo transform check
+phlo-transform check
    ↓
-phlo transform plan --base main
+phlo-transform plan --base main
    ↓
 create CI Nessie branch
    ↓
@@ -2403,7 +2403,7 @@ It must then:
 A mature release should allow a developer to run:
 
 ```bash
-phlo transform plan
+phlo-transform plan
 ```
 
 and understand what changed, why, what will execute, what data may change, what schemas will change, which downstream models are affected, what tests will run and whether promotion is safe.
@@ -2411,7 +2411,7 @@ and understand what changed, why, what will execute, what data may change, what 
 Then:
 
 ```bash
-phlo transform apply
+phlo-transform apply
 ```
 
 should execute only required work, run appropriate tests, persist reproducible execution state, generate complete artifacts and leave production unaffected until promotion.
@@ -2419,7 +2419,7 @@ should execute only required work, run appropriate tests, persist reproducible e
 Then:
 
 ```bash
-phlo transform promote
+phlo-transform promote
 ```
 
 should atomically publish approved state where supported.

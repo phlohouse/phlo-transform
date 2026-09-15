@@ -889,12 +889,46 @@ async fn plan_and_run_against_an_environment_target_the_same_catalog() {
         .unwrap_or_else(|| panic!("shared.sites missing from run: {done}"));
     assert_eq!(run_target, plan_target, "{done}");
 
-    // Without the override the environment resolves its own generated name —
-    // still collision-safe and still identical between plan and run. The run
-    // itself fails on DuckDB (no `phlo_dev_*` catalog exists), so only the
-    // plan side is asserted here.
+    // Without the override the environment resolves its own generated
+    // name — and DuckDB cannot provision it, so plan and run now fail
+    // closed the same way (covered by
+    // `plan_fails_closed_when_the_adapter_cannot_provision` below).
     let generated = catalog_name("dev");
     assert!(generated.starts_with("phlo_dev_"));
+}
+
+/// A `plan(environment)` whose generated catalog needs provisioning the
+/// adapter cannot perform fails closed — the same API007 the run gets,
+/// not a preview of a target no run could reach. An explicit `--catalog`
+/// pin stays the escape hatch (asserted by
+/// `plan_and_run_against_an_environment_target_the_same_catalog` above).
+#[tokio::test]
+async fn plan_fails_closed_when_the_adapter_cannot_provision() {
+    use phlo_transform_nessie::InMemoryNessie;
+
+    let dir = duckdb_workspace();
+    let nessie = Arc::new(InMemoryNessie::new());
+    nessie.seed("main", "aaaa").seed("dev", "bbbb");
+    let (base, _service) = start_with_config(
+        dir.path().to_path_buf(),
+        ServiceConfig {
+            adapter: Some(Arc::new(DuckDbAdapter::in_memory().expect("duckdb"))),
+            nessie: Some(nessie),
+            nessie_uri: Some("http://nessie.invalid".to_string()),
+            ..ServiceConfig::default()
+        },
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!("{base}/v1/plan?environment=dev"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status().as_u16(), 503);
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "API007", "{body}");
 }
 
 /// A `plan(environment)` on a Nessie-configured service that cannot

@@ -63,7 +63,9 @@ implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
 - **Phase 1 — MVP build engine: done.** Trino adapter, view/table
   materialisations, `plan`/`apply`/`run`/`test`, bounded-concurrency scheduler,
   custom SQL tests, SQLite run history, cancellation and versioned artifacts.
-  See [`docs/engine.md`](docs/engine.md). Retries are not automated.
+  `--retries N` retries retryable adapter failures with bounded backoff;
+  `--resume`/`--retry-failed` continue interrupted runs.
+  See [`docs/engine.md`](docs/engine.md).
 - **Phase 2 — typed compiler and lineage: partial.** Typed semantic IR, schema
   provider boundary and catalogue enrichment, column resolution and type
   inference, inferred output schemas, a canonical lineage graph behind

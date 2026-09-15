@@ -536,6 +536,12 @@ impl Adapter for TrinoAdapter {
         out
     }
 
+    fn supports_catalog_provisioning(&self) -> bool {
+        // Trino provisions dynamic catalogs — `ensure_catalog` issues
+        // `CREATE CATALOG` bound to the candidate's Nessie ref.
+        true
+    }
+
     async fn ensure_catalog(
         &self,
         request: &CatalogRequest,

@@ -535,6 +535,12 @@ impl Adapter for FakeAdapter {
             .collect()
     }
 
+    /// The `catalogs_unmanaged` flag plays a non-provisioning adapter
+    /// (like DuckDB) — read-only resolution consults the same answer.
+    fn supports_catalog_provisioning(&self) -> bool {
+        !self.catalogs_unmanaged.load(Ordering::SeqCst)
+    }
+
     async fn ensure_catalog(
         &self,
         request: &CatalogRequest,
@@ -5677,6 +5683,90 @@ async fn an_unverified_catalog_with_no_recorded_binding_is_refused() {
 }
 
 #[tokio::test]
+async fn an_unverified_generated_catalog_with_no_artifact_is_refused() {
+    // The generated name is a public convention — a stale install, an
+    // admin or a failed old run can mint `phlo_<ref>_<hash>` pointed at
+    // some other Nessie ref. With no recorded binding the ensure must
+    // refuse, roll back the branch it just created, and leave no
+    // evidence claiming the binding.
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let adapter = FakeAdapter::default();
+    adapter
+        .catalogs
+        .lock()
+        .unwrap()
+        .insert(catalog_name("ci/x"));
+    let dir = tempfile::tempdir().unwrap();
+
+    let error = ensure_candidate(
+        dir.path(),
+        &nessie,
+        &adapter,
+        &EnvironmentSpec {
+            catalog: None,
+            ..environment_spec("ci/x")
+        },
+    )
+    .await
+    .expect_err("a generated-name catalog is not adopted on name alone");
+
+    assert!(error.to_string().contains("cannot be verified"), "{error}");
+    assert!(
+        nessie.get_reference("ci/x").await.unwrap().is_none(),
+        "the branch created for a rejected catalog is rolled back"
+    );
+    assert!(
+        read_environment_for(dir.path(), "ci/x").is_none(),
+        "no artifact claims a refused binding"
+    );
+}
+
+#[tokio::test]
+async fn a_ref_create_artifact_does_not_adopt_a_stale_generated_catalog() {
+    // `ref create` records the conventional name with `Unmanaged` status —
+    // intent, written before any catalog existed. It cannot vouch for a
+    // catalog that appeared later: an `Unverified` answer needs a binding
+    // that observed the catalog, or an explicit non-conventional pin.
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa").seed("ci/x", "bbb");
+    let adapter = FakeAdapter::default();
+    adapter
+        .catalogs
+        .lock()
+        .unwrap()
+        .insert(catalog_name("ci/x"));
+    let dir = tempfile::tempdir().unwrap();
+    write_environment_artifacts(
+        dir.path(),
+        &EnvironmentSetup {
+            base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
+            candidate: phlo_transform_nessie::ReferenceInfo::branch("ci/x", "bbb"),
+            created_from: Some(phlo_transform_nessie::ReferenceInfo::branch("main", "aaa")),
+            created_branch: true,
+            catalog: catalog_name("ci/x"),
+            catalog_status: CatalogStatus::Unmanaged,
+            catalog_owned_by_phlo: None,
+        },
+    )
+    .expect("writes");
+
+    let error = ensure_candidate(
+        dir.path(),
+        &nessie,
+        &adapter,
+        &EnvironmentSpec {
+            catalog: None,
+            ..environment_spec("ci/x")
+        },
+    )
+    .await
+    .expect_err("a ref-create intent is not a catalog binding");
+
+    assert!(error.to_string().contains("cannot be verified"), "{error}");
+}
+
+#[tokio::test]
 async fn a_catalog_claimed_by_another_candidate_is_refused() {
     let nessie = InMemoryNessie::new();
     nessie
@@ -6179,6 +6269,110 @@ async fn a_nessie_backed_environment_without_a_catalog_uri_fails_closed() {
             Ok(_) => panic!("a claimed branch without provisioning capability must fail"),
         }
     }
+}
+
+#[tokio::test]
+async fn a_non_provisioning_adapter_fails_read_only_and_ensure_the_same_way() {
+    // `plan`/`test` must fail where a later `run` would: a generated
+    // catalog the adapter cannot provision means the environment's
+    // isolation can never be honoured — previewing it anyway would name a
+    // target no run reaches.
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let adapter = FakeAdapter::default();
+    adapter.catalogs_unmanaged.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    write_workspace(dir.path());
+    let context = resolve_context(
+        dir.path(),
+        Some(&nessie),
+        Some(&adapter),
+        Some("http://nessie"),
+    );
+
+    for mode in [EnvironmentMode::ReadOnly, EnvironmentMode::Ensure] {
+        let result = context.resolve(Some("dev"), "main", mode).await;
+        match result {
+            Err(error @ EngineError::NotConfigured(_)) => {
+                assert!(error.to_string().contains("dev"), "{error}");
+            }
+            Err(error) => panic!("expected NotConfigured, got {error}"),
+            Ok(_) => panic!("a generated catalog needing unprovisionable provisioning must fail"),
+        }
+    }
+    assert!(
+        nessie.get_reference("dev").await.unwrap().is_none(),
+        "a failed ensure must not leave a stray branch"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_catalog_resolves_without_provisioning_capability() {
+    // The escape hatch in both modes: an explicit `--catalog` names a
+    // user-managed catalog — nothing needs provisioning, so a
+    // non-provisioning adapter resolves fine.
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let adapter = FakeAdapter::default();
+    adapter.catalogs_unmanaged.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    write_workspace(dir.path());
+    let context = EnvironmentContext {
+        catalog: Some("memory"),
+        ..resolve_context(
+            dir.path(),
+            Some(&nessie),
+            Some(&adapter),
+            Some("http://nessie"),
+        )
+    };
+
+    let preview = context
+        .resolve(Some("dev"), "main", EnvironmentMode::ReadOnly)
+        .await
+        .expect("a pinned catalog previews on a non-provisioning adapter");
+    assert_eq!(preview.catalog.as_deref(), Some("memory"));
+
+    let ensured = context
+        .resolve(Some("dev"), "main", EnvironmentMode::Ensure)
+        .await
+        .expect("a pinned catalog ensures on a non-provisioning adapter");
+    assert_eq!(ensured.catalog.as_deref(), Some("memory"));
+    assert_eq!(
+        ensured.setup.as_ref().map(|setup| setup.catalog_status),
+        Some(CatalogStatus::Unmanaged)
+    );
+}
+
+#[tokio::test]
+async fn a_recorded_binding_resolves_read_only_when_provisioning_is_lost() {
+    // A recorded binding is a pin too: once phlo provisioned the catalog
+    // the workspace stands behind it, so a preview resolves it even when
+    // the adapter later cannot provision at all (e.g. catalog management
+    // was revoked).
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+    write_workspace(dir.path());
+    let context = resolve_context(
+        dir.path(),
+        Some(&nessie),
+        Some(&adapter),
+        Some("http://nessie"),
+    );
+
+    let ensured = context
+        .resolve(Some("dev"), "main", EnvironmentMode::Ensure)
+        .await
+        .expect("ensure while provisioning works");
+    adapter.catalogs_unmanaged.store(true, Ordering::SeqCst);
+
+    let preview = context
+        .resolve(Some("dev"), "main", EnvironmentMode::ReadOnly)
+        .await
+        .expect("the recorded binding is honoured without provisioning");
+    assert_eq!(preview.catalog, ensured.catalog);
 }
 
 #[tokio::test]

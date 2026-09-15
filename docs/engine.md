@@ -111,6 +111,10 @@ pub trait Adapter: Send + Sync {
     /// schema, which would misclassify every column as added.
     async fn relation_columns_many(&self, relations: &[Relation])
         -> Vec<Result<Vec<ColumnInfo>, AdapterError>>;
+    /// Whether `ensure_catalog` can provision a catalog bound to a Nessie
+    /// ref (default `false`) — read-only environment resolution fails a
+    /// preview whose generated catalog the adapter could never create.
+    fn supports_catalog_provisioning(&self) -> bool;
     async fn ensure_catalog(&self, request: &CatalogRequest) -> Result<CatalogStatus, AdapterError>;
     /// Drop a catalog the caller proved phlo owns; quoting is the
     /// adapter's business (default reports UNSUPPORTED).

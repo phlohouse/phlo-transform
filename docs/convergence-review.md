@@ -34,6 +34,11 @@ Now CLI and daemon share `EnvironmentContext::resolve`:
   retargeted compile, but nothing is created and no evidence is written.
   A `plan(environment=X)` names exactly the targets `run(environment=X)`
   executes.
+- `ReadOnly` also applies `Ensure`'s provisioning requirement: when
+  resolution lands on the generated catalog and the adapter cannot
+  provision catalogs (`supports_catalog_provisioning`), the preview fails
+  closed too — it never names a target a run would refuse. An explicit or
+  recorded user-managed pin is the escape hatch.
 - Nessie present but isolation unprovisionable (no adapter or no
   catalog-facing URI) fails closed with `NotConfigured`/`API007` — the run
   never proceeds on the default target while claiming a candidate.
@@ -67,9 +72,13 @@ literally identical rules.
 
 Provisioning records how each catalog was established
 (`created`/`unverified`/`unmanaged`) plus whether Phlo provably owns it.
-A pre-existing catalog is accepted only under the candidate's own generated
-name or a recorded binding; a catalog another candidate claims is refused;
-an `unmanaged` generated name fails closed. `cleanup_candidate` drops only
+A pre-existing catalog is accepted only on a recorded binding — the
+generated name is a public convention anyone can mint, so it proves
+nothing on its own, and a `ref create` intent record cannot vouch for a
+catalog that appeared later. A catalog another candidate claims is
+refused; an `unmanaged` generated name fails closed; a refused
+`unverified` catalog rolls back a just-created branch so a failed
+provisioning attempt leaves nothing behind. `cleanup_candidate` drops only
 catalogs Phlo owns — including legacy `created` records predating the
 ownership flag — and reports every failure rather than leaving silent
 leftovers. Environment artifacts are removed only after the branch and
@@ -186,6 +195,28 @@ is a leaf client. No splits were needed — the fix was moving orchestration
   bulk metadata could narrow this further.
 
 ## Maturity
+
+Levels: **prototype** — the happy path works; failure modes unexplored.
+**functional** — works end to end with documented gaps. **hardened** —
+failure modes handled deliberately and covered by tests; fails closed
+where safety demands. **production** — hardened *and* operationally
+complete; nothing here is there yet.
+
+| area | level | evidence / remaining gap |
+|---|---|---|
+| compiler + diagnostics | hardened | typed IR, deterministic DAG, stable IDs, contracts; unsupported SQL degrades to `Unknown` honestly rather than guessing |
+| dbt translator | functional | 100% of jaffle_shop/canvas-exemplar convert CLEAN; dynamic Jinja/macros, exposures, metrics are REVIEW/UNSUPPORTED by design |
+| lineage + impact | functional | canonical graph, OpenLineage export, `--diff` across refs; offline column lineage needs catalog schemas; unsupported SQL → `Unknown` |
+| planner + state/cache | hardened | batched warehouse+state evidence, synchronous `decide`, cache reuse requires same-relation + same-adapter + strong output identity; `cached` still classifies — reuse is not executed |
+| execution runner | hardened | bounded concurrency, `--retries` backoff on retryable adapter failures, timeouts, cancellation, `--resume`/`--retry-failed`; DuckDB has no remote cancel |
+| incremental models | functional | append/merge/partition/window strategies, watermarks, schema-change rebuilds; Trino `MERGE` verified live; partition replace is a column-list delete, and watermark coverage is not per-adapter |
+| state store | hardened | env-scoped records, `main`↔default fold, SQLite/Postgres parity tested; watermarks deliberately do not fold |
+| environments + provisioning | hardened | one resolve path, fail-closed, recorded bindings, ownership-aware cleanup, branch rollback on rejected catalogs |
+| WAP + promotion | hardened | hash-bound evidence, provenance-required base, merge-time hash recheck, gates fail closed, live golden-path E2E; artifacts are file-local (portability is the top debt) |
+| data diff | functional | keyed/tolerance/partition/sampled diff live-tested; no distribution summaries, no example-value redaction |
+| daemon API | functional | versioned ops API, idempotency, cancellation, coherent snapshots; reload is a full recompile and progress is polled |
+| CLI | hardened | every surface shares engine orchestration; JSON output everywhere; `--environment`/`--ref` agreement enforced |
+| workflow integration | prototype | ownership + `quality_gate` exist; host workflow tasks, run correlation and gating APIs are Phase 7 debt |
 
 The model now holds together: one environment resolution path, one
 promotion audit, one ownership story, one state scope — and every surface

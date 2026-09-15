@@ -155,6 +155,16 @@ pub trait Adapter: Send + Sync {
         out
     }
 
+    /// Whether `ensure_catalog` can provision a catalog bound to a Nessie
+    /// reference (dynamic catalog management). `false` — the default — is
+    /// the honest answer for adapters without it. Environment resolution
+    /// reads this to fail a read-only preview whose generated catalog the
+    /// adapter could never create, instead of previewing a target a run
+    /// would refuse.
+    fn supports_catalog_provisioning(&self) -> bool {
+        false
+    }
+
     /// Ensure a catalog exists for a Nessie reference, reporting what was
     /// established — see [`CatalogStatus`]. Adapters that do not support
     /// catalog provisioning return [`CatalogStatus::Unmanaged`]. An adapter

@@ -86,8 +86,8 @@ impl EnvironmentSetup {
 /// [`CatalogStatus::Unverified`] catalog — one that already existed, whose
 /// bound Nessie ref cannot be read back — is *not* vetted here. Callers
 /// with workspace access must go through [`ensure_candidate`], which
-/// checks unverified catalogs against the recorded binding, the generated
-/// name convention, and claims by other candidates.
+/// accepts an unverified catalog only on a recorded binding and refuses
+/// catalogs claimed by other candidates.
 pub async fn ensure_environment(
     nessie: &dyn NessieClient,
     adapter: &dyn Adapter,
@@ -136,7 +136,7 @@ pub async fn ensure_environment(
         .catalog
         .clone()
         .unwrap_or_else(|| catalog_name(&spec.candidate_ref));
-    let catalog_status = adapter
+    let catalog_status = match adapter
         .ensure_catalog(&CatalogRequest {
             catalog: catalog.clone(),
             reference: Some(spec.candidate_ref.clone()),
@@ -144,7 +144,18 @@ pub async fn ensure_environment(
             warehouse: spec.warehouse.clone(),
         })
         .await
-        .map_err(EngineError::Adapter)?;
+    {
+        Ok(status) => status,
+        // A failed provisioning attempt must not leak the branch it just
+        // created — a stray pre-existing branch has unprovable provenance
+        // on the next attempt and would block promotion later.
+        Err(error) => {
+            if created_branch {
+                let _ = nessie.delete_branch(&spec.candidate_ref).await;
+            }
+            return Err(EngineError::Adapter(error));
+        }
+    };
 
     // A Nessie-bound environment whose adapter cannot provision the
     // generated catalog would run on the default target while evidence
@@ -190,6 +201,29 @@ fn resolve_catalog(spec: &EnvironmentSpec, prior: Option<&EnvironmentSetup>) -> 
         .unwrap_or_else(|| catalog_name(&spec.candidate_ref))
 }
 
+/// Whether a recorded artifact attests a *binding* between the candidate
+/// and a catalog — not merely intent. An artifact that observed the
+/// catalog (`Created`, or `Unverified` already vetted by an earlier
+/// ensure) attests it; so does a non-conventional recorded name, which is
+/// a `ref create --catalog` pin the workspace stands behind. A plain
+/// `ref create` artifact's conventional name is intent only: it was
+/// written before the catalog existed and cannot vouch for a catalog that
+/// appeared later.
+fn prior_records_binding(prior: &EnvironmentSetup, candidate_ref: &str) -> bool {
+    prior.catalog_status != CatalogStatus::Unmanaged || prior.catalog != catalog_name(candidate_ref)
+}
+
+/// Whether the resolved catalog is a pin — an explicit override or a
+/// recorded binding the workspace stands behind — rather than the
+/// generated convention, which requires the adapter to provision it.
+/// `ensure_candidate` (`Ensure`) and `EnvironmentContext::resolve`
+/// (`ReadOnly`) share this so both modes apply the same provisioning
+/// requirement.
+fn catalog_is_pinned(spec: &EnvironmentSpec, prior: Option<&EnvironmentSetup>) -> bool {
+    spec.catalog.is_some()
+        || prior.is_some_and(|prior| prior_records_binding(prior, &spec.candidate_ref))
+}
+
 /// Ensure a candidate environment exists — Nessie branch plus its catalog —
 /// preserving any previously recorded cut-from provenance, and persist the
 /// provisioning artifacts. Shared by the CLI's `--ref` provisioning and the
@@ -225,27 +259,26 @@ pub async fn ensure_candidate(
     // `ref create` artifact records only the conventional name with
     // `Unmanaged` status, which is an intent, not a binding: pinning it
     // would silence the fail-closed check on a non-provisioning adapter.
-    let pinned = spec.catalog.is_some()
-        || prior.as_ref().is_some_and(|prior| {
-            prior.catalog_status != CatalogStatus::Unmanaged
-                || prior.catalog != catalog_name(&spec.candidate_ref)
-        });
     let resolved = EnvironmentSpec {
-        catalog: pinned.then_some(catalog),
+        catalog: catalog_is_pinned(spec, prior.as_ref()).then_some(catalog),
         ..spec.clone()
     };
     let mut setup = ensure_environment(nessie, adapter, &resolved).await?;
     if setup.catalog_status == CatalogStatus::Unverified {
         // The catalog already existed and its configured Nessie ref cannot
-        // be introspected — "exists" is not "correct". Accept it only when
-        // the binding is already established: the name is the generated
-        // convention (the ref's hash is in the name itself) or this
-        // workspace recorded the catalog for this same ref before.
-        let self_naming = setup.catalog == catalog_name(&spec.candidate_ref);
-        let recorded = prior
-            .as_ref()
-            .is_some_and(|prior| prior.catalog == setup.catalog);
-        if !(self_naming || recorded) {
+        // be introspected — "exists" is not "correct", and the generated
+        // name is no proof either: `phlo_<ref>_<hash>` is a public
+        // convention anyone can mint pointed at another ref. Accept the
+        // catalog only when this workspace recorded the binding for this
+        // exact ref and catalog — an artifact that observed it before, or
+        // an explicit `ref create --catalog` pin.
+        let recorded = prior.as_ref().is_some_and(|prior| {
+            prior.catalog == setup.catalog && prior_records_binding(prior, &spec.candidate_ref)
+        });
+        if !recorded {
+            if setup.created_branch {
+                let _ = nessie.delete_branch(&spec.candidate_ref).await;
+            }
             return Err(EngineError::Environment(format!(
                 "catalog `{}` already exists but cannot be verified as bound to `{}` — \
                  drop it or let phlo provision it once so the binding is recorded",
@@ -254,15 +287,12 @@ pub async fn ensure_candidate(
         }
     }
     // Ownership is decided once, here, so a later `Unverified` status cannot
-    // make a phlo-owned catalog look abandoned. The generated name embeds
-    // the ref's hash — only phlo mints it, and only for this ref — so a
-    // self-named catalog is ours even when the adapter could not re-verify
-    // it. An adopted name keeps whatever ownership an earlier artifact
-    // recorded.
-    let self_named = setup.catalog == catalog_name(&spec.candidate_ref);
+    // make a phlo-owned catalog look abandoned. A catalog phlo just created
+    // is ours; an `Unverified` one was accepted only on this workspace's
+    // recorded binding, so it keeps whatever ownership that record
+    // established; an adopted or unmanaged catalog belongs to someone else.
     setup.catalog_owned_by_phlo = Some(match setup.catalog_status {
         CatalogStatus::Created => true,
-        CatalogStatus::Unverified if self_named => true,
         CatalogStatus::Unverified => prior
             .as_ref()
             .filter(|p| p.catalog == setup.catalog)
@@ -368,6 +398,11 @@ impl EnvironmentContext<'_> {
     ///   catalog-facing `nessie_uri`) → [`EngineError::NotConfigured`] —
     ///   failing closed, since running on the default target and binding
     ///   evidence to the candidate's head would fabricate isolation.
+    /// - `ReadOnly` applies the same requirement `Ensure` ends in: a
+    ///   resolution that lands on the generated catalog fails when the
+    ///   adapter cannot provision catalogs at all — an explicit or
+    ///   recorded pin is the escape hatch — so a preview never names a
+    ///   target no run could execute against.
     pub async fn resolve(
         &self,
         environment: Option<&str>,
@@ -411,6 +446,23 @@ impl EnvironmentContext<'_> {
                 // generated convention — so the previewed target is the
                 // one a later `Ensure` resolves to.
                 let prior = read_environment_for(self.root, environment);
+                // And the same provisioning requirement: when resolution
+                // lands on the generated convention, a later `Ensure` must
+                // provision that catalog — an adapter that cannot provision
+                // it fails the preview too, rather than previewing a target
+                // no run can reach. An explicit or recorded user-managed
+                // pin stays the escape hatch.
+                if !catalog_is_pinned(&spec, prior.as_ref())
+                    && !adapter.supports_catalog_provisioning()
+                {
+                    return Err(EngineError::NotConfigured(format!(
+                        "environment `{environment}` resolves to generated catalog `{}`, which \
+                         adapter `{}` cannot provision — a run would fail closed the same way; \
+                         pin an existing catalog with `--catalog`",
+                        catalog_name(environment),
+                        adapter.name()
+                    )));
+                }
                 let catalog = resolve_catalog(&spec, prior.as_ref());
                 let compilation =
                     compile_for_catalog(self.root, Some(&catalog), Some(adapter), true).await?;
@@ -531,11 +583,13 @@ pub async fn enrich_sources(
 /// `phlo_<ref>_<hash>` — the readable ref (unsafe characters folded to
 /// `_`, truncated) plus the first 8 hex of the ref's SHA-256. The hash is
 /// the collision guard: refs that fold identically (`ci/pr-1`, `ci_pr_1`,
-/// `ci-pr-1`) must not share one physical catalog, and an existing catalog
-/// with this name is self-evidently bound to this ref — the name carries
-/// the binding a catalog's configured ref cannot otherwise prove.
-/// Provisioning and diff/promotion evidence resolution share this
-/// convention.
+/// `ci-pr-1`) must not share one physical catalog. The name is *not*
+/// proof of binding — anyone (an admin, a stale install, a failed old
+/// run) can create `phlo_<ref>_<hash>` pointed at another Nessie ref, and
+/// a catalog's configured ref cannot be read back over SQL. An existing
+/// catalog with this name is trusted only when this workspace recorded
+/// the binding — see [`ensure_candidate`]. Provisioning and
+/// diff/promotion evidence resolution share this convention.
 pub fn catalog_name(reference: &str) -> String {
     let mut name = String::from("phlo_");
     let mut previous_underscore = false;

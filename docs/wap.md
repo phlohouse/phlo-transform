@@ -54,8 +54,11 @@ creates or deletes a branch as a side effect of another operation except the
 explicit provisioning on `apply`/`run --ref` and `--cleanup` on
 `promote`. `plan`/`test --ref` resolve the same environment read-only — they
 compile against the candidate's catalog when it exists and never create
-anything. `ref delete main` is refused outright: `main` is every
-environment's default base, not a scratch branch.
+anything — and they fail where a run would: when the environment resolves to
+the generated catalog and the adapter cannot provision catalogs, the preview
+fails closed rather than naming a target no run reaches. `ref delete main` is
+refused outright: `main` is every environment's default base, not a scratch
+branch.
 
 ## WAP
 
@@ -77,11 +80,14 @@ readable ref plus 8 hex of its SHA-256, so punctuation-equivalent refs
 (`ci/pr-1`, `ci_pr_1`) can never collide on one physical catalog — and can be
 overridden with `--catalog`; `--warehouse` sets the Iceberg warehouse (for
 example `local:///tmp/phlo-warehouse` or `s3://bucket/wh`). Because a
-catalog's bound Nessie ref cannot be read back over SQL, an existing catalog
-is never adopted on name alone: an `unverified` catalog is accepted only when
-its name is the candidate's own generated convention or a recorded artifact
-binds it to the same ref, and a catalog another candidate's evidence claims is
-refused outright. The provisioning records `catalog_status` (`created`,
+catalog's bound Nessie ref cannot be read back over SQL and the generated
+name is a public convention anyone can mint, an existing catalog is never
+adopted on name alone: an `unverified` catalog is accepted only when a
+recorded artifact binds that catalog to this ref — an artifact that
+observed the catalog before, or an explicit `ref create --catalog` pin —
+and a catalog another candidate's evidence claims is refused outright.
+Refusal rolls back a just-created candidate branch so a failed
+provisioning attempt leaves no stray ref. The provisioning records `catalog_status` (`created`,
 `unverified`, `unmanaged`) so cleanup drops only catalogs Phlo provably
 created. Provisioning is recorded in
 `.phlo/transform/environment.json` — the workspace's current
