@@ -19,8 +19,9 @@ Nessie references — `--from`, `--ref` or `--environment` names the candidate
 `--partition` and `--sample` do not apply). When a Nessie endpoint is
 configured both references must exist; a typo errors rather than producing a
 misleading report. Candidate relations resolve through the provisioned
-catalog recorded in `environment_<ref>.json` (per-candidate, falling back
-to the `phlo_<ref>_<hash>` convention); the base resolves through the
+catalog recorded in the environment evidence (per-candidate, exported to
+`environment_<ref>.json`, falling back to the `phlo_<ref>_<hash>`
+convention); the base resolves through the
 workspace catalog for `main` or the same convention for other refs.
 Recorded materialisation targets take precedence over both — and for
 `main`, records from runs with no `--ref` (the default environment) count
@@ -61,10 +62,11 @@ The report also carries:
   branch-aware graph diffs.
 
 Output is deterministic (datasets sorted by name) and identical in content
-between human and `--json` output. The report is written to
-`.phlo/transform/branch_diff.json` (including `deep`, whether `--full`
-value-level diffs ran), which `promote --require-diff` consumes. The
-artifact only authorises the candidate→target pair it names; it is rejected
+between human and `--json` output. The report is persisted as branch-diff
+evidence in the state store — exported to `.phlo/transform/branch_diff.json`
+(including `deep`, whether `--full` value-level diffs ran) — which
+`promote --require-diff` consumes. The
+evidence only authorises the candidate→target pair it names; it is rejected
 when its recorded versions no longer match either side's current
 materialisations (stale — including a dataset that materialised on either
 ref after the diff), when a diff entry compared a relation to itself, or
@@ -206,9 +208,10 @@ zeros, and `require_full_diff` likewise fails without a stable key.
 ## WAP integration
 
 `PromotionRequest` accepts `diff_passed` and `require_diff`. `phlo-transform
-promote --require-diff` reads `branch_diff.json` and requires a passing
+promote --require-diff` reads the branch-diff evidence recorded in the
+state store (exported to `branch_diff.json`) and requires a passing
 value-level diff that covers the exact candidate→target pair being promoted:
-an artifact naming different refs, one produced without `--full`, one whose
+evidence naming different refs, produced without `--full`, whose
 recorded versions no longer match either side's materialised state, or a
 self-comparison is rejected, failing the `data_diff` promotion gate. The
 single-model `diff.json` is not promotion evidence — it examined one model

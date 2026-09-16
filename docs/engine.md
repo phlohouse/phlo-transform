@@ -78,9 +78,15 @@ are a compilation error (`PROJECT007`).
 
 Models are written as ordinary SQL against logical names. The compiler
 rewrites every relation that resolves to a workspace model into that model's
-physical target, and leaves external sources untouched. The rewrite mirrors
-relation extraction, including CTE scope, so a CTE that shadows a workspace
-model name is never rewritten.
+physical target, and resolves external sources through the same mapping the
+engine uses for source probes and seed loads: when a `default_catalog` is
+configured, a source written with fewer than three parts is qualified to
+`<default_catalog>.<schema>.<table>` (a source written as `external.feed`
+compiles to `memory.external.feed` in the config above), while a source
+already carrying an explicit catalog is left untouched. With no
+`default_catalog` configured, source names pass through unchanged. The
+rewrite mirrors relation extraction, including CTE scope, so a CTE that
+shadows a workspace model name is never rewritten.
 
 ## Adapter boundary
 
@@ -389,7 +395,12 @@ Written under `.phlo/transform/` with `schema_version = 3`:
 | `lineage_diff.json` | semantic lineage diff vs a Git baseline (nodes/edges added, removed, changed; orphaned consumers and affected downstream paths) bound to `base_kind`/`base_commit`, the candidate's git head + worktree state, and the Nessie pair when resolved |
 | `promotion.json` | promotion id, references/hashes, gates, conflicts, timestamp |
 
-`schema_version` makes the interface explicit and versionable.
+`schema_version` makes the interface explicit and versionable. The
+promotion-evidence artifacts (`environment*.json`, `branch_diff.json`,
+`lineage_diff.json`) are exports: their authority is the immutable
+`evidence` records in the state store (see `docs/state.md` §Audit
+evidence), which is what `promote` reads — including across machines on a
+shared backend.
 
 ## Observability
 

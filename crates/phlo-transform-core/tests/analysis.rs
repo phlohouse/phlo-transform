@@ -265,6 +265,35 @@ fn key_and_not_null_directives_become_assertions() {
 }
 
 #[test]
+fn a_composite_key_asserts_one_composite_unique() {
+    // `@key a,b` is one composite key: the pair must be unique, which is
+    // not the same as each column being unique alone. Generating
+    // per-column uniques fails on legitimately non-unique components.
+    let mut raw = model("assay.daily", "select * from external.daily");
+    raw.directives.keys = vec!["day".to_string(), "analyte".to_string()];
+    let compilation = compile(vec![raw]);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+    let model = compilation.model(&id("assay.daily")).unwrap();
+    let described: Vec<String> = model
+        .assertions
+        .iter()
+        .map(|assertion| assertion.describe())
+        .collect();
+    assert!(
+        described.contains(&"unique day, analyte".to_string()),
+        "{described:?}"
+    );
+    assert!(
+        !described
+            .iter()
+            .any(|a| a == "unique day" || a == "unique analyte"),
+        "per-column uniques misstate a composite key: {described:?}"
+    );
+    assert!(described.contains(&"not_null day".to_string()));
+    assert!(described.contains(&"not_null analyte".to_string()));
+}
+
+#[test]
 fn selection_options_are_unaffected_by_analysis() {
     let compilation = compile(vec![
         model("assay.raw_results", "select * from external.raw_results"),

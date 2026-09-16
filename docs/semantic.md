@@ -83,10 +83,12 @@ representation as execution; there is no separate lineage parser.
 
 ## Assertions
 
-`-- @key x` implies `unique x` and `not_null x`; `-- @not-null a,b` implies
-`not_null` for each. They are recorded on the compiled model and surfaced by
-`inspect`. Runtime execution of these assertions is deferred to the test
-runtime.
+`-- @key x` implies `unique x` and `not_null x`; a composite `-- @key a,b`
+implies `not_null` for each column and a single `unique a, b` assertion —
+the pair must be unique, which does not require either column to be unique
+alone. `-- @not-null a,b` implies `not_null` for each. They are recorded on
+the compiled model and surfaced by `inspect`. Runtime execution of these
+assertions is deferred to the test runtime.
 
 ## Contracts
 
@@ -109,12 +111,15 @@ produces a "cannot be fully validated" diagnostic rather than a false failure.
 
 ## Generated runtime tests
 
-`@key x` implies `unique x` and `not_null x`; `@not-null a,b` implies
-`not_null` for each. These are represented as `Assertion`s on the compiled
-model **and** lowered into generated SQL tests:
+`@key x` implies `unique x` and `not_null x`; a composite `@key a,b` implies
+`not_null` for each column plus one composite `unique a, b` — it does not
+require `a` or `b` to be unique alone. `@not-null a,b` implies `not_null`
+for each. These are represented as `Assertion`s on the compiled model
+**and** lowered into generated SQL tests:
 
 - `not_null`: `select * from <target> where "x" is null`;
-- `unique`: `select "x", count(*) from <target> group by "x" having count(*) > 1`.
+- `unique`: `select "x", count(*) from <target> group by "x" having count(*) > 1`
+  (a composite key groups by every key column).
 
 Generated tests appear in `list`, `plan` and `run`, and are marked `generated`
 in reports.

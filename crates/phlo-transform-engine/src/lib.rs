@@ -36,8 +36,9 @@ pub use artifacts::{
 };
 pub use audit::{
     audited_diff, audited_lineage, compiled_catalog, contract_breaking_changes,
-    environment_artifact_name, read_branch_diff, read_diff, read_environment, read_environment_for,
-    remove_environment_artifacts, write_environment_artifacts, AuditEvidence, LineageEvidence,
+    environment_artifact_name, environment_artifacts, persist_branch_diff, read_branch_diff,
+    read_diff, read_environment, read_environment_for, remove_environment_artifacts,
+    write_environment_artifacts, AuditEvidence, LineageEvidence,
 };
 pub use branch_diff::{
     branch_diff, materialized_for_environment, model_keys, retarget, seeds_for_environment,
@@ -81,7 +82,7 @@ pub use source_state::{
     seed_relation,
 };
 pub use state::{
-    MaterializedRecord, ModelRunRecord, RunRecord, RunSummary, SeedRecord, SeedRunRecord,
-    SqliteStateStore, StateStore, StoredPlan, StoredRun, TestRunRecord,
+    EvidenceKind, EvidenceRecord, MaterializedRecord, ModelRunRecord, RunRecord, RunSummary,
+    SeedRecord, SeedRunRecord, SqliteStateStore, StateStore, StoredPlan, StoredRun, TestRunRecord,
 };
 pub use state_postgres::PostgresStateStore;

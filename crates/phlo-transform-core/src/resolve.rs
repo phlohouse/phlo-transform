@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use phlo_transform_sql::RelationName;
 
 use crate::identity::{ModelId, Namespace, SourceId};
-use crate::model::{RootRef, TransformRootId};
+use crate::model::{Relation, RootRef, TransformRootId};
 
 /// A model known to the resolver, before its own dependencies are resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,6 +162,42 @@ impl Resolver {
             1 => Some(Resolution::Model(candidates.pop().expect("one candidate"))),
             _ => Some(Resolution::Ambiguous(candidates)),
         }
+    }
+}
+
+/// Build the physical relation for a logical source.
+///
+/// Sources named with one or two parts take the workspace defaults; a
+/// three-or-more-part name is already catalog-qualified and kept verbatim.
+pub fn relation_for_source(
+    source: &SourceId,
+    default_catalog: Option<&str>,
+    default_schema: Option<&str>,
+) -> Relation {
+    let parts = source.parts();
+    let schema = || default_schema.unwrap_or("default").to_string();
+    let catalog = || default_catalog.map(str::to_string);
+    match parts.len() {
+        0 => Relation {
+            catalog: catalog(),
+            schema: schema(),
+            table: String::new(),
+        },
+        1 => Relation {
+            catalog: catalog(),
+            schema: schema(),
+            table: parts[0].clone(),
+        },
+        2 => Relation {
+            catalog: catalog(),
+            schema: parts[0].clone(),
+            table: parts[1].clone(),
+        },
+        _ => Relation {
+            catalog: Some(parts[0].clone()),
+            schema: parts[1].clone(),
+            table: parts[2..].join("."),
+        },
     }
 }
 

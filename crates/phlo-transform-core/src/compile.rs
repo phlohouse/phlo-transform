@@ -205,6 +205,8 @@ pub fn compile_with_options(
         resolver: &resolver,
         targets: &targets,
         dependencies: &dependencies_by_id,
+        default_catalog: project.defaults.catalog.as_deref(),
+        default_schema: project.defaults.schema.as_deref(),
         memo: BTreeMap::new(),
         visiting: BTreeSet::new(),
     };
@@ -234,6 +236,8 @@ pub fn compile_with_options(
             &resolver,
             &targets,
             &ephemerals,
+            project.defaults.catalog.as_deref(),
+            project.defaults.schema.as_deref(),
         );
 
         compiled_models.push(CompiledModel {
@@ -486,8 +490,12 @@ fn assertions_for(model: &SemanticModel) -> Vec<Assertion> {
         assertions.push(Assertion::NotNull {
             column: column.clone(),
         });
+    }
+    if !model.directives.keys.is_empty() {
+        // `@key a,b` declares one composite key — the pair must be unique,
+        // which is not the same as each column being unique alone.
         assertions.push(Assertion::Unique {
-            columns: vec![column.clone()],
+            columns: model.directives.keys.clone(),
         });
     }
     for column in &model.directives.not_null {
@@ -627,6 +635,8 @@ struct Expansion<'a> {
     resolver: &'a Resolver,
     targets: &'a BTreeMap<ModelId, Relation>,
     dependencies: &'a BTreeMap<ModelId, Vec<Dependency>>,
+    default_catalog: Option<&'a str>,
+    default_schema: Option<&'a str>,
     memo: BTreeMap<ModelId, Option<Query>>,
     visiting: BTreeSet<ModelId>,
 }
@@ -679,6 +689,8 @@ impl<'a> Expansion<'a> {
             self.resolver,
             self.targets,
             &ephemerals,
+            self.default_catalog,
+            self.default_schema,
         );
         self.visiting.remove(id);
 
@@ -822,8 +834,15 @@ fn compile_tests(
                 }
             }
         }
-        let compiled_sql =
-            rewrite_statements(&mut statements, None, resolver, targets, &ephemerals);
+        let compiled_sql = rewrite_statements(
+            &mut statements,
+            None,
+            resolver,
+            targets,
+            &ephemerals,
+            project.defaults.catalog.as_deref(),
+            project.defaults.schema.as_deref(),
+        );
 
         tests.push(CompiledTest {
             id: test.id.clone(),

@@ -11,7 +11,13 @@ use sha2::{Digest, Sha256};
 use crate::identity::{ModelId, SourceId};
 
 /// Bumped only when compiler/materialisation semantics could change outputs.
-pub const COMPILER_SEMANTICS_VERSION: u32 = 1;
+///
+/// History: 2 — under a configured catalog, external sources compile to
+/// `<catalog>.schema.relation` instead of resolving through the session
+/// catalog. The rewrite acts on the emitted SQL, not the versioned
+/// canonical AST, so without a bump a version recorded by a pre-change
+/// build would still compare equal and the fix would never take effect.
+pub const COMPILER_SEMANTICS_VERSION: u32 = 2;
 
 /// Component hashes that make up a model version.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]

@@ -162,6 +162,7 @@ impl WorkspaceService {
             root: &self.root,
             nessie: self.config.nessie.as_deref(),
             adapter: self.config.adapter.as_deref(),
+            state: self.config.state.as_deref(),
             nessie_uri: self.config.nessie_uri.as_deref(),
             warehouse: self.config.warehouse.as_deref(),
             catalog: self.config.catalog.as_deref(),
@@ -667,9 +668,17 @@ async fn plan(RawQuery(raw): RawQuery, State(service): State<Arc<WorkspaceServic
         .or_else(|| service.default_environment().map(str::to_string));
     let base_ref = phlo_transform_engine::base_ref_for(
         service.root(),
+        service.state().as_deref(),
         environment.as_deref(),
         query.base.as_deref(),
-    );
+    )
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "API011",
+            error.to_string(),
+        )
+    })?;
     let target = service
         .environment_context()
         .resolve(environment.as_deref(), &base_ref, EnvironmentMode::ReadOnly)
@@ -753,6 +762,7 @@ async fn diff_lineage(
         nessie: service.nessie(),
         candidate_env: service.default_environment().map(str::to_string),
         write_artifact: true,
+        state: service.state(),
     };
     let result = match &query.candidate {
         Some(candidate) => context.diff_ref_vs_ref(&query.base, candidate).await,
@@ -836,13 +846,28 @@ async fn diff_branch(
     // The shared catalog resolution — the same precedence the CLI's `diff`
     // applies: candidate through its recorded/generated binding, `main`
     // through the deployment catalog, other refs through their bindings.
-    let candidate_catalog = environment_catalog(root, &candidate_ref);
+    let candidate_catalog = environment_catalog(root, service.state().as_deref(), &candidate_ref)
+        .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "API011",
+            error.to_string(),
+        )
+    })?;
     let base_catalog = phlo_transform_engine::base_catalog(
         root,
+        service.state().as_deref(),
         &base_ref,
         service.config.catalog.as_deref(),
         compiled_catalog(&compilation).as_deref(),
-    );
+    )
+    .map_err(|error| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "API011",
+            error.to_string(),
+        )
+    })?;
     let report = branch_diff(
         adapter,
         service.state().as_deref(),
@@ -861,9 +886,17 @@ async fn diff_branch(
     .await;
     match report {
         Ok(report) => {
-            // Persist the audit artifact exactly like the CLI: `promote`
-            // relies on it.
-            let _ = ArtifactWriter::for_workspace(root).write_branch_diff(&report);
+            // Persist the audit evidence exactly like the CLI: the store
+            // record is the portable authority `promote` reads; the
+            // artifact stays the human-readable export.
+            phlo_transform_engine::persist_branch_diff(root, service.state().as_deref(), &report)
+                .map_err(|error| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "API011",
+                    error.to_string(),
+                )
+            })?;
             Ok(Json(
                 serde_json::to_value(&report).expect("report serialises"),
             ))

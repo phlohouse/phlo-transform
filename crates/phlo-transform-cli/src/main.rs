@@ -21,12 +21,12 @@ use phlo_transform_daemon::{serve, spawn_watcher, ServiceConfig, WorkspaceServic
 use phlo_transform_duckdb::DuckDbAdapter;
 use phlo_transform_engine::{
     base_ref_for, branch_diff, changed_models, diff, diff_reasons, environment_catalog,
-    materialized_for_environment, model_keys, promote, retarget, Adapter, ArtifactWriter,
-    BranchDiffReport, BranchDiffRequest, CancelHandle, CatalogStatus, DiffPolicy, DiffRequest,
-    DiffStrategy, EnvironmentContext, EnvironmentMode, EnvironmentSetup, ExecutionStatus,
-    LineageEvidence, Membership, Plan, PlanAction, PlanOptions, PlanReason, Planner,
-    PostgresStateStore, PromotionOptions, ReasonKind, RetryPolicy, RunOptions, RunResult, Runner,
-    SqliteStateStore, StateStore,
+    materialized_for_environment, model_keys, promote, read_environment_for, retarget, Adapter,
+    ArtifactWriter, BranchDiffReport, BranchDiffRequest, CancelHandle, CatalogStatus, DiffPolicy,
+    DiffRequest, DiffStrategy, EnvironmentContext, EnvironmentMode, EnvironmentSetup,
+    ExecutionStatus, LineageEvidence, Membership, Plan, PlanAction, PlanOptions, PlanReason,
+    Planner, PostgresStateStore, PromotionOptions, ReasonKind, RetryPolicy, RunOptions, RunResult,
+    Runner, SqliteStateStore, StateStore,
 };
 use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -254,6 +254,13 @@ enum StateAction {
     },
     /// List recorded promotions, newest first.
     Promotions,
+    /// List the audit evidence promotion reads: the newest environment,
+    /// branch-diff and lineage-diff record per candidate/target pair. A
+    /// candidate ref filters to that subject's records.
+    Evidence {
+        /// Candidate ref to inspect — omit to list every subject.
+        subject: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -534,11 +541,19 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
             if let Some(nessie_uri) = nessie_catalog_uri(cli) {
                 let nessie = build_nessie(cli)?;
                 let adapter = build_adapter(cli)?;
-                let base = base_ref_for(&cli.root, Some(&label), cli.from.as_deref());
+                let state = open_state(cli)?;
+                let base = base_ref_for(
+                    &cli.root,
+                    state.as_deref(),
+                    Some(&label),
+                    cli.from.as_deref(),
+                )
+                .map_err(|error| error.to_string())?;
                 let target = EnvironmentContext {
                     root: &cli.root,
                     nessie: Some(nessie.as_ref()),
                     adapter: Some(adapter.as_ref()),
+                    state: state.as_deref(),
                     nessie_uri: Some(&nessie_uri),
                     warehouse: cli.warehouse.as_deref(),
                     catalog: cli.catalog.as_deref(),
@@ -1139,11 +1154,8 @@ fn environment_artifact_name(reference: &str) -> String {
 }
 
 fn write_environment_artifacts(cli: &Cli, setup: &EnvironmentSetup) -> Result<(), String> {
-    phlo_transform_engine::write_environment_artifacts(&cli.root, setup)
-}
-
-fn remove_environment_artifacts(cli: &Cli, candidate: &str) {
-    phlo_transform_engine::remove_environment_artifacts(&cli.root, candidate)
+    let state = open_state(cli)?;
+    phlo_transform_engine::write_environment_artifacts(&cli.root, state.as_deref(), setup)
 }
 
 fn build_nessie(cli: &Cli) -> Result<Arc<dyn NessieClient>, String> {
@@ -1243,6 +1255,7 @@ async fn run_promote(
                 let adapter = build_adapter(cli).ok();
                 phlo_transform_engine::cleanup_candidate(
                     &cli.root,
+                    state.as_deref(),
                     adapter.as_deref(),
                     nessie.as_ref(),
                     candidate,
@@ -1400,16 +1413,37 @@ async fn run_ref(cli: &Cli, action: &RefAction) -> Result<ExitCode, String> {
             }
         }
         RefAction::Delete { name } => {
-            nessie
-                .delete_branch(name)
+            // Deleting a candidate means its catalog and evidence too — the
+            // same cleanup a merged promotion runs. Only a catalog recorded
+            // evidence proves phlo owns is dropped; an already-deleted branch
+            // is the goal state, not a failure, so a retried delete still
+            // reaches the evidence removal.
+            let branch_existed = nessie
+                .get_reference(name)
                 .await
+                .map_err(|error| error.to_string())?
+                .is_some();
+            let state = open_state(cli)?;
+            let environment = read_environment_for(&cli.root, state.as_deref(), name)
                 .map_err(|error| error.to_string())?;
-            // The branch is gone; its local provisioning evidence is stale.
-            remove_environment_artifacts(cli, name);
+            let adapter = build_adapter(cli).ok();
+            phlo_transform_engine::cleanup_candidate(
+                &cli.root,
+                state.as_deref(),
+                adapter.as_deref(),
+                nessie.as_ref(),
+                name,
+                environment.as_ref(),
+            )
+            .await?;
             if cli.json {
-                print_json(&serde_json::json!({ "deleted": name }))?;
-            } else {
+                print_json(
+                    &serde_json::json!({ "deleted": name, "branch_existed": branch_existed }),
+                )?;
+            } else if branch_existed {
                 println!("Deleted branch {name}");
+            } else {
+                println!("Branch {name} was already gone; removed its provisioning evidence");
             }
         }
     }
@@ -1611,6 +1645,52 @@ fn run_state(cli: &Cli, action: &StateAction) -> Result<ExitCode, String> {
                         promotion.merged,
                         promotion.dry_run,
                         promotion.timestamp,
+                    );
+                }
+            }
+        }
+        StateAction::Evidence { subject } => {
+            let mut records = Vec::new();
+            for kind in [
+                phlo_transform_engine::EvidenceKind::Environment,
+                phlo_transform_engine::EvidenceKind::BranchDiff,
+                phlo_transform_engine::EvidenceKind::LineageDiff,
+            ] {
+                let kind_records = match &subject {
+                    Some(subject) => state
+                        .evidence_for(kind, subject)
+                        .map_err(|error| error.to_string())?,
+                    None => state
+                        .latest_evidence(kind)
+                        .map_err(|error| error.to_string())?,
+                };
+                records.extend(kind_records);
+            }
+            records.sort_by(|a, b| {
+                phlo_transform_engine::util::cmp_rfc3339(&b.created_at, &a.created_at)
+                    .then_with(|| a.subject.cmp(&b.subject))
+            });
+            if cli.json {
+                print_json(&records)?;
+            } else if records.is_empty() {
+                println!("No audit evidence recorded");
+            } else {
+                for record in &records {
+                    let pair = if record.target_ref.is_empty() {
+                        record.subject.clone()
+                    } else {
+                        format!("{} -> {}", record.subject, record.target_ref)
+                    };
+                    println!(
+                        "{:<14} {:<34} {}  {}",
+                        record.kind.as_str(),
+                        pair,
+                        record
+                            .candidate_hash
+                            .as_deref()
+                            .map(|hash| short(hash, 12))
+                            .unwrap_or_else(|| "-".to_string()),
+                        record.created_at,
                     );
                 }
             }
@@ -2023,6 +2103,7 @@ async fn run_lineage_diff(
         nessie,
         candidate_env: environment(cli).or_else(|| cli.from.clone()),
         write_artifact: true,
+        state: open_state(cli)?,
     };
     let artifact = match refs {
         [base_ref] => context.diff_vs_ref(base_ref).await,
@@ -3051,19 +3132,25 @@ async fn run_diff(
     // branch diff and the environment provisioner apply: a ref resolves
     // through its recorded/generated binding, `main` through the
     // configured or compiled catalog.
-    let candidate_catalog = candidate_ref
-        .as_deref()
-        .and_then(|reference| nessie_backed.then(|| environment_catalog(&cli.root, reference)));
-    let base_catalog = nessie_backed
-        .then(|| {
-            phlo_transform_engine::base_catalog(
-                &cli.root,
-                &base_ref,
-                cli.catalog.as_deref(),
-                compilation_model_catalog(compilation).as_deref(),
-            )
-        })
-        .flatten();
+    let candidate_catalog = match candidate_ref.as_deref() {
+        Some(reference) if nessie_backed => Some(
+            environment_catalog(&cli.root, state.as_deref(), reference)
+                .map_err(|error| error.to_string())?,
+        ),
+        _ => None,
+    };
+    let base_catalog = if nessie_backed {
+        phlo_transform_engine::base_catalog(
+            &cli.root,
+            state.as_deref(),
+            &base_ref,
+            cli.catalog.as_deref(),
+            compilation_model_catalog(compilation).as_deref(),
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
     let candidate_relation = match candidate_record
         .as_ref()
         .map(|record| Relation::parse(&record.target))
@@ -3221,19 +3308,23 @@ async fn run_branch_diff(
         }
     }
 
+    let adapter = build_adapter(cli)?;
+    let state = open_state(cli)?;
+
     // Shared catalog resolution — identical to the daemon's branch diff:
     // the candidate through its recorded/generated binding, `main` through
     // the configured or compiled catalog, other refs through their own.
-    let candidate_catalog = environment_catalog(&cli.root, &candidate_ref);
+    let candidate_catalog = environment_catalog(&cli.root, state.as_deref(), &candidate_ref)
+        .map_err(|error| error.to_string())?;
     let base_catalog = phlo_transform_engine::base_catalog(
         &cli.root,
+        state.as_deref(),
         &base_ref,
         cli.catalog.as_deref(),
         compilation_model_catalog(compilation).as_deref(),
-    );
+    )
+    .map_err(|error| error.to_string())?;
 
-    let adapter = build_adapter(cli)?;
-    let state = open_state(cli)?;
     let report = branch_diff(
         adapter,
         state.as_deref(),
@@ -3252,8 +3343,10 @@ async fn run_branch_diff(
     .await
     .map_err(|error| error.to_string())?;
 
-    ArtifactWriter::for_workspace(&cli.root)
-        .write_branch_diff(&report)
+    // The evidence record makes this audit portable — a shared store
+    // carries it to whichever stage (or machine) runs `promote`. The
+    // `branch_diff.json` artifact stays the human-readable export.
+    phlo_transform_engine::persist_branch_diff(&cli.root, state.as_deref(), &report)
         .map_err(|error| error.to_string())?;
     if cli.json {
         print_json(&report)?;
@@ -4484,12 +4577,18 @@ mod tests {
         };
         write_environment_artifacts(&cli, &other).expect("writes");
 
-        let found = read_environment_for(&cli.root, "ci/x").expect("ci/x evidence");
+        let found = read_environment_for(&cli.root, None, "ci/x")
+            .expect("read")
+            .expect("ci/x evidence");
         assert_eq!(found.catalog, "custom_catalog");
         assert_eq!(found.candidate.hash, "bbb");
-        let found = read_environment_for(&cli.root, "ci/y").expect("ci/y evidence");
+        let found = read_environment_for(&cli.root, None, "ci/y")
+            .expect("read")
+            .expect("ci/y evidence");
         assert_eq!(found.catalog, "phlo_ci_y");
-        assert!(read_environment_for(&cli.root, "ci/unknown").is_none());
+        assert!(read_environment_for(&cli.root, None, "ci/unknown")
+            .expect("read")
+            .is_none());
     }
 
     #[test]
@@ -4893,6 +4992,7 @@ mod tests {
             },
             environment,
             diff: phlo_transform_core::LineageDiff::default(),
+            created_at: Some("2026-01-01T00:00:00Z".to_string()),
         }
     }
 
@@ -4925,6 +5025,7 @@ mod tests {
 
         let evidence = phlo_transform_engine::audited_lineage(
             &cli.root,
+            None,
             "ci/x",
             "main",
             "h1",
@@ -4961,6 +5062,7 @@ mod tests {
 
         let evidence = phlo_transform_engine::audited_lineage(
             &cli.root,
+            None,
             "ci/x",
             "main",
             "h1",
@@ -5004,6 +5106,7 @@ mod tests {
 
         let evidence = phlo_transform_engine::audited_lineage(
             &cli.root,
+            None,
             "ci/x",
             "main",
             "h1",
@@ -5046,6 +5149,7 @@ mod tests {
 
         let evidence = phlo_transform_engine::audited_lineage(
             &cli.root,
+            None,
             "ci/x",
             "main",
             "h1",
@@ -5088,6 +5192,7 @@ mod tests {
 
         let evidence = phlo_transform_engine::audited_lineage(
             &cli.root,
+            None,
             "ci/x",
             "main",
             "new",
@@ -5117,6 +5222,7 @@ mod tests {
 
         let evidence = phlo_transform_engine::audited_lineage(
             &cli.root,
+            None,
             "ci/x",
             "main",
             "h1",
@@ -5142,6 +5248,7 @@ mod tests {
         let cli = cli_at(dir.path());
         assert!(phlo_transform_engine::audited_lineage(
             &cli.root,
+            None,
             "ci/x",
             "main",
             "h1",
@@ -5184,6 +5291,7 @@ mod tests {
         );
         let evidence = phlo_transform_engine::audited_lineage(
             &cli.root,
+            None,
             "ci/x",
             "main",
             "h1",
@@ -5200,6 +5308,7 @@ mod tests {
         );
         let evidence = phlo_transform_engine::audited_lineage(
             &cli.root,
+            None,
             "ci/x",
             "main",
             "h1",
@@ -5218,6 +5327,7 @@ mod tests {
         );
         let evidence = phlo_transform_engine::audited_lineage(
             &cli.root,
+            None,
             "ci/x",
             "main",
             "h1",
@@ -5263,6 +5373,7 @@ mod tests {
         // Both refs resolve to the recorded commits — advisory.
         let evidence = phlo_transform_engine::audited_lineage(
             &cli.root,
+            None,
             "ci/x",
             "main",
             "h1",
@@ -5277,6 +5388,7 @@ mod tests {
         git(&["branch", "-D", "feature"]);
         let evidence = phlo_transform_engine::audited_lineage(
             &cli.root,
+            None,
             "ci/x",
             "main",
             "h1",
@@ -5300,6 +5412,7 @@ mod tests {
         git(&["branch", "-D", "base"]);
         let evidence = phlo_transform_engine::audited_lineage(
             &cli.root,
+            None,
             "ci/x",
             "main",
             "h1",

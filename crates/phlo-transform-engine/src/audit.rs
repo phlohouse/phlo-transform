@@ -1,24 +1,33 @@
-//! Promotion audit evidence. The diff a promotion relies on is recorded as
-//! workspace artifacts (`branch_diff.json`, plus `environment*.json`
-//! provisioning records). A single-model `diff.json` is never promotion
-//! evidence: it examined one model and cannot certify a branch's schema.
-//! These helpers read that evidence and decide whether it authorises a
-//! candidate -> target promotion — shared by the CLI's `promote` path and
-//! the daemon's operations API so both apply the same strict rules.
+//! Promotion audit evidence. The evidence a promotion relies on is
+//! persisted in the state store as immutable [`EvidenceRecord`]s — so a
+//! shared Postgres backend carries it across CI stages and machines — and
+//! exported to workspace artifacts (`branch_diff.json`,
+//! `lineage_diff.json`, `environment*.json`) for inspection and debugging.
+//! A single-model `diff.json` is never promotion evidence: it examined one
+//! model and cannot certify a branch's schema.
+//!
+//! Reads are store-first. The artifact files remain the compatibility
+//! path: a workspace that only has files keeps working, and file evidence
+//! a store has not seen is imported so it becomes portable from then on.
+//! These helpers decide whether the evidence authorises a candidate ->
+//! target promotion — shared by the CLI's `promote` path and the daemon's
+//! operations API so both apply the same strict rules.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use phlo_transform_core::Compilation;
 
-use crate::artifacts::{ArtifactWriter, EnvironmentArtifact, SCHEMA_VERSION};
+use crate::artifacts::{ArtifactWriter, EnvironmentArtifact, LineageDiffArtifact, SCHEMA_VERSION};
 use crate::branch_diff::{
     materialized_for_environment, seeds_for_environment, BranchDiffReport, DatasetKind,
 };
 use crate::contracts::{contract_diff, ContractSafety};
 use crate::environment::EnvironmentSetup;
 use crate::error::EngineError;
-use crate::state::StateStore;
+use crate::state::{EvidenceKind, EvidenceRecord, StateStore};
+use crate::util::{cmp_rfc3339, now_rfc3339};
 
 fn artifact_path(workspace_root: &Path, name: &str) -> PathBuf {
     ArtifactWriter::for_workspace(workspace_root)
@@ -58,13 +67,216 @@ pub fn environment_artifact_name(reference: &str) -> String {
     format!("{sanitized}_{hash:08x}.json")
 }
 
-/// Persist the provisioning record: the conventional `environment.json` for
-/// the workspace's current environment, plus a per-candidate copy so one
-/// candidate's evidence survives another being provisioned later.
+/// The evidence record an `EnvironmentSetup` maps to. The record's commit
+/// columns carry the candidate head and the cut-from base when recorded.
+fn environment_record(setup: &EnvironmentSetup) -> Result<EvidenceRecord, String> {
+    Ok(EvidenceRecord {
+        evidence_id: uuid::Uuid::new_v4().to_string(),
+        kind: EvidenceKind::Environment,
+        subject: setup.candidate.name.clone(),
+        target_ref: setup
+            .created_from
+            .as_ref()
+            .map(|base| base.name.clone())
+            .unwrap_or_default(),
+        candidate_hash: Some(setup.candidate.hash.clone()),
+        target_hash: setup.created_from.as_ref().map(|base| base.hash.clone()),
+        fingerprint: None,
+        payload: serde_json::to_value(setup).map_err(|error| error.to_string())?,
+        run_id: None,
+        created_at: now_rfc3339(),
+    })
+}
+
+/// The evidence record a `BranchDiffReport` maps to. `created_at` is the
+/// report's own finish time so a file import and a live write order
+/// identically — the report's clock is what the evidence attests.
+fn branch_diff_record(report: &BranchDiffReport) -> Result<EvidenceRecord, String> {
+    Ok(EvidenceRecord {
+        evidence_id: uuid::Uuid::new_v4().to_string(),
+        kind: EvidenceKind::BranchDiff,
+        subject: report.candidate_ref.clone(),
+        target_ref: report.base_ref.clone(),
+        candidate_hash: report.candidate_hash.clone(),
+        target_hash: report.base_hash.clone(),
+        fingerprint: None,
+        payload: serde_json::to_value(report).map_err(|error| error.to_string())?,
+        run_id: None,
+        created_at: report.finished_at.clone(),
+    })
+}
+
+/// The evidence record a `LineageDiffArtifact` maps to. The subject is the
+/// environment binding's candidate ref when bound — the identity promotion
+/// matches — else the candidate's Git ref.
+pub(crate) fn lineage_diff_record(
+    artifact: &LineageDiffArtifact,
+) -> Result<EvidenceRecord, String> {
+    Ok(EvidenceRecord {
+        evidence_id: uuid::Uuid::new_v4().to_string(),
+        kind: EvidenceKind::LineageDiff,
+        subject: artifact
+            .environment
+            .as_ref()
+            .map(|binding| binding.candidate_ref.clone())
+            .or_else(|| artifact.candidate.git_ref.clone())
+            .unwrap_or_default(),
+        target_ref: artifact
+            .environment
+            .as_ref()
+            .map(|binding| binding.target_ref.clone())
+            .unwrap_or_else(|| artifact.base_ref.clone()),
+        candidate_hash: artifact
+            .environment
+            .as_ref()
+            .map(|binding| binding.candidate_hash.clone())
+            .or_else(|| artifact.candidate.head.clone()),
+        target_hash: artifact
+            .environment
+            .as_ref()
+            .map(|binding| binding.target_hash.clone())
+            .or_else(|| Some(artifact.base_commit.clone())),
+        fingerprint: artifact.candidate.lineage_hash.clone(),
+        payload: serde_json::to_value(artifact).map_err(|error| error.to_string())?,
+        run_id: None,
+        created_at: artifact.created_at.clone().unwrap_or_else(now_rfc3339),
+    })
+}
+
+/// The candidate ref a lineage-diff artifact speaks for — its Nessie
+/// environment binding's candidate when bound, else the Git ref recorded
+/// at diff time. The same identity [`lineage_diff_record`] persists the
+/// evidence under.
+fn lineage_diff_subject(artifact: &LineageDiffArtifact) -> Option<&str> {
+    artifact
+        .environment
+        .as_ref()
+        .map(|binding| binding.candidate_ref.as_str())
+        .or(artifact.candidate.git_ref.as_deref())
+}
+
+/// The target ref a lineage-diff artifact speaks for — its Nessie
+/// binding's target when bound, else the Git base ref it diffed against.
+/// The same identity [`lineage_diff_record`] persists under `target_ref`.
+fn lineage_diff_target(artifact: &LineageDiffArtifact) -> &str {
+    artifact
+        .environment
+        .as_ref()
+        .map(|binding| binding.target_ref.as_str())
+        .unwrap_or(artifact.base_ref.as_str())
+}
+
+/// Append file-derived evidence the store does not already carry. A read
+/// that reaches an artifact naming a *different* subject would otherwise
+/// re-import it on every call — the (subject, target, instant) match
+/// keeps repeated audits from piling up duplicate rows. Identical
+/// payloads deduplicate too: artifacts without a `created_at` (environment
+/// setups, pre-timestamp lineage diffs) are recorded at import time, so
+/// the timestamp alone cannot anchor them — without the payload check
+/// every audit would append another copy. Best-effort, like every import:
+/// a record that fails to persist does not disqualify the file being
+/// evaluated — but the failure is surfaced, because evidence that never
+/// reaches the store is not portable: a promotion on another machine will
+/// see no record and fail closed.
+fn import_evidence(state: &dyn StateStore, record: &EvidenceRecord) {
+    let known = state
+        .evidence_for(record.kind, &record.subject)
+        .map(|records| {
+            records.iter().any(|existing| {
+                existing.target_ref == record.target_ref
+                    && (existing.created_at == record.created_at
+                        || existing.payload == record.payload)
+            })
+        })
+        .unwrap_or(false);
+    if !known {
+        if let Err(error) = state.record_evidence(record) {
+            eprintln!(
+                "warning: could not persist {} evidence for `{}` to the state store: \
+                 {error} — the artifact still audits locally, but the evidence is not portable",
+                record.kind.as_str(),
+                record.subject
+            );
+        }
+    }
+}
+
+/// Persist a branch-diff audit: the immutable evidence record (portable —
+/// a shared store carries it to whichever stage promotes) plus the
+/// `branch_diff.json` export. Shared by the CLI's `diff` and the daemon's
+/// branch-diff endpoint.
+pub fn persist_branch_diff(
+    workspace_root: &Path,
+    state: Option<&dyn StateStore>,
+    report: &BranchDiffReport,
+) -> Result<(), EngineError> {
+    ArtifactWriter::for_workspace(workspace_root)
+        .write_branch_diff(report)
+        .map_err(|error| EngineError::Artifact(error.to_string()))?;
+    if let Some(state) = state {
+        let record = branch_diff_record(report).map_err(EngineError::Artifact)?;
+        state
+            .record_evidence(&record)
+            .map_err(|error| EngineError::State(error.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Persist a lineage-diff audit through the store, when one is configured.
+/// The artifact file is written by the caller (`ArtifactWriter`); this
+/// records the portable record.
+pub(crate) fn persist_lineage_evidence(
+    state: Option<&dyn StateStore>,
+    artifact: &LineageDiffArtifact,
+) -> Result<(), EngineError> {
+    let Some(state) = state else {
+        return Ok(());
+    };
+    // An artifact with no subject — neither a Nessie binding nor a Git ref
+    // — has nothing to bind the evidence to. The import path already skips
+    // such artifacts; the write path does too, rather than persist a
+    // `subject=""` row no lookup can reach.
+    if lineage_diff_subject(artifact).is_none() {
+        return Ok(());
+    }
+    let record = lineage_diff_record(artifact).map_err(EngineError::Artifact)?;
+    state.record_evidence(&record)
+}
+
+/// Persist the provisioning record: the immutable evidence record in the
+/// store first (the portable authority), then the conventional
+/// `environment.json` for the workspace's current environment and a
+/// per-candidate copy so one candidate's evidence survives another being
+/// provisioned later. The record is written before the files because a
+/// read prefers store evidence: files written first could be masked by an
+/// older record if the record write then failed, while a persisted record
+/// with missing files stays consistent — the store wins either way. An
+/// unchanged binding is not re-recorded: identical rows carry no
+/// information, and an `ensure` runs on every `run --ref`/`apply --ref`.
 pub fn write_environment_artifacts(
     workspace_root: &Path,
+    state: Option<&dyn StateStore>,
     setup: &EnvironmentSetup,
 ) -> Result<(), String> {
+    if let Some(state) = state {
+        let record = environment_record(setup)?;
+        // The newest record is the live binding; an identical payload is
+        // already what every read resolves, so recording it again adds
+        // nothing. A changed binding (or changed base) appends a record
+        // that becomes the new live binding.
+        let unchanged = state
+            .evidence_for(EvidenceKind::Environment, &record.subject)
+            .map_err(|error| error.to_string())?
+            .first()
+            .is_some_and(|existing| {
+                existing.target_ref == record.target_ref && existing.payload == record.payload
+            });
+        if !unchanged {
+            state
+                .record_evidence(&record)
+                .map_err(|error| error.to_string())?;
+        }
+    }
     ArtifactWriter::for_workspace(workspace_root)
         .write_environment(setup)
         .map_err(|error| error.to_string())?;
@@ -77,13 +289,61 @@ pub fn write_environment_artifacts(
         environment: setup.clone(),
     })
     .map_err(|error| error.to_string())?;
-    std::fs::write(path, payload).map_err(|error| error.to_string())
+    std::fs::write(path, payload).map_err(|error| error.to_string())?;
+    Ok(())
 }
 
-/// The recorded provisioning setup for a specific candidate: the
-/// per-candidate artifact first, then the single-slot `environment.json`
-/// (which only describes the most recently provisioned candidate).
-pub fn read_environment_for(workspace_root: &Path, candidate: &str) -> Option<EnvironmentSetup> {
+/// The recorded provisioning setup for a specific candidate: the evidence
+/// store first (the portable authority), then the artifact files — the
+/// per-candidate artifact, then the single-slot `environment.json` (which
+/// only describes the most recently provisioned candidate). File evidence
+/// the store lacks is imported, so a workspace that predates the evidence
+/// table keeps working and becomes portable. A store read failure is an
+/// error, not a cache miss: falling back to local files could resolve a
+/// different binding than the store recorded for another machine.
+pub fn read_environment_for(
+    workspace_root: &Path,
+    state: Option<&dyn StateStore>,
+    candidate: &str,
+) -> Result<Option<EnvironmentSetup>, EngineError> {
+    if let Some(state) = state {
+        let records = state
+            .evidence_for(EvidenceKind::Environment, candidate)
+            .map_err(|error| {
+                EngineError::State(format!("cannot read the evidence store: {error}"))
+            })?;
+        if let Some(record) = records.first() {
+            // Only the newest record speaks; an undecodable one fails
+            // closed — silently skipping it could resurrect a stale
+            // binding an older record superseded.
+            let setup: EnvironmentSetup =
+                serde_json::from_value(record.payload.clone()).map_err(|error| {
+                    EngineError::State(format!("undecodable environment evidence: {error}"))
+                })?;
+            // The subject column is the indexed identity; a payload naming
+            // a different candidate is contradictory evidence — fail closed
+            // rather than audit a binding for another environment.
+            if setup.candidate.name != candidate {
+                return Err(EngineError::State(format!(
+                    "environment evidence recorded for `{candidate}` decodes to a binding for `{}`",
+                    setup.candidate.name
+                )));
+            }
+            return Ok(Some(setup));
+        }
+        let setup = read_environment_files(workspace_root, candidate);
+        if let Some(setup) = &setup {
+            if let Ok(record) = environment_record(setup) {
+                import_evidence(state, &record);
+            }
+        }
+        return Ok(setup);
+    }
+    Ok(read_environment_files(workspace_root, candidate))
+}
+
+/// The artifact-file environment lookup — the compatibility path.
+fn read_environment_files(workspace_root: &Path, candidate: &str) -> Option<EnvironmentSetup> {
     let matches = |setup: &EnvironmentSetup| setup.candidate.name == candidate;
     let setup = std::fs::read_to_string(artifact_path(
         workspace_root,
@@ -97,16 +357,47 @@ pub fn read_environment_for(workspace_root: &Path, candidate: &str) -> Option<En
         .or_else(|| read_environment(workspace_root).filter(matches))
 }
 
-/// Every recorded environment binding in this workspace: the per-candidate
-/// files plus the single-slot `environment.json`, deduplicated by candidate
-/// name. Used to detect one physical catalog claimed by two refs.
-pub fn environment_artifacts(workspace_root: &Path) -> Vec<EnvironmentSetup> {
+/// Every recorded environment binding: the store's latest record per
+/// candidate, plus artifact files for candidates the store does not know
+/// (imported so they become portable), deduplicated by candidate name.
+/// Used to detect one physical catalog claimed by two refs.
+pub fn environment_artifacts(
+    workspace_root: &Path,
+    state: Option<&dyn StateStore>,
+) -> Result<Vec<EnvironmentSetup>, EngineError> {
+    let mut setups: Vec<EnvironmentSetup> = Vec::new();
+    if let Some(state) = state {
+        let records = state
+            .latest_evidence(EvidenceKind::Environment)
+            .map_err(|error| {
+                EngineError::State(format!("cannot read the evidence store: {error}"))
+            })?;
+        for record in records {
+            // The catalog-claim check needs every binding — an undecodable
+            // record could hide the claim being checked for.
+            let setup: EnvironmentSetup =
+                serde_json::from_value(record.payload.clone()).map_err(|error| {
+                    EngineError::State(format!("undecodable environment evidence: {error}"))
+                })?;
+            // `latest_evidence` keeps the newest record per (subject,
+            // target) pair, so a candidate re-provisioned from a different
+            // base can appear several times. The list is newest-first:
+            // only a candidate's newest record is its live binding — an
+            // older, superseded one must not keep claiming its catalog.
+            if setups
+                .iter()
+                .any(|seen| seen.candidate.name == setup.candidate.name)
+            {
+                continue;
+            }
+            setups.push(setup);
+        }
+    }
     let directory = artifact_path(workspace_root, "");
     let parse = |text: String| -> Option<EnvironmentSetup> {
         let value: serde_json::Value = serde_json::from_str(&text).ok()?;
         serde_json::from_value(value.get("environment")?.clone()).ok()
     };
-    let mut setups: Vec<EnvironmentSetup> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&directory) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -116,27 +407,60 @@ pub fn environment_artifacts(workspace_root: &Path) -> Vec<EnvironmentSetup> {
             }
             if let Ok(text) = std::fs::read_to_string(entry.path()) {
                 if let Some(setup) = parse(text) {
-                    if !setups
+                    if setups
                         .iter()
                         .any(|seen: &EnvironmentSetup| seen.candidate.name == setup.candidate.name)
                     {
-                        setups.push(setup);
+                        continue;
                     }
+                    if let (Some(state), Ok(record)) = (state, environment_record(&setup)) {
+                        import_evidence(state, &record);
+                    }
+                    setups.push(setup);
                 }
             }
         }
     }
-    setups
+    Ok(setups)
 }
 
-/// Drop a candidate's local provisioning evidence after its branch is gone.
-pub fn remove_environment_artifacts(workspace_root: &Path, candidate: &str) {
-    let _ = std::fs::remove_file(artifact_path(
+/// Drop a candidate's provisioning evidence after its branch is gone —
+/// the local artifacts and the store records alike. Removal failures are
+/// reported on both sides: a leftover store record would let a stale
+/// binding claim the catalog for a ref that no longer exists, and a
+/// leftover `environment_*.json` re-imports that binding on the next
+/// artifact scan. The files go first so a failure leaves file and record
+/// consistent; a missing file is already the goal state.
+pub fn remove_environment_artifacts(
+    workspace_root: &Path,
+    state: Option<&dyn StateStore>,
+    candidate: &str,
+) -> Result<(), EngineError> {
+    remove_artifact_file(&artifact_path(
         workspace_root,
         &environment_artifact_name(candidate),
-    ));
+    ))?;
     if read_environment(workspace_root).is_some_and(|setup| setup.candidate.name == candidate) {
-        let _ = std::fs::remove_file(artifact_path(workspace_root, "environment.json"));
+        remove_artifact_file(&artifact_path(workspace_root, "environment.json"))?;
+    }
+    if let Some(state) = state {
+        state
+            .remove_evidence(EvidenceKind::Environment, candidate)
+            .map_err(|error| {
+                EngineError::State(format!("cannot remove environment evidence: {error}"))
+            })?;
+    }
+    Ok(())
+}
+
+fn remove_artifact_file(path: &Path) -> Result<(), EngineError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(EngineError::Artifact(format!(
+            "cannot remove {}: {error}",
+            path.display()
+        ))),
     }
 }
 
@@ -220,16 +544,112 @@ pub struct AuditEvidence {
     pub schema_audited: bool,
 }
 
-/// Read the audited diff artifact (`branch_diff.json` — a single-model
-/// `diff.json` is never promotion evidence) and derive what it proves for this
-/// promotion: the diff verdict, why the artifact cannot be used, the breaking
-/// schema changes it recorded, and whether a schema audit genuinely ran.
+/// What the freshest branch-diff evidence holds.
+enum BranchDiffLookup {
+    /// No branch-diff evidence anywhere.
+    Missing,
+    /// A report was found — the caller decides whether it applies.
+    Found(Box<BranchDiffReport>),
+    /// The evidence exists but cannot be read — a corrupt store row or a
+    /// store error. Fail closed: rejected, not skipped.
+    Corrupt(String),
+}
+
+/// The freshest branch-diff evidence for a promotion: the artifact file
+/// when it names this exact pair and outdates the store's record for it,
+/// else the store's record for this pair — else whatever the candidate's
+/// newest evidence covers, so a rejection names it. A file produced for
+/// another target was imported under its own pair and masks nothing
+/// here. Either way the report still has to pass the commit-binding and
+/// staleness checks in `audited_diff`.
+fn branch_diff_evidence(
+    workspace_root: &Path,
+    state: &dyn StateStore,
+    candidate: &str,
+    to: &str,
+) -> BranchDiffLookup {
+    let file = read_branch_diff(workspace_root);
+    let records = match state.evidence_for(EvidenceKind::BranchDiff, candidate) {
+        Ok(records) => records,
+        Err(error) => {
+            return BranchDiffLookup::Corrupt(format!("cannot read the evidence store: {error}"))
+        }
+    };
+    // Whatever the file attests, persist it under the subject it names so
+    // the evidence is portable even when it is not this candidate's —
+    // the single-slot artifact is overwritten by the next `diff`, while
+    // the store record is not. `import_evidence` dedups, so repeated
+    // audits do not append the same instant twice.
+    if let Some(report) = &file {
+        if let Ok(record) = branch_diff_record(report) {
+            import_evidence(state, &record);
+        }
+    }
+    // The store's newest record auditing this exact pair — what the file
+    // has to beat to outrank it.
+    let pair_record = records.iter().find(|record| record.target_ref == to);
+    // The file competes only when it names this pair — a file for another
+    // target was imported under its own pair above and cannot mask this
+    // pair's evidence. The file's own finish time is the fair comparison
+    // — imported records carry it as `created_at` — parsed so
+    // variable-width fractions order chronologically, not lexically.
+    let file_fresher = match (&file, pair_record) {
+        (Some(report), Some(record))
+            if report.candidate_ref == candidate && report.base_ref == to =>
+        {
+            cmp_rfc3339(&report.finished_at, &record.created_at) == Ordering::Greater
+        }
+        (Some(report), None) => report.candidate_ref == candidate && report.base_ref == to,
+        _ => false,
+    };
+    if file_fresher {
+        return file.map_or(BranchDiffLookup::Missing, |report| {
+            BranchDiffLookup::Found(Box::new(report))
+        });
+    }
+    // The store's word for this candidate: prefer the record that audited
+    // this exact pair; else the newest, so the rejection can name what the
+    // evidence actually covers.
+    if let Some(record) = pair_record.or(records.first()) {
+        return match serde_json::from_value::<BranchDiffReport>(record.payload.clone()) {
+            Ok(report) => BranchDiffLookup::Found(Box::new(report)),
+            Err(error) => {
+                BranchDiffLookup::Corrupt(format!("undecodable branch-diff evidence: {error}"))
+            }
+        };
+    }
+    if let Some(report) = file {
+        return BranchDiffLookup::Found(Box::new(report));
+    }
+    // Nothing for this candidate and no file: for the rejection to name
+    // what was audited instead, look at the newest record anywhere.
+    match state.latest_evidence(EvidenceKind::BranchDiff) {
+        Ok(latest) => match latest.first() {
+            Some(record) => {
+                match serde_json::from_value::<BranchDiffReport>(record.payload.clone()) {
+                    Ok(report) => BranchDiffLookup::Found(Box::new(report)),
+                    Err(error) => BranchDiffLookup::Corrupt(format!(
+                        "undecodable branch-diff evidence: {error}"
+                    )),
+                }
+            }
+            None => BranchDiffLookup::Missing,
+        },
+        Err(error) => BranchDiffLookup::Corrupt(format!("cannot read the evidence store: {error}")),
+    }
+}
+
+/// Read the audited diff evidence (`branch_diff.json` and its store record
+/// — a single-model `diff.json` is never promotion evidence) and derive
+/// what it proves for this promotion: the diff verdict, why the evidence
+/// cannot be used, the breaking schema changes it recorded, and whether a
+/// schema audit genuinely ran.
 ///
-/// The artifact only counts when it was produced for this candidate against
+/// The evidence only counts when it was produced for this candidate against
 /// this target at the commits being promoted — a diff of another pair, of an
 /// older head, or one that went stale since is rejected with a reason naming
 /// the rerun. `candidate_hash`/`base_hash` are the refs' current heads; a
-/// hash-bound artifact must match them exactly.
+/// hash-bound report must match them exactly.
 pub fn audited_diff(
     workspace_root: &Path,
     state: Option<&dyn StateStore>,
@@ -241,7 +661,19 @@ pub fn audited_diff(
     let Some(state) = state else {
         return AuditEvidence::default();
     };
-    if let Some(report) = read_branch_diff(workspace_root) {
+    let found = match branch_diff_evidence(workspace_root, state, candidate, to) {
+        BranchDiffLookup::Found(report) => Some(report),
+        BranchDiffLookup::Corrupt(reason) => {
+            return AuditEvidence {
+                diff_rejected: Some(format!(
+                    "{reason}; rerun `diff --from {candidate} --to {to} --full`"
+                )),
+                ..AuditEvidence::default()
+            };
+        }
+        BranchDiffLookup::Missing => None,
+    };
+    if let Some(report) = found {
         // An audit of another candidate, or against another target, is not
         // evidence for this promotion.
         if report.candidate_ref != candidate || report.base_ref != to {
@@ -462,29 +894,109 @@ pub struct LineageEvidence {
     pub changes: usize,
 }
 
-/// Read `lineage_diff.json` and audit its provenance against the pair
-/// being promoted. The artifact only counts when it was produced for this
-/// candidate against this target — bound to the Nessie commits when it
-/// carries an environment binding, else to the Git identity it recorded —
-/// and only while its candidate fingerprint still matches the compiled
-/// workspace. Anything stale, unreadable, or about another pair is
-/// rejected with a reason naming the rerun rather than silently treated
-/// as current.
+/// The `lineage_diff.json` artifact file — the export/compatibility form.
+fn read_lineage_diff(workspace_root: &Path) -> Option<Result<LineageDiffArtifact, String>> {
+    let text = std::fs::read_to_string(artifact_path(workspace_root, "lineage_diff.json")).ok()?;
+    Some(
+        serde_json::from_str::<LineageDiffArtifact>(&text)
+            .map_err(|error| format!("unreadable lineage artifact: {error}")),
+    )
+}
+
+/// The freshest lineage-diff evidence for a pair: the artifact file when
+/// it names this exact pair and carries a `created_at` newer than the
+/// store's record for it (a diff produced against a different state
+/// backend converges instead of going unseen), else the store's record
+/// for this pair — else the candidate's newest record or the file, so a
+/// rejection names what the evidence actually covers. Evidence for other
+/// targets was imported under its own pair and masks nothing here.
+fn lineage_diff_evidence(
+    workspace_root: &Path,
+    state: Option<&dyn StateStore>,
+    candidate: &str,
+    to: &str,
+) -> Option<Result<LineageDiffArtifact, String>> {
+    let file = read_lineage_diff(workspace_root);
+    let Some(state) = state else {
+        return file;
+    };
+    let records = match state.evidence_for(EvidenceKind::LineageDiff, candidate) {
+        Ok(records) => records,
+        Err(error) => return Some(Err(format!("cannot read the evidence store: {error}"))),
+    };
+    // Whatever the file attests, persist it under the subject it names so
+    // the evidence is portable even when it is not this candidate's — the
+    // single-slot artifact is overwritten by the next `lineage --diff`,
+    // while the store record is not. An artifact with no subject (no Nessie
+    // binding, no Git ref) has nothing to bind the evidence to, so it is
+    // not recorded. `import_evidence` dedups repeated audits of one file.
+    if let Some(Ok(artifact)) = &file {
+        if lineage_diff_subject(artifact).is_some() {
+            if let Ok(record) = lineage_diff_record(artifact) {
+                import_evidence(state, &record);
+            }
+        }
+    }
+    // The store's newest record auditing this exact pair — what the file
+    // has to beat to outrank it.
+    let pair_record = records.iter().find(|record| record.target_ref == to);
+    // The artifact can only outrank the store's record when it names
+    // *this* pair — a newer file produced for another candidate or target
+    // was imported under its own pair above and shadows nothing here.
+    let file_newer = match (&file, pair_record) {
+        (Some(Ok(artifact)), Some(record))
+            if lineage_diff_subject(artifact) == Some(candidate)
+                && lineage_diff_target(artifact) == to =>
+        {
+            match &artifact.created_at {
+                Some(created_at) => {
+                    cmp_rfc3339(created_at, &record.created_at) == Ordering::Greater
+                }
+                None => false,
+            }
+        }
+        (Some(Ok(artifact)), None) => {
+            lineage_diff_subject(artifact) == Some(candidate) && lineage_diff_target(artifact) == to
+        }
+        _ => false,
+    };
+    if file_newer {
+        return file;
+    }
+    // The pair's record when the store holds one, else the candidate's
+    // newest — so a rejection names what the evidence actually covers.
+    if let Some(record) = pair_record.or(records.first()) {
+        return Some(
+            serde_json::from_value::<LineageDiffArtifact>(record.payload.clone())
+                .map_err(|error| format!("undecodable lineage evidence: {error}")),
+        );
+    }
+    file
+}
+
+/// Read the lineage-diff evidence (`lineage_diff.json` and its store
+/// record) and audit its provenance against the pair being promoted. The
+/// evidence only counts when it was produced for this candidate against
+/// this target — bound to the Nessie commits when it carries an
+/// environment binding, else to the Git identity it recorded — and only
+/// while its candidate fingerprint still matches the compiled workspace.
+/// Anything stale, unreadable, or about another pair is rejected with a
+/// reason naming the rerun rather than silently treated as current.
 pub fn audited_lineage(
     workspace_root: &Path,
+    state: Option<&dyn StateStore>,
     candidate: &str,
     to: &str,
     candidate_hash: &str,
     target_hash: &str,
     current_lineage_hash: Option<&str>,
 ) -> Option<LineageEvidence> {
-    let text = std::fs::read_to_string(artifact_path(workspace_root, "lineage_diff.json")).ok()?;
-    let artifact = match serde_json::from_str::<crate::artifacts::LineageDiffArtifact>(&text) {
+    let artifact = match lineage_diff_evidence(workspace_root, state, candidate, to)? {
         Ok(artifact) => artifact,
         Err(error) => {
             return Some(LineageEvidence {
                 status: "stale",
-                reason: Some(format!("unreadable lineage artifact: {error}")),
+                reason: Some(error),
                 base: "unknown".to_string(),
                 changes: 0,
             });
@@ -614,4 +1126,91 @@ pub fn audited_lineage(
             )),
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::artifacts::CandidateProvenance;
+    use crate::state::SqliteStateStore;
+
+    fn unbound_artifact() -> LineageDiffArtifact {
+        LineageDiffArtifact {
+            schema_version: SCHEMA_VERSION,
+            base_kind: "merge-base".to_string(),
+            base_ref: "main".to_string(),
+            base_commit: "git-base".to_string(),
+            candidate: CandidateProvenance {
+                git_ref: None,
+                head: None,
+                dirty: false,
+                lineage_hash: None,
+                model_versions: BTreeMap::new(),
+            },
+            environment: None,
+            diff: phlo_transform_core::LineageDiff::default(),
+            created_at: None,
+        }
+    }
+
+    /// An artifact with no subject — no Nessie binding, no Git ref — has
+    /// nothing to bind the evidence to. The write path must skip it like
+    /// the import path does, rather than persist a `subject=""` row no
+    /// lookup can reach.
+    #[test]
+    fn persist_lineage_evidence_skips_a_subjectless_artifact() {
+        let state = SqliteStateStore::in_memory().unwrap();
+        persist_lineage_evidence(Some(&state), &unbound_artifact()).expect("no-op");
+        assert!(state
+            .latest_evidence(EvidenceKind::LineageDiff)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// `import_evidence` dedups identical payloads, not only
+    /// (target, created_at): a timestampless artifact is recorded at import
+    /// time, so the timestamp alone can never re-match and every read would
+    /// append another copy.
+    #[test]
+    fn import_evidence_dedups_identical_payloads() {
+        let state = SqliteStateStore::in_memory().unwrap();
+        let mut record = EvidenceRecord {
+            evidence_id: "first".to_string(),
+            kind: EvidenceKind::LineageDiff,
+            subject: "ci/x".to_string(),
+            target_ref: "main".to_string(),
+            candidate_hash: Some("bbb".to_string()),
+            target_hash: Some("aaa".to_string()),
+            fingerprint: Some("fp".to_string()),
+            payload: serde_json::json!({"diff": "payload"}),
+            run_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        import_evidence(&state, &record);
+        // A re-import of the same artifact gets a fresh evidence id and
+        // timestamp — the payload is what must dedup it.
+        record.evidence_id = "second".to_string();
+        record.created_at = "2026-02-01T00:00:00Z".to_string();
+        import_evidence(&state, &record);
+        assert_eq!(
+            state
+                .evidence_for(EvidenceKind::LineageDiff, "ci/x")
+                .unwrap()
+                .len(),
+            1,
+            "the same evidence imports once"
+        );
+
+        // A genuinely different payload for the same pair still appends.
+        record.payload = serde_json::json!({"diff": "changed"});
+        import_evidence(&state, &record);
+        assert_eq!(
+            state
+                .evidence_for(EvidenceKind::LineageDiff, "ci/x")
+                .unwrap()
+                .len(),
+            2,
+            "different evidence is not deduplicated away"
+        );
+    }
 }

@@ -30,6 +30,8 @@ use crate::artifacts::{
 };
 use crate::environment::compile_for_catalog;
 use crate::error::EngineError;
+use crate::state::StateStore;
+use crate::util::now_rfc3339;
 
 /// Everything a lineage diff needs that a bare `lineage_diff()` call does
 /// not carry: the workspace root, the live compilation, and the handles for
@@ -58,9 +60,12 @@ pub struct LineageDiffContext {
     /// Names `environment.candidate_ref` in the artifact. Unused in
     /// ref→ref mode, where the candidate ref itself names the branch.
     pub candidate_env: Option<String>,
-    /// Persist `.phlo/transform/lineage_diff.json` — the artifact promotion
-    /// audits.
+    /// Persist `.phlo/transform/lineage_diff.json` — the artifact export —
+    /// plus the evidence record in `state`, when one is configured.
     pub write_artifact: bool,
+    /// The state store the evidence record persists to — the portable
+    /// authority a promotion on another machine or CI stage audits.
+    pub state: Option<Arc<dyn StateStore>>,
 }
 
 impl LineageDiffContext {
@@ -229,12 +234,14 @@ impl LineageDiffContext {
             base_commit,
             candidate,
             environment: environment_binding,
+            created_at: Some(now_rfc3339()),
             diff,
         };
         if self.write_artifact {
             ArtifactWriter::for_workspace(&self.root)
                 .write_lineage_diff(&artifact)
                 .map_err(|error| EngineError::Artifact(error.to_string()))?;
+            crate::audit::persist_lineage_evidence(self.state.as_deref(), &artifact)?;
         }
         Ok(artifact)
     }

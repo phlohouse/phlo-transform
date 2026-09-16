@@ -9,7 +9,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use phlo_transform_core::Compilation;
-use phlo_transform_nessie::{Conflict, NessieClient, ReferenceInfo};
+use phlo_transform_nessie::{Conflict, NessieClient, NessieError, ReferenceInfo};
 
 use crate::environment::EnvironmentSetup;
 use crate::error::EngineError;
@@ -262,10 +262,11 @@ impl PromotionEvaluation {
 
 /// Gather the evidence for a `candidate` → `to` promotion and evaluate the
 /// gates over it — the shared pre-merge audit both control surfaces run.
-/// Reads the workspace's evidence artifacts (`branch_diff.json`,
-/// `lineage_diff.json`, `environment*.json`) and the state store's run
-/// history; computes contract breaks live so an edit after `diff` cannot
-/// sneak a break past the gate on a stale artifact's analysis.
+/// Reads the evidence store's audit records (with the workspace's
+/// `branch_diff.json`, `lineage_diff.json`, `environment*.json` artifacts
+/// as the compatibility/export path) and the store's run history; computes
+/// contract breaks live so an edit after `diff` cannot sneak a break past
+/// the gate on a stale artifact's analysis.
 pub async fn evaluate_promotion(
     workspace_root: &Path,
     nessie: &dyn NessieClient,
@@ -309,7 +310,7 @@ pub async fn evaluate_promotion(
         _ => (Vec::new(), Vec::new(), Vec::new()),
     };
 
-    let environment = crate::audit::read_environment_for(workspace_root, candidate);
+    let environment = crate::audit::read_environment_for(workspace_root, state, candidate)?;
     let mut audit = crate::audit::audited_diff(
         workspace_root,
         state,
@@ -336,6 +337,7 @@ pub async fn evaluate_promotion(
     // candidate's compiled lineage fingerprint.
     let lineage = crate::audit::audited_lineage(
         workspace_root,
+        state,
         candidate,
         to,
         &candidate_reference.hash,
@@ -412,6 +414,7 @@ pub fn persist_promotion(
 /// recorded ownership the name is only a guess.
 pub async fn cleanup_candidate(
     workspace_root: &Path,
+    state: Option<&dyn crate::state::StateStore>,
     adapter: Option<&dyn crate::adapter::Adapter>,
     nessie: &dyn NessieClient,
     candidate: &str,
@@ -432,12 +435,23 @@ pub async fn cleanup_candidate(
         }
         (None, _) => {}
     }
-    if let Err(error) = nessie.delete_branch(candidate).await {
-        failures.push(format!("delete branch `{candidate}`: {error}"));
+    match nessie.delete_branch(candidate).await {
+        // An already-deleted branch is the goal state, not a failure: a
+        // retry after a cleanup that failed at the last step must still
+        // reach the evidence removal below, or the record is orphaned.
+        Err(NessieError::NotFound(_)) => {}
+        Err(error) => failures.push(format!("delete branch `{candidate}`: {error}")),
+        Ok(()) => {}
     }
     if failures.is_empty() {
         // The branch and catalog are gone; the provisioning record is stale.
-        crate::audit::remove_environment_artifacts(workspace_root, candidate);
+        if let Err(error) =
+            crate::audit::remove_environment_artifacts(workspace_root, state, candidate)
+        {
+            failures.push(format!("remove environment evidence: {error}"));
+        }
+    }
+    if failures.is_empty() {
         Ok(())
     } else {
         Err(failures.join("; "))

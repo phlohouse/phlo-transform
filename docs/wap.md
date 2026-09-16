@@ -39,6 +39,16 @@ the one the warehouse uses. They default to the same value; set the catalog
 URI when Trino reaches Nessie on a different address than the CLI does, e.g. a
 container-network hostname versus a host-mapped port.
 
+A provisioned candidate catalog is a branch view of the whole repository at
+the candidate ref, not a view over just the models a run produces. Compiled
+SQL therefore qualifies every external source reference into the
+environment's catalog — reads and writes both happen on the candidate
+branch, so seeds loaded for a candidate and sources it reads are
+branch-consistent and nothing silently resolves through the warehouse's
+session catalog. Source schema enrichment, by contrast, always probes the
+project's own catalog, which is the only catalog guaranteed to exist while a
+read-only preview compiles.
+
 ## Reference management
 
 ```bash
@@ -52,7 +62,13 @@ phlo-transform ref delete ci/pr-1
 mutate Nessie references directly, and they do exactly what they say — nothing
 creates or deletes a branch as a side effect of another operation except the
 explicit provisioning on `apply`/`run --ref` and `--cleanup` on
-`promote`. `plan`/`test --ref` resolve the same environment read-only — they
+`promote`. `ref delete` also drops the environment's candidate catalog when
+recorded evidence says Phlo provisioned it (`catalog_status = created`) — a
+catalog Phlo did not provably create is left in place and reported rather than
+dropped. Both `ref delete` and `--cleanup` are idempotent: a branch that is
+already gone counts as deleted, so a retry after a partially-completed cleanup
+still reaches the evidence-removal step. `plan`/`test --ref` resolve the same
+environment read-only — they
 compile against the candidate's catalog when it exists and never create
 anything — and they fail where a run would: when the environment resolves to
 the generated catalog and the adapter cannot provision catalogs, the preview
@@ -92,17 +108,22 @@ and a catalog another candidate's evidence claims is refused outright.
 Refusal rolls back a just-created candidate branch so a failed
 provisioning attempt leaves no stray ref. The provisioning records `catalog_status` (`created`,
 `unverified`, `unmanaged`) so cleanup drops only catalogs Phlo provably
-created. Provisioning is recorded in
-`.phlo/transform/environment.json` — the workspace's current
-environment — plus a per-candidate copy named
+created. Provisioning is recorded as an immutable
+environment `EvidenceRecord` in the state store — the portable authority —
+and exported to `.phlo/transform/environment.json` (the workspace's
+current environment) plus a per-candidate copy named
 `environment_<sanitised ref>_<hash>.json`, so one candidate's evidence
 survives another being provisioned and similarly-named refs never share a
-file. Both are removed when the branch is deleted.
+file. The record is written before the files, so a failed store write cannot
+leave a newer artifact masked behind an older record; and re-provisioning an
+unchanged binding does not append a duplicate — a new record appears only
+when the binding itself changes. Both file and record are removed when the
+branch is deleted.
 
-Each artifact records the commit the candidate was *provably* cut from as
+Each record carries the commit the candidate was *provably* cut from as
 `created_from` — set when `ref create` or provisioning creates the branch,
 and preserved across later re-provisioning. A branch Phlo did not create has
-unrecorded provenance unless an earlier artifact captured it; `promote`
+unrecorded provenance unless earlier evidence captured it; `promote`
 refuses such candidates rather than treat today's target as their base.
 
 A failed run or audit leaves the candidate isolated and does not advance
@@ -116,12 +137,13 @@ Two reviews precede promotion, one per axis:
   columns, tests and dependency edges added, removed or changed relative
   to the merge-base the work branched from, plus the consumers each
   removal orphans and the downstream each lost lineage path affects.
-  Persisted to `lineage_diff.json` and bound to the candidate; `promote`
-  surfaces it as `current`, `advisory` or `stale`. See `docs/lineage.md`.
+  Persisted as lineage-diff evidence and exported to `lineage_diff.json`;
+  `promote` surfaces it as `current`, `advisory` or `stale`. See
+  `docs/lineage.md`.
 - `diff --from <candidate> --to <target>` — the **data-side** delta:
   dataset classification, schema and contract changes, row counts and
-  keyed value diffs between the two Nessie references. Persisted to
-  `branch_diff.json`. See below.
+  keyed value diffs between the two Nessie references. Persisted as
+  branch-diff evidence and exported to `branch_diff.json`. See below.
 
 ## Branch diff
 
@@ -134,9 +156,10 @@ With no model argument, `diff` compares two references: every dataset known to
 the workspace or recorded in state is classified `added`, `removed`,
 `changed`, `unchanged` or `absent`, schema and nullability changes are listed
 per model, and row counts come from the catalogs. `--full` additionally runs
-keyed value diffs on changed models that declare keys. The report is written
-to `.phlo/transform/branch_diff.json` and is the audit artifact `promote`
-consumes. See `docs/diff.md`.
+keyed value diffs on changed models that declare keys. The report is
+persisted as a branch-diff `EvidenceRecord` in the state store — the
+portable audit authority `promote` reads — and exported to
+`.phlo/transform/branch_diff.json` for inspection. See `docs/diff.md`.
 
 ## Promotion
 
@@ -146,8 +169,17 @@ phlo-transform promote --from ci/pr-1 --to main        # equivalent
 phlo-transform promote ci/pr-1 --to main --check
 ```
 
-Promotion is authorised by named gates, printed and emitted identically in
-JSON:
+Promotion is authorised by named gates over **persisted evidence**: every
+artifact an audit produces — environment bindings, branch diffs, lineage
+diffs — is recorded as an immutable `EvidenceRecord` in the state store
+(see `docs/state.md`), so a shared PostgreSQL backend carries the evidence
+from whichever machine or CI stage produced it to the one that promotes.
+Reads are store-first: a workspace that only has artifact files keeps
+working — file evidence the store lacks is imported on read — but a store
+read failure fails closed rather than silently falling back to files that
+could disagree with what another stage recorded.
+
+The gates, printed and emitted identically in JSON:
 
 ```text
 PASS run        — run ba168bc5 passed candidate@3f8c…
@@ -175,23 +207,24 @@ PASS conflicts  — candidate merges cleanly
   nullability guarantee, a declared rename, a changed or dropped effective
   key) are computed live at promotion time — the workspace's desired
   contracts against the contracts the target environment last recorded —
-  so editing a contract after `diff` cannot bypass the gate on a stale
-  artifact. A state-store error fails promotion rather than reading as "no
-  contracts recorded". Without an audited artifact the gate fails closed:
+  so editing a contract after `diff` cannot bypass the gate on stale
+  evidence. A state-store error fails promotion rather than reading as "no
+  contracts recorded". Without audited evidence the gate fails closed:
   "no evidence" never reads as "no changes". The waiver covers the schema
   gate only — it does not waive provenance or run binding.
 - `data_diff` — only evaluated with `--require-diff`; the audited diff
-  (`branch_diff.json` from a `--full` branch diff) must exist, pass its
-  policies, cover this exact candidate→target pair **at the commits being
-  promoted** (the artifact records both refs' resolved heads; an artifact
-  bound to older heads, or to none, is rejected), and still be fresh (its
-  recorded versions match both sides' current materialisations). A shallow
+  (the branch-diff evidence from a `--full` branch diff) must exist, pass
+  its policies, cover this exact candidate→target pair **at the commits
+  being promoted** (the evidence records both refs' resolved heads; a
+  report bound to older heads, or to none, is rejected), and still be
+  fresh (its recorded versions match both sides' current
+  materialisations). A shallow
   branch diff — schema and row counts only, no value-level policies — or a
   diff that compared a relation to itself does not satisfy it. A
   single-model `diff.json` is never promotion evidence: it examined one
   model and cannot certify a branch.
 - `base` — the target's hash still equals the commit the evidence was
-  established against: the hash-bound diff artifact's recorded base, or
+  established against: the hash-bound diff report's recorded base, or
   failing that the immutable `created_from` provenance recorded when the
   candidate branch was cut. A candidate whose origin is unrecorded and which
   was never audited against this target fails this gate — its base is never

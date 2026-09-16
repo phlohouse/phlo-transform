@@ -20,6 +20,7 @@ use crate::adapter::{Adapter, CatalogRequest, CatalogStatus};
 use crate::audit::{read_environment_for, write_environment_artifacts};
 use crate::error::EngineError;
 use crate::source_state::{adapter_default_schema, collect_source_states, relation_for_source};
+use crate::state::StateStore;
 
 /// A request to ensure an environment exists.
 #[derive(Clone, Debug)]
@@ -244,16 +245,17 @@ fn catalog_is_pinned(spec: &EnvironmentSpec, prior: Option<&EnvironmentSetup>) -
 /// caller decides how to surface the warning.
 pub async fn ensure_candidate(
     workspace_root: &Path,
+    state: Option<&dyn StateStore>,
     nessie: &dyn NessieClient,
     adapter: &dyn Adapter,
     spec: &EnvironmentSpec,
 ) -> Result<EnvironmentSetup, EngineError> {
-    let prior = read_environment_for(workspace_root, &spec.candidate_ref);
+    let prior = read_environment_for(workspace_root, state, &spec.candidate_ref)?;
     let catalog = resolve_catalog(spec, prior.as_ref());
     // A catalog another candidate's evidence claims is refused outright —
     // whatever the adapter would report, sharing one physical catalog
     // across refs breaks the isolation the environment claims.
-    if crate::audit::environment_artifacts(workspace_root)
+    if crate::audit::environment_artifacts(workspace_root, state)?
         .iter()
         .any(|other| other.catalog == catalog && other.candidate.name != spec.candidate_ref)
     {
@@ -315,7 +317,7 @@ pub async fn ensure_candidate(
         // provenance is unknown and `promote` will refuse this candidate.
         setup.created_from = prior.and_then(|recorded| recorded.created_from);
     }
-    write_environment_artifacts(workspace_root, &setup)
+    write_environment_artifacts(workspace_root, state, &setup)
         .map_err(|error| EngineError::Artifact(error.to_string()))?;
     Ok(setup)
 }
@@ -336,12 +338,13 @@ pub struct CandidateWorkspace {
 /// schemas and source states) for run/apply/plan/test.
 pub async fn provision_candidate(
     workspace_root: &Path,
+    state: Option<&dyn StateStore>,
     nessie: &dyn NessieClient,
     adapter: &dyn Adapter,
     spec: &EnvironmentSpec,
     enrich: bool,
 ) -> Result<CandidateWorkspace, EngineError> {
-    let setup = ensure_candidate(workspace_root, nessie, adapter, spec).await?;
+    let setup = ensure_candidate(workspace_root, state, nessie, adapter, spec).await?;
     let compilation =
         compile_for_catalog(workspace_root, Some(&setup.catalog), Some(adapter), enrich).await?;
     Ok(CandidateWorkspace { setup, compilation })
@@ -367,12 +370,15 @@ pub enum EnvironmentMode {
 /// environment's work physically lands.
 pub struct EnvironmentContext<'a> {
     /// The workspace root — the live checkout and where provisioning
-    /// artifacts are recorded.
+    /// artifacts are exported.
     pub root: &'a Path,
     /// Nessie client. `None` means environment labels are state records
     /// only — honest local mode, never an error.
     pub nessie: Option<&'a dyn NessieClient>,
     pub adapter: Option<&'a dyn Adapter>,
+    /// The state store — where provisioning evidence is read and recorded.
+    /// `None` degrades evidence to the workspace's artifact files.
+    pub state: Option<&'a dyn StateStore>,
     /// The catalog-facing Nessie URI — what `ensure_catalog` needs to bind
     /// a branch-scoped catalog. Required whenever a candidate environment
     /// is resolved against a Nessie client.
@@ -443,7 +449,9 @@ impl EnvironmentContext<'_> {
         };
         match mode {
             EnvironmentMode::Ensure => {
-                let target = provision_candidate(self.root, nessie, adapter, &spec, true).await?;
+                let target =
+                    provision_candidate(self.root, self.state, nessie, adapter, &spec, true)
+                        .await?;
                 Ok(EnvironmentTarget {
                     catalog: Some(target.setup.catalog.clone()),
                     setup: Some(target.setup),
@@ -455,7 +463,7 @@ impl EnvironmentContext<'_> {
                 // explicit override, then the recorded binding, then the
                 // generated convention — so the previewed target is the
                 // one a later `Ensure` resolves to.
-                let prior = read_environment_for(self.root, environment);
+                let prior = read_environment_for(self.root, self.state, environment)?;
                 // And the same provisioning requirement: when resolution
                 // lands on the generated convention, a later `Ensure` must
                 // provision that catalog — an adapter that cannot provision
@@ -488,9 +496,12 @@ impl EnvironmentContext<'_> {
 
 /// Compile the workspace at `root`, retargeted at `catalog` when given, and
 /// — when `enrich` and an adapter are both present — recompiled with
-/// adapter-observed source schemas and source states. Sources resolve in the
-/// project's own catalog (`defaults.catalog` before the override): the
-/// candidate catalog is for outputs, not inputs.
+/// adapter-observed source schemas and source states. Enrichment probes
+/// sources in the project's own catalog (`defaults.catalog` before the
+/// override), which is guaranteed to exist even before the candidate is
+/// provisioned. Compiled SQL still qualifies sources with the retargeted
+/// catalog — under Nessie the candidate catalog is a branch view of the
+/// whole repo, so reads stay consistent with the candidate's own seeds.
 pub async fn compile_for_catalog(
     workspace_root: &Path,
     catalog: Option<&str>,
@@ -627,17 +638,19 @@ pub fn catalog_name(reference: &str) -> String {
 /// diff/promotion never disagree about a candidate's base.
 pub fn base_ref_for(
     workspace_root: &Path,
+    state: Option<&dyn StateStore>,
     environment: Option<&str>,
     explicit: Option<&str>,
-) -> String {
-    explicit
-        .map(str::to_string)
-        .or_else(|| {
-            environment
-                .and_then(|env| read_environment_for(workspace_root, env))
-                .map(|setup| setup.base.name)
-        })
-        .unwrap_or_else(|| "main".to_string())
+) -> Result<String, EngineError> {
+    if let Some(explicit) = explicit {
+        return Ok(explicit.to_string());
+    }
+    if let Some(environment) = environment {
+        if let Some(setup) = read_environment_for(workspace_root, state, environment)? {
+            return Ok(setup.base.name);
+        }
+    }
+    Ok("main".to_string())
 }
 
 /// The physical catalog a reference's environment resolves through: the
@@ -645,10 +658,14 @@ pub fn base_ref_for(
 /// `phlo_<ref>` convention — the same precedence provisioning applies, so
 /// evidence readers and provisioners never disagree about where a ref's
 /// data physically lives.
-pub fn environment_catalog(workspace_root: &Path, reference: &str) -> String {
-    read_environment_for(workspace_root, reference)
+pub fn environment_catalog(
+    workspace_root: &Path,
+    state: Option<&dyn StateStore>,
+    reference: &str,
+) -> Result<String, EngineError> {
+    Ok(read_environment_for(workspace_root, state, reference)?
         .map(|setup| setup.catalog)
-        .unwrap_or_else(|| catalog_name(reference))
+        .unwrap_or_else(|| catalog_name(reference)))
 }
 
 /// The catalog the *base* side of a branch diff resolves through: `main`
@@ -658,13 +675,14 @@ pub fn environment_catalog(workspace_root: &Path, reference: &str) -> String {
 /// `diff` and the daemon's branch-diff operation.
 pub fn base_catalog(
     workspace_root: &Path,
+    state: Option<&dyn StateStore>,
     base_ref: &str,
     configured: Option<&str>,
     compiled: Option<&str>,
-) -> Option<String> {
+) -> Result<Option<String>, EngineError> {
     if base_ref == "main" {
-        configured.or(compiled).map(str::to_string)
+        Ok(configured.or(compiled).map(str::to_string))
     } else {
-        Some(environment_catalog(workspace_root, base_ref))
+        Ok(Some(environment_catalog(workspace_root, state, base_ref)?))
     }
 }

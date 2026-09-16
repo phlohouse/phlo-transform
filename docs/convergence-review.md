@@ -163,13 +163,17 @@ surfaced the Nessie endpoint/catalog-URI conflation.
 ## Evidence and provenance model
 
 Promotion evidence chains four sources: the live Nessie refs, the state
-store's env-scoped run/model/seed/test records, the workspace artifacts
-(`environment*.json`, `branch_diff.json`, `lineage_diff.json`), and
-live-computed contract breaks. Everything is hash-bound: the diff artifact
-records both refs' resolved heads, the run binds to the candidate's
-post-run head, and `promote` re-checks both hashes at merge time. Unknown
-provenance fails closed — a branch Phlo did not create has no recorded base,
-and "no evidence" never reads as "no changes".
+store's env-scoped run/model/seed/test records, the store's immutable
+audit-evidence records (environment bindings, branch diffs, lineage diffs —
+exported to `environment*.json`, `branch_diff.json`, `lineage_diff.json`),
+and live-computed contract breaks. Everything is hash-bound: the diff
+evidence records both refs' resolved heads, the run binds to the
+candidate's post-run head, and `promote` re-checks both hashes at merge
+time. Evidence in a shared state backend is portable across CI stages; a
+store read failure fails closed rather than substituting local files that
+could disagree with what another stage recorded. Unknown provenance fails
+closed — a branch Phlo did not create has no recorded base, and "no
+evidence" never reads as "no changes".
 
 ## Crate boundaries
 
@@ -182,10 +186,6 @@ is a leaf client. No splits were needed — the fix was moving orchestration
 
 ## Remaining debt
 
-- **Artifacts are file-local.** `.phlo/transform/*.json` evidence does not
-  travel between machines — a pipeline that provisions on one runner and
-  promotes on another needs the artifacts carried (committed or shipped).
-  The state store can be shared via Postgres; the artifacts cannot yet.
 - **`output_identity` is inherently per-relation.** Warm plans at 5k models
   still spend ~2.6s on 5000 metadata reads at 16-way concurrency — correct,
   but a ceiling.
@@ -216,7 +216,7 @@ sketch, present but not exercised.
 | incremental models | Production-credible | append/merge/partition/window strategies, watermarks, schema-change rebuilds; Trino `MERGE` verified live; partition replace is a column-list delete, and watermark coverage is not per-adapter |
 | state store | Strong | env-scoped records, `main`↔default fold, SQLite/Postgres parity tested; watermarks deliberately do not fold |
 | environments + provisioning | Strong | one resolve path, fail-closed, recorded bindings, ownership-aware cleanup, branch rollback on rejected catalogs |
-| WAP + promotion | Strong | hash-bound evidence, provenance-required base, merge-time hash recheck, gates fail closed, live golden-path E2E; artifacts are file-local (portability is the top debt) |
+| WAP + promotion | Strong | hash-bound evidence, provenance-required base, merge-time hash recheck, gates fail closed, live golden-path E2E; evidence is state-store backed and portable across machines via Postgres |
 | data diff | Production-credible | keyed/tolerance/partition/sampled diff live-tested; no distribution summaries, no example-value redaction |
 | daemon API | Production-credible | versioned ops API, idempotency, cancellation, coherent snapshots; reload is a full recompile and progress is polled |
 | CLI | Strong | every surface shares engine orchestration; JSON output everywhere; `--environment`/`--ref` agreement enforced |
@@ -232,12 +232,10 @@ on real infrastructure.
 
 ## Top priorities from here
 
-1. Portable evidence — make promotion artifacts shareable (e.g. state-store
-   backed) so multi-stage CI pipelines work across machines.
-2. Cache-reuse *execution* — `cached` currently classifies; actually
+1. Cache-reuse *execution* — `cached` currently classifies; actually
    reusing the materialised output closes the loop.
-3. Targeted daemon invalidation — reload by changed paths rather than full
+2. Targeted daemon invalidation — reload by changed paths rather than full
    recompile.
-4. Bulk source-state/output-identity reads where the catalog allows.
-5. `plan` output — surface the resolved physical catalog once at the top
+3. Bulk source-state/output-identity reads where the catalog allows.
+4. `plan` output — surface the resolved physical catalog once at the top
    (it is currently only per-model in each target row).

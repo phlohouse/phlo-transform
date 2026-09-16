@@ -1526,14 +1526,12 @@ fn materialized_scope(
                 .into_iter()
                 .map(|record| (record.model_id.clone(), record))
                 .collect();
-            for record in state.materialized_in(Some("main"))? {
-                match records.get(&record.model_id) {
-                    Some(existing) if existing.materialized_at >= record.materialized_at => {}
-                    _ => {
-                        records.insert(record.model_id.clone(), record);
-                    }
-                }
-            }
+            crate::branch_diff::merge_latest(
+                &mut records,
+                state.materialized_in(Some("main"))?,
+                |record| &record.model_id,
+                |record| &record.materialized_at,
+            );
             Ok(records)
         }
     }
@@ -1554,14 +1552,12 @@ fn seeds_scope(
                 .into_iter()
                 .map(|record| (record.name.clone(), record))
                 .collect();
-            for record in state.seeds_in(Some("main"))? {
-                match records.get(&record.name) {
-                    Some(existing) if existing.loaded_at >= record.loaded_at => {}
-                    _ => {
-                        records.insert(record.name.clone(), record);
-                    }
-                }
-            }
+            crate::branch_diff::merge_latest(
+                &mut records,
+                state.seeds_in(Some("main"))?,
+                |record| &record.name,
+                |record| &record.loaded_at,
+            );
             Ok(records)
         }
     }

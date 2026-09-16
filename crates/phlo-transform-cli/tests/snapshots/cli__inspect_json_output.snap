@@ -1,6 +1,5 @@
 ---
 source: crates/phlo-transform-cli/tests/cli.rs
-assertion_line: 90
 expression: stdout(&output)
 ---
 {
@@ -20,12 +19,12 @@ expression: stdout(&output)
     "target": "reporting.monthly",
     "tests": [],
     "used_by": [],
-    "version": "4e889bb",
+    "version": "a33d808",
     "workflow": "reporting"
   },
   "state": {
     "current": null,
-    "desired": "4e889bb",
+    "desired": "a33d808",
     "status": "new"
   }
 }

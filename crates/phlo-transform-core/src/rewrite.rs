@@ -3,8 +3,15 @@
 //!
 //! Native SQL refers to models by logical name (`assay.raw`). Before
 //! execution the compiler replaces every relation that resolves to a workspace
-//! model with that model's physical target relation. External sources are left
-//! untouched.
+//! model with that model's physical target relation.
+//!
+//! External sources are left untouched unless a default catalog is
+//! configured: a source named `schema.table` would otherwise resolve through
+//! the session catalog, which under a candidate environment is the wrong
+//! branch — or no catalog at all. When `default_catalog` is set, sources with
+//! fewer than three name parts are rewritten to the same physical relation
+//! [`relation_for_source`] maps them to, so compiled SQL names the relation
+//! the engine actually loads seeds into and probes.
 //!
 //! The rewrite mirrors relation extraction exactly, including CTE scope, so a
 //! CTE that shadows a workspace model name is never rewritten.
@@ -20,7 +27,7 @@ use sqlparser::ast::{
 
 use crate::identity::ModelId;
 use crate::model::Relation;
-use crate::resolve::{RegistryEntry, Resolution, Resolver};
+use crate::resolve::{relation_for_source, RegistryEntry, Resolution, Resolver};
 
 /// Rewrite a model's statements into compiled SQL.
 ///
@@ -34,6 +41,8 @@ pub(crate) fn rewrite_statements(
     resolver: &Resolver,
     targets: &BTreeMap<ModelId, Relation>,
     ephemerals: &BTreeMap<ModelId, Query>,
+    default_catalog: Option<&str>,
+    default_schema: Option<&str>,
 ) -> String {
     for statement in statements.iter_mut() {
         let mut rewriter = RelationRewriter {
@@ -42,6 +51,8 @@ pub(crate) fn rewrite_statements(
             resolver,
             targets,
             ephemerals,
+            default_catalog,
+            default_schema,
         };
         let _ = statement.visit(&mut rewriter);
     }
@@ -59,6 +70,8 @@ struct RelationRewriter<'a> {
     resolver: &'a Resolver,
     targets: &'a BTreeMap<ModelId, Relation>,
     ephemerals: &'a BTreeMap<ModelId, Query>,
+    default_catalog: Option<&'a str>,
+    default_schema: Option<&'a str>,
 }
 
 impl RelationRewriter<'_> {
@@ -125,8 +138,22 @@ impl VisitorMut for RelationRewriter<'_> {
             Some(current) => self.resolver.resolve(current, &relation),
             None => self.resolver.resolve_global(&relation),
         };
-        let Resolution::Model(id) = resolution else {
-            return ControlFlow::Continue(());
+        let id = match resolution {
+            Resolution::Model(id) => id,
+            Resolution::External(source) => {
+                // Only a configured catalog changes a source reference: a
+                // one/two-part name would otherwise resolve through the
+                // session catalog instead of the workspace's.
+                if self.default_catalog.is_some() && source.parts().len() < 3 {
+                    *name = object_name(&relation_for_source(
+                        &source,
+                        self.default_catalog,
+                        self.default_schema,
+                    ));
+                }
+                return ControlFlow::Continue(());
+            }
+            Resolution::Ambiguous(_) => return ControlFlow::Continue(()),
         };
         if let Some(subquery) = self.ephemerals.get(&id) {
             // Keep the user's alias (`from x as y`) — outer column refs bind

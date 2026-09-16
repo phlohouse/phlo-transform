@@ -408,6 +408,7 @@ async fn mutating_operations_are_serialized() {
                     base: None,
                     force: false,
                     run_tests: None,
+                    retries: None,
                 },
             ),
             None,
@@ -555,6 +556,7 @@ async fn promote_operation_runs_the_full_gated_merge() {
     // this cut-from provenance rather than guessing it.
     write_environment_artifacts(
         dir.path(),
+        None,
         &EnvironmentSetup {
             base: ReferenceInfo::branch("main", "aaaa"),
             candidate: ReferenceInfo::branch("dev", "bbbb"),
@@ -863,7 +865,9 @@ async fn plan_and_run_against_an_environment_target_the_same_catalog() {
         "a read-only plan must not create the branch"
     );
     assert!(
-        read_environment_for(dir.path(), "dev").is_none(),
+        read_environment_for(dir.path(), None, "dev")
+            .expect("read")
+            .is_none(),
         "a read-only plan must not write provisioning evidence"
     );
 
