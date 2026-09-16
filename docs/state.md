@@ -259,9 +259,11 @@ human-readable exports and the compatibility path: a workspace that
 predates the table keeps working, and file evidence the store has not
 seen is imported on read so it becomes portable from then on. Store read
 failures fail closed — never a silent fallback to files that could
-disagree with what another stage recorded. Environment evidence is removed
-when its branch is deleted; branch- and lineage-diff records are kept as
-audit history.
+disagree with what another stage recorded — and so does the import: a
+file whose record cannot be persisted is rejected rather than audited
+locally while the authoritative store knows nothing of it. Environment
+evidence is removed when its branch is deleted; branch- and lineage-diff
+records are kept as audit history.
 
 ## Shared and concurrent state
 

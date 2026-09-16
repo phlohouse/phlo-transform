@@ -3899,15 +3899,36 @@ async fn fail_fast_cancels_in_flight_queries() {
     );
 }
 
-/// A store that accepts everything except `record_model` — a mid-run write
-/// failure stand-in.
+/// A store that accepts everything except the simulated failure points:
+/// `record_model` always fails. Without `evidence_read_only` the evidence
+/// surface rejects outright, like a store that never learned the evidence
+/// table; with it, evidence reads reach the inner store while the
+/// evidence writes refuse — a store that reads successfully yet cannot
+/// persist.
 struct FailingStore {
     inner: SqliteStateStore,
+    evidence_read_only: bool,
 }
 
 impl FailingStore {
     fn new(inner: SqliteStateStore) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            evidence_read_only: false,
+        }
+    }
+
+    fn read_only_evidence(inner: SqliteStateStore) -> Self {
+        Self {
+            inner,
+            evidence_read_only: true,
+        }
+    }
+
+    fn evidence_unsupported<T>() -> Result<T, EngineError> {
+        Err(EngineError::State(
+            "this state store does not persist audit evidence".to_string(),
+        ))
     }
 }
 
@@ -4049,6 +4070,42 @@ impl StateStore for FailingStore {
 
     fn seeds_in(&self, environment: Option<&str>) -> Result<Vec<SeedRecord>, EngineError> {
         self.inner.seeds_in(environment)
+    }
+
+    fn record_evidence(&self, _record: &EvidenceRecord) -> Result<(), EngineError> {
+        if self.evidence_read_only {
+            return Err(EngineError::State(
+                "simulated evidence write refusal".to_string(),
+            ));
+        }
+        Self::evidence_unsupported()
+    }
+
+    fn evidence_for(
+        &self,
+        kind: EvidenceKind,
+        subject: &str,
+    ) -> Result<Vec<EvidenceRecord>, EngineError> {
+        if self.evidence_read_only {
+            return self.inner.evidence_for(kind, subject);
+        }
+        Self::evidence_unsupported()
+    }
+
+    fn latest_evidence(&self, kind: EvidenceKind) -> Result<Vec<EvidenceRecord>, EngineError> {
+        if self.evidence_read_only {
+            return self.inner.latest_evidence(kind);
+        }
+        Self::evidence_unsupported()
+    }
+
+    fn remove_evidence(&self, _kind: EvidenceKind, _subject: &str) -> Result<(), EngineError> {
+        if self.evidence_read_only {
+            return Err(EngineError::State(
+                "simulated evidence write refusal".to_string(),
+            ));
+        }
+        Self::evidence_unsupported()
     }
 }
 
@@ -6892,6 +6949,87 @@ fn a_state_read_failure_fails_environment_resolution_closed() {
     let error = read_environment_for(dir.path(), Some(&failing), "ci/x")
         .expect_err("a store read failure must not fall back to files");
     assert!(error.to_string().contains("evidence store"), "{error}");
+}
+
+#[test]
+fn an_environment_artifact_that_cannot_reach_the_store_cannot_audit() {
+    // With a store configured the store is the authority: a file whose
+    // import cannot persist must not resolve the binding locally while
+    // other machines sharing the store see no record of it.
+    let dir = tempfile::tempdir().unwrap();
+    write_environment_artifacts(dir.path(), None, &evidence_setup("ci/x", "cat_x"))
+        .expect("file-only evidence");
+    let refusing = FailingStore::read_only_evidence(SqliteStateStore::in_memory().unwrap());
+
+    let error = read_environment_for(dir.path(), Some(&refusing), "ci/x")
+        .expect_err("an unimportable artifact must not resolve the binding");
+    assert!(error.to_string().contains("persist"), "{error}");
+}
+
+#[test]
+fn a_branch_diff_artifact_that_cannot_reach_the_store_is_rejected() {
+    // The file names this exact pair and — with a working store — would be
+    // imported and audit. When the import cannot persist, the evidence is
+    // rejected rather than passing gates the authority cannot confirm.
+    let dir = tempfile::tempdir().unwrap();
+    ArtifactWriter::for_workspace(dir.path())
+        .write_branch_diff(&bound_branch_report("ci/x", "main", "bbb", "aaa"))
+        .expect("artifact file");
+    let refusing = FailingStore::read_only_evidence(SqliteStateStore::in_memory().unwrap());
+
+    let evidence = phlo_transform_engine::audited_diff(
+        dir.path(),
+        Some(&refusing),
+        "ci/x",
+        "main",
+        Some("bbb"),
+        Some("aaa"),
+    );
+    let reason = evidence
+        .diff_rejected
+        .expect("unimportable evidence must be rejected");
+    assert!(reason.contains("persist"), "{reason}");
+    assert!(evidence.diff_passed.is_none());
+}
+
+#[test]
+fn a_lineage_artifact_that_cannot_reach_the_store_is_rejected() {
+    // Same on the lineage path: a fingerprinted artifact for this pair
+    // would audit `current` once imported; an import the store refuses
+    // marks the evidence stale instead.
+    let dir = tempfile::tempdir().unwrap();
+    let compilation = project_with_tests();
+    ArtifactWriter::for_workspace(dir.path())
+        .write_lineage_diff(&bound_lineage_artifact(
+            "ci/x",
+            "bbb",
+            "main",
+            "aaa",
+            &compilation.lineage.fingerprint(),
+        ))
+        .expect("artifact file");
+    let refusing = FailingStore::read_only_evidence(SqliteStateStore::in_memory().unwrap());
+
+    let evidence = phlo_transform_engine::audited_lineage(
+        dir.path(),
+        Some(&refusing),
+        "ci/x",
+        "main",
+        "bbb",
+        "aaa",
+        Some(&compilation.lineage.fingerprint()),
+    )
+    .expect("evidence");
+    assert_eq!(evidence.status, "stale");
+    assert!(
+        evidence
+            .reason
+            .as_deref()
+            .expect("a rejection names the failure")
+            .contains("persist"),
+        "{:?}",
+        evidence.reason
+    );
 }
 
 #[test]

@@ -173,32 +173,32 @@ fn lineage_diff_target(artifact: &LineageDiffArtifact) -> &str {
 /// payloads deduplicate too: artifacts without a `created_at` (environment
 /// setups, pre-timestamp lineage diffs) are recorded at import time, so
 /// the timestamp alone cannot anchor them — without the payload check
-/// every audit would append another copy. Best-effort, like every import:
-/// a record that fails to persist does not disqualify the file being
-/// evaluated — but the failure is surfaced, because evidence that never
-/// reaches the store is not portable: a promotion on another machine will
-/// see no record and fail closed.
-fn import_evidence(state: &dyn StateStore, record: &EvidenceRecord) {
+/// every audit would append another copy.
+///
+/// Fail-closed: with a store configured the store is the authority, so
+/// evidence that cannot be persisted may not audit at all — the caller
+/// rejects the artifact rather than pass gates on a local file the
+/// authoritative record knows nothing about. File-only compatibility is
+/// for workspaces with no store configured.
+fn import_evidence(state: &dyn StateStore, record: &EvidenceRecord) -> Result<(), EngineError> {
     let known = state
         .evidence_for(record.kind, &record.subject)
-        .map(|records| {
-            records.iter().any(|existing| {
-                existing.target_ref == record.target_ref
-                    && (existing.created_at == record.created_at
-                        || existing.payload == record.payload)
-            })
-        })
-        .unwrap_or(false);
-    if !known {
-        if let Err(error) = state.record_evidence(record) {
-            eprintln!(
-                "warning: could not persist {} evidence for `{}` to the state store: \
-                 {error} — the artifact still audits locally, but the evidence is not portable",
-                record.kind.as_str(),
-                record.subject
-            );
-        }
+        .map_err(|error| EngineError::State(format!("cannot read the evidence store: {error}")))?
+        .iter()
+        .any(|existing| {
+            existing.target_ref == record.target_ref
+                && (existing.created_at == record.created_at || existing.payload == record.payload)
+        });
+    if known {
+        return Ok(());
     }
+    state.record_evidence(record).map_err(|error| {
+        EngineError::State(format!(
+            "cannot persist {} evidence for `{}` to the state store: {error}",
+            record.kind.as_str(),
+            record.subject
+        ))
+    })
 }
 
 /// Persist a branch-diff audit: the immutable evidence record (portable —
@@ -334,7 +334,10 @@ pub fn read_environment_for(
         let setup = read_environment_files(workspace_root, candidate);
         if let Some(setup) = &setup {
             if let Ok(record) = environment_record(setup) {
-                import_evidence(state, &record);
+                // The file cannot resolve the binding unless it reaches
+                // the store — a local-only artifact would audit here while
+                // other machines sharing the store see nothing.
+                import_evidence(state, &record)?;
             }
         }
         return Ok(setup);
@@ -414,7 +417,7 @@ pub fn environment_artifacts(
                         continue;
                     }
                     if let (Some(state), Ok(record)) = (state, environment_record(&setup)) {
-                        import_evidence(state, &record);
+                        import_evidence(state, &record)?;
                     }
                     setups.push(setup);
                 }
@@ -582,7 +585,9 @@ fn branch_diff_evidence(
     // audits do not append the same instant twice.
     if let Some(report) = &file {
         if let Ok(record) = branch_diff_record(report) {
-            import_evidence(state, &record);
+            if let Err(error) = import_evidence(state, &record) {
+                return BranchDiffLookup::Corrupt(error.to_string());
+            }
         }
     }
     // The store's newest record auditing this exact pair — what the file
@@ -933,7 +938,9 @@ fn lineage_diff_evidence(
     if let Some(Ok(artifact)) = &file {
         if lineage_diff_subject(artifact).is_some() {
             if let Ok(record) = lineage_diff_record(artifact) {
-                import_evidence(state, &record);
+                if let Err(error) = import_evidence(state, &record) {
+                    return Some(Err(error.to_string()));
+                }
             }
         }
     }
@@ -1186,12 +1193,12 @@ mod tests {
             run_id: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
         };
-        import_evidence(&state, &record);
+        import_evidence(&state, &record).expect("import");
         // A re-import of the same artifact gets a fresh evidence id and
         // timestamp — the payload is what must dedup it.
         record.evidence_id = "second".to_string();
         record.created_at = "2026-02-01T00:00:00Z".to_string();
-        import_evidence(&state, &record);
+        import_evidence(&state, &record).expect("re-import dedups");
         assert_eq!(
             state
                 .evidence_for(EvidenceKind::LineageDiff, "ci/x")
@@ -1203,7 +1210,7 @@ mod tests {
 
         // A genuinely different payload for the same pair still appends.
         record.payload = serde_json::json!({"diff": "changed"});
-        import_evidence(&state, &record);
+        import_evidence(&state, &record).expect("changed payload appends");
         assert_eq!(
             state
                 .evidence_for(EvidenceKind::LineageDiff, "ci/x")

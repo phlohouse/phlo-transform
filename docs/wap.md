@@ -177,7 +177,8 @@ from whichever machine or CI stage produced it to the one that promotes.
 Reads are store-first: a workspace that only has artifact files keeps
 working — file evidence the store lacks is imported on read — but a store
 read failure fails closed rather than silently falling back to files that
-could disagree with what another stage recorded.
+could disagree with what another stage recorded, and an import that
+cannot persist rejects the artifact instead of auditing it locally.
 
 The gates, printed and emitted identically in JSON:
 
