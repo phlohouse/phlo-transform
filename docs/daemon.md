@@ -42,8 +42,8 @@ launched with (`adapter`, `state`, `nessie`).
 | `GET /v1/impact?select=` | `impact --select <terms>` | selection blast radius: dependents outside the set + covering tests |
 | `GET /v1/graph` | `graph` artifact | typed graph artifact |
 | `GET /v1/plan?select=&environment=&base=&force=` | `plan --json` | needs adapter; `select` repeats or singles; an `environment` resolves through the same physical-target resolution a `run` uses (read-only — it provisions nothing) |
-| `GET /v1/diff/lineage?base=<git-ref>[&candidate=<git-ref>]` | `lineage --diff <base> [candidate]` | the shared engine diff: one ref is merge-base→worktree, two refs is exact→exact; writes `lineage_diff.json` like the CLI so a later `promote` can audit it |
-| `GET /v1/diff/branch?from=&to=&full=` | `diff --from --to [--full]` | needs adapter; writes `branch_diff.json` like the CLI |
+| `GET /v1/diff/lineage?base=<git-ref>[&candidate=<git-ref>]` | `lineage --diff <base> [candidate]` | the shared engine diff: one ref is merge-base→worktree, two refs is exact→exact; records lineage-diff evidence in the state store (exported to `lineage_diff.json`) like the CLI so a later `promote` can audit it |
+| `GET /v1/diff/branch?from=&to=&full=` | `diff --from --to [--full]` | needs adapter; records branch-diff evidence in the state store (exported to `branch_diff.json`) like the CLI |
 | `GET /v1/state/runs?environment=` | `state runs` | newest first |
 | `GET /v1/state/runs/{id-or-prefix}` | `state show <run>` | run + stored plan + per-item records |
 | `GET /v1/state/runs/{id-or-prefix}/failed` | `state show <run> --failed` | failed/blocked/cancelled items — what `resume`/`retry_failed` would pick up |
@@ -63,9 +63,9 @@ Response: `{"operation": {...}, "replayed": false}`.
 
 | Kind | CLI equivalent | Params | Needs |
 |---|---|---|---|
-| `run` | `run [selectors] --ref --from --force` | `selectors`, `environment`, `base`, `force`, `run_tests` | adapter |
-| `resume` | `run --resume <run>` | `run` | adapter + state |
-| `retry_failed` | `run --retry-failed <run>` | `run` | adapter + state |
+| `run` | `run [selectors] --ref --from --force --retries` | `selectors`, `environment`, `base`, `force`, `run_tests`, `retries` | adapter |
+| `resume` | `run --resume <run> [--retries]` | `run`, `retries` | adapter + state |
+| `retry_failed` | `run --retry-failed <run> [--retries]` | `run`, `retries` | adapter + state |
 | `test` | `test [selectors] --ref --from` | `selectors`, `environment`, `base` | adapter |
 | `promote` | `promote <ref> --to <ref> [--check] [--require-diff] [--allow-breaking-schema] [--cleanup]` | `candidate`, `to`, `check`, `require_diff`, `allow_breaking_schema`, `cleanup`, `actor` | nessie |
 | `reload` | — | — | — |
@@ -89,8 +89,8 @@ created (or reused), a branch-scoped Iceberg catalog is provisioned, and
 the workspace is recompiled retargeted at that catalog before planning —
 the run physically writes to the environment it claims, and a passed run
 binds to the environment's **post-run** Nessie head. The provisioning
-evidence is persisted (`environment_<ref>.json`) so `promote` can audit
-cut-from provenance.
+evidence is persisted in the state store (exported to
+`environment_<ref>.json`) so `promote` can audit cut-from provenance.
 
 The provisioned catalog is named `phlo_<sanitised-ref>_<hash>` — the
 readable ref plus 8 hex of the ref's SHA-256 — so refs that fold to the
@@ -100,8 +100,8 @@ Trino cannot read a catalog's configured Nessie ref back over SQL, and the
 generated name is a public convention anyone can mint, so the engine
 records how each catalog was established (`created` / `unverified` /
 `unmanaged`) and accepts a pre-existing catalog only on a recorded
-`environment_<ref>.json` binding for that exact ref and catalog — an
-artifact that vetted the catalog before (recorded with the
+environment-evidence binding for that exact ref and catalog — a record
+that vetted the catalog before (recorded with the
 `catalog_owned_by_phlo` ownership flag; a pre-flag `unverified` record
 cannot vouch), or an explicit `ref create --catalog` pin. An unverifiable foreign catalog, or one
 another candidate already claims, fails the operation rather than write
@@ -160,7 +160,7 @@ failures end `failed` with `error.code`/`error.message`.
 
 `promote` applies the same evidence rules as the CLI (see `docs/wap.md`):
 the recorded run must be bound to the candidate's current Nessie head, the
-branch-diff artifact must name both current heads, the `base` gate needs
+branch-diff evidence must name both current heads, the `base` gate needs
 immutable branch-cut provenance or a hash-bound audit, and the merge request
 pins both refs so a concurrent advance is rejected. A passed `run`,
 `resume`, or `retry_failed` op binds the run to the environment's

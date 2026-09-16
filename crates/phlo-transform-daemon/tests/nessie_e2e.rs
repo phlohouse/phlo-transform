@@ -304,7 +304,9 @@ async fn environment_targeted_run_is_branch_isolated() {
 
     // The provisioning evidence the operation persisted records the
     // cut-from provenance and the candidate catalog.
-    let setup = read_environment_for(dir.path(), "ci/pr-1").expect("environment artifact");
+    let setup = read_environment_for(dir.path(), None, "ci/pr-1")
+        .expect("read")
+        .expect("environment artifact");
     assert_eq!(setup.candidate.name, "ci/pr-1");
     assert_eq!(setup.catalog, candidate_catalog);
     assert_eq!(setup.catalog_status, CatalogStatus::Created);

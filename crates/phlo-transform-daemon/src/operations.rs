@@ -129,6 +129,9 @@ pub struct RunParams {
     #[serde(default)]
     pub force: bool,
     pub run_tests: Option<bool>,
+    /// Extra attempts for retryable adapter failures (the CLI's
+    /// `--retries`, default 0).
+    pub retries: Option<u32>,
 }
 
 /// `resume`/`retry_failed` share one parameter shape: the run to continue.
@@ -139,6 +142,9 @@ pub struct ContinueParams {
     /// The stored run's environment is authoritative — the continuation
     /// targets whatever environment the original run ran against.
     pub run: String,
+    /// Extra attempts for retryable adapter failures — the CLI applies
+    /// `--retries` to continuations too.
+    pub retries: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,8 +216,11 @@ impl Params {
                 "base": p.base,
                 "force": p.force,
                 "run_tests": p.run_tests,
+                "retries": p.retries,
             }),
-            Params::Resume(p) | Params::RetryFailed(p) => json!({ "run": p.run }),
+            Params::Resume(p) | Params::RetryFailed(p) => {
+                json!({ "run": p.run, "retries": p.retries })
+            }
             Params::Test(p) => json!({
                 "selectors": p.selectors,
                 "environment": p.environment,
@@ -615,6 +624,7 @@ mod tests {
             base: None,
             force: false,
             run_tests: None,
+            retries: None,
         })
     }
 
@@ -625,6 +635,7 @@ mod tests {
             base: None,
             force: false,
             run_tests: None,
+            retries: None,
         })
     }
 

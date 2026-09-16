@@ -27,10 +27,11 @@ use phlo_transform_core::{ModelVersion, VersionDetail};
 use crate::error::EngineError;
 use crate::events::ExecutionStatus;
 use crate::state::{
-    incremental_key_claim, status_str, MaterializedRecord, ModelRunRecord, RunRecord, RunSummary,
-    SeedRecord, SeedRunRecord, StateStore, StoredPlan, StoredRun, TestRunRecord,
+    incremental_key_claim, status_str, EvidenceKind, EvidenceRecord, MaterializedRecord,
+    ModelRunRecord, RunRecord, RunSummary, SeedRecord, SeedRunRecord, StateStore, StoredPlan,
+    StoredRun, TestRunRecord,
 };
-use crate::util::now_rfc3339;
+use crate::util::{cmp_rfc3339, now_rfc3339};
 
 /// The `model_runs` read-back column list, in order — mirrors SQLite.
 const MODEL_RUN_COLUMNS: &str = "run_id, model_id, materialization, status, started_at, \
@@ -55,6 +56,16 @@ fn parse_status(value: &str) -> ExecutionStatus {
         "ready" => ExecutionStatus::Ready,
         _ => ExecutionStatus::Pending,
     }
+}
+
+/// Re-order rows the query pre-sorted by timestamp text into true
+/// chronological order — mirrors the SQLite backend: rows written before
+/// timestamps went fixed-width can carry variable-width fractions that
+/// sort wrong as bytes. The sort is stable, so rows at the same instant
+/// keep the query's `seq` order.
+fn newest_first<T>(mut rows: Vec<T>, timestamp: impl Fn(&T) -> &str) -> Vec<T> {
+    rows.sort_by(|a, b| cmp_rfc3339(timestamp(b), timestamp(a)));
+    rows
 }
 
 fn map_error(error: postgres::Error) -> EngineError {
@@ -137,6 +148,29 @@ fn materialized_from_row(row: &Row) -> MaterializedRecord {
         run_id: row.get(11),
         materialized_at: row.get(12),
     }
+}
+
+/// The `evidence` read-back column list — mirrors SQLite.
+const EVIDENCE_COLUMNS: &str = "evidence_id, kind, subject, target_ref, candidate_hash, \
+     target_hash, fingerprint, payload, run_id, created_at";
+
+fn evidence_from_row(row: &Row) -> Result<EvidenceRecord, EngineError> {
+    let kind: String = row.get(1);
+    let payload: String = row.get(7);
+    Ok(EvidenceRecord {
+        evidence_id: row.get(0),
+        kind: EvidenceKind::parse(&kind)
+            .ok_or_else(|| EngineError::State(format!("unknown evidence kind `{kind}`")))?,
+        subject: row.get(2),
+        target_ref: row.get(3),
+        candidate_hash: row.get(4),
+        target_hash: row.get(5),
+        fingerprint: row.get(6),
+        payload: serde_json::from_str(&payload)
+            .map_err(|error| EngineError::State(error.to_string()))?,
+        run_id: row.get(8),
+        created_at: row.get(9),
+    })
 }
 
 fn seed_from_row(row: &Row) -> SeedRecord {
@@ -353,6 +387,53 @@ fn ensure_schema(client: &mut Client) -> Result<(), String> {
                 created_at TEXT NOT NULL,
                 seq BIGINT GENERATED ALWAYS AS IDENTITY
             );
+            CREATE TABLE IF NOT EXISTS evidence (
+                evidence_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                target_ref TEXT NOT NULL DEFAULT '',
+                candidate_hash TEXT,
+                target_hash TEXT,
+                fingerprint TEXT,
+                payload TEXT NOT NULL,
+                run_id TEXT,
+                created_at TEXT NOT NULL,
+                seq BIGINT GENERATED ALWAYS AS IDENTITY
+            );
+            CREATE INDEX IF NOT EXISTS evidence_subject ON evidence (kind, subject, created_at);
+            -- Ordered upserts compare the incoming timestamp against the
+            -- stored one inside the statement, so the comparison must happen
+            -- in SQL. Chronological comparison matching Rust `cmp_rfc3339`:
+            -- both sides must be well-formed RFC 3339 with an explicit
+            -- offset to compare as instants — the cast is then
+            -- TimeZone-independent. Anything else (offset-less values,
+            -- foreign formats timestamptz would accept like `now` or
+            -- `infinity`, corrupt strings) falls back to byte order, so
+            -- legacy/foreign rows keep a deterministic ordering identical
+            -- to the SQLite backend's.
+            CREATE OR REPLACE FUNCTION phlo_cmp_rfc3339(a TEXT, b TEXT)
+            RETURNS INTEGER AS $$
+            BEGIN
+                IF a ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?([Zz]|[+-][0-9]{2}:[0-9]{2})$'
+                   AND b ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?([Zz]|[+-][0-9]{2}:[0-9]{2})$' THEN
+                    IF a::timestamptz < b::timestamptz THEN
+                        RETURN -1;
+                    ELSIF a::timestamptz > b::timestamptz THEN
+                        RETURN 1;
+                    ELSE
+                        RETURN 0;
+                    END IF;
+                ELSIF a < b THEN RETURN -1;
+                ELSIF a > b THEN RETURN 1;
+                ELSE RETURN 0;
+                END IF;
+            EXCEPTION WHEN OTHERS THEN
+                -- A value matching the shape but not the calendar
+                -- (month 13, hour 99) casts to byte order, as a failed
+                -- parse does on the Rust side.
+                IF a < b THEN RETURN -1; ELSIF a > b THEN RETURN 1; ELSE RETURN 0; END IF;
+            END;
+            $$ LANGUAGE plpgsql;
             ",
         )
         .map_err(|error| error.to_string())?;
@@ -620,21 +701,31 @@ impl StateStore for PostgresStateStore {
                     &[],
                 )
                 .map_err(map_error)?;
-            Ok(rows.iter().map(run_summary).collect())
+            Ok(newest_first(rows.iter().map(run_summary).collect(), |run| {
+                &run.started_at
+            }))
         })
     }
 
     fn latest_run(&self, environment: Option<&str>) -> Result<Option<RunSummary>, EngineError> {
         let environment = environment.unwrap_or("").to_string();
         self.call(move |client| {
-            let row = client
-                .query_opt(
+            // No `LIMIT 1` — the freshest row is chosen after the
+            // parsed-time re-sort, so a variable-width legacy timestamp
+            // cannot shadow a newer run.
+            let rows = client
+                .query(
                     "SELECT run_id, plan_id, environment, started_at, finished_at, status, model_count, failed_count, reference_hash
-                     FROM runs WHERE environment = $1 ORDER BY started_at DESC, seq DESC LIMIT 1",
+                     FROM runs WHERE environment = $1 ORDER BY started_at DESC, seq DESC",
                     &[&environment],
                 )
                 .map_err(map_error)?;
-            Ok(row.as_ref().map(run_summary))
+            Ok(newest_first(
+                rows.iter().map(run_summary).collect(),
+                |run| &run.started_at,
+            )
+            .into_iter()
+            .next())
         })
     }
 
@@ -681,7 +772,9 @@ impl StateStore for PostgresStateStore {
                     &[&prefix],
                 )
                 .map_err(map_error)?;
-            Ok(rows.iter().map(run_summary).collect())
+            Ok(newest_first(rows.iter().map(run_summary).collect(), |run| {
+                &run.started_at
+            }))
         })
     }
 
@@ -811,7 +904,7 @@ impl StateStore for PostgresStateStore {
                         output_identity = EXCLUDED.output_identity,
                         contract_json = EXCLUDED.contract_json,
                         effective_key_json = EXCLUDED.effective_key_json
-                     WHERE EXCLUDED.materialized_at >= model_versions.materialized_at",
+                     WHERE phlo_cmp_rfc3339(EXCLUDED.materialized_at, model_versions.materialized_at) >= 0",
                     &[
                         &record.model_id,
                         &environment,
@@ -964,13 +1057,115 @@ impl StateStore for PostgresStateStore {
                     &[],
                 )
                 .map_err(map_error)?;
-            rows.iter()
+            let mut promotions = rows
+                .iter()
                 .map(|row| {
                     let json: String = row.get(0);
                     serde_json::from_str(&json)
                         .map_err(|error| EngineError::State(error.to_string()))
                 })
-                .collect()
+                .collect::<Result<Vec<crate::promotion::PromotionRecord>, _>>()?;
+            promotions.sort_by(|a, b| cmp_rfc3339(&b.timestamp, &a.timestamp));
+            Ok(promotions)
+        })
+    }
+
+    fn record_evidence(&self, record: &EvidenceRecord) -> Result<(), EngineError> {
+        let record = record.clone();
+        self.call(move |client| {
+            let payload = serde_json::to_string(&record.payload)
+                .map_err(|error| EngineError::State(error.to_string()))?;
+            // INSERT only — evidence is immutable; a colliding id is a bug,
+            // not an upsert.
+            client
+                .execute(
+                    "INSERT INTO evidence
+                     (evidence_id, kind, subject, target_ref, candidate_hash, target_hash, fingerprint, payload, run_id, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                    &[
+                        &record.evidence_id,
+                        &record.kind.as_str(),
+                        &record.subject,
+                        &record.target_ref,
+                        &record.candidate_hash,
+                        &record.target_hash,
+                        &record.fingerprint,
+                        &payload,
+                        &record.run_id,
+                        &record.created_at,
+                    ],
+                )
+                .map_err(map_error)?;
+            Ok(())
+        })
+    }
+
+    fn evidence_for(
+        &self,
+        kind: EvidenceKind,
+        subject: &str,
+    ) -> Result<Vec<EvidenceRecord>, EngineError> {
+        let kind = kind.as_str().to_string();
+        let subject = subject.to_string();
+        self.call(move |client| {
+            let rows = client
+                .query(
+                    &format!(
+                        "SELECT {EVIDENCE_COLUMNS} FROM evidence
+                         WHERE kind = $1 AND subject = $2
+                         ORDER BY created_at DESC, seq DESC"
+                    ),
+                    &[&kind, &subject],
+                )
+                .map_err(map_error)?;
+            let records: Vec<EvidenceRecord> = rows
+                .iter()
+                .map(evidence_from_row)
+                .collect::<Result<_, _>>()?;
+            Ok(newest_first(records, |record| &record.created_at))
+        })
+    }
+
+    fn latest_evidence(&self, kind: EvidenceKind) -> Result<Vec<EvidenceRecord>, EngineError> {
+        let kind = kind.as_str().to_string();
+        self.call(move |client| {
+            let rows = client
+                .query(
+                    &format!(
+                        "SELECT {EVIDENCE_COLUMNS} FROM evidence
+                         WHERE kind = $1
+                         ORDER BY created_at DESC, seq DESC"
+                    ),
+                    &[&kind],
+                )
+                .map_err(map_error)?;
+            let records: Vec<EvidenceRecord> = rows
+                .iter()
+                .map(evidence_from_row)
+                .collect::<Result<_, _>>()?;
+            let mut seen = std::collections::BTreeSet::new();
+            let mut latest = Vec::new();
+            for record in newest_first(records, |record| &record.created_at) {
+                // Latest per (subject, target) pair — mirrors SQLite.
+                if seen.insert((record.subject.clone(), record.target_ref.clone())) {
+                    latest.push(record);
+                }
+            }
+            Ok(latest)
+        })
+    }
+
+    fn remove_evidence(&self, kind: EvidenceKind, subject: &str) -> Result<(), EngineError> {
+        let kind = kind.as_str().to_string();
+        let subject = subject.to_string();
+        self.call(move |client| {
+            client
+                .execute(
+                    "DELETE FROM evidence WHERE kind = $1 AND subject = $2",
+                    &[&kind, &subject],
+                )
+                .map_err(map_error)?;
+            Ok(())
         })
     }
 
@@ -1000,13 +1195,16 @@ impl StateStore for PostgresStateStore {
                         last_value = EXCLUDED.last_value,
                         run_id = EXCLUDED.run_id,
                         updated_at = EXCLUDED.updated_at
-                     WHERE COALESCE(
-                               (SELECT started_at FROM runs WHERE run_id = EXCLUDED.run_id),
-                               EXCLUDED.updated_at
-                           ) >= COALESCE(
-                               (SELECT started_at FROM runs WHERE run_id = incremental_state.run_id),
-                               ''
-                           )",
+                     WHERE phlo_cmp_rfc3339(
+                               COALESCE(
+                                   (SELECT started_at FROM runs WHERE run_id = EXCLUDED.run_id),
+                                   EXCLUDED.updated_at
+                               ),
+                               COALESCE(
+                                   (SELECT started_at FROM runs WHERE run_id = incremental_state.run_id),
+                                   ''
+                               )
+                           ) >= 0",
                     &[&model_id, &environment, &value, &run_id, &updated_at],
                 )
                 .map_err(map_error)?;
@@ -1046,7 +1244,7 @@ impl StateStore for PostgresStateStore {
                         target = EXCLUDED.target,
                         run_id = EXCLUDED.run_id,
                         loaded_at = EXCLUDED.loaded_at
-                     WHERE EXCLUDED.loaded_at >= seed_loads.loaded_at",
+                     WHERE phlo_cmp_rfc3339(EXCLUDED.loaded_at, seed_loads.loaded_at) >= 0",
                     &[
                         &record.name,
                         &environment,
@@ -1100,6 +1298,13 @@ mod tests {
     use super::*;
     use crate::state::{ModelRunRecord, RunRecord, StoredPlan};
 
+    /// Serialises the Postgres tests: they share one database and
+    /// `connect()` truncates every table, so they cannot run concurrently.
+    fn pg_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A Postgres to run against is opt-in: `PHLO_TEST_POSTGRES_URL`.
     fn connect() -> Option<PostgresStateStore> {
         let url = std::env::var("PHLO_TEST_POSTGRES_URL").ok()?;
@@ -1115,6 +1320,7 @@ mod tests {
                     "incremental_state",
                     "seed_loads",
                     "promotions",
+                    "evidence",
                 ] {
                     client
                         .execute(&format!("DELETE FROM {table}"), &[])
@@ -1151,6 +1357,7 @@ mod tests {
 
     #[test]
     fn postgres_roundtrip_run_and_versions() {
+        let _guard = pg_lock();
         let Some(store) = connect() else {
             return;
         };
@@ -1243,5 +1450,290 @@ mod tests {
             .expect("version")
             .expect("record");
         assert_eq!(record.version.hash, "v2", "the stale write must lose");
+    }
+
+    fn materialized(model_id: &str, hash: &str, at: &str, run_id: &str) -> MaterializedRecord {
+        MaterializedRecord {
+            model_id: model_id.to_string(),
+            environment: Some("ci/x".to_string()),
+            version: ModelVersion {
+                hash: hash.to_string(),
+                ..Default::default()
+            },
+            detail: None,
+            target: "cat.m.a".to_string(),
+            incremental_strategy: None,
+            incremental_key: None,
+            adapter: Some("trino".to_string()),
+            output_identity: Some(format!("snap:{hash}")),
+            contract: None,
+            effective_key: Some(Vec::new()),
+            run_id: run_id.to_string(),
+            materialized_at: at.to_string(),
+        }
+    }
+
+    /// Mixed-version writers disagree on timestamp shape: a legacy
+    /// `...00.5Z` row sorts after a newer `...00.501000000Z` byte-wise, so
+    /// the ordered upserts must compare parsed instants — mirrored for all
+    /// three timestamp-gated writes.
+    #[test]
+    fn postgres_mixed_format_timestamp_writes_order_by_instant() {
+        let _guard = pg_lock();
+        let Some(store) = connect() else {
+            return;
+        };
+
+        store
+            .record_materialized(&materialized(
+                "m.a",
+                "v-legacy",
+                "2026-01-01T00:00:00.5Z",
+                "run-old",
+            ))
+            .expect("legacy write");
+        store
+            .record_materialized(&materialized(
+                "m.a",
+                "v-new",
+                "2026-01-01T00:00:00.501000000Z",
+                "run-new",
+            ))
+            .expect("newer write");
+        assert_eq!(
+            store
+                .materialized_version("m.a", Some("ci/x"))
+                .expect("version")
+                .expect("record")
+                .version
+                .hash,
+            "v-new",
+            "a newer instant wins regardless of timestamp shape"
+        );
+        store
+            .record_materialized(&materialized(
+                "m.a",
+                "v-stale",
+                "2026-01-01T00:00:00.499000000Z",
+                "run-stale",
+            ))
+            .expect("stale write");
+        assert_eq!(
+            store
+                .materialized_version("m.a", Some("ci/x"))
+                .expect("version")
+                .expect("record")
+                .version
+                .hash,
+            "v-new"
+        );
+
+        let seed = |hash: &str, at: &str, run_id: &str| SeedRecord {
+            name: "raw.events".to_string(),
+            environment: Some("ci/x".to_string()),
+            content_hash: hash.to_string(),
+            target: "cat.raw.events".to_string(),
+            run_id: run_id.to_string(),
+            loaded_at: at.to_string(),
+        };
+        store
+            .record_seed(&seed("h-legacy", "2026-01-01T00:00:00.5Z", "run-old"))
+            .expect("legacy seed");
+        store
+            .record_seed(&seed("h-new", "2026-01-01T00:00:00.501000000Z", "run-new"))
+            .expect("newer seed");
+        assert_eq!(
+            store
+                .seed_state("raw.events", Some("ci/x"))
+                .expect("seed")
+                .expect("record")
+                .content_hash,
+            "h-new"
+        );
+
+        // incremental_state orders on the writer run's `started_at`.
+        for (run_id, started_at) in [
+            ("run-old", "2026-01-01T00:00:00.5Z"),
+            ("run-new", "2026-01-01T00:00:00.501000000Z"),
+        ] {
+            let (mut record, plan) = run(run_id, Some("ci/x"));
+            record.started_at = started_at.to_string();
+            store.start_run(&record, &plan).expect("start");
+        }
+        store
+            .set_watermark("m.a", Some("ci/x"), "old-mark", "run-old")
+            .expect("old mark");
+        store
+            .set_watermark("m.a", Some("ci/x"), "new-mark", "run-new")
+            .expect("new mark");
+        assert_eq!(
+            store.watermark("m.a", Some("ci/x")).expect("watermark"),
+            Some("new-mark".to_string()),
+            "the newer run's mark must win across timestamp shapes"
+        );
+    }
+
+    fn evidence(id: &str, kind: EvidenceKind, subject: &str, created_at: &str) -> EvidenceRecord {
+        EvidenceRecord {
+            evidence_id: id.to_string(),
+            kind,
+            subject: subject.to_string(),
+            target_ref: "main".to_string(),
+            candidate_hash: Some("candhash".to_string()),
+            target_hash: Some("targ_hash".to_string()),
+            fingerprint: Some("fp".to_string()),
+            payload: serde_json::json!({"marker": id}),
+            run_id: Some("run-pg".to_string()),
+            created_at: created_at.to_string(),
+        }
+    }
+
+    /// Evidence parity with the SQLite backend: append-only records, newest
+    /// first, latest per (subject, target) pair, per-subject removal — the
+    /// semantics cross-stage promotion depends on.
+    #[test]
+    fn postgres_evidence_roundtrip() {
+        let _guard = pg_lock();
+        let Some(store) = connect() else {
+            return;
+        };
+        store
+            .record_evidence(&evidence(
+                "e1",
+                EvidenceKind::BranchDiff,
+                "ci/x",
+                "2026-01-01T00:00:00Z",
+            ))
+            .expect("record");
+        store
+            .record_evidence(&evidence(
+                "e2",
+                EvidenceKind::BranchDiff,
+                "ci/x",
+                "2026-01-02T00:00:00Z",
+            ))
+            .expect("record");
+
+        let records = store
+            .evidence_for(EvidenceKind::BranchDiff, "ci/x")
+            .expect("read");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].evidence_id, "e2");
+        assert_eq!(records[1].evidence_id, "e1");
+        assert_eq!(records[1].payload["marker"], "e1");
+
+        // A duplicate id is rejected — evidence never overwrites in place.
+        assert!(store
+            .record_evidence(&evidence(
+                "e1",
+                EvidenceKind::BranchDiff,
+                "ci/x",
+                "2026-01-03T00:00:00Z",
+            ))
+            .is_err());
+
+        // A re-audit against another target keeps both latest records.
+        let mut release = evidence(
+            "e3",
+            EvidenceKind::BranchDiff,
+            "ci/x",
+            "2026-01-03T00:00:00Z",
+        );
+        release.target_ref = "release".to_string();
+        store.record_evidence(&release).expect("record");
+        let latest = store
+            .latest_evidence(EvidenceKind::BranchDiff)
+            .expect("latest");
+        let pairs: Vec<(&str, &str)> = latest
+            .iter()
+            .map(|record| (record.subject.as_str(), record.target_ref.as_str()))
+            .collect();
+        assert_eq!(pairs, vec![("ci/x", "release"), ("ci/x", "main")]);
+
+        // Environment evidence removes per subject, leaving the diffs.
+        store
+            .record_evidence(&evidence(
+                "e4",
+                EvidenceKind::Environment,
+                "ci/x",
+                "2026-01-04T00:00:00Z",
+            ))
+            .expect("record");
+        store
+            .remove_evidence(EvidenceKind::Environment, "ci/x")
+            .expect("remove");
+        assert!(store
+            .evidence_for(EvidenceKind::Environment, "ci/x")
+            .expect("read")
+            .is_empty());
+        assert_eq!(
+            store
+                .evidence_for(EvidenceKind::BranchDiff, "ci/x")
+                .expect("read")
+                .len(),
+            3
+        );
+    }
+
+    /// Same-second records with variable-width fractions order
+    /// chronologically, not lexically — `.5Z` (500ms) must lose to `.52Z`
+    /// (520ms) and a bare `Z` is its second's earliest instant.
+    #[test]
+    fn postgres_evidence_orders_same_second_records_chronologically() {
+        let _guard = pg_lock();
+        let Some(store) = connect() else {
+            return;
+        };
+        for (id, created_at) in [
+            ("e-mid", "2026-01-01T00:00:00.5Z"),
+            ("e-new", "2026-01-01T00:00:00.52Z"),
+            ("e-zero", "2026-01-01T00:00:00Z"),
+        ] {
+            store
+                .record_evidence(&evidence(id, EvidenceKind::BranchDiff, "ci/x", created_at))
+                .expect("record");
+        }
+        let records = store
+            .evidence_for(EvidenceKind::BranchDiff, "ci/x")
+            .expect("read");
+        let ids: Vec<&str> = records
+            .iter()
+            .map(|record| record.evidence_id.as_str())
+            .collect();
+        assert_eq!(ids, ["e-new", "e-mid", "e-zero"]);
+        assert_eq!(
+            store
+                .latest_evidence(EvidenceKind::BranchDiff)
+                .expect("latest")[0]
+                .evidence_id,
+            "e-new"
+        );
+    }
+
+    /// A second store handle sees what the first wrote — the shared-store
+    /// property a multi-stage CI promotion relies on.
+    #[test]
+    fn postgres_evidence_is_visible_across_connections() {
+        let _guard = pg_lock();
+        let Some(writer) = connect() else {
+            return;
+        };
+        writer
+            .record_evidence(&evidence(
+                "shared-1",
+                EvidenceKind::Environment,
+                "ci/shared",
+                "2026-01-01T00:00:00Z",
+            ))
+            .expect("record");
+
+        let url = std::env::var("PHLO_TEST_POSTGRES_URL").expect("url");
+        let reader = PostgresStateStore::connect(&url).expect("reader connects");
+        let records = reader
+            .evidence_for(EvidenceKind::Environment, "ci/shared")
+            .expect("read");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].evidence_id, "shared-1");
+        assert_eq!(records[0].candidate_hash.as_deref(), Some("candhash"));
     }
 }

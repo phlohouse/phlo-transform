@@ -249,6 +249,77 @@ pub(crate) fn incremental_key_claim(raw: &str) -> Option<Vec<Vec<String>>> {
     (!columns.is_empty()).then_some(vec![columns])
 }
 
+/// The kind of audit evidence a record carries — which typed document the
+/// payload decodes as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    /// A candidate environment's provisioning record (`environment*.json`).
+    Environment,
+    /// A branch-diff audit report (`branch_diff.json`).
+    BranchDiff,
+    /// A lineage-diff audit (`lineage_diff.json`).
+    LineageDiff,
+}
+
+impl EvidenceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Environment => "environment",
+            Self::BranchDiff => "branch_diff",
+            Self::LineageDiff => "lineage_diff",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "environment" => Some(Self::Environment),
+            "branch_diff" => Some(Self::BranchDiff),
+            "lineage_diff" => Some(Self::LineageDiff),
+            _ => None,
+        }
+    }
+}
+
+/// One immutable audit-evidence record — the portable, shared form of the
+/// workspace's promotion artifacts. The store is the authority: the
+/// `.phlo/transform/*.json` files are exports of (and import sources for)
+/// these records, so evidence produced on one machine is visible to a
+/// promotion evaluated on another against the same store.
+///
+/// `payload` is the typed document the artifact file also exports
+/// (`EnvironmentSetup`, `BranchDiffReport`, `LineageDiffArtifact`); the
+/// denormalised binding columns exist for lookup and inspection — the
+/// payload remains authoritative.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EvidenceRecord {
+    pub evidence_id: String,
+    pub kind: EvidenceKind,
+    /// The candidate ref the evidence speaks for.
+    pub subject: String,
+    /// The other side of a pair-scoped record (a branch diff's base ref);
+    /// empty when the kind is not pair-scoped.
+    pub target_ref: String,
+    /// The subject's commit the evidence was produced at, when bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_hash: Option<String>,
+    /// The target's commit the evidence was produced at, when bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_hash: Option<String>,
+    /// The definitional fingerprint the evidence carries (a lineage diff's
+    /// candidate graph fingerprint), when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    pub payload: serde_json::Value,
+    /// The producing run, when the evidence is run-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// When the evidence was produced — RFC 3339. For diffs this is the
+    /// report's own finish time, so an imported artifact and a stored
+    /// record order identically.
+    pub created_at: String,
+}
+
 /// A seed load recorded against an environment.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SeedRecord {
@@ -350,6 +421,45 @@ pub trait StateStore: Send + Sync {
     /// Recorded promotions, newest first.
     fn promotions(&self) -> Result<Vec<crate::promotion::PromotionRecord>, EngineError>;
 
+    /// Append an immutable audit-evidence record. Records are never
+    /// updated — a later audit of the same subject appends a new record —
+    /// so shared state carries the history, not just the latest claim.
+    ///
+    /// The default rejects: a store that cannot persist evidence must say
+    /// so rather than silently dropping the audit trail.
+    fn record_evidence(&self, _record: &EvidenceRecord) -> Result<(), EngineError> {
+        Err(EngineError::State(
+            "this state store does not persist audit evidence".to_string(),
+        ))
+    }
+    /// Every record of `kind` for a subject, newest first.
+    fn evidence_for(
+        &self,
+        _kind: EvidenceKind,
+        _subject: &str,
+    ) -> Result<Vec<EvidenceRecord>, EngineError> {
+        Err(EngineError::State(
+            "this state store does not persist audit evidence".to_string(),
+        ))
+    }
+    /// The newest record of `kind` for each (subject, target) pair that
+    /// has one — a candidate audited against two targets keeps both
+    /// current records.
+    fn latest_evidence(&self, _kind: EvidenceKind) -> Result<Vec<EvidenceRecord>, EngineError> {
+        Err(EngineError::State(
+            "this state store does not persist audit evidence".to_string(),
+        ))
+    }
+    /// Drop a subject's evidence of `kind` — used when the binding it
+    /// describes no longer exists (a deleted environment branch). This is
+    /// removal, not mutation: evidence is immutable while its subject
+    /// exists. Promotion history lives in `promotions` and is untouched.
+    fn remove_evidence(&self, _kind: EvidenceKind, _subject: &str) -> Result<(), EngineError> {
+        Err(EngineError::State(
+            "this state store does not persist audit evidence".to_string(),
+        ))
+    }
+
     /// Record a successful time-window watermark. Only called on success.
     /// Ordered by run generation: a later-started run's observation
     /// supersedes an earlier run's, whatever order the writes land in.
@@ -411,6 +521,27 @@ impl SqliteStateStore {
         // wait for the lock rather than failing the run with SQLITE_BUSY.
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        // Ordered upserts compare the incoming timestamp against the stored
+        // one inside the statement, under the write lock — so the comparison
+        // has to happen in SQL. Expose `cmp_rfc3339` so legacy variable-width
+        // timestamps order chronologically rather than as bytes.
+        connection
+            .create_scalar_function(
+                "phlo_cmp_rfc3339",
+                2,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                    | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+                |ctx| {
+                    let a: String = ctx.get(0)?;
+                    let b: String = ctx.get(1)?;
+                    Ok(match crate::util::cmp_rfc3339(&a, &b) {
+                        std::cmp::Ordering::Less => -1,
+                        std::cmp::Ordering::Equal => 0,
+                        std::cmp::Ordering::Greater => 1,
+                    })
+                },
+            )
             .map_err(|error| EngineError::State(error.to_string()))?;
         connection
             .execute_batch(
@@ -517,6 +648,19 @@ impl SqliteStateStore {
                     record_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS evidence (
+                    evidence_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    target_ref TEXT NOT NULL DEFAULT '',
+                    candidate_hash TEXT,
+                    target_hash TEXT,
+                    fingerprint TEXT,
+                    payload TEXT NOT NULL,
+                    run_id TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS evidence_subject ON evidence (kind, subject, created_at);
                 ",
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
@@ -813,28 +957,13 @@ impl StateStore for SqliteStateStore {
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
         let rows = statement
-            .query_map([], |row| {
-                let status: String = row.get(5)?;
-                let environment: String = row.get(2)?;
-                Ok(RunSummary {
-                    run_id: row.get(0)?,
-                    plan_id: row.get(1)?,
-                    environment: if environment.is_empty() {
-                        None
-                    } else {
-                        Some(environment)
-                    },
-                    reference_hash: row.get(8)?,
-                    started_at: row.get(3)?,
-                    finished_at: row.get(4)?,
-                    status: parse_status(&status),
-                    model_count: row.get::<_, i64>(6)? as usize,
-                    failed_count: row.get::<_, i64>(7)? as usize,
-                })
-            })
+            .query_map([], run_summary_from_row)
             .map_err(|error| EngineError::State(error.to_string()))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| EngineError::State(error.to_string()))
+        let mut runs = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        newest_first(&mut runs, |run| &run.started_at);
+        Ok(runs)
     }
 
     fn latest_run(&self, environment: Option<&str>) -> Result<Option<RunSummary>, EngineError> {
@@ -842,38 +971,23 @@ impl StateStore for SqliteStateStore {
         let mut statement = connection
             .prepare(
                 "SELECT run_id, plan_id, environment, started_at, finished_at, status, model_count, failed_count, reference_hash
-                 FROM runs WHERE environment = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                 FROM runs WHERE environment = ?1 ORDER BY started_at DESC, rowid DESC",
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
-        let mut rows = statement
-            .query(rusqlite::params![environment.unwrap_or("")])
+        let rows = statement
+            .query_map(
+                rusqlite::params![environment.unwrap_or("")],
+                run_summary_from_row,
+            )
             .map_err(|error| EngineError::State(error.to_string()))?;
-        match rows
-            .next()
-            .map_err(|error| EngineError::State(error.to_string()))?
-        {
-            Some(row) => {
-                let map = |error: rusqlite::Error| EngineError::State(error.to_string());
-                let status: String = row.get(5).map_err(map)?;
-                let environment: String = row.get(2).map_err(map)?;
-                Ok(Some(RunSummary {
-                    run_id: row.get(0).map_err(map)?,
-                    plan_id: row.get(1).map_err(map)?,
-                    environment: if environment.is_empty() {
-                        None
-                    } else {
-                        Some(environment)
-                    },
-                    reference_hash: row.get(8).map_err(map)?,
-                    started_at: row.get(3).map_err(map)?,
-                    finished_at: row.get(4).map_err(map)?,
-                    status: parse_status(&status),
-                    model_count: row.get::<_, i64>(6).map_err(map)? as usize,
-                    failed_count: row.get::<_, i64>(7).map_err(map)? as usize,
-                }))
-            }
-            None => Ok(None),
-        }
+        // No `LIMIT 1` — the freshest row is chosen after the parsed-time
+        // re-sort, so a variable-width legacy timestamp cannot shadow a
+        // newer run.
+        let mut runs = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        newest_first(&mut runs, |run| &run.started_at);
+        Ok(runs.into_iter().next())
     }
 
     fn run(&self, run_id: &str) -> Result<Option<StoredRun>, EngineError> {
@@ -922,28 +1036,13 @@ impl StateStore for SqliteStateStore {
             )
             .map_err(|error| EngineError::State(error.to_string()))?;
         let rows = statement
-            .query_map(rusqlite::params![prefix], |row| {
-                let status: String = row.get(5)?;
-                let environment: String = row.get(2)?;
-                Ok(RunSummary {
-                    run_id: row.get(0)?,
-                    plan_id: row.get(1)?,
-                    environment: if environment.is_empty() {
-                        None
-                    } else {
-                        Some(environment)
-                    },
-                    reference_hash: row.get(8)?,
-                    started_at: row.get(3)?,
-                    finished_at: row.get(4)?,
-                    status: parse_status(&status),
-                    model_count: row.get::<_, i64>(6)? as usize,
-                    failed_count: row.get::<_, i64>(7)? as usize,
-                })
-            })
+            .query_map(rusqlite::params![prefix], run_summary_from_row)
             .map_err(|error| EngineError::State(error.to_string()))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| EngineError::State(error.to_string()))
+        let mut runs = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        newest_first(&mut runs, |run| &run.started_at);
+        Ok(runs)
     }
 
     fn model_runs(&self, run_id: &str) -> Result<Vec<ModelRunRecord>, EngineError> {
@@ -1065,7 +1164,7 @@ impl StateStore for SqliteStateStore {
                     output_identity = excluded.output_identity,
                     contract_json = excluded.contract_json,
                     effective_key_json = excluded.effective_key_json
-                 WHERE excluded.materialized_at >= model_versions.materialized_at",
+                 WHERE phlo_cmp_rfc3339(excluded.materialized_at, model_versions.materialized_at) >= 0",
                 rusqlite::params![
                     record.model_id,
                     record.environment.clone().unwrap_or_default(),
@@ -1231,11 +1330,102 @@ impl StateStore for SqliteStateStore {
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
             .map_err(|error| EngineError::State(error.to_string()))?;
-        rows.map(|row| {
-            let json = row.map_err(|error| EngineError::State(error.to_string()))?;
-            serde_json::from_str(&json).map_err(|error| EngineError::State(error.to_string()))
-        })
-        .collect()
+        let mut promotions = rows
+            .map(|row| {
+                let json = row.map_err(|error| EngineError::State(error.to_string()))?;
+                serde_json::from_str(&json).map_err(|error| EngineError::State(error.to_string()))
+            })
+            .collect::<Result<Vec<crate::promotion::PromotionRecord>, _>>()?;
+        newest_first(&mut promotions, |record| &record.timestamp);
+        Ok(promotions)
+    }
+
+    fn record_evidence(&self, record: &EvidenceRecord) -> Result<(), EngineError> {
+        let payload = serde_json::to_string(&record.payload)
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO evidence
+                 (evidence_id, kind, subject, target_ref, candidate_hash, target_hash, fingerprint, payload, run_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    record.evidence_id,
+                    record.kind.as_str(),
+                    record.subject,
+                    record.target_ref,
+                    record.candidate_hash,
+                    record.target_hash,
+                    record.fingerprint,
+                    payload,
+                    record.run_id,
+                    record.created_at,
+                ],
+            )
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        Ok(())
+    }
+
+    fn evidence_for(
+        &self,
+        kind: EvidenceKind,
+        subject: &str,
+    ) -> Result<Vec<EvidenceRecord>, EngineError> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT evidence_id, kind, subject, target_ref, candidate_hash, target_hash, fingerprint, payload, run_id, created_at
+                 FROM evidence WHERE kind = ?1 AND subject = ?2
+                 ORDER BY created_at DESC, rowid DESC",
+            )
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        let rows = statement
+            .query_map(rusqlite::params![kind.as_str(), subject], evidence_from_row)
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        let mut records = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        newest_first(&mut records, |record| &record.created_at);
+        Ok(records)
+    }
+
+    fn latest_evidence(&self, kind: EvidenceKind) -> Result<Vec<EvidenceRecord>, EngineError> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT evidence_id, kind, subject, target_ref, candidate_hash, target_hash, fingerprint, payload, run_id, created_at
+                 FROM evidence WHERE kind = ?1
+                 ORDER BY created_at DESC, rowid DESC",
+            )
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        let rows = statement
+            .query_map(rusqlite::params![kind.as_str()], evidence_from_row)
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        let mut records = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        newest_first(&mut records, |record| &record.created_at);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut latest = Vec::new();
+        for record in records {
+            // Latest per (subject, target) pair — a candidate audited
+            // against `main` and `release` keeps both current records.
+            if seen.insert((record.subject.clone(), record.target_ref.clone())) {
+                latest.push(record);
+            }
+        }
+        Ok(latest)
+    }
+
+    fn remove_evidence(&self, kind: EvidenceKind, subject: &str) -> Result<(), EngineError> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "DELETE FROM evidence WHERE kind = ?1 AND subject = ?2",
+                rusqlite::params![kind.as_str(), subject],
+            )
+            .map_err(|error| EngineError::State(error.to_string()))?;
+        Ok(())
     }
 
     fn set_watermark(
@@ -1260,13 +1450,16 @@ impl StateStore for SqliteStateStore {
                     last_value = excluded.last_value,
                     run_id = excluded.run_id,
                     updated_at = excluded.updated_at
-                 WHERE COALESCE(
-                           (SELECT started_at FROM runs WHERE run_id = excluded.run_id),
-                           excluded.updated_at
-                       ) >= COALESCE(
-                           (SELECT started_at FROM runs WHERE run_id = incremental_state.run_id),
-                           ''
-                       )",
+                 WHERE phlo_cmp_rfc3339(
+                           COALESCE(
+                               (SELECT started_at FROM runs WHERE run_id = excluded.run_id),
+                               excluded.updated_at
+                           ),
+                           COALESCE(
+                               (SELECT started_at FROM runs WHERE run_id = incremental_state.run_id),
+                               ''
+                           )
+                       ) >= 0",
                 rusqlite::params![
                     model_id,
                     environment.unwrap_or(""),
@@ -1316,7 +1509,7 @@ impl StateStore for SqliteStateStore {
                     target = excluded.target,
                     run_id = excluded.run_id,
                     loaded_at = excluded.loaded_at
-                 WHERE excluded.loaded_at >= seed_loads.loaded_at",
+                 WHERE phlo_cmp_rfc3339(excluded.loaded_at, seed_loads.loaded_at) >= 0",
                 rusqlite::params![
                     record.name,
                     record.environment.clone().unwrap_or_default(),
@@ -1406,6 +1599,58 @@ const MATERIALIZED_COLUMNS: &str = "model_id, environment, version_hash, sql_has
      contract_hash, dependency_hash, source_state_hash, compiler_version, target_hash, target, \
      run_id, materialized_at, incremental_strategy, incremental_key, version_detail, adapter, \
      output_identity, contract_json, effective_key_json";
+
+/// Re-order rows the query pre-sorted by timestamp text into true
+/// chronological order: rows written before timestamps went fixed-width
+/// can carry variable-width fractions that sort wrong as bytes. The sort
+/// is stable, so rows at the same instant keep the query's `rowid` order.
+fn newest_first<T>(rows: &mut [T], timestamp: impl Fn(&T) -> &str) {
+    rows.sort_by(|a, b| crate::util::cmp_rfc3339(timestamp(b), timestamp(a)));
+}
+
+fn run_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
+    let status: String = row.get(5)?;
+    let environment: String = row.get(2)?;
+    Ok(RunSummary {
+        run_id: row.get(0)?,
+        plan_id: row.get(1)?,
+        environment: if environment.is_empty() {
+            None
+        } else {
+            Some(environment)
+        },
+        reference_hash: row.get(8)?,
+        started_at: row.get(3)?,
+        finished_at: row.get(4)?,
+        status: parse_status(&status),
+        model_count: row.get::<_, i64>(6)? as usize,
+        failed_count: row.get::<_, i64>(7)? as usize,
+    })
+}
+
+fn evidence_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceRecord> {
+    let kind: String = row.get(1)?;
+    let payload: String = row.get(7)?;
+    let corrupt = |error: String| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error.into())
+    };
+    Ok(EvidenceRecord {
+        evidence_id: row.get(0)?,
+        // An unrecognised kind or an undecodable payload is corrupt
+        // evidence — erroring the read fails closed rather than letting a
+        // row masquerade as a kind it is not.
+        kind: EvidenceKind::parse(&kind)
+            .ok_or_else(|| corrupt(format!("unknown evidence kind `{kind}`")))?,
+        subject: row.get(2)?,
+        target_ref: row.get(3)?,
+        candidate_hash: row.get(4)?,
+        target_hash: row.get(5)?,
+        fingerprint: row.get(6)?,
+        payload: serde_json::from_str(&payload).map_err(|error| corrupt(error.to_string()))?,
+        run_id: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
 
 fn materialized_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MaterializedRecord> {
     let environment: String = row.get(1)?;
@@ -1721,5 +1966,466 @@ mod tests {
             store.watermark("assay.results", Some("prod")).unwrap(),
             Some("2026-12-01".to_string())
         );
+    }
+
+    /// Mixed-version writers disagree on timestamp shape: legacy rows carry
+    /// bare `Z` or variable-width fractions, new writes fixed-width
+    /// nanoseconds. Byte-wise a legacy `...00.5Z` sorts *after* a newer
+    /// `...00.501000000Z` (`Z` > `0`), so the ordered upserts must compare
+    /// parsed instants — this covers all three timestamp-gated writes.
+    #[test]
+    fn mixed_format_timestamp_writes_order_by_instant() {
+        let store = SqliteStateStore::in_memory().unwrap();
+
+        // model_versions: a legacy-format row wins its insert, then a
+        // same-second newer write — byte-wise smaller — must still apply.
+        store
+            .record_materialized(&materialized(
+                "assay.results",
+                "v-legacy",
+                "2026-01-01T00:00:00.5Z",
+                "run-old",
+            ))
+            .unwrap();
+        store
+            .record_materialized(&materialized(
+                "assay.results",
+                "v-new",
+                "2026-01-01T00:00:00.501000000Z",
+                "run-new",
+            ))
+            .unwrap();
+        assert_eq!(
+            store
+                .materialized_version("assay.results", Some("prod"))
+                .unwrap()
+                .expect("record")
+                .version
+                .hash,
+            "v-new",
+            "a newer instant wins regardless of timestamp shape"
+        );
+        // The stale direction still loses.
+        store
+            .record_materialized(&materialized(
+                "assay.results",
+                "v-stale",
+                "2026-01-01T00:00:00.499000000Z",
+                "run-stale",
+            ))
+            .unwrap();
+        assert_eq!(
+            store
+                .materialized_version("assay.results", Some("prod"))
+                .unwrap()
+                .expect("record")
+                .version
+                .hash,
+            "v-new"
+        );
+        // An equal instant written differently re-records idempotently.
+        store
+            .record_materialized(&materialized(
+                "assay.results",
+                "v-same",
+                "2026-01-01T00:00:00.501000000Z",
+                "run-same",
+            ))
+            .unwrap();
+        assert_eq!(
+            store
+                .materialized_version("assay.results", Some("prod"))
+                .unwrap()
+                .expect("record")
+                .version
+                .hash,
+            "v-same"
+        );
+        // Bare-`Z` legacy vs fractional new format on another key.
+        store
+            .record_materialized(&materialized(
+                "assay.other",
+                "v-legacy",
+                "2026-01-01T00:00:01Z",
+                "run-old",
+            ))
+            .unwrap();
+        store
+            .record_materialized(&materialized(
+                "assay.other",
+                "v-new",
+                "2026-01-01T00:00:01.25Z",
+                "run-new",
+            ))
+            .unwrap();
+        assert_eq!(
+            store
+                .materialized_version("assay.other", Some("prod"))
+                .unwrap()
+                .expect("record")
+                .version
+                .hash,
+            "v-new"
+        );
+
+        // seed_loads: the same ordering through `loaded_at`.
+        let seed = |hash: &str, at: &str, run_id: &str| SeedRecord {
+            name: "raw.events".to_string(),
+            environment: Some("prod".to_string()),
+            content_hash: hash.to_string(),
+            target: "cat.raw.events".to_string(),
+            run_id: run_id.to_string(),
+            loaded_at: at.to_string(),
+        };
+        store
+            .record_seed(&seed("h-legacy", "2026-01-01T00:00:00.5Z", "run-old"))
+            .unwrap();
+        store
+            .record_seed(&seed("h-new", "2026-01-01T00:00:00.501000000Z", "run-new"))
+            .unwrap();
+        assert_eq!(
+            store
+                .seed_state("raw.events", Some("prod"))
+                .unwrap()
+                .expect("seed")
+                .content_hash,
+            "h-new"
+        );
+
+        // incremental_state: the ordering reads `runs.started_at` — a
+        // legacy-shaped run start must not beat a newer run's
+        // different-shaped start.
+        let run = |run_id: &str, started_at: &str| {
+            store
+                .start_run(
+                    &RunRecord {
+                        run_id: run_id.to_string(),
+                        plan_id: "plan".to_string(),
+                        environment: Some("prod".to_string()),
+                        started_at: started_at.to_string(),
+                        finished_at: None,
+                        status: ExecutionStatus::Running,
+                        model_count: 1,
+                        failed_count: 0,
+                        reference_hash: None,
+                    },
+                    &StoredPlan {
+                        plan_id: "plan".to_string(),
+                        environment: Some("prod".to_string()),
+                        models: Vec::new(),
+                        seeds: Vec::new(),
+                        tests: Vec::new(),
+                    },
+                )
+                .unwrap();
+        };
+        run("run-old", "2026-01-01T00:00:00.5Z");
+        run("run-new", "2026-01-01T00:00:00.501000000Z");
+        store
+            .set_watermark("assay.results", Some("prod"), "old-mark", "run-old")
+            .unwrap();
+        store
+            .set_watermark("assay.results", Some("prod"), "new-mark", "run-new")
+            .unwrap();
+        assert_eq!(
+            store.watermark("assay.results", Some("prod")).unwrap(),
+            Some("new-mark".to_string()),
+            "the newer run's mark must win across timestamp shapes"
+        );
+    }
+
+    fn evidence(id: &str, kind: EvidenceKind, subject: &str, created_at: &str) -> EvidenceRecord {
+        EvidenceRecord {
+            evidence_id: id.to_string(),
+            kind,
+            subject: subject.to_string(),
+            target_ref: "main".to_string(),
+            candidate_hash: Some("candhash".to_string()),
+            target_hash: Some("targ_hash".to_string()),
+            fingerprint: Some("fp".to_string()),
+            payload: serde_json::json!({"marker": id}),
+            run_id: Some("run-1".to_string()),
+            created_at: created_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn evidence_orders_same_second_records_chronologically() {
+        let store = SqliteStateStore::in_memory().unwrap();
+        // Timestamps written before the format went fixed-width carry
+        // variable-width fractions: `.5Z` (500ms) sorts after `.52Z`
+        // (520ms) as text — `Z` > `2` — and a bare `Z` sorts after every
+        // fraction. Byte order alone would return these oldest-first.
+        for (id, created_at) in [
+            ("e-mid", "2026-01-01T00:00:00.5Z"),
+            ("e-new", "2026-01-01T00:00:00.52Z"),
+            ("e-zero", "2026-01-01T00:00:00Z"),
+        ] {
+            store
+                .record_evidence(&evidence(id, EvidenceKind::BranchDiff, "ci/x", created_at))
+                .unwrap();
+        }
+        let records = store
+            .evidence_for(EvidenceKind::BranchDiff, "ci/x")
+            .unwrap();
+        let ids: Vec<&str> = records
+            .iter()
+            .map(|record| record.evidence_id.as_str())
+            .collect();
+        assert_eq!(ids, ["e-new", "e-mid", "e-zero"]);
+        // `latest_evidence` dedups to the same freshest record.
+        assert_eq!(
+            store.latest_evidence(EvidenceKind::BranchDiff).unwrap()[0].evidence_id,
+            "e-new"
+        );
+    }
+
+    #[test]
+    fn latest_run_orders_same_second_starts_chronologically() {
+        let store = SqliteStateStore::in_memory().unwrap();
+        let plan = StoredPlan {
+            plan_id: "plan".to_string(),
+            environment: Some("ci/x".to_string()),
+            models: Vec::new(),
+            seeds: Vec::new(),
+            tests: Vec::new(),
+        };
+        for (run_id, started_at) in [
+            ("run-mid", "2026-01-01T00:00:00.5Z"),
+            ("run-new", "2026-01-01T00:00:00.52Z"),
+            ("run-zero", "2026-01-01T00:00:00Z"),
+        ] {
+            store
+                .start_run(
+                    &RunRecord {
+                        run_id: run_id.to_string(),
+                        plan_id: "plan".to_string(),
+                        environment: Some("ci/x".to_string()),
+                        reference_hash: None,
+                        started_at: started_at.to_string(),
+                        finished_at: None,
+                        status: ExecutionStatus::Running,
+                        model_count: 0,
+                        failed_count: 0,
+                    },
+                    &plan,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.latest_run(Some("ci/x")).unwrap().unwrap().run_id,
+            "run-new"
+        );
+    }
+
+    #[test]
+    fn evidence_appends_and_reads_newest_first() {
+        let store = SqliteStateStore::in_memory().unwrap();
+        store
+            .record_evidence(&evidence(
+                "e1",
+                EvidenceKind::BranchDiff,
+                "ci/x",
+                "2026-01-01T00:00:00Z",
+            ))
+            .unwrap();
+        store
+            .record_evidence(&evidence(
+                "e2",
+                EvidenceKind::BranchDiff,
+                "ci/x",
+                "2026-01-02T00:00:00Z",
+            ))
+            .unwrap();
+
+        // Append-only: both audits are retained, newest first.
+        let records = store
+            .evidence_for(EvidenceKind::BranchDiff, "ci/x")
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].evidence_id, "e2");
+        assert_eq!(records[1].evidence_id, "e1");
+        // A re-audit does not mutate the earlier record.
+        assert_eq!(records[1].payload["marker"], "e1");
+
+        // Other kinds and subjects are separate.
+        assert!(store
+            .evidence_for(EvidenceKind::LineageDiff, "ci/x")
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .evidence_for(EvidenceKind::BranchDiff, "ci/y")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn evidence_latest_is_per_subject_and_target_pair() {
+        let store = SqliteStateStore::in_memory().unwrap();
+        store
+            .record_evidence(&evidence(
+                "e1",
+                EvidenceKind::BranchDiff,
+                "ci/x",
+                "2026-01-01T00:00:00Z",
+            ))
+            .unwrap();
+        // ci/x re-audited against a different target — both stay current.
+        let mut release = evidence(
+            "e2",
+            EvidenceKind::BranchDiff,
+            "ci/x",
+            "2026-01-02T00:00:00Z",
+        );
+        release.target_ref = "release".to_string();
+        store.record_evidence(&release).unwrap();
+        store
+            .record_evidence(&evidence(
+                "e3",
+                EvidenceKind::BranchDiff,
+                "ci/y",
+                "2026-01-03T00:00:00Z",
+            ))
+            .unwrap();
+
+        let latest = store.latest_evidence(EvidenceKind::BranchDiff).unwrap();
+        let pairs: Vec<(&str, &str)> = latest
+            .iter()
+            .map(|record| (record.subject.as_str(), record.target_ref.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("ci/y", "main"), ("ci/x", "release"), ("ci/x", "main")]
+        );
+    }
+
+    #[test]
+    fn evidence_ids_are_unique() {
+        let store = SqliteStateStore::in_memory().unwrap();
+        store
+            .record_evidence(&evidence(
+                "e1",
+                EvidenceKind::Environment,
+                "ci/x",
+                "2026-01-01T00:00:00Z",
+            ))
+            .unwrap();
+        // A colliding id is rejected — evidence never overwrites in place.
+        let error = store
+            .record_evidence(&evidence(
+                "e1",
+                EvidenceKind::Environment,
+                "ci/x",
+                "2026-01-02T00:00:00Z",
+            ))
+            .expect_err("duplicate evidence id must fail");
+        assert!(matches!(error, EngineError::State(_)), "{error}");
+    }
+
+    #[test]
+    fn evidence_removal_is_per_kind_and_subject() {
+        let store = SqliteStateStore::in_memory().unwrap();
+        store
+            .record_evidence(&evidence(
+                "e1",
+                EvidenceKind::Environment,
+                "ci/x",
+                "2026-01-01T00:00:00Z",
+            ))
+            .unwrap();
+        store
+            .record_evidence(&evidence(
+                "e2",
+                EvidenceKind::BranchDiff,
+                "ci/x",
+                "2026-01-01T00:00:00Z",
+            ))
+            .unwrap();
+        store
+            .record_evidence(&evidence(
+                "e3",
+                EvidenceKind::Environment,
+                "ci/y",
+                "2026-01-01T00:00:00Z",
+            ))
+            .unwrap();
+
+        // Deleting ci/x's environment binding leaves its diffs and other
+        // candidates' environment evidence alone.
+        store
+            .remove_evidence(EvidenceKind::Environment, "ci/x")
+            .unwrap();
+        assert!(store
+            .evidence_for(EvidenceKind::Environment, "ci/x")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .evidence_for(EvidenceKind::BranchDiff, "ci/x")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .evidence_for(EvidenceKind::Environment, "ci/y")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn evidence_is_visible_across_connections() {
+        // Two store handles on one database file stand in for two processes
+        // sharing state: what one records, the other reads.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let writer = SqliteStateStore::open(&path).unwrap();
+        writer
+            .record_evidence(&evidence(
+                "e1",
+                EvidenceKind::Environment,
+                "ci/x",
+                "2026-01-01T00:00:00Z",
+            ))
+            .unwrap();
+
+        let reader = SqliteStateStore::open(&path).unwrap();
+        let records = reader
+            .evidence_for(EvidenceKind::Environment, "ci/x")
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].payload["marker"], "e1");
+        assert_eq!(records[0].candidate_hash.as_deref(), Some("candhash"));
+    }
+
+    #[test]
+    fn a_corrupt_evidence_row_fails_the_read() {
+        // A row whose payload cannot be decoded is corrupt evidence — the
+        // read errors rather than silently dropping it. (Unknown kinds are
+        // filtered by the query itself, so a newer binary's records are
+        // invisible to an older one rather than fatal.)
+        let store = SqliteStateStore::in_memory().unwrap();
+        {
+            let connection = store.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO evidence
+                     (evidence_id, kind, subject, target_ref, payload, created_at)
+                     VALUES ('bad', 'environment', 'ci/x', '', 'not json', 't')",
+                    [],
+                )
+                .unwrap();
+        }
+        let error = store
+            .evidence_for(EvidenceKind::Environment, "ci/x")
+            .expect_err("an undecodable payload is corrupt evidence");
+        assert!(matches!(error, EngineError::State(_)), "{error}");
+        // …and it does not poison unrelated subjects.
+        assert!(store
+            .evidence_for(EvidenceKind::Environment, "ci/y")
+            .unwrap()
+            .is_empty());
     }
 }

@@ -396,8 +396,14 @@ fn compiled_sql_rewrites_models_and_preserves_sources() {
     let results = compilation
         .model(&ModelId::parse("assay.results").unwrap())
         .unwrap();
-    // External sources are left alone.
-    assert!(results.compiled_sql.contains("external.local_raw"));
+    // External sources take the configured catalog: `external.local_raw`
+    // would otherwise resolve through the session catalog — under a
+    // candidate environment that is the wrong branch, or no catalog at all.
+    assert!(
+        results.compiled_sql.contains("memory.external.local_raw"),
+        "{}",
+        results.compiled_sql
+    );
     // Workspace relations become physical targets.
     assert!(
         results.compiled_sql.contains("memory.analytics.assay__raw"),

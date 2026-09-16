@@ -127,9 +127,11 @@ async fn op_run(
         .or_else(|| service.default_environment().map(str::to_string));
     let base_ref = base_ref_for(
         service.root(),
+        service.state().as_deref(),
         environment.as_deref(),
         params.base.as_deref(),
-    );
+    )
+    .map_err(|error| op_error("API011", error.to_string()))?;
     let compilation = target_for(service, environment.as_deref(), &base_ref).await?;
     let set = SelectorSet::parse(&params.selectors, &[], &[], false, false)
         .map_err(|error| op_error("API006", error.to_string()))?;
@@ -159,7 +161,10 @@ async fn op_run(
         environment,
         run_tests: params.run_tests.unwrap_or(true),
         cancel: ops.cancel_handle(id),
-        retry: RetryPolicy::default(),
+        retry: RetryPolicy {
+            retries: params.retries.unwrap_or(0),
+            ..RetryPolicy::default()
+        },
         ..RunOptions::default()
     };
     let result = Runner::new(adapter, service.state())
@@ -204,13 +209,22 @@ async fn op_continue(
         .environment;
     // Provision against the base the environment was cut from when that is
     // recorded, else the conventional `main`.
-    let base_ref = base_ref_for(service.root(), environment.as_deref(), None);
+    let base_ref = base_ref_for(
+        service.root(),
+        service.state().as_deref(),
+        environment.as_deref(),
+        None,
+    )
+    .map_err(|error| op_error("API011", error.to_string()))?;
     let compilation = target_for(service, environment.as_deref(), &base_ref).await?;
     let options = RunOptions {
         environment,
         run_tests: true,
         cancel: ops.cancel_handle(id),
-        retry: RetryPolicy::default(),
+        retry: RetryPolicy {
+            retries: params.retries.unwrap_or(0),
+            ..RetryPolicy::default()
+        },
         ..RunOptions::default()
     };
     let runner = Runner::new(adapter, service.state());
@@ -249,9 +263,11 @@ async fn op_test(
         .or_else(|| service.default_environment().map(str::to_string));
     let base_ref = base_ref_for(
         service.root(),
+        service.state().as_deref(),
         environment.as_deref(),
         params.base.as_deref(),
-    );
+    )
+    .map_err(|error| op_error("API011", error.to_string()))?;
     let compilation = match environment.as_deref() {
         Some(environment) => {
             let target = service
@@ -359,6 +375,7 @@ async fn op_promote(
     let cleanup_error = if params.cleanup && record.merged {
         cleanup_candidate(
             &root,
+            state.as_deref(),
             service.adapter().as_deref(),
             nessie.as_ref(),
             candidate,

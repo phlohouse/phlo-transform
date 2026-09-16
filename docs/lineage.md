@@ -204,19 +204,21 @@ Impacts
   model://assay/legacy orphans: assay.report, test://legacy_range
 ```
 
-The report is written to `.phlo/transform/lineage_diff.json`; `--json`
-prints the same document. Beyond the diff itself the artifact binds its
+The report is persisted as lineage-diff evidence in the state store — the
+record `promote` audits, portable to whichever machine runs the promotion
+— and exported to `.phlo/transform/lineage_diff.json`; `--json`
+prints the same document. Beyond the diff itself the evidence binds its
 provenance: `base_kind` (`merge-base` or `ref`), the resolved `base_commit`,
 the candidate's git head and worktree state, a `lineage_hash` fingerprint
 of the candidate's canonical graph, and — when `--ref`/`--from`
 names a Nessie environment that resolves — the candidate and target branch
-hashes it was produced for. `promote` reads that binding: a lineage artifact
+hashes it was produced for. `promote` reads that binding: a lineage record
 covering this candidate and target at their current commits *and* whose
 fingerprint still matches the compiled workspace reports
 `current`; one produced for another pair, before either side moved, before
 the candidate's definitions changed, or naming refs that no longer resolve,
 reports `stale` with the reason rather than standing as evidence; an
-unbound artifact is advisory only. A base ref that fails to load or compile
+unbound record is advisory only. A base ref that fails to load or compile
 reports its diagnostics and exits non-zero rather than diffing a partial
 graph.
 

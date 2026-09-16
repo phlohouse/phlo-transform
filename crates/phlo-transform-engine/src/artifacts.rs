@@ -113,6 +113,11 @@ pub struct LineageDiffArtifact {
     /// an environment — promotion can only treat it as advisory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<LineageEnvironment>,
+    /// When the diff was produced — lets the persisted evidence record and
+    /// the exported artifact order identically. `None` on artifacts
+    /// written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
     pub diff: phlo_transform_core::LineageDiff,
 }
 

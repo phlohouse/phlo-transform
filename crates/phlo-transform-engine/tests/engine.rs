@@ -21,15 +21,17 @@ use phlo_transform_core::{
 };
 use phlo_transform_engine::{
     branch_diff, catalog_name, changed_models, cleanup_candidate, collect_source_states,
-    ensure_candidate, ensure_environment, environment_artifact_name, evaluate_promotion,
-    materialized_for_environment, read_environment_for, write_environment_artifacts, Adapter,
-    AdapterError, ArtifactWriter, BranchDiffRequest, CancelHandle, CatalogRequest, CatalogStatus,
-    ColumnInfo, ContractSafety, DatasetStatus, EngineError, EngineEvent, EnvironmentContext,
-    EnvironmentMode, EnvironmentSetup, EnvironmentSpec, ExecutionStatus, FailureCategory,
+    ensure_candidate, ensure_environment, environment_artifact_name, environment_artifacts,
+    evaluate_promotion, materialized_for_environment, persist_branch_diff, read_environment_for,
+    seeds_for_environment, write_environment_artifacts, Adapter, AdapterError, ArtifactWriter,
+    BranchDiffReport, BranchDiffRequest, CancelHandle, CandidateProvenance, CatalogRequest,
+    CatalogStatus, ColumnInfo, ContractSafety, DatasetStatus, EngineError, EngineEvent,
+    EnvironmentContext, EnvironmentMode, EnvironmentSetup, EnvironmentSpec, EvidenceKind,
+    EvidenceRecord, ExecutionStatus, FailureCategory, LineageDiffArtifact, LineageEnvironment,
     MaterializedRecord, Membership, ModelResult, ModelRunRecord, Plan, PlanAction, PlanOptions,
     Planner, PromotionOptions, PromotionRecord, QueryResult, ReasonKind, RetryPolicy, RunOptions,
     RunRecord, RunResult, RunSummary, Runner, SeedRecord, SeedRunRecord, SqliteStateStore,
-    StateStore, StoredPlan, StoredRun, TestRunRecord,
+    StateStore, StoredPlan, StoredRun, TestRunRecord, SCHEMA_VERSION,
 };
 
 /// How a target should fail: the error to return, and how many attempts it
@@ -3897,15 +3899,36 @@ async fn fail_fast_cancels_in_flight_queries() {
     );
 }
 
-/// A store that accepts everything except `record_model` — a mid-run write
-/// failure stand-in.
+/// A store that accepts everything except the simulated failure points:
+/// `record_model` always fails. Without `evidence_read_only` the evidence
+/// surface rejects outright, like a store that never learned the evidence
+/// table; with it, evidence reads reach the inner store while the
+/// evidence writes refuse — a store that reads successfully yet cannot
+/// persist.
 struct FailingStore {
     inner: SqliteStateStore,
+    evidence_read_only: bool,
 }
 
 impl FailingStore {
     fn new(inner: SqliteStateStore) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            evidence_read_only: false,
+        }
+    }
+
+    fn read_only_evidence(inner: SqliteStateStore) -> Self {
+        Self {
+            inner,
+            evidence_read_only: true,
+        }
+    }
+
+    fn evidence_unsupported<T>() -> Result<T, EngineError> {
+        Err(EngineError::State(
+            "this state store does not persist audit evidence".to_string(),
+        ))
     }
 }
 
@@ -4047,6 +4070,42 @@ impl StateStore for FailingStore {
 
     fn seeds_in(&self, environment: Option<&str>) -> Result<Vec<SeedRecord>, EngineError> {
         self.inner.seeds_in(environment)
+    }
+
+    fn record_evidence(&self, _record: &EvidenceRecord) -> Result<(), EngineError> {
+        if self.evidence_read_only {
+            return Err(EngineError::State(
+                "simulated evidence write refusal".to_string(),
+            ));
+        }
+        Self::evidence_unsupported()
+    }
+
+    fn evidence_for(
+        &self,
+        kind: EvidenceKind,
+        subject: &str,
+    ) -> Result<Vec<EvidenceRecord>, EngineError> {
+        if self.evidence_read_only {
+            return self.inner.evidence_for(kind, subject);
+        }
+        Self::evidence_unsupported()
+    }
+
+    fn latest_evidence(&self, kind: EvidenceKind) -> Result<Vec<EvidenceRecord>, EngineError> {
+        if self.evidence_read_only {
+            return self.inner.latest_evidence(kind);
+        }
+        Self::evidence_unsupported()
+    }
+
+    fn remove_evidence(&self, _kind: EvidenceKind, _subject: &str) -> Result<(), EngineError> {
+        if self.evidence_read_only {
+            return Err(EngineError::State(
+                "simulated evidence write refusal".to_string(),
+            ));
+        }
+        Self::evidence_unsupported()
     }
 }
 
@@ -5029,6 +5088,66 @@ fn materialized_for_environment_merges_default_env_by_latest() {
     assert!(dev.is_empty());
 }
 
+/// Legacy rows carry variable-width fractions: `...:00Z` (exactly on the
+/// second) sorts *after* `...:00.5Z` (500ms later) byte-wise, so the merge
+/// must order by instant, not string. Otherwise the older `main` record
+/// would shadow the default env's real last write.
+#[test]
+fn materialized_for_environment_orders_mixed_width_timestamps() {
+    let state = SqliteStateStore::in_memory().unwrap();
+    let target = Relation {
+        catalog: Some("iceberg".to_string()),
+        schema: "main".to_string(),
+        table: "t".to_string(),
+    };
+    state
+        .record_materialized(&materialized_at(
+            "main.t",
+            Some("main"),
+            "v-old",
+            &target,
+            "2024-01-01T00:00:00Z",
+        ))
+        .unwrap();
+    state
+        .record_materialized(&materialized_at(
+            "main.t",
+            None,
+            "v-new",
+            &target,
+            "2024-01-01T00:00:00.5Z",
+        ))
+        .unwrap();
+    let records = materialized_for_environment(&state, "main").unwrap();
+    assert_eq!(
+        records["main.t"].version.hash, "v-new",
+        "the chronologically later record must win, whatever the string width"
+    );
+}
+
+/// Same hazard for seeds: `loaded_at` ordering across the `main`/default
+/// fold must be chronological.
+#[test]
+fn seeds_for_environment_orders_mixed_width_timestamps() {
+    let state = SqliteStateStore::in_memory().unwrap();
+    let seed = |env: Option<&str>, hash: &str, at: &str| SeedRecord {
+        name: "raw.events".to_string(),
+        environment: env.map(str::to_string),
+        content_hash: hash.to_string(),
+        target: "iceberg.main.events".to_string(),
+        run_id: "run-1".to_string(),
+        loaded_at: at.to_string(),
+    };
+    state
+        .record_seed(&seed(Some("main"), "h-old", "2024-01-01T00:00:00Z"))
+        .unwrap();
+    state
+        .record_seed(&seed(None, "h-new", "2024-01-01T00:00:00.5Z"))
+        .unwrap();
+    let records = seeds_for_environment(&state, "main").unwrap();
+    assert_eq!(records["raw.events"].content_hash, "h-new");
+}
+
 #[test]
 fn promotion_records_persist_in_state() {
     let state = SqliteStateStore::in_memory().unwrap();
@@ -5565,6 +5684,7 @@ async fn a_fresh_candidate_gets_the_generated_catalog_name() {
 
     let setup = ensure_candidate(
         dir.path(),
+        None,
         &nessie,
         &adapter,
         &EnvironmentSpec {
@@ -5590,12 +5710,12 @@ async fn a_rerun_of_the_same_candidate_reuses_its_recorded_catalog() {
         ..environment_spec("ci/pr-1")
     };
 
-    let first = ensure_candidate(dir.path(), &nessie, &adapter, &spec)
+    let first = ensure_candidate(dir.path(), None, &nessie, &adapter, &spec)
         .await
         .expect("first provision");
     // The catalog now exists in the adapter: the second call reports
     // Unverified, and the recorded binding is what accepts it.
-    let second = ensure_candidate(dir.path(), &nessie, &adapter, &spec)
+    let second = ensure_candidate(dir.path(), None, &nessie, &adapter, &spec)
         .await
         .expect("reprovision");
 
@@ -5623,6 +5743,7 @@ async fn an_unverified_catalog_recorded_for_this_ref_is_accepted() {
     // Recorded evidence: this workspace bound `ci/x` to `custom_cat` before.
     write_environment_artifacts(
         dir.path(),
+        None,
         &EnvironmentSetup {
             base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
             candidate: phlo_transform_nessie::ReferenceInfo::branch("ci/x", "bbb"),
@@ -5639,6 +5760,7 @@ async fn an_unverified_catalog_recorded_for_this_ref_is_accepted() {
 
     let setup = ensure_candidate(
         dir.path(),
+        None,
         &nessie,
         &adapter,
         &EnvironmentSpec {
@@ -5670,6 +5792,7 @@ async fn an_unverified_catalog_with_no_recorded_binding_is_refused() {
 
     let error = ensure_candidate(
         dir.path(),
+        None,
         &nessie,
         &adapter,
         &EnvironmentSpec {
@@ -5702,6 +5825,7 @@ async fn an_unverified_generated_catalog_with_no_artifact_is_refused() {
 
     let error = ensure_candidate(
         dir.path(),
+        None,
         &nessie,
         &adapter,
         &EnvironmentSpec {
@@ -5718,7 +5842,9 @@ async fn an_unverified_generated_catalog_with_no_artifact_is_refused() {
         "the branch created for a rejected catalog is rolled back"
     );
     assert!(
-        read_environment_for(dir.path(), "ci/x").is_none(),
+        read_environment_for(dir.path(), None, "ci/x")
+            .expect("read")
+            .is_none(),
         "no artifact claims a refused binding"
     );
 }
@@ -5763,6 +5889,7 @@ async fn a_legacy_unverified_artifact_does_not_vouch_for_a_generated_catalog() {
 
     let error = ensure_candidate(
         dir.path(),
+        None,
         &nessie,
         &adapter,
         &EnvironmentSpec {
@@ -5797,6 +5924,7 @@ async fn a_ref_create_artifact_does_not_adopt_a_stale_generated_catalog() {
     let dir = tempfile::tempdir().unwrap();
     write_environment_artifacts(
         dir.path(),
+        None,
         &EnvironmentSetup {
             base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
             candidate: phlo_transform_nessie::ReferenceInfo::branch("ci/x", "bbb"),
@@ -5811,6 +5939,7 @@ async fn a_ref_create_artifact_does_not_adopt_a_stale_generated_catalog() {
 
     let error = ensure_candidate(
         dir.path(),
+        None,
         &nessie,
         &adapter,
         &EnvironmentSpec {
@@ -5841,6 +5970,7 @@ async fn a_catalog_claimed_by_another_candidate_is_refused() {
     // `ci/y`'s evidence says `shared` is its catalog.
     write_environment_artifacts(
         dir.path(),
+        None,
         &EnvironmentSetup {
             base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
             candidate: phlo_transform_nessie::ReferenceInfo::branch("ci/y", "ccc"),
@@ -5855,6 +5985,7 @@ async fn a_catalog_claimed_by_another_candidate_is_refused() {
 
     let error = ensure_candidate(
         dir.path(),
+        None,
         &nessie,
         &adapter,
         &EnvironmentSpec {
@@ -5888,6 +6019,7 @@ async fn a_fresh_catalog_name_claimed_by_another_candidate_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     write_environment_artifacts(
         dir.path(),
+        None,
         &EnvironmentSetup {
             base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
             candidate: phlo_transform_nessie::ReferenceInfo::branch("ci/y", "ccc"),
@@ -5902,6 +6034,7 @@ async fn a_fresh_catalog_name_claimed_by_another_candidate_is_refused() {
 
     let error = ensure_candidate(
         dir.path(),
+        None,
         &nessie,
         &adapter,
         &EnvironmentSpec {
@@ -5929,6 +6062,7 @@ async fn an_explicit_catalog_created_fresh_is_accepted() {
 
     let setup = ensure_candidate(
         dir.path(),
+        None,
         &nessie,
         &adapter,
         &EnvironmentSpec {
@@ -5957,6 +6091,7 @@ async fn a_ref_create_artifact_does_not_silence_the_unmanaged_fail_closed() {
     let dir = tempfile::tempdir().unwrap();
     write_environment_artifacts(
         dir.path(),
+        None,
         &EnvironmentSetup {
             base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
             candidate: phlo_transform_nessie::ReferenceInfo::branch("ci/x", "bbb"),
@@ -5971,6 +6106,7 @@ async fn a_ref_create_artifact_does_not_silence_the_unmanaged_fail_closed() {
 
     let error = ensure_candidate(
         dir.path(),
+        None,
         &nessie,
         &adapter,
         &EnvironmentSpec {
@@ -6001,6 +6137,7 @@ async fn a_recorded_user_named_binding_survives_an_unmanaged_adapter() {
     let dir = tempfile::tempdir().unwrap();
     write_environment_artifacts(
         dir.path(),
+        None,
         &EnvironmentSetup {
             base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
             candidate: phlo_transform_nessie::ReferenceInfo::branch("ci/x", "bbb"),
@@ -6015,6 +6152,7 @@ async fn a_recorded_user_named_binding_survives_an_unmanaged_adapter() {
 
     let setup = ensure_candidate(
         dir.path(),
+        None,
         &nessie,
         &adapter,
         &EnvironmentSpec {
@@ -6053,9 +6191,16 @@ async fn cleanup_drops_a_catalog_phlo_owns_despite_unverified_status() {
     let dir = tempfile::tempdir().unwrap();
     let setup = recorded_setup("cat_x", CatalogStatus::Unverified, Some(true));
 
-    cleanup_candidate(dir.path(), Some(&adapter), &nessie, "ci/x", Some(&setup))
-        .await
-        .expect("cleanup");
+    cleanup_candidate(
+        dir.path(),
+        None,
+        Some(&adapter),
+        &nessie,
+        "ci/x",
+        Some(&setup),
+    )
+    .await
+    .expect("cleanup");
 
     assert!(
         adapter
@@ -6079,9 +6224,16 @@ async fn cleanup_drops_a_legacy_created_catalog() {
     let dir = tempfile::tempdir().unwrap();
     let setup = recorded_setup("cat_x", CatalogStatus::Created, None);
 
-    cleanup_candidate(dir.path(), Some(&adapter), &nessie, "ci/x", Some(&setup))
-        .await
-        .expect("cleanup");
+    cleanup_candidate(
+        dir.path(),
+        None,
+        Some(&adapter),
+        &nessie,
+        "ci/x",
+        Some(&setup),
+    )
+    .await
+    .expect("cleanup");
 
     assert!(adapter
         .executed
@@ -6102,9 +6254,16 @@ async fn cleanup_quotes_the_catalog_identifier() {
     let dir = tempfile::tempdir().unwrap();
     let setup = recorded_setup("odd\"cat", CatalogStatus::Created, None);
 
-    cleanup_candidate(dir.path(), Some(&adapter), &nessie, "ci/x", Some(&setup))
-        .await
-        .expect("cleanup");
+    cleanup_candidate(
+        dir.path(),
+        None,
+        Some(&adapter),
+        &nessie,
+        "ci/x",
+        Some(&setup),
+    )
+    .await
+    .expect("cleanup");
 
     assert!(adapter
         .executed
@@ -6168,9 +6327,16 @@ async fn cleanup_never_drops_a_catalog_phlo_does_not_own() {
     // else may be using it.
     let setup = recorded_setup("foreign", CatalogStatus::Unverified, Some(false));
 
-    cleanup_candidate(dir.path(), Some(&adapter), &nessie, "ci/x", Some(&setup))
-        .await
-        .expect("branch deletion still succeeds");
+    cleanup_candidate(
+        dir.path(),
+        None,
+        Some(&adapter),
+        &nessie,
+        "ci/x",
+        Some(&setup),
+    )
+    .await
+    .expect("branch deletion still succeeds");
 
     assert!(
         !adapter
@@ -6191,7 +6357,7 @@ async fn cleanup_without_environment_evidence_drops_no_catalog() {
     let adapter = FakeAdapter::default();
     let dir = tempfile::tempdir().unwrap();
 
-    cleanup_candidate(dir.path(), Some(&adapter), &nessie, "ci/x", None)
+    cleanup_candidate(dir.path(), None, Some(&adapter), &nessie, "ci/x", None)
         .await
         .expect("branch deletion");
 
@@ -6203,6 +6369,52 @@ async fn cleanup_without_environment_evidence_drops_no_catalog() {
             .iter()
             .any(|sql| sql.contains("DROP CATALOG")),
         "no recorded environment, no drop — the name would only be a guess"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_on_an_already_deleted_branch_still_removes_evidence() {
+    // The wedge this guards: a first cleanup deleted the branch and
+    // catalog but failed before the evidence removal; a retry sees
+    // NotFound on the branch and must still reach the removal — otherwise
+    // the record is orphaned with no path that clears it.
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    let nessie = InMemoryNessie::new(); // `ci/x` was never seeded — already gone
+    let adapter = FakeAdapter::default();
+    let setup = recorded_setup("cat_x", CatalogStatus::Created, Some(true));
+    write_environment_artifacts(dir.path(), Some(&state), &setup).expect("writes");
+
+    cleanup_candidate(
+        dir.path(),
+        Some(&state),
+        Some(&adapter),
+        &nessie,
+        "ci/x",
+        Some(&setup),
+    )
+    .await
+    .expect("cleanup of an already-deleted branch is not a failure");
+
+    assert!(
+        state
+            .evidence_for(EvidenceKind::Environment, "ci/x")
+            .unwrap()
+            .is_empty(),
+        "the orphaned store record is removed"
+    );
+    assert!(
+        !dir.path()
+            .join(".phlo/transform")
+            .join(environment_artifact_name("ci/x"))
+            .exists(),
+        "the orphaned artifact file is removed"
+    );
+    assert!(
+        read_environment_for(dir.path(), Some(&state), "ci/x")
+            .expect("read")
+            .is_none(),
+        "no binding survives for the deleted environment"
     );
 }
 
@@ -6220,6 +6432,7 @@ fn resolve_context<'a>(
         root,
         nessie: nessie.map(|n| n as &dyn NessieClient),
         adapter: adapter.map(|a| a as &dyn Adapter),
+        state: None,
         nessie_uri,
         warehouse: None,
         catalog: None,
@@ -6268,7 +6481,9 @@ async fn a_read_only_resolve_never_provisions() {
         adapter.catalogs.lock().unwrap().is_empty(),
         "a preview must not create the catalog"
     );
-    assert!(read_environment_for(dir.path(), "ci/pr-1").is_none());
+    assert!(read_environment_for(dir.path(), None, "ci/pr-1")
+        .expect("read")
+        .is_none());
 }
 
 #[tokio::test]
@@ -6306,6 +6521,49 @@ async fn read_only_and_ensure_resolve_the_same_physical_catalog() {
         .expect("re-resolve");
     assert_eq!(after.catalog, ensured.catalog);
     assert!(after.setup.is_some(), "the recorded binding is returned");
+}
+
+#[tokio::test]
+async fn a_candidate_compile_qualifies_source_references() {
+    // A source written `external.feed` must compile to the environment's
+    // catalog — left unqualified it would resolve through the session
+    // catalog, which under a candidate is the wrong branch (or none at all).
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa");
+    let adapter = FakeAdapter::default();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("phlo.toml"),
+        "[transform]\ndefault_materialization = \"table\"\n",
+    )
+    .expect("phlo.toml");
+    let transforms = dir.path().join("transforms").join("assay");
+    std::fs::create_dir_all(&transforms).expect("dirs");
+    std::fs::write(transforms.join("raw.sql"), "select * from external.feed\n").expect("raw.sql");
+
+    let target = resolve_context(
+        dir.path(),
+        Some(&nessie),
+        Some(&adapter),
+        Some("http://nessie"),
+    )
+    .resolve(Some("ci/pr-1"), "main", EnvironmentMode::ReadOnly)
+    .await
+    .expect("resolved");
+
+    let catalog = target.catalog.as_deref().expect("candidate catalog");
+    let model = target
+        .compilation
+        .as_ref()
+        .and_then(|compilation| compilation.model(&ModelId::parse("assay.raw").unwrap()))
+        .expect("model");
+    assert!(
+        model
+            .compiled_sql
+            .contains(&format!("{catalog}.external.feed")),
+        "{}",
+        model.compiled_sql
+    );
 }
 
 #[tokio::test]
@@ -6604,4 +6862,1228 @@ async fn plan_batches_metadata_round_trips() {
     );
     assert!(!calls.contains_key("relation_exists"), "{calls:?}");
     assert!(!calls.contains_key("relation_columns"), "{calls:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Portable audit evidence — the state store is the authority, artifacts are
+// exports. These cover the multi-machine/CI promotion path: evidence written
+// by one workspace resolves for another against the same store.
+// ---------------------------------------------------------------------------
+
+fn evidence_setup(candidate_ref: &str, catalog: &str) -> EnvironmentSetup {
+    EnvironmentSetup {
+        base: phlo_transform_nessie::ReferenceInfo::branch("main", "aaa"),
+        candidate: phlo_transform_nessie::ReferenceInfo::branch(candidate_ref, "bbb"),
+        created_from: Some(phlo_transform_nessie::ReferenceInfo::branch("main", "aaa")),
+        created_branch: true,
+        catalog: catalog.to_string(),
+        catalog_status: CatalogStatus::Created,
+        catalog_owned_by_phlo: Some(true),
+    }
+}
+
+#[test]
+fn environment_evidence_resolves_from_the_store_without_local_artifacts() {
+    // Workspace A provisions and persists; workspace B — another checkout or
+    // CI stage sharing the state store — resolves the same binding with no
+    // artifact files at all.
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+
+    write_environment_artifacts(dir_a.path(), Some(&state), &evidence_setup("ci/x", "cat_x"))
+        .expect("writes");
+
+    let found = read_environment_for(dir_b.path(), Some(&state), "ci/x")
+        .expect("read")
+        .expect("the store carries the binding");
+    assert_eq!(found.catalog, "cat_x");
+    assert_eq!(found.candidate.hash, "bbb");
+    assert_eq!(
+        found.created_from.as_ref().map(|base| base.hash.as_str()),
+        Some("aaa"),
+        "the cut-from provenance travels with the evidence"
+    );
+}
+
+#[test]
+fn artifact_only_environment_evidence_is_imported_into_the_store() {
+    // A workspace written before the evidence table existed keeps working —
+    // and its file evidence becomes portable the first time it is read.
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    write_environment_artifacts(dir.path(), None, &evidence_setup("ci/x", "cat_x"))
+        .expect("legacy workspace writes files only");
+
+    let found = read_environment_for(dir.path(), Some(&state), "ci/x")
+        .expect("read")
+        .expect("the artifact still resolves");
+    assert_eq!(found.catalog, "cat_x");
+    assert_eq!(
+        state
+            .evidence_for(EvidenceKind::Environment, "ci/x")
+            .unwrap()
+            .len(),
+        1,
+        "the file evidence was imported into the store"
+    );
+
+    // And from then on the store serves other workspaces directly.
+    let dir_b = tempfile::tempdir().unwrap();
+    let found = read_environment_for(dir_b.path(), Some(&state), "ci/x")
+        .expect("read")
+        .expect("the imported record resolves elsewhere");
+    assert_eq!(found.catalog, "cat_x");
+}
+
+#[test]
+fn a_state_read_failure_fails_environment_resolution_closed() {
+    // A store that errors is not "no evidence" — artifact files must not
+    // silently stand in for a store that could hold a different truth.
+    let dir = tempfile::tempdir().unwrap();
+    write_environment_artifacts(dir.path(), None, &evidence_setup("ci/x", "cat_x"))
+        .expect("writes");
+    // FailingStore does not delegate the evidence methods — they error.
+    let failing = FailingStore::new(SqliteStateStore::in_memory().unwrap());
+
+    let error = read_environment_for(dir.path(), Some(&failing), "ci/x")
+        .expect_err("a store read failure must not fall back to files");
+    assert!(error.to_string().contains("evidence store"), "{error}");
+}
+
+#[test]
+fn an_environment_artifact_that_cannot_reach_the_store_cannot_audit() {
+    // With a store configured the store is the authority: a file whose
+    // import cannot persist must not resolve the binding locally while
+    // other machines sharing the store see no record of it.
+    let dir = tempfile::tempdir().unwrap();
+    write_environment_artifacts(dir.path(), None, &evidence_setup("ci/x", "cat_x"))
+        .expect("file-only evidence");
+    let refusing = FailingStore::read_only_evidence(SqliteStateStore::in_memory().unwrap());
+
+    let error = read_environment_for(dir.path(), Some(&refusing), "ci/x")
+        .expect_err("an unimportable artifact must not resolve the binding");
+    assert!(error.to_string().contains("persist"), "{error}");
+}
+
+#[test]
+fn a_branch_diff_artifact_that_cannot_reach_the_store_is_rejected() {
+    // The file names this exact pair and — with a working store — would be
+    // imported and audit. When the import cannot persist, the evidence is
+    // rejected rather than passing gates the authority cannot confirm.
+    let dir = tempfile::tempdir().unwrap();
+    ArtifactWriter::for_workspace(dir.path())
+        .write_branch_diff(&bound_branch_report("ci/x", "main", "bbb", "aaa"))
+        .expect("artifact file");
+    let refusing = FailingStore::read_only_evidence(SqliteStateStore::in_memory().unwrap());
+
+    let evidence = phlo_transform_engine::audited_diff(
+        dir.path(),
+        Some(&refusing),
+        "ci/x",
+        "main",
+        Some("bbb"),
+        Some("aaa"),
+    );
+    let reason = evidence
+        .diff_rejected
+        .expect("unimportable evidence must be rejected");
+    assert!(reason.contains("persist"), "{reason}");
+    assert!(evidence.diff_passed.is_none());
+}
+
+#[test]
+fn a_lineage_artifact_that_cannot_reach_the_store_is_rejected() {
+    // Same on the lineage path: a fingerprinted artifact for this pair
+    // would audit `current` once imported; an import the store refuses
+    // marks the evidence stale instead.
+    let dir = tempfile::tempdir().unwrap();
+    let compilation = project_with_tests();
+    ArtifactWriter::for_workspace(dir.path())
+        .write_lineage_diff(&bound_lineage_artifact(
+            "ci/x",
+            "bbb",
+            "main",
+            "aaa",
+            &compilation.lineage.fingerprint(),
+        ))
+        .expect("artifact file");
+    let refusing = FailingStore::read_only_evidence(SqliteStateStore::in_memory().unwrap());
+
+    let evidence = phlo_transform_engine::audited_lineage(
+        dir.path(),
+        Some(&refusing),
+        "ci/x",
+        "main",
+        "bbb",
+        "aaa",
+        Some(&compilation.lineage.fingerprint()),
+    )
+    .expect("evidence");
+    assert_eq!(evidence.status, "stale");
+    assert!(
+        evidence
+            .reason
+            .as_deref()
+            .expect("a rejection names the failure")
+            .contains("persist"),
+        "{:?}",
+        evidence.reason
+    );
+}
+
+#[test]
+fn store_evidence_wins_over_a_stale_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    write_environment_artifacts(
+        dir.path(),
+        Some(&state),
+        &evidence_setup("ci/x", "cat_store"),
+    )
+    .expect("writes");
+    // The artifact files are then overwritten with a different binding —
+    // the store's record is the authority and wins.
+    write_environment_artifacts(dir.path(), None, &evidence_setup("ci/x", "cat_stale"))
+        .expect("stale files written");
+
+    let found = read_environment_for(dir.path(), Some(&state), "ci/x")
+        .expect("read")
+        .expect("setup");
+    assert_eq!(found.catalog, "cat_store");
+}
+
+#[test]
+fn an_unchanged_environment_binding_is_not_re_recorded() {
+    // `ensure` runs on every `run --ref`/`apply --ref`; re-recording an
+    // identical binding would grow the evidence table with rows that carry
+    // no information. A changed binding still appends — the newest record
+    // is the live one.
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    let setup = evidence_setup("ci/x", "cat_x");
+
+    write_environment_artifacts(dir.path(), Some(&state), &setup).expect("first write");
+    write_environment_artifacts(dir.path(), Some(&state), &setup).expect("repeat write");
+    assert_eq!(
+        state
+            .evidence_for(EvidenceKind::Environment, "ci/x")
+            .unwrap()
+            .len(),
+        1,
+        "an identical binding is not recorded twice"
+    );
+
+    let mut changed = evidence_setup("ci/x", "cat_y");
+    changed.candidate.hash = "ccc".to_string();
+    write_environment_artifacts(dir.path(), Some(&state), &changed).expect("changed write");
+    let records = state
+        .evidence_for(EvidenceKind::Environment, "ci/x")
+        .unwrap();
+    assert_eq!(records.len(), 2, "a changed binding appends a record");
+    let found = read_environment_for(dir.path(), Some(&state), "ci/x")
+        .expect("read")
+        .expect("setup");
+    assert_eq!(found.catalog, "cat_y", "the newest record is live");
+}
+
+#[test]
+fn a_failed_evidence_write_leaves_the_existing_artifacts() {
+    // The record is written before the files: when the store write fails,
+    // the files are never touched — a file-first order would overwrite
+    // them with a binding the older store record then masks.
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    write_environment_artifacts(dir.path(), Some(&state), &evidence_setup("ci/x", "cat_x"))
+        .expect("the established binding");
+    let failing = FailingStore::new(SqliteStateStore::in_memory().unwrap());
+
+    write_environment_artifacts(
+        dir.path(),
+        Some(&failing),
+        &evidence_setup("ci/x", "cat_new"),
+    )
+    .expect_err("a store failure must abort the write");
+
+    let file = dir
+        .path()
+        .join(".phlo/transform")
+        .join(environment_artifact_name("ci/x"));
+    let text = std::fs::read_to_string(&file).expect("the earlier artifact is untouched");
+    assert!(
+        text.contains("cat_x") && !text.contains("cat_new"),
+        "{text}"
+    );
+    let found = read_environment_for(dir.path(), Some(&state), "ci/x")
+        .expect("read")
+        .expect("setup");
+    assert_eq!(found.catalog, "cat_x", "the failed write changed nothing");
+}
+
+#[tokio::test]
+async fn ensure_candidate_honours_a_binding_persisted_by_another_workspace() {
+    // The portable half of provisioning: evidence A persisted resolves B's
+    // ensure to the same physical catalog, with no artifacts on B's side.
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa").seed("ci/x", "bbb");
+    let adapter = FakeAdapter::default();
+    adapter
+        .catalogs
+        .lock()
+        .unwrap()
+        .insert("shared_cat".to_string());
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    let mut setup = evidence_setup("ci/x", "shared_cat");
+    setup.catalog_status = CatalogStatus::Unmanaged;
+    setup.catalog_owned_by_phlo = Some(false);
+    write_environment_artifacts(dir_a.path(), Some(&state), &setup).expect("writes");
+
+    let resolved = ensure_candidate(
+        dir_b.path(),
+        Some(&state),
+        &nessie,
+        &adapter,
+        &EnvironmentSpec {
+            catalog: None,
+            ..environment_spec("ci/x")
+        },
+    )
+    .await
+    .expect("the recorded binding travels through the store");
+
+    assert_eq!(resolved.catalog, "shared_cat");
+}
+
+#[test]
+fn a_branch_diff_persisted_to_the_store_audits_without_the_artifact() {
+    // `persist_branch_diff` writes the export file and the record; a
+    // promotion on another machine (no files at all) audits the record.
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    let report = bound_branch_report("ci/x", "main", "bbb", "aaa");
+    persist_branch_diff(dir_a.path(), Some(&state), &report).expect("persists");
+
+    let evidence = phlo_transform_engine::audited_diff(
+        dir_b.path(),
+        Some(&state),
+        "ci/x",
+        "main",
+        Some("bbb"),
+        Some("aaa"),
+    );
+    assert_eq!(
+        evidence.diff_passed,
+        Some(true),
+        "{:?}",
+        evidence.diff_rejected
+    );
+    assert!(evidence.diff_rejected.is_none());
+    assert!(evidence.schema_audited);
+    assert_eq!(evidence.audited_base_hash.as_deref(), Some("aaa"));
+}
+
+#[test]
+fn a_branch_diff_store_read_failure_rejects_the_evidence() {
+    // An unreachable store cannot read as "no diff" — the promotion sees a
+    // rejection naming the rerun, never a silent pass or miss.
+    let dir = tempfile::tempdir().unwrap();
+    let failing = FailingStore::new(SqliteStateStore::in_memory().unwrap());
+
+    let evidence = phlo_transform_engine::audited_diff(
+        dir.path(),
+        Some(&failing),
+        "ci/x",
+        "main",
+        Some("bbb"),
+        Some("aaa"),
+    );
+    let reason = evidence
+        .diff_rejected
+        .expect("a store failure must reject the evidence");
+    assert!(reason.contains("evidence store"), "{reason}");
+}
+
+#[test]
+fn remove_environment_artifacts_clears_the_store_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    write_environment_artifacts(dir.path(), Some(&state), &evidence_setup("ci/x", "cat_x"))
+        .expect("writes");
+    assert_eq!(
+        state
+            .evidence_for(EvidenceKind::Environment, "ci/x")
+            .unwrap()
+            .len(),
+        1
+    );
+
+    phlo_transform_engine::remove_environment_artifacts(dir.path(), Some(&state), "ci/x")
+        .expect("removal");
+
+    assert!(state
+        .evidence_for(EvidenceKind::Environment, "ci/x")
+        .unwrap()
+        .is_empty());
+    assert!(read_environment_for(dir.path(), Some(&state), "ci/x")
+        .expect("read")
+        .is_none());
+}
+
+fn bound_branch_report(
+    candidate: &str,
+    base: &str,
+    candidate_hash: &str,
+    base_hash: &str,
+) -> BranchDiffReport {
+    BranchDiffReport {
+        candidate_ref: candidate.to_string(),
+        base_ref: base.to_string(),
+        candidate_hash: Some(candidate_hash.to_string()),
+        base_hash: Some(base_hash.to_string()),
+        datasets: Vec::new(),
+        schema_changes: Vec::new(),
+        contract_changes: Vec::new(),
+        impacts: Vec::new(),
+        rows: Vec::new(),
+        diffs: Vec::new(),
+        deep: true,
+        passed: true,
+        started_at: "t".to_string(),
+        finished_at: "t".to_string(),
+    }
+}
+
+/// A lineage artifact bound to a Nessie pair and fingerprinted for the
+/// given compilation — the shape `lineage --diff` persists.
+fn bound_lineage_artifact(
+    candidate: &str,
+    candidate_hash: &str,
+    target: &str,
+    target_hash: &str,
+    lineage_hash: &str,
+) -> LineageDiffArtifact {
+    LineageDiffArtifact {
+        schema_version: SCHEMA_VERSION,
+        base_kind: "ref".to_string(),
+        base_ref: target.to_string(),
+        base_commit: "git-base".to_string(),
+        candidate: CandidateProvenance {
+            git_ref: Some(candidate.to_string()),
+            head: Some("git-head".to_string()),
+            dirty: false,
+            lineage_hash: Some(lineage_hash.to_string()),
+            model_versions: BTreeMap::new(),
+        },
+        environment: Some(LineageEnvironment {
+            candidate_ref: candidate.to_string(),
+            candidate_hash: candidate_hash.to_string(),
+            target_ref: target.to_string(),
+            target_hash: target_hash.to_string(),
+        }),
+        diff: phlo_transform_core::LineageDiff::default(),
+        created_at: Some("2026-01-01T00:00:00Z".to_string()),
+    }
+}
+
+#[test]
+fn lineage_evidence_written_in_one_workspace_audits_in_another() {
+    // Workspace A writes the artifact; its audit imports the record into the
+    // shared store; workspace B audits the store record alone.
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    let compilation = project_with_tests();
+    let artifact = bound_lineage_artifact(
+        "ci/x",
+        "bbb",
+        "main",
+        "aaa",
+        &compilation.lineage.fingerprint(),
+    );
+    ArtifactWriter::for_workspace(dir_a.path())
+        .write_lineage_diff(&artifact)
+        .expect("artifact writes");
+
+    // A's first read imports the file evidence.
+    let evidence = phlo_transform_engine::audited_lineage(
+        dir_a.path(),
+        Some(&state),
+        "ci/x",
+        "main",
+        "bbb",
+        "aaa",
+        Some(&compilation.lineage.fingerprint()),
+    )
+    .expect("evidence");
+    assert_eq!(evidence.status, "current", "{:?}", evidence.reason);
+    assert_eq!(
+        state
+            .evidence_for(EvidenceKind::LineageDiff, "ci/x")
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // B — no artifact — audits the store record to the same verdict.
+    let evidence = phlo_transform_engine::audited_lineage(
+        dir_b.path(),
+        Some(&state),
+        "ci/x",
+        "main",
+        "bbb",
+        "aaa",
+        Some(&compilation.lineage.fingerprint()),
+    )
+    .expect("evidence");
+    assert_eq!(evidence.status, "current", "{:?}", evidence.reason);
+}
+
+#[test]
+fn a_store_recorded_lineage_diff_still_rejects_a_moved_candidate() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    let compilation = project_with_tests();
+    let artifact = bound_lineage_artifact(
+        "ci/x",
+        "bbb",
+        "main",
+        "aaa",
+        &compilation.lineage.fingerprint(),
+    );
+    ArtifactWriter::for_workspace(dir_a.path())
+        .write_lineage_diff(&artifact)
+        .expect("artifact writes");
+    phlo_transform_engine::audited_lineage(
+        dir_a.path(),
+        Some(&state),
+        "ci/x",
+        "main",
+        "bbb",
+        "aaa",
+        Some(&compilation.lineage.fingerprint()),
+    )
+    .expect("evidence");
+
+    // The branch advanced past what the diff audited — the portable record
+    // must reject the same way the file would have.
+    let evidence = phlo_transform_engine::audited_lineage(
+        dir_b.path(),
+        Some(&state),
+        "ci/x",
+        "main",
+        "ccc",
+        "aaa",
+        Some(&compilation.lineage.fingerprint()),
+    )
+    .expect("evidence");
+    assert_eq!(evidence.status, "stale");
+    assert!(
+        evidence.reason.as_deref().unwrap().contains("moved"),
+        "{:?}",
+        evidence.reason
+    );
+}
+
+/// The release-blocking scenario: machine A provisions the candidate, runs
+/// it, and audits it; machine B — a separate workspace sharing only the
+/// state store — evaluates and promotes with no copied artifacts.
+#[tokio::test]
+async fn a_promotion_evaluates_evidence_written_by_another_workspace() {
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa").seed("ci/x", "bbb");
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let state_path = tempfile::tempdir().unwrap().path().join("state.db");
+    let state_a = SqliteStateStore::open(&state_path).unwrap();
+    let state_b = SqliteStateStore::open(&state_path).unwrap();
+    let compilation = project_with_tests();
+
+    // A's side: environment evidence, a bound passing run, a deep diff, and
+    // a lineage audit — everything promotion consumes, persisted to the
+    // shared store.
+    write_environment_artifacts(
+        dir_a.path(),
+        Some(&state_a),
+        &evidence_setup("ci/x", "cat_x"),
+    )
+    .expect("environment evidence");
+    state_a
+        .start_run(
+            &RunRecord {
+                run_id: "run-a".to_string(),
+                plan_id: "plan-a".to_string(),
+                environment: Some("ci/x".to_string()),
+                reference_hash: None,
+                started_at: "t".to_string(),
+                finished_at: None,
+                status: ExecutionStatus::Running,
+                model_count: 1,
+                failed_count: 0,
+            },
+            &StoredPlan {
+                plan_id: "plan-a".to_string(),
+                environment: Some("ci/x".to_string()),
+                models: Vec::new(),
+                seeds: Vec::new(),
+                tests: Vec::new(),
+            },
+        )
+        .expect("start run");
+    state_a
+        .record_model(&ModelRunRecord {
+            run_id: "run-a".to_string(),
+            model_id: "assay.raw".to_string(),
+            materialization: "table".to_string(),
+            action: "build".to_string(),
+            status: ExecutionStatus::Passed,
+            started_at: "t".to_string(),
+            finished_at: "t".to_string(),
+            sql_hash: "h".to_string(),
+            target: "cat_x.assay.raw".to_string(),
+            desired_version: "v".to_string(),
+            attempts: Vec::new(),
+            query_id: None,
+            error: None,
+            error_category: None,
+        })
+        .expect("model run");
+    state_a
+        .finish_run("run-a", ExecutionStatus::Passed, "t", 0)
+        .expect("finish run");
+    state_a
+        .bind_run_reference_hash("run-a", "bbb")
+        .expect("bind head");
+    persist_branch_diff(
+        dir_a.path(),
+        Some(&state_a),
+        &bound_branch_report("ci/x", "main", "bbb", "aaa"),
+    )
+    .expect("diff evidence");
+    let lineage = bound_lineage_artifact(
+        "ci/x",
+        "bbb",
+        "main",
+        "aaa",
+        &compilation.lineage.fingerprint(),
+    );
+    ArtifactWriter::for_workspace(dir_a.path())
+        .write_lineage_diff(&lineage)
+        .expect("lineage artifact");
+    phlo_transform_engine::audited_lineage(
+        dir_a.path(),
+        Some(&state_a),
+        "ci/x",
+        "main",
+        "bbb",
+        "aaa",
+        Some(&compilation.lineage.fingerprint()),
+    )
+    .expect("lineage audit imports the record");
+
+    // B's side: a fresh store handle on the same database, an empty
+    // workspace — the evaluation must see A's evidence.
+    let evaluation = evaluate_promotion(
+        dir_b.path(),
+        &nessie,
+        Some(&state_b),
+        &compilation,
+        "ci/x",
+        "main",
+        &PromotionOptions {
+            require_diff: true,
+            allow_breaking_schema: false,
+        },
+    )
+    .await
+    .expect("evaluates");
+
+    assert!(
+        evaluation.gates.passed,
+        "{:?}",
+        evaluation
+            .gates
+            .results
+            .iter()
+            .map(|result| format!("{}: {}", result.name, result.detail))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(evaluation.audit.diff_passed, Some(true));
+    assert_eq!(
+        evaluation
+            .environment
+            .as_ref()
+            .map(|setup| setup.catalog.as_str()),
+        Some("cat_x"),
+        "the environment binding resolved from shared state"
+    );
+    assert_eq!(
+        evaluation.lineage.as_ref().map(|entry| entry.status),
+        Some("current")
+    );
+}
+
+/// The evidence record a bound lineage artifact maps to — what the store
+/// holds once `lineage --diff` persists it.
+fn lineage_store_record(artifact: &LineageDiffArtifact, evidence_id: &str) -> EvidenceRecord {
+    let binding = artifact.environment.as_ref().expect("bound artifact");
+    EvidenceRecord {
+        evidence_id: evidence_id.to_string(),
+        kind: EvidenceKind::LineageDiff,
+        subject: binding.candidate_ref.clone(),
+        target_ref: binding.target_ref.clone(),
+        candidate_hash: Some(binding.candidate_hash.clone()),
+        target_hash: Some(binding.target_hash.clone()),
+        fingerprint: artifact.candidate.lineage_hash.clone(),
+        payload: serde_json::to_value(artifact).expect("serialises"),
+        run_id: None,
+        created_at: artifact
+            .created_at
+            .clone()
+            .expect("bound artifacts carry created_at"),
+    }
+}
+
+/// The evidence record a bound branch-diff report maps to — what the
+/// store holds once `diff --from --to` persists it.
+fn branch_store_record(report: &BranchDiffReport, evidence_id: &str) -> EvidenceRecord {
+    EvidenceRecord {
+        evidence_id: evidence_id.to_string(),
+        kind: EvidenceKind::BranchDiff,
+        subject: report.candidate_ref.clone(),
+        target_ref: report.base_ref.clone(),
+        candidate_hash: report.candidate_hash.clone(),
+        target_hash: report.base_hash.clone(),
+        fingerprint: None,
+        payload: serde_json::to_value(report).expect("serialises"),
+        run_id: None,
+        created_at: report.finished_at.clone(),
+    }
+}
+
+/// `lineage_diff.json` is a single slot — a diff run for one candidate
+/// overwrites the previous one. A newer file produced for a *different*
+/// candidate must not shadow this candidate's store record: the multi-candidate
+/// CI flow this feature exists for would otherwise report a current audit as
+/// stale.
+#[test]
+fn a_newer_lineage_artifact_for_another_candidate_does_not_mask_the_store_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    let compilation = project_with_tests();
+    let fingerprint = compilation.lineage.fingerprint();
+
+    // ci/a's audit exists only in the store (e.g. produced by another CI
+    // stage): bound to ci/a -> main at these commits.
+    let a = bound_lineage_artifact("ci/a", "aaa-head", "main", "main-head", &fingerprint);
+    state
+        .record_evidence(&lineage_store_record(&a, "a-rec"))
+        .expect("store record");
+
+    // This workspace's lineage_diff.json is for ci/b — and it is NEWER
+    // (a `lineage --diff` for ci/b ran after ci/a's audit).
+    let mut b = bound_lineage_artifact("ci/b", "bbb-head", "main", "main-head", &fingerprint);
+    b.created_at = Some("2026-02-01T00:00:00Z".to_string());
+    ArtifactWriter::for_workspace(dir.path())
+        .write_lineage_diff(&b)
+        .expect("artifact writes");
+
+    // Auditing ci/a must see ci/a's store record — the file says nothing
+    // about ci/a and must not shadow it.
+    let evidence = phlo_transform_engine::audited_lineage(
+        dir.path(),
+        Some(&state),
+        "ci/a",
+        "main",
+        "aaa-head",
+        "main-head",
+        Some(&fingerprint),
+    )
+    .expect("evidence");
+    assert_eq!(
+        evidence.status, "current",
+        "the store's current record for ci/a was masked by ci/b's newer artifact: {:?}",
+        evidence.reason
+    );
+    // And the file's evidence imported under its own subject — ci/b's
+    // audit is portable from here on.
+    assert_eq!(
+        state
+            .evidence_for(EvidenceKind::LineageDiff, "ci/b")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// Auditing a candidate whose only lineage evidence is a file for a
+/// different subject imports that file once — not again on every read.
+#[test]
+fn a_lineage_artifact_for_another_candidate_imports_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    let compilation = project_with_tests();
+    let fingerprint = compilation.lineage.fingerprint();
+    let b = bound_lineage_artifact("ci/b", "bbb-head", "main", "main-head", &fingerprint);
+    ArtifactWriter::for_workspace(dir.path())
+        .write_lineage_diff(&b)
+        .expect("artifact writes");
+
+    for _ in 0..2 {
+        let evidence = phlo_transform_engine::audited_lineage(
+            dir.path(),
+            Some(&state),
+            "ci/a",
+            "main",
+            "aaa-head",
+            "main-head",
+            Some(&fingerprint),
+        )
+        .expect("evidence");
+        // ci/a has no evidence — the ci/b file is reported as covering
+        // another pair, not treated as ci/a's audit.
+        assert_eq!(evidence.status, "stale");
+        assert!(
+            evidence
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("ci/b")),
+            "{:?}",
+            evidence.reason
+        );
+    }
+    assert_eq!(
+        state
+            .evidence_for(EvidenceKind::LineageDiff, "ci/b")
+            .unwrap()
+            .len(),
+        1,
+        "the foreign-subject artifact must import once, not per read"
+    );
+}
+
+/// The same single-slot masking protection on the branch-diff path: a
+/// newer `branch_diff.json` for another candidate must not shadow this
+/// candidate's store record — which, unlike lineage, drives the schema
+/// and data_diff gates.
+#[test]
+fn a_newer_branch_diff_for_another_candidate_does_not_mask_the_store_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+
+    // ci/a's audit exists only in the store.
+    let mut a = bound_branch_report("ci/a", "main", "aaa-head", "main-head");
+    a.finished_at = "2026-01-01T00:00:00Z".to_string();
+    state
+        .record_evidence(&EvidenceRecord {
+            evidence_id: "a-rec".to_string(),
+            kind: EvidenceKind::BranchDiff,
+            subject: "ci/a".to_string(),
+            target_ref: "main".to_string(),
+            candidate_hash: a.candidate_hash.clone(),
+            target_hash: a.base_hash.clone(),
+            fingerprint: None,
+            payload: serde_json::to_value(&a).expect("serialises"),
+            run_id: None,
+            created_at: a.finished_at.clone(),
+        })
+        .expect("store record");
+
+    // A newer branch_diff.json for ci/b sits in the workspace.
+    let mut b = bound_branch_report("ci/b", "main", "bbb-head", "main-head");
+    b.finished_at = "2026-02-01T00:00:00Z".to_string();
+    ArtifactWriter::for_workspace(dir.path())
+        .write_branch_diff(&b)
+        .expect("artifact writes");
+
+    let evidence = phlo_transform_engine::audited_diff(
+        dir.path(),
+        Some(&state),
+        "ci/a",
+        "main",
+        Some("aaa-head"),
+        Some("main-head"),
+    );
+    assert!(
+        evidence.diff_rejected.is_none(),
+        "ci/a's store record was masked by ci/b's newer artifact: {:?}",
+        evidence.diff_rejected
+    );
+    assert_eq!(evidence.diff_passed, Some(true));
+    // The file's evidence imported under its own subject — ci/b's audit
+    // is portable from here on.
+    assert_eq!(
+        state
+            .evidence_for(EvidenceKind::BranchDiff, "ci/b")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// The store keeps the newest record per (subject, target) pair, so one
+/// candidate can hold evidence against several targets at once — the
+/// multi-stage promotion flow. Selection must find the record for the
+/// pair being promoted: a newer record for another target cannot shadow
+/// it.
+#[test]
+fn a_newer_lineage_record_for_another_target_does_not_mask_the_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    let compilation = project_with_tests();
+    let fingerprint = compilation.lineage.fingerprint();
+
+    // ci/x audited against main, then release — both retained.
+    let main_audit = bound_lineage_artifact("ci/x", "cand-head", "main", "main-head", &fingerprint);
+    let mut release_audit =
+        bound_lineage_artifact("ci/x", "cand-head", "release", "rel-head", &fingerprint);
+    release_audit.created_at = Some("2026-02-01T00:00:00Z".to_string());
+    state
+        .record_evidence(&lineage_store_record(&main_audit, "main-rec"))
+        .expect("store record");
+    state
+        .record_evidence(&lineage_store_record(&release_audit, "rel-rec"))
+        .expect("store record");
+
+    let evidence = phlo_transform_engine::audited_lineage(
+        dir.path(),
+        Some(&state),
+        "ci/x",
+        "main",
+        "cand-head",
+        "main-head",
+        Some(&fingerprint),
+    )
+    .expect("evidence");
+    assert_eq!(
+        evidence.status, "current",
+        "the ci/x -> main record was masked by the newer ci/x -> release record: {:?}",
+        evidence.reason
+    );
+}
+
+/// The same protection against the single-slot artifact: a
+/// `lineage_diff.json` naming this candidate against a *different
+/// target* is imported under its own pair and must not shadow the
+/// store's valid record for the pair being promoted.
+#[test]
+fn a_newer_lineage_artifact_for_another_target_does_not_mask_the_store_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    let compilation = project_with_tests();
+    let fingerprint = compilation.lineage.fingerprint();
+
+    // ci/x -> main's audit exists only in the store.
+    let main_audit = bound_lineage_artifact("ci/x", "cand-head", "main", "main-head", &fingerprint);
+    state
+        .record_evidence(&lineage_store_record(&main_audit, "main-rec"))
+        .expect("store record");
+
+    // This workspace's lineage_diff.json is ci/x -> release — and newer.
+    let mut release_audit =
+        bound_lineage_artifact("ci/x", "cand-head", "release", "rel-head", &fingerprint);
+    release_audit.created_at = Some("2026-02-01T00:00:00Z".to_string());
+    ArtifactWriter::for_workspace(dir.path())
+        .write_lineage_diff(&release_audit)
+        .expect("artifact writes");
+
+    let evidence = phlo_transform_engine::audited_lineage(
+        dir.path(),
+        Some(&state),
+        "ci/x",
+        "main",
+        "cand-head",
+        "main-head",
+        Some(&fingerprint),
+    )
+    .expect("evidence");
+    assert_eq!(
+        evidence.status, "current",
+        "the ci/x -> main record was masked by the newer ci/x -> release artifact: {:?}",
+        evidence.reason
+    );
+    // The file still imported — under its own pair.
+    assert_eq!(
+        state
+            .evidence_for(EvidenceKind::LineageDiff, "ci/x")
+            .unwrap()
+            .iter()
+            .filter(|record| record.target_ref == "release")
+            .count(),
+        1
+    );
+}
+
+/// The converse direction: a same-pair artifact newer than the store's
+/// record *for the pair* still wins even when the candidate's newest
+/// stored record belongs to another target — the freshness comparison is
+/// per pair, not per candidate.
+#[test]
+fn a_same_pair_lineage_artifact_outranks_a_newer_other_target_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    let compilation = project_with_tests();
+    let fingerprint = compilation.lineage.fingerprint();
+
+    // Store: an old ci/x -> main audit bound to a superseded candidate
+    // commit, and a NEWER ci/x -> release audit.
+    let old_main = bound_lineage_artifact("ci/x", "old-cand", "main", "main-head", &fingerprint);
+    let mut release_audit =
+        bound_lineage_artifact("ci/x", "cand-head", "release", "rel-head", &fingerprint);
+    release_audit.created_at = Some("2026-03-01T00:00:00Z".to_string());
+    state
+        .record_evidence(&lineage_store_record(&old_main, "old-main-rec"))
+        .expect("store record");
+    state
+        .record_evidence(&lineage_store_record(&release_audit, "rel-rec"))
+        .expect("store record");
+
+    // The workspace file is a ci/x -> main audit between the two —
+    // fresher than the store's record *for this pair*.
+    let mut file_audit =
+        bound_lineage_artifact("ci/x", "cand-head", "main", "main-head", &fingerprint);
+    file_audit.created_at = Some("2026-02-01T00:00:00Z".to_string());
+    ArtifactWriter::for_workspace(dir.path())
+        .write_lineage_diff(&file_audit)
+        .expect("artifact writes");
+
+    let evidence = phlo_transform_engine::audited_lineage(
+        dir.path(),
+        Some(&state),
+        "ci/x",
+        "main",
+        "cand-head",
+        "main-head",
+        Some(&fingerprint),
+    )
+    .expect("evidence");
+    // The file must win — the store's ci/x -> main record is bound to
+    // `old-cand` and would read stale.
+    assert_eq!(
+        evidence.status, "current",
+        "the fresher ci/x -> main artifact lost to an other-target record: {:?}",
+        evidence.reason
+    );
+}
+
+/// The same protection on the branch-diff path: a `branch_diff.json`
+/// naming this candidate against a different target must not shadow the
+/// store's valid record for the pair being promoted.
+#[test]
+fn a_newer_branch_diff_for_another_target_does_not_mask_the_store_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+
+    // ci/x -> main's audit exists only in the store.
+    let mut a = bound_branch_report("ci/x", "main", "cand-head", "main-head");
+    a.finished_at = "2026-01-01T00:00:00Z".to_string();
+    state
+        .record_evidence(&branch_store_record(&a, "main-rec"))
+        .expect("store record");
+
+    // A newer branch_diff.json for ci/x -> release sits in the workspace.
+    let mut b = bound_branch_report("ci/x", "release", "cand-head", "rel-head");
+    b.finished_at = "2026-02-01T00:00:00Z".to_string();
+    ArtifactWriter::for_workspace(dir.path())
+        .write_branch_diff(&b)
+        .expect("artifact writes");
+
+    let evidence = phlo_transform_engine::audited_diff(
+        dir.path(),
+        Some(&state),
+        "ci/x",
+        "main",
+        Some("cand-head"),
+        Some("main-head"),
+    );
+    assert!(
+        evidence.diff_rejected.is_none(),
+        "the ci/x -> main record was masked by the newer ci/x -> release artifact: {:?}",
+        evidence.diff_rejected
+    );
+    assert_eq!(evidence.diff_passed, Some(true));
+    // The file still imported — under its own pair.
+    assert_eq!(
+        state
+            .evidence_for(EvidenceKind::BranchDiff, "ci/x")
+            .unwrap()
+            .iter()
+            .filter(|record| record.target_ref == "release")
+            .count(),
+        1
+    );
+}
+
+/// And a same-pair `branch_diff.json` newer than the store's record for
+/// the pair still wins when a newer record for another target tops the
+/// candidate's list.
+#[test]
+fn a_same_pair_branch_diff_outranks_a_newer_other_target_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+
+    // Store: an old ci/x -> main audit bound to a superseded candidate
+    // commit, and a NEWER ci/x -> release audit.
+    let mut old_main = bound_branch_report("ci/x", "main", "old-cand", "main-head");
+    old_main.finished_at = "2026-01-01T00:00:00Z".to_string();
+    let mut release = bound_branch_report("ci/x", "release", "cand-head", "rel-head");
+    release.finished_at = "2026-03-01T00:00:00Z".to_string();
+    state
+        .record_evidence(&branch_store_record(&old_main, "old-main-rec"))
+        .expect("store record");
+    state
+        .record_evidence(&branch_store_record(&release, "rel-rec"))
+        .expect("store record");
+
+    // The workspace file is a ci/x -> main audit between the two.
+    let mut file_report = bound_branch_report("ci/x", "main", "cand-head", "main-head");
+    file_report.finished_at = "2026-02-01T00:00:00Z".to_string();
+    ArtifactWriter::for_workspace(dir.path())
+        .write_branch_diff(&file_report)
+        .expect("artifact writes");
+
+    let evidence = phlo_transform_engine::audited_diff(
+        dir.path(),
+        Some(&state),
+        "ci/x",
+        "main",
+        Some("cand-head"),
+        Some("main-head"),
+    );
+    // The file must win — the store's ci/x -> main record is bound to
+    // `old-cand` and would read stale.
+    assert!(
+        evidence.diff_rejected.is_none(),
+        "the fresher ci/x -> main artifact lost to an other-target record: {:?}",
+        evidence.diff_rejected
+    );
+    assert_eq!(evidence.diff_passed, Some(true));
+}
+
+/// A store record whose subject column says `ci/x` but whose payload
+/// decodes to a binding for `ci/y` is contradictory evidence — resolution
+/// fails closed rather than audit another candidate's binding.
+#[test]
+fn environment_evidence_with_a_mismatched_payload_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    state
+        .record_evidence(&EvidenceRecord {
+            evidence_id: "planted".to_string(),
+            kind: EvidenceKind::Environment,
+            subject: "ci/x".to_string(),
+            target_ref: "main".to_string(),
+            candidate_hash: Some("bbb".to_string()),
+            target_hash: Some("aaa".to_string()),
+            fingerprint: None,
+            payload: serde_json::to_value(evidence_setup("ci/y", "cat_y")).expect("serialises"),
+            run_id: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        })
+        .expect("record");
+
+    let error = read_environment_for(dir.path(), Some(&state), "ci/x")
+        .expect_err("a payload naming another candidate is contradictory evidence");
+    assert!(error.to_string().contains("ci/y"), "{error}");
+}
+
+/// A candidate re-provisioned from a different base keeps a record per
+/// (subject, target) pair, but only its newest is the live binding — the
+/// superseded record must not keep claiming its catalog for other
+/// candidates' claim checks.
+#[test]
+fn environment_artifacts_reports_only_the_live_binding_per_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    let record = |id: &str, setup: &EnvironmentSetup, target: &str, at: &str| EvidenceRecord {
+        evidence_id: id.to_string(),
+        kind: EvidenceKind::Environment,
+        subject: setup.candidate.name.clone(),
+        target_ref: target.to_string(),
+        candidate_hash: Some(setup.candidate.hash.clone()),
+        target_hash: None,
+        fingerprint: None,
+        payload: serde_json::to_value(setup).expect("serialises"),
+        run_id: None,
+        created_at: at.to_string(),
+    };
+
+    // ci/x provisioned before it had recorded provenance (target_ref ""),
+    // then re-provisioned from `main` — the second binding supersedes.
+    let mut old = evidence_setup("ci/x", "cat_old");
+    old.created_from = None;
+    state
+        .record_evidence(&record("old", &old, "", "2026-01-01T00:00:00Z"))
+        .expect("old record");
+    state
+        .record_evidence(&record(
+            "new",
+            &evidence_setup("ci/x", "cat_new"),
+            "main",
+            "2026-02-01T00:00:00Z",
+        ))
+        .expect("new record");
+    // Another candidate legitimately claims the abandoned catalog.
+    state
+        .record_evidence(&record(
+            "other",
+            &evidence_setup("ci/y", "cat_old"),
+            "main",
+            "2026-02-02T00:00:00Z",
+        ))
+        .expect("other record");
+
+    let setups = environment_artifacts(dir.path(), Some(&state)).expect("bindings");
+    let for_x: Vec<_> = setups
+        .iter()
+        .filter(|setup| setup.candidate.name == "ci/x")
+        .collect();
+    assert_eq!(for_x.len(), 1, "only ci/x's live binding reports");
+    assert_eq!(for_x[0].catalog, "cat_new");
+    assert!(
+        setups
+            .iter()
+            .any(|setup| setup.candidate.name == "ci/y" && setup.catalog == "cat_old"),
+        "the abandoned catalog is free for another candidate to claim"
+    );
+}
+
+/// A pre-timestamp lineage artifact (`created_at` absent) is recorded at
+/// import time, so the (target, created_at) dedup key can never re-match —
+/// the payload equality check is what keeps repeated audits to one row.
+#[test]
+fn a_lineage_artifact_without_created_at_imports_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    let compilation = project_with_tests();
+    let fingerprint = compilation.lineage.fingerprint();
+    let mut b = bound_lineage_artifact("ci/b", "bbb-head", "main", "main-head", &fingerprint);
+    b.created_at = None;
+    ArtifactWriter::for_workspace(dir.path())
+        .write_lineage_diff(&b)
+        .expect("artifact writes");
+
+    for _ in 0..2 {
+        phlo_transform_engine::audited_lineage(
+            dir.path(),
+            Some(&state),
+            "ci/a",
+            "main",
+            "aaa-head",
+            "main-head",
+            Some(&fingerprint),
+        )
+        .expect("evidence");
+    }
+    assert_eq!(
+        state
+            .evidence_for(EvidenceKind::LineageDiff, "ci/b")
+            .unwrap()
+            .len(),
+        1,
+        "a timestampless artifact imports once, not once per audit"
+    );
 }

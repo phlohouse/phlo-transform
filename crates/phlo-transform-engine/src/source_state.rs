@@ -6,6 +6,8 @@
 
 use phlo_transform_core::{CompiledSeed, Relation, SourceId, StaticSourceStateProvider};
 
+pub use phlo_transform_core::resolve::relation_for_source;
+
 use crate::adapter::Adapter;
 use crate::error::EngineError;
 
@@ -32,39 +34,6 @@ pub fn seed_relation(
         .or_else(|| adapter_default_schema(adapter_name))
         .unwrap_or("default");
     seed.relation(default_catalog, fallback)
-}
-
-/// Build the physical relation for a logical source.
-pub fn relation_for_source(
-    source: &SourceId,
-    default_catalog: Option<&str>,
-    default_schema: Option<&str>,
-) -> Relation {
-    let parts = source.parts();
-    let schema = || default_schema.unwrap_or("default").to_string();
-    let catalog = || default_catalog.map(str::to_string);
-    match parts.len() {
-        0 => Relation {
-            catalog: catalog(),
-            schema: schema(),
-            table: String::new(),
-        },
-        1 => Relation {
-            catalog: catalog(),
-            schema: schema(),
-            table: parts[0].clone(),
-        },
-        2 => Relation {
-            catalog: catalog(),
-            schema: parts[0].clone(),
-            table: parts[1].clone(),
-        },
-        _ => Relation {
-            catalog: Some(parts[0].clone()),
-            schema: parts[1].clone(),
-            table: parts[2..].join("."),
-        },
-    }
 }
 
 /// The seed whose target relation matches `relation`, if any.

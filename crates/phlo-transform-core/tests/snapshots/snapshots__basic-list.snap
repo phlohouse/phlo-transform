@@ -1,6 +1,5 @@
 ---
 source: crates/phlo-transform-core/tests/snapshots.rs
-assertion_line: 31
 expression: "compiled(\"basic-multi-root\").list_report()"
 ---
 {
@@ -11,7 +10,7 @@ expression: "compiled(\"basic-multi-root\").list_report()"
       "namespace": "assay",
       "materialization": "view",
       "target": "assay.raw",
-      "version": "bd1f2c4",
+      "version": "f9ac069",
       "path": "workflows/assay/transforms/raw.sql",
       "depends_on": [],
       "sources": [
@@ -24,7 +23,7 @@ expression: "compiled(\"basic-multi-root\").list_report()"
       "namespace": "assay",
       "materialization": "view",
       "target": "assay.results",
-      "version": "ea19693",
+      "version": "9c605c9",
       "path": "workflows/assay/transforms/results.sql",
       "depends_on": [
         "assay.raw"
@@ -37,7 +36,7 @@ expression: "compiled(\"basic-multi-root\").list_report()"
       "namespace": "reporting",
       "materialization": "view",
       "target": "reporting.monthly",
-      "version": "4e889bb",
+      "version": "a33d808",
       "path": "workflows/reporting/transforms/monthly.sql",
       "depends_on": [
         "assay.results"

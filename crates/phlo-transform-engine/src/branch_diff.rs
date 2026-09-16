@@ -21,6 +21,7 @@
 //! The report carries per-dataset `upstream` dependencies and version hashes
 //! as lineage hooks for graph-level diffing.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -34,7 +35,7 @@ use crate::diff::{
 };
 use crate::error::{AdapterError, EngineError};
 use crate::state::{MaterializedRecord, SeedRecord, StateStore};
-use crate::util::now_rfc3339;
+use crate::util::{cmp_rfc3339, now_rfc3339};
 
 /// Empty rename map shared by datasets whose model declares no renames.
 static EMPTY_RENAMES: BTreeMap<String, String> = BTreeMap::new();
@@ -697,6 +698,28 @@ pub(crate) fn includes_default_environment(environment: &str) -> bool {
     environment == "main"
 }
 
+/// Fold `incoming` records into `by_key`, keeping per key the record with
+/// the chronologically latest `timestamp`. The comparison is parsed, not
+/// lexical: legacy variable-width fractions (`...:05Z` vs `...:05.5Z`)
+/// must order as instants, or an older record can shadow the physical
+/// table's real last write.
+pub(crate) fn merge_latest<R>(
+    by_key: &mut BTreeMap<String, R>,
+    incoming: impl IntoIterator<Item = R>,
+    key: impl Fn(&R) -> &str,
+    timestamp: impl Fn(&R) -> &str,
+) {
+    for record in incoming {
+        match by_key.get(key(&record)) {
+            Some(existing)
+                if cmp_rfc3339(timestamp(existing), timestamp(&record)) != Ordering::Less => {}
+            _ => {
+                by_key.insert(key(&record).to_string(), record);
+            }
+        }
+    }
+}
+
 /// Every materialised model recorded for an environment label, keyed by
 /// model id. `main` also folds in the default environment — a run on `main`
 /// with no `--ref` records there — so a dropped model's record is found
@@ -713,14 +736,12 @@ pub fn materialized_for_environment(
         .map(|record| (record.model_id.clone(), record))
         .collect();
     if includes_default_environment(environment) {
-        for record in state.materialized_in(None)? {
-            match records.get(&record.model_id) {
-                Some(existing) if existing.materialized_at >= record.materialized_at => {}
-                _ => {
-                    records.insert(record.model_id.clone(), record);
-                }
-            }
-        }
+        merge_latest(
+            &mut records,
+            state.materialized_in(None)?,
+            |record| &record.model_id,
+            |record| &record.materialized_at,
+        );
     }
     Ok(records)
 }
@@ -737,14 +758,12 @@ pub fn seeds_for_environment(
         .map(|record| (record.name.clone(), record))
         .collect();
     if includes_default_environment(environment) {
-        for record in state.seeds_in(None)? {
-            match records.get(&record.name) {
-                Some(existing) if existing.loaded_at >= record.loaded_at => {}
-                _ => {
-                    records.insert(record.name.clone(), record);
-                }
-            }
-        }
+        merge_latest(
+            &mut records,
+            state.seeds_in(None)?,
+            |record| &record.name,
+            |record| &record.loaded_at,
+        );
     }
     Ok(records)
 }

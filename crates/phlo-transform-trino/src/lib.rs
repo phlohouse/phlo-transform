@@ -6,6 +6,7 @@
 //! (<https://trino.io/docs/current/develop/client-protocol.html>).
 
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -168,7 +169,7 @@ impl TrinoAdapter {
 
         loop {
             if let Some(error) = payload.error.take() {
-                return Err(AdapterError::new(error.code(), error.message()));
+                return Err(error.into_adapter_error());
             }
             if let Some(descriptions) = payload.columns.take() {
                 columns = descriptions
@@ -636,6 +637,83 @@ impl Adapter for TrinoAdapter {
         Ok(self.iceberg_snapshot(relation).await)
     }
 
+    /// CSV seeds are local files Trino cannot read, so the adapter loads
+    /// them itself: infer a column type per column (all values empty, an
+    /// integer, or a number → `bigint`/`double`; `true`/`false` →
+    /// `boolean`; anything else → `varchar`), create the table, then insert
+    /// rows in batches. Seeds are small reference inputs by contract — this
+    /// is not a bulk-load path.
+    async fn load_csv(
+        &self,
+        relation: &Relation,
+        path: &Path,
+    ) -> Result<QueryResult, AdapterError> {
+        let mut reader = csv::Reader::from_path(path)
+            .map_err(|error| AdapterError::new("SEED_IO", error.to_string()))?;
+        let headers: Vec<String> = reader
+            .headers()
+            .map_err(|error| AdapterError::new("SEED_IO", error.to_string()))?
+            .iter()
+            .map(str::to_string)
+            .collect();
+        if headers.is_empty() {
+            return Err(AdapterError::new(
+                "SEED_IO",
+                format!("{} has no header row", path.display()),
+            ));
+        }
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for record in reader.records() {
+            let record = record.map_err(|error| AdapterError::new("SEED_IO", error.to_string()))?;
+            rows.push(record.iter().map(str::to_string).collect());
+        }
+
+        let columns: Vec<SeedColumn> = headers
+            .iter()
+            .enumerate()
+            .map(|(index, name)| SeedColumn {
+                name: name.clone(),
+                data_type: infer_csv_type(rows.iter().filter_map(|row| row.get(index))),
+            })
+            .collect();
+        let ddl = format!(
+            "CREATE OR REPLACE TABLE {} ({})",
+            relation.sql(),
+            columns
+                .iter()
+                .map(|column| format!("{} {}", quote(&column.name), column.data_type))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        self.run(&ddl).await?;
+
+        // One INSERT per batch keeps each statement comfortably under any
+        // server-side query length limit.
+        let mut inserted = 0u64;
+        for batch in rows.chunks(200) {
+            let values = batch
+                .iter()
+                .map(|row| {
+                    let fields = columns
+                        .iter()
+                        .enumerate()
+                        .map(|(index, column)| csv_literal(row.get(index), column.data_type))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("({fields})")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.run(&format!("INSERT INTO {} VALUES {values}", relation.sql()))
+                .await?;
+            inserted += batch.len() as u64;
+        }
+        Ok(QueryResult {
+            row_count: inserted,
+            ..Default::default()
+        })
+    }
+
     async fn partition_counts(
         &self,
         relation: &Relation,
@@ -690,6 +768,65 @@ impl TrinoAdapter {
 
 fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// A seed column and the Trino type inferred from its CSV values.
+struct SeedColumn {
+    name: String,
+    data_type: &'static str,
+}
+
+/// The narrowest Trino type every non-empty value in `values` fits:
+/// `boolean` for true/false, `bigint` for integers, `double` for numbers,
+/// `varchar` otherwise (and for an all-empty column).
+fn infer_csv_type<'a>(values: impl Iterator<Item = &'a String>) -> &'static str {
+    let mut boolean = true;
+    let mut integer = true;
+    let mut number = true;
+    let mut saw_value = false;
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        saw_value = true;
+        boolean &= matches!(value.to_ascii_lowercase().as_str(), "true" | "false");
+        integer &= value.parse::<i64>().is_ok();
+        number &= value.parse::<f64>().is_ok();
+    }
+    if !saw_value {
+        "varchar"
+    } else if boolean {
+        "boolean"
+    } else if integer {
+        "bigint"
+    } else if number {
+        "double"
+    } else {
+        "varchar"
+    }
+}
+
+/// A VALUES literal for `value` in a column of `data_type`. Empty cells are
+/// NULL (matching `read_csv_auto`); numerics and booleans go in bare;
+/// varchar values are emitted verbatim — whitespace is data, not noise.
+fn csv_literal(value: Option<&String>, data_type: &str) -> String {
+    let Some(value) = value else {
+        return "NULL".to_string();
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return if value.is_empty() || data_type != "varchar" {
+            "NULL".to_string()
+        } else {
+            literal(value)
+        };
+    }
+    match data_type {
+        "bigint" | "double" => trimmed.to_string(),
+        "boolean" => trimmed.to_ascii_lowercase(),
+        _ => literal(value),
+    }
 }
 
 /// A SQL string literal — single quotes doubled per the SQL standard.
@@ -758,6 +895,10 @@ struct TrinoErrorPayload {
     error_name: Option<String>,
     #[serde(rename = "errorCode")]
     error_code: Option<i64>,
+    /// Trino's error class: `USER_ERROR`, `INTERNAL_ERROR`,
+    /// `INSUFFICIENT_RESOURCES` or `EXTERNAL`.
+    #[serde(rename = "errorType")]
+    error_type: Option<String>,
 }
 
 impl TrinoErrorPayload {
@@ -771,5 +912,104 @@ impl TrinoErrorPayload {
         self.message
             .clone()
             .unwrap_or_else(|| "Trino query failed".into())
+    }
+
+    /// Statement errors that are plausibly transient: `EXTERNAL` means a
+    /// connector could not reach its backing system (Nessie, object
+    /// storage), `INSUFFICIENT_RESOURCES` means the coordinator refused
+    /// work it may accept later. `GENERIC_INTERNAL_ERROR` is nominally
+    /// internal, but the Iceberg connector wraps Nessie REST client
+    /// failures ("Failed to execute … request against …") in it, so that
+    /// signature is retried too.
+    fn into_adapter_error(self) -> AdapterError {
+        let code = self.code();
+        let message = self.message();
+        let transient = matches!(
+            self.error_type.as_deref(),
+            Some("EXTERNAL") | Some("INSUFFICIENT_RESOURCES")
+        ) || (code == "GENERIC_INTERNAL_ERROR"
+            && message.contains("Failed to execute"));
+        let error = AdapterError::new(code, message);
+        if transient {
+            error.retryable()
+        } else {
+            error
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{csv_literal, infer_csv_type, TrinoErrorPayload};
+
+    fn infer(values: &[&str]) -> &'static str {
+        let owned: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+        infer_csv_type(owned.iter())
+    }
+
+    #[test]
+    fn csv_types_infer_narrowly() {
+        assert_eq!(infer(&["1", "42", "-7"]), "bigint");
+        assert_eq!(infer(&["1.5", "2"]), "double");
+        assert_eq!(infer(&["true", "FALSE"]), "boolean");
+        assert_eq!(infer(&["a", "1"]), "varchar");
+        assert_eq!(infer(&["", ""]), "varchar");
+        // Mixed empty + numeric still infers the numeric type; the empty
+        // cell lands as NULL.
+        assert_eq!(infer(&["", "5"]), "bigint");
+    }
+
+    #[test]
+    fn csv_literals_escape_and_null() {
+        let v = |s: &str| Some(s.to_string());
+        assert_eq!(csv_literal(None, "varchar"), "NULL");
+        assert_eq!(csv_literal(v("").as_ref(), "bigint"), "NULL");
+        assert_eq!(csv_literal(v("").as_ref(), "varchar"), "NULL");
+        assert_eq!(csv_literal(v("42").as_ref(), "bigint"), "42");
+        assert_eq!(csv_literal(v("TRUE").as_ref(), "boolean"), "true");
+        assert_eq!(csv_literal(v("o'clock").as_ref(), "varchar"), "'o''clock'");
+        // Whitespace is preserved for text columns, not trimmed away.
+        assert_eq!(csv_literal(v(" pad ").as_ref(), "varchar"), "' pad '");
+    }
+
+    fn payload(error_type: &str, name: &str, message: &str) -> TrinoErrorPayload {
+        serde_json::from_value(serde_json::json!({
+            "message": message,
+            "errorName": name,
+            "errorCode": 1,
+            "errorType": error_type,
+        }))
+        .expect("payload parses")
+    }
+
+    #[test]
+    fn external_and_resource_errors_are_retryable() {
+        // A connector that cannot reach Nessie/object storage, or a
+        // coordinator that refused work under pressure, may succeed on a
+        // later attempt.
+        for error_type in ["EXTERNAL", "INSUFFICIENT_RESOURCES"] {
+            let error =
+                payload(error_type, "ICEBERG_COMMIT_ERROR", "commit failed").into_adapter_error();
+            assert!(error.retryable, "{error_type}");
+        }
+    }
+
+    #[test]
+    fn nessie_client_failures_wrapped_as_internal_are_retryable() {
+        let error = payload(
+            "INTERNAL_ERROR",
+            "GENERIC_INTERNAL_ERROR",
+            "Failed to execute POST request against 'http://nessie:19120/api/v2/trees/main/contents'.",
+        )
+        .into_adapter_error();
+        assert!(error.retryable);
+    }
+
+    #[test]
+    fn user_and_internal_errors_are_not_retried() {
+        let error = payload("USER_ERROR", "SYNTAX_ERROR", "bad sql").into_adapter_error();
+        assert!(!error.retryable);
+        let error = payload("INTERNAL_ERROR", "GENERIC_INTERNAL_ERROR", "npe").into_adapter_error();
+        assert!(!error.retryable);
     }
 }

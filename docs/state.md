@@ -234,9 +234,36 @@ version differs from the current compile.
 - `state model <name>` — the recorded materialised version for the
   effective environment: version components, target, adapter, contract
   summary, run;
-- `state promotions` — promotion history.
+- `state promotions` — promotion history;
+- `state evidence [candidate-ref]` — the audit evidence promotion reads:
+  the newest environment, branch-diff and lineage-diff record per
+  candidate/target pair, or every record for one candidate.
 
-All four honour `--json`.
+All five honour `--json`.
+
+## Audit evidence
+
+The `evidence` table is the portable authority for promotion audits:
+environment bindings, branch diffs and lineage diffs are appended as
+immutable `EvidenceRecord`s — kind, subject (the candidate ref), target
+ref, candidate/target commit hashes, a definitional fingerprint, the typed
+payload the artifact files also export, an optional run id, and the
+evidence's own timestamp. Records are never updated; a later audit of the
+same subject appends, so the store carries the history.
+
+Because the records live in the store, a shared PostgreSQL backend makes
+promotion evidence portable across machines and CI stages: one stage runs
+and diffs the candidate, another promotes it, and no artifact files need
+to be copied. The `.phlo/transform/*.json` artifacts remain the
+human-readable exports and the compatibility path: a workspace that
+predates the table keeps working, and file evidence the store has not
+seen is imported on read so it becomes portable from then on. Store read
+failures fail closed — never a silent fallback to files that could
+disagree with what another stage recorded — and so does the import: a
+file whose record cannot be persisted is rejected rather than audited
+locally while the authoritative store knows nothing of it. Environment
+evidence is removed when its branch is deleted; branch- and lineage-diff
+records are kept as audit history.
 
 ## Shared and concurrent state
 
@@ -264,7 +291,9 @@ All four honour `--json`.
 - stale plan rejection;
 - cache reuse gated on same target + same adapter;
 - concurrent SQLite writers on a shared state file;
-- Postgres backend round-trip (opt-in via `PHLO_TEST_POSTGRES_URL`).
+- Postgres backend round-trip (opt-in via `PHLO_TEST_POSTGRES_URL`);
+- evidence append/read ordering, latest-per-(subject, target) semantics,
+  cross-connection visibility and corrupt-row rejection on both backends.
 
 ## Deferred
 
