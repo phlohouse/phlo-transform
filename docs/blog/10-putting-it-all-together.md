@@ -174,7 +174,7 @@ Git answers:
 
 > Which definitions changed?
 
-Phlo's compiler/state system answers:
+Phlo Transform's compiler/state system answers:
 
 > Given those definitions and current physical evidence, what actually needs work?
 
@@ -190,7 +190,7 @@ Iceberg    analytical table format
 Nessie     versioned catalog/reference layer
 ```
 
-Phlo's Trino adapter talks to Trino's HTTP protocol directly.
+Phlo Transform's Trino adapter talks to Trino's HTTP protocol directly.
 
 The workspace still contains ordinary SQL. The adapter changes physical execution, not the semantic programming model.
 
@@ -216,7 +216,7 @@ Then:
 phlo-transform run --ref ci/pr-42
 ```
 
-Phlo resolves the candidate's Nessie branch and branch-scoped catalog, recompiles the workspace against that physical target, and plans the candidate.
+Phlo Transform resolves the candidate's Nessie branch and branch-scoped catalog, recompiles the workspace against that physical target, and plans the candidate.
 
 Unchanged inherited tables can be `CACHED` when the candidate target reports the same verified Iceberg output identity recorded on the base.
 
@@ -237,7 +237,7 @@ adapter:             trino
 
 The candidate wants the same semantic version `V` in the same content slot but through its own catalog.
 
-Phlo checks the candidate target live.
+Phlo Transform checks the candidate target live.
 
 If it also reports:
 
@@ -293,7 +293,7 @@ Schema/contract changes are evaluated separately because a dataset can keep simi
 
 A local JSON file is useful for a developer but insufficient for a multi-stage delivery pipeline.
 
-Phlo persists environment, branch-diff and lineage-diff evidence into the configured state backend.
+Phlo Transform persists environment, branch-diff and lineage-diff evidence into the configured state backend.
 
 With Postgres:
 
@@ -357,13 +357,13 @@ That last point closes a subtle concurrency gap: the record does not perform a l
 
 Promotion history is therefore an audit trail of the actual decision.
 
-## Step 13: clean up only what Phlo can prove it owns
+## Step 13: clean up only what Phlo Transform can prove it owns
 
 Candidate cleanup may remove the branch and its branch-scoped catalog.
 
 The catalog is dropped only when ownership is recorded.
 
-If Phlo cannot prove that a catalog belongs to the candidate, it leaves the catalog alone.
+If Phlo Transform cannot prove that a catalog belongs to the candidate, it leaves the catalog alone.
 
 This is the same fail-closed philosophy used throughout the system.
 
@@ -470,7 +470,7 @@ The Nessie-backed Iceberg catalog path cannot store views, so those projects mat
 
 ### No generic cross-engine cache
 
-Cache reuse solves the verified Phlo/Iceberg/Nessie case. It is not a claim that arbitrary outputs from different engines can be reused interchangeably.
+Cache reuse solves the verified Phlo Transform/Iceberg/Nessie case. It is not a claim that arbitrary outputs from different engines can be reused interchangeably.
 
 ### Dynamic dbt/Jinja semantics
 
@@ -502,7 +502,7 @@ Candidates are built in isolation and promotion is bound to exact run/diff/linea
 
 ### Fail closed
 
-When provenance, ownership, identity or compatibility cannot be established, Phlo rebuilds, rejects or leaves resources alone rather than making an optimistic correctness claim.
+When provenance, ownership, identity or compatibility cannot be established, Phlo Transform rebuilds, rejects or leaves resources alone rather than making an optimistic correctness claim.
 
 That is the core of Phlo Transform.
 
