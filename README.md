@@ -197,7 +197,7 @@ runs a disposable container and is executed explicitly in CI.
 - [Full specification](SPEC.md)
 - [Blog series: what Phlo Transform is, from first principles](docs/blog/README.md)
 - [Implementation roadmap](docs/roadmap/README.md)
-- [v0.1 release notes](docs/v0.1-release-notes.md)
+- [v0.1 release notes](docs/v0.1-release-notes.md) and the [final release review](docs/v0.1-final-review.md)
 - [Compiler architecture](docs/architecture.md)
 - [Engine architecture](docs/engine.md)
 - [Semantic compiler](docs/semantic.md)

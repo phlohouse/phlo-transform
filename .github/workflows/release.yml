@@ -58,7 +58,7 @@ jobs:
           name=phlo-transform-${{ matrix.target }}
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/phlo-transform" "dist/$name/"
-          cp README.md LICENSE "dist/$name/" 2>/dev/null || true
+          cp README.md LICENSE "dist/$name/"
           cd dist && tar -czf "$name.tar.gz" "$name"
           echo "artifact=$name.tar.gz" >> "$GITHUB_OUTPUT"
 
