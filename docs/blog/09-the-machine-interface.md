@@ -17,7 +17,7 @@ whatever the CLI happens to print today
 whatever exit codes callers guessed were meaningful
 ```
 
-Phlo therefore exposes a machine-facing daemon built on the same compiler and engine libraries as the CLI.
+Phlo Transform therefore exposes a machine-facing daemon built on the same compiler and engine libraries as the CLI.
 
 ## The first principle: one truth, multiple interfaces
 
@@ -83,7 +83,7 @@ A read should return an answer.
 
 A mutation may run for minutes, be cancelled, retried or inspected later.
 
-So Phlo separates them.
+So Phlo Transform separates them.
 
 ### Read endpoints
 
@@ -206,7 +206,7 @@ This is particularly important for agents, which may retry actions automatically
 
 In-memory idempotency is only useful until the daemon restarts.
 
-Phlo journals operation transitions to:
+Phlo Transform journals operation transitions to:
 
 ```text
 .phlo/transform/operations.jsonl
@@ -344,7 +344,7 @@ A human can read the message.
 
 A machine can reason about the code without string matching.
 
-The same philosophy appears throughout Phlo: human-readable explanations and machine-readable structure should come from the same underlying result.
+The same philosophy appears throughout Phlo Transform: human-readable explanations and machine-readable structure should come from the same underlying result.
 
 ## The daemon serves immutable compiled snapshots
 
@@ -381,7 +381,7 @@ The compiler, planner, state store and promotion gates remain the source of trut
 
 That is the important inversion:
 
-> Phlo is not made “agentic” by letting an LLM improvise transformation semantics. It becomes agent-friendly by exposing deterministic semantics through a structured interface.
+> Phlo Transform is not made “agentic” by letting an LLM improvise transformation semantics. It becomes agent-friendly by exposing deterministic semantics through a structured interface.
 
 ## Where v0.1 deliberately stops
 
