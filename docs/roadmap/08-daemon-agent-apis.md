@@ -443,7 +443,10 @@ Implemented:
 
 - `phlo-transform-daemon`: `WorkspaceService` holding an immutable compiled
   snapshot, versioned `/v1` routes for status/check/models/inspect/lineage/
-  impact/graph, and a polling file watcher that reloads on change.
+  impact/graph/plan plus diff and state reads, tracked `POST /v1/operations`
+  mutations (`run`/`test`/`promote`/`resume`/`retry_failed`/`reload`) with
+  idempotency keys and cooperative cancellation, and a polling file watcher
+  that reloads on change.
 - CLI `daemon` command binds `127.0.0.1`.
 - API and CLI share the same report DTOs; errors carry stable codes.
 - Tests cover the HTTP surface, explicit reload and watcher-driven reload
@@ -451,7 +454,6 @@ Implemented:
 
 Missing / deviated:
 
-- No plan endpoint on the API (the roadmap lists plan information).
 - Reload is a **coherent full recompile**, not dependency-aware targeted
   invalidation (acceptance criterion 2 is deviated).
 - No concurrency/snapshot-consistency test under simultaneous reads and writes.
