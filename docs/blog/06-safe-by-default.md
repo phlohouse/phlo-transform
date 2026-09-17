@@ -6,7 +6,7 @@ Shipping it safely is a different problem.
 
 A model can compile. Its SQL can execute. Its tests can pass. And it can still be the wrong thing to publish to production.
 
-Phlo's lakehouse workflow is built around a simple rule:
+Phlo Transform's lakehouse workflow is built around a simple rule:
 
 > **Do not test a proposed production change by writing it directly into production.**
 
@@ -40,9 +40,9 @@ main ────── A ────── B
 
 A branch is a separate reference to lakehouse state. Writes on the candidate can advance that candidate without advancing `main`.
 
-Phlo uses that primitive as the isolation boundary for production changes.
+Phlo Transform uses that primitive as the isolation boundary for production changes.
 
-## What is an environment in Phlo?
+## What is an environment in Phlo Transform?
 
 An **environment** is the logical execution context for a run.
 
@@ -56,7 +56,7 @@ release/2026-09
 
 But a SQL engine such as Trino also needs a physical catalog configuration telling it which Nessie reference to use.
 
-So Phlo keeps two concepts separate:
+So Phlo Transform keeps two concepts separate:
 
 ```text
 logical environment/reference
@@ -65,7 +65,7 @@ logical environment/reference
 physical catalog binding
 ```
 
-For a candidate, Phlo can provision a branch-scoped catalog such as:
+For a candidate, Phlo Transform can provision a branch-scoped catalog such as:
 
 ```text
 phlo_ci_pr_42_<hash>
@@ -91,7 +91,7 @@ phlo-transform run --ref ci/pr-42
 
 The environment resolver makes sure the candidate reference and its physical catalog binding are coherent.
 
-If the candidate catalog is created by Phlo, ownership is recorded. If the catalog already exists but cannot be proven to belong to this candidate, Phlo fails closed rather than adopting a possibly foreign resource.
+If the candidate catalog is created by Phlo Transform, ownership is recorded. If the catalog already exists but cannot be proven to belong to this candidate, Phlo Transform fails closed rather than adopting a possibly foreign resource.
 
 This ownership detail matters later when cleanup decides whether a catalog is safe to drop.
 
@@ -158,7 +158,7 @@ These are different gates because they protect against different failure modes.
 
 A diff should not download an entire table into the CLI merely to compare it.
 
-Phlo asks the warehouse to calculate the comparison.
+Phlo Transform asks the warehouse to calculate the comparison.
 
 For a keyed model, row identity allows a `FULL OUTER JOIN` style comparison that can classify rows as:
 
@@ -214,7 +214,7 @@ If the reference moves, the old evidence becomes stale.
 
 ## Audit evidence is portable state
 
-Early versions of Phlo used workspace JSON artifacts as the primary audit record.
+Early versions of Phlo Transform used workspace JSON artifacts as the primary audit record.
 
 That is not enough for real CI.
 
@@ -275,7 +275,7 @@ If promotion first evaluates evidence record `e1`, then later performs a new “
 
 The promotion record would then claim the wrong evidence authorised the decision.
 
-Phlo avoids that race by carrying the selected evidence ID *with the evidence read itself*.
+Phlo Transform avoids that race by carrying the selected evidence ID *with the evidence read itself*.
 
 A promotion record can therefore contain exact IDs for the records consulted:
 
@@ -340,10 +340,10 @@ That makes promotion a queryable event rather than an ephemeral terminal message
 After a candidate is merged or abandoned, cleanup may remove:
 
 - the Nessie branch;
-- the Phlo-owned candidate catalog;
+- the Phlo Transform-owned candidate catalog;
 - the environment binding evidence.
 
-But Phlo only drops a physical catalog when recorded evidence says Phlo owns it.
+But Phlo Transform only drops a physical catalog when recorded evidence says Phlo Transform owns it.
 
 An unproven catalog is left alone.
 
@@ -401,7 +401,7 @@ v0.1 is intentionally conservative.
 - Nessie-backed Iceberg catalogs do not support views, so Nessie-targeted projects materialise those outputs as tables.
 - Shared Postgres state currently uses `NoTls`, so it belongs on trusted networks.
 - A candidate that does not physically inherit a reusable output cannot magically cache it; it builds.
-- If strong physical identity cannot be proven, Phlo rebuilds rather than assuming reuse is safe.
+- If strong physical identity cannot be proven, Phlo Transform rebuilds rather than assuming reuse is safe.
 
 Those limits all follow the same rule:
 
