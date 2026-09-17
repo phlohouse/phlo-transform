@@ -17,6 +17,35 @@ use crate::gates::{evaluate_gates, GateReport};
 use crate::state::RunSummary;
 use crate::util::now_rfc3339;
 
+/// The immutable evidence rows that authorised a promotion — the join from
+/// a `PromotionRecord` back to the audit trail exactly as the gates read
+/// it. Every id is captured at evaluation time; no "latest evidence" lookup
+/// after the merge can redefine what the decision rested on.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PromotionEvidenceIds {
+    /// The branch-diff evidence record for the (candidate, target) pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_diff: Option<String>,
+    /// The lineage-diff evidence record for the pair, when the consulted
+    /// artifact was environment-bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_diff: Option<String>,
+    /// The environment-provisioning record for the candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+}
+
+impl PromotionEvidenceIds {
+    /// `Some(ids)` when at least one evidence id was captured.
+    fn or_none(self) -> Option<Self> {
+        if self.branch_diff.is_none() && self.lineage_diff.is_none() && self.environment.is_none() {
+            None
+        } else {
+            Some(self)
+        }
+    }
+}
+
 /// A promotion request.
 #[derive(Clone, Debug)]
 pub struct PromotionRequest {
@@ -44,6 +73,9 @@ pub struct PromotionRequest {
     pub actor: Option<String>,
     /// Gate results computed by the caller, carried into the record.
     pub gates: Vec<crate::gates::GateResult>,
+    /// The evidence ids the evaluation consulted — empty for requests built
+    /// without an evaluation.
+    pub evidence: PromotionEvidenceIds,
 }
 
 /// A reproducible promotion record.
@@ -66,6 +98,11 @@ pub struct PromotionRecord {
     /// The gate evaluation that authorised (or refused) this promotion.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gates: Vec<crate::gates::GateResult>,
+    /// The immutable evidence records the gates consulted. `None` on
+    /// records written before evidence ids were tracked, and whenever no
+    /// store-backed evidence existed at evaluation time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<PromotionEvidenceIds>,
     pub timestamp: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
@@ -144,6 +181,7 @@ pub async fn promote(
         merged: false,
         conflicts: Vec::new(),
         gates: request.gates.clone(),
+        evidence: request.evidence.clone().or_none(),
         timestamp: now_rfc3339(),
         actor: request.actor.clone(),
     };
@@ -228,6 +266,10 @@ pub struct PromotionEvaluation {
     /// The base commit the evidence was established against — the hash the
     /// merge asserts on.
     pub expected_target_hash: Option<String>,
+    /// The evidence records the gates consulted, captured at evaluation
+    /// time — a promotion record carries these so history can name the
+    /// exact audit rows it was authorised by.
+    pub evidence: PromotionEvidenceIds,
     /// The gate verdict.
     pub gates: GateReport,
 }
@@ -256,6 +298,7 @@ impl PromotionEvaluation {
             dry_run: false,
             actor,
             gates: self.gates.results.clone(),
+            evidence: self.evidence.clone(),
         }
     }
 }
@@ -310,7 +353,8 @@ pub async fn evaluate_promotion(
         _ => (Vec::new(), Vec::new(), Vec::new()),
     };
 
-    let environment = crate::audit::read_environment_for(workspace_root, state, candidate)?;
+    let (environment, environment_evidence_id) =
+        crate::audit::read_environment_evidence(workspace_root, state, candidate)?;
     let mut audit = crate::audit::audited_diff(
         workspace_root,
         state,
@@ -376,6 +420,18 @@ pub async fn evaluate_promotion(
         merge_check,
     });
 
+    // The ids the audit functions resolved against travel back with the
+    // evidence itself — a promotion names the exact rows the gates
+    // consulted, not whatever row a second query would find after a
+    // concurrent writer landed newer evidence.
+    let evidence = PromotionEvidenceIds {
+        branch_diff: audit.diff_evidence_id.clone(),
+        lineage_diff: lineage
+            .as_ref()
+            .and_then(|evidence| evidence.evidence_id.clone()),
+        environment: environment_evidence_id,
+    };
+
     Ok(PromotionEvaluation {
         candidate: candidate_reference,
         target,
@@ -384,6 +440,7 @@ pub async fn evaluate_promotion(
         lineage,
         environment,
         expected_target_hash,
+        evidence,
         gates,
     })
 }
@@ -530,6 +587,7 @@ mod tests {
             dry_run,
             actor: None,
             gates: Vec::new(),
+            evidence: PromotionEvidenceIds::default(),
         }
     }
 
@@ -690,6 +748,7 @@ mod schema_gate_tests {
             dry_run: true,
             actor: None,
             gates: Vec::new(),
+            evidence: PromotionEvidenceIds::default(),
         };
 
         assert!(promote(&nessie, &make(false)).await.is_err());

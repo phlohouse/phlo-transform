@@ -180,25 +180,35 @@ fn lineage_diff_target(artifact: &LineageDiffArtifact) -> &str {
 /// rejects the artifact rather than pass gates on a local file the
 /// authoritative record knows nothing about. File-only compatibility is
 /// for workspaces with no store configured.
-fn import_evidence(state: &dyn StateStore, record: &EvidenceRecord) -> Result<(), EngineError> {
-    let known = state
+///
+/// Returns the id of the *standing* record for this evidence — the
+/// already-persisted row a dedup matched, else the row just written — so a
+/// caller can name exactly which record the audit consulted without a
+/// second, raceable store read.
+fn import_evidence(
+    state: &dyn StateStore,
+    record: &EvidenceRecord,
+) -> Result<Option<String>, EngineError> {
+    let standing = state
         .evidence_for(record.kind, &record.subject)
         .map_err(|error| EngineError::State(format!("cannot read the evidence store: {error}")))?
-        .iter()
-        .any(|existing| {
+        .into_iter()
+        .find(|existing| {
             existing.target_ref == record.target_ref
                 && (existing.created_at == record.created_at || existing.payload == record.payload)
         });
-    if known {
-        return Ok(());
+    if let Some(existing) = standing {
+        return Ok(Some(existing.evidence_id));
     }
+    let evidence_id = record.evidence_id.clone();
     state.record_evidence(record).map_err(|error| {
         EngineError::State(format!(
             "cannot persist {} evidence for `{}` to the state store: {error}",
             record.kind.as_str(),
             record.subject
         ))
-    })
+    })?;
+    Ok(Some(evidence_id))
 }
 
 /// Persist a branch-diff audit: the immutable evidence record (portable —
@@ -306,6 +316,20 @@ pub fn read_environment_for(
     state: Option<&dyn StateStore>,
     candidate: &str,
 ) -> Result<Option<EnvironmentSetup>, EngineError> {
+    Ok(read_environment_evidence(workspace_root, state, candidate)?.0)
+}
+
+/// The same resolution, also returning the id of the evidence record the
+/// setup was read from — the store's newest record, or the row a file
+/// import just stood up. `None` for file-only workspaces (no store) and
+/// for files that could not be recorded. A caller recording provenance
+/// uses this rather than re-querying: the id travels with the read that
+/// consulted it.
+pub fn read_environment_evidence(
+    workspace_root: &Path,
+    state: Option<&dyn StateStore>,
+    candidate: &str,
+) -> Result<(Option<EnvironmentSetup>, Option<String>), EngineError> {
     if let Some(state) = state {
         let records = state
             .evidence_for(EvidenceKind::Environment, candidate)
@@ -329,20 +353,21 @@ pub fn read_environment_for(
                     setup.candidate.name
                 )));
             }
-            return Ok(Some(setup));
+            return Ok((Some(setup), Some(record.evidence_id.clone())));
         }
         let setup = read_environment_files(workspace_root, candidate);
+        let mut evidence_id = None;
         if let Some(setup) = &setup {
             if let Ok(record) = environment_record(setup) {
                 // The file cannot resolve the binding unless it reaches
                 // the store — a local-only artifact would audit here while
                 // other machines sharing the store see nothing.
-                import_evidence(state, &record)?;
+                evidence_id = import_evidence(state, &record)?;
             }
         }
-        return Ok(setup);
+        return Ok((setup, evidence_id));
     }
-    Ok(read_environment_files(workspace_root, candidate))
+    Ok((read_environment_files(workspace_root, candidate), None))
 }
 
 /// The artifact-file environment lookup — the compatibility path.
@@ -545,14 +570,22 @@ pub struct AuditEvidence {
     /// A fresh, ref-and-commit-bound audit actually inspected this pair.
     /// `false` means "no evidence", which must never read as "no changes".
     pub schema_audited: bool,
+    /// The id of the evidence record this audit resolved through — the row
+    /// a promotion record names as having authorised it. `None` when the
+    /// consulted evidence was a file that never reached the store.
+    pub diff_evidence_id: Option<String>,
 }
 
 /// What the freshest branch-diff evidence holds.
 enum BranchDiffLookup {
     /// No branch-diff evidence anywhere.
     Missing,
-    /// A report was found — the caller decides whether it applies.
-    Found(Box<BranchDiffReport>),
+    /// A report was found — the caller decides whether it applies — plus
+    /// the id of the store record the report resolved through, when the
+    /// consulted evidence is a record (`None` only for a file that never
+    /// reached the store). The id travels with the read so a caller
+    /// recording provenance names the exact row this audit used.
+    Found(Box<BranchDiffReport>, Option<String>),
     /// The evidence exists but cannot be read — a corrupt store row or a
     /// store error. Fail closed: rejected, not skipped.
     Corrupt(String),
@@ -582,11 +615,15 @@ fn branch_diff_evidence(
     // the evidence is portable even when it is not this candidate's —
     // the single-slot artifact is overwritten by the next `diff`, while
     // the store record is not. `import_evidence` dedups, so repeated
-    // audits do not append the same instant twice.
+    // audits do not append the same instant twice; the id it returns is
+    // the standing record's, so a file that wins below names the row its
+    // evidence lives in.
+    let mut file_record_id = None;
     if let Some(report) = &file {
         if let Ok(record) = branch_diff_record(report) {
-            if let Err(error) = import_evidence(state, &record) {
-                return BranchDiffLookup::Corrupt(error.to_string());
+            match import_evidence(state, &record) {
+                Ok(id) => file_record_id = id,
+                Err(error) => return BranchDiffLookup::Corrupt(error.to_string()),
             }
         }
     }
@@ -609,30 +646,32 @@ fn branch_diff_evidence(
     };
     if file_fresher {
         return file.map_or(BranchDiffLookup::Missing, |report| {
-            BranchDiffLookup::Found(Box::new(report))
+            BranchDiffLookup::Found(Box::new(report), file_record_id)
         });
     }
     // The store's word for this candidate: prefer the record that audited
     // this exact pair; else the newest, so the rejection can name what the
     // evidence actually covers.
     if let Some(record) = pair_record.or(records.first()) {
+        let evidence_id = record.evidence_id.clone();
         return match serde_json::from_value::<BranchDiffReport>(record.payload.clone()) {
-            Ok(report) => BranchDiffLookup::Found(Box::new(report)),
+            Ok(report) => BranchDiffLookup::Found(Box::new(report), Some(evidence_id)),
             Err(error) => {
                 BranchDiffLookup::Corrupt(format!("undecodable branch-diff evidence: {error}"))
             }
         };
     }
     if let Some(report) = file {
-        return BranchDiffLookup::Found(Box::new(report));
+        return BranchDiffLookup::Found(Box::new(report), file_record_id);
     }
     // Nothing for this candidate and no file: for the rejection to name
     // what was audited instead, look at the newest record anywhere.
     match state.latest_evidence(EvidenceKind::BranchDiff) {
         Ok(latest) => match latest.first() {
             Some(record) => {
+                let evidence_id = record.evidence_id.clone();
                 match serde_json::from_value::<BranchDiffReport>(record.payload.clone()) {
-                    Ok(report) => BranchDiffLookup::Found(Box::new(report)),
+                    Ok(report) => BranchDiffLookup::Found(Box::new(report), Some(evidence_id)),
                     Err(error) => BranchDiffLookup::Corrupt(format!(
                         "undecodable branch-diff evidence: {error}"
                     )),
@@ -666,8 +705,8 @@ pub fn audited_diff(
     let Some(state) = state else {
         return AuditEvidence::default();
     };
-    let found = match branch_diff_evidence(workspace_root, state, candidate, to) {
-        BranchDiffLookup::Found(report) => Some(report),
+    let (found, evidence_id) = match branch_diff_evidence(workspace_root, state, candidate, to) {
+        BranchDiffLookup::Found(report, evidence_id) => (Some(report), evidence_id),
         BranchDiffLookup::Corrupt(reason) => {
             return AuditEvidence {
                 diff_rejected: Some(format!(
@@ -676,7 +715,7 @@ pub fn audited_diff(
                 ..AuditEvidence::default()
             };
         }
-        BranchDiffLookup::Missing => None,
+        BranchDiffLookup::Missing => (None, None),
     };
     if let Some(report) = found {
         // An audit of another candidate, or against another target, is not
@@ -688,6 +727,7 @@ pub fn audited_diff(
                      rerun `diff --from {candidate} --to {to} --full`",
                     report.candidate_ref, report.base_ref
                 )),
+                diff_evidence_id: evidence_id,
                 ..AuditEvidence::default()
             };
         }
@@ -854,6 +894,7 @@ pub fn audited_diff(
             breaking_schema_changes: breaking,
             audited_base_hash: report.base_hash.clone(),
             schema_audited: fresh,
+            diff_evidence_id: evidence_id,
         };
     }
 
@@ -897,6 +938,11 @@ pub struct LineageEvidence {
     pub base: String,
     /// Total lineage changes the artifact reports.
     pub changes: usize,
+    /// The id of the evidence record this audit resolved through — the row
+    /// a promotion record names as having authorised it. `None` when the
+    /// consulted evidence was a file that never reached the store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_id: Option<String>,
 }
 
 /// The `lineage_diff.json` artifact file — the export/compatibility form.
@@ -920,10 +966,10 @@ fn lineage_diff_evidence(
     state: Option<&dyn StateStore>,
     candidate: &str,
     to: &str,
-) -> Option<Result<LineageDiffArtifact, String>> {
+) -> Option<Result<(LineageDiffArtifact, Option<String>), String>> {
     let file = read_lineage_diff(workspace_root);
     let Some(state) = state else {
-        return file;
+        return file.map(|result| result.map(|artifact| (artifact, None)));
     };
     let records = match state.evidence_for(EvidenceKind::LineageDiff, candidate) {
         Ok(records) => records,
@@ -934,12 +980,16 @@ fn lineage_diff_evidence(
     // single-slot artifact is overwritten by the next `lineage --diff`,
     // while the store record is not. An artifact with no subject (no Nessie
     // binding, no Git ref) has nothing to bind the evidence to, so it is
-    // not recorded. `import_evidence` dedups repeated audits of one file.
+    // not recorded. `import_evidence` dedups repeated audits of one file;
+    // the id it returns is the standing record's — a file that wins below
+    // names the row its evidence lives in.
+    let mut file_record_id = None;
     if let Some(Ok(artifact)) = &file {
         if lineage_diff_subject(artifact).is_some() {
             if let Ok(record) = lineage_diff_record(artifact) {
-                if let Err(error) = import_evidence(state, &record) {
-                    return Some(Err(error.to_string()));
+                match import_evidence(state, &record) {
+                    Ok(id) => file_record_id = id,
+                    Err(error) => return Some(Err(error.to_string())),
                 }
             }
         }
@@ -968,17 +1018,19 @@ fn lineage_diff_evidence(
         _ => false,
     };
     if file_newer {
-        return file;
+        return file.map(|result| result.map(|artifact| (artifact, file_record_id.clone())));
     }
     // The pair's record when the store holds one, else the candidate's
     // newest — so a rejection names what the evidence actually covers.
     if let Some(record) = pair_record.or(records.first()) {
+        let evidence_id = record.evidence_id.clone();
         return Some(
             serde_json::from_value::<LineageDiffArtifact>(record.payload.clone())
+                .map(|artifact| (artifact, Some(evidence_id)))
                 .map_err(|error| format!("undecodable lineage evidence: {error}")),
         );
     }
-    file
+    file.map(|result| result.map(|artifact| (artifact, file_record_id)))
 }
 
 /// Read the lineage-diff evidence (`lineage_diff.json` and its store
@@ -998,14 +1050,16 @@ pub fn audited_lineage(
     target_hash: &str,
     current_lineage_hash: Option<&str>,
 ) -> Option<LineageEvidence> {
-    let artifact = match lineage_diff_evidence(workspace_root, state, candidate, to)? {
-        Ok(artifact) => artifact,
+    let (artifact, evidence_id) = match lineage_diff_evidence(workspace_root, state, candidate, to)?
+    {
+        Ok(resolved) => resolved,
         Err(error) => {
             return Some(LineageEvidence {
                 status: "stale",
                 reason: Some(error),
                 base: "unknown".to_string(),
                 changes: 0,
+                evidence_id: None,
             });
         }
     };
@@ -1020,12 +1074,14 @@ pub fn audited_lineage(
         reason: Some(reason),
         base: base.clone(),
         changes,
+        evidence_id: evidence_id.clone(),
     };
     let evidence = |status: &'static str| LineageEvidence {
         status,
         reason: None,
         base: base.clone(),
         changes,
+        evidence_id: evidence_id.clone(),
     };
     let rerun = format!("rerun `lineage --diff {to} --ref {candidate}`");
     let verdict = match &artifact.environment {

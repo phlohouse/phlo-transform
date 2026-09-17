@@ -19,12 +19,12 @@ expression: stdout(&output)
     "target": "reporting.monthly",
     "tests": [],
     "used_by": [],
-    "version": "a33d808",
+    "version": "0f91c75",
     "workflow": "reporting"
   },
   "state": {
     "current": null,
-    "desired": "a33d808",
+    "desired": "0f91c75",
     "status": "new"
   }
 }

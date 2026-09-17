@@ -10,7 +10,7 @@ expression: "compilation.inspect_report(&id).expect(\"model exists\")"
     "workflow": "assay",
     "materialization": "view",
     "target": "assay.results",
-    "version": "9c605c9",
+    "version": "d1c2c94",
     "path": "workflows/assay/transforms/results.sql",
     "depends_on": [
       "assay.raw"

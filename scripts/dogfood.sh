@@ -148,8 +148,17 @@ if [ -n "${PHLO_NESSIE_ENDPOINT:-}" ] && [ -n "${PHLO_TRINO_ENDPOINT:-}" ]; then
     record $? "ref-list"
     $PHLO ref create "$REF" --from main $NESSIE >/dev/null 2>&1
     record $? "ref-create"
-    $PHLO run --ref "$REF" --adapter trino --retries 2 $NESSIE >/dev/null 2>&1
+    REFRUN="$($PHLO run --ref "$REF" --adapter trino --retries 2 --json $NESSIE 2>/dev/null)"
     record $? "run-ref"
+    # The candidate inherits main's Iceberg tables untouched: identical
+    # content must adopt the recorded outputs, not rebuild them.
+    echo "$REFRUN" | python3 -c 'import json,sys
+r = json.load(sys.stdin)
+models = r.get("models", [])
+cached = sum(1 for m in models if m.get("status") == "cached")
+built = sum(1 for m in models if m.get("status") == "passed")
+sys.exit(0 if models and cached == len(models) and built == 0 else 1)'
+    record $? "run-ref-cache-reuse"
     $PHLO diff --from "$REF" --to main $NESSIE >/dev/null 2>&1
     record $? "branch-diff"
     $PHLO promote "$REF" --to main --check $NESSIE >/dev/null 2>&1

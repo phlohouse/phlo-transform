@@ -581,6 +581,32 @@ async fn run(cli: &Cli) -> Result<ExitCode, String> {
             );
         }
     }
+    // ReadOnly resolution names the would-be catalog but creates nothing —
+    // when the generated catalog has never been provisioned the plan below
+    // can only see an empty target. A `run` provisions first and may find
+    // inherited outputs to adopt. A recorded pin to a differently-named
+    // catalog is user-managed and real — no note.
+    if environment_compilation.is_some()
+        && matches!(environment_mode, Some(EnvironmentMode::ReadOnly))
+        && !cli.json
+    {
+        if let Some(label) = run_environment(cli)? {
+            let unprovisioned = match &environment_setup {
+                None => true,
+                Some(setup) => {
+                    setup.catalog_status == CatalogStatus::Unmanaged
+                        && setup.catalog == catalog_name(&label)
+                }
+            };
+            if unprovisioned {
+                eprintln!(
+                    "note: environment `{label}` is not provisioned — this previews an empty \
+                     target; `run --ref {label}` creates the candidate and may adopt outputs \
+                     already materialised on the base"
+                );
+            }
+        }
+    }
 
     let compilation = match environment_compilation {
         // The environment resolution already compiled the workspace
@@ -2986,11 +3012,12 @@ fn print_run_human(result: &RunResult) {
             model.model,
             model.duration_ms
         );
-        // Skipped and blocked models keep their plan reasons visible —
-        // "unchanged" and "required by …" explain the outcome.
+        // Skipped, cached and blocked models keep their plan reasons
+        // visible — "unchanged", "adopted from …" and "required by …"
+        // explain the outcome.
         if matches!(
             model.status,
-            ExecutionStatus::Skipped | ExecutionStatus::Blocked
+            ExecutionStatus::Skipped | ExecutionStatus::Blocked | ExecutionStatus::Cached
         ) {
             for reason in &model.reasons {
                 println!("           {reason}");

@@ -1245,20 +1245,54 @@ async fn plan_prod_after(
     plan_all_with_state(compilation, adapter, state, Some("prod".to_string())).await
 }
 
+/// The Nessie case: `dev`'s record names the same content slot under its
+/// own catalog binding. Version equality already proves the model is
+/// identical; the live identity read through *this* environment's target
+/// proves the bytes are visible here. That is a cache hit.
 #[tokio::test]
-async fn cache_reuse_requires_same_physical_target() {
+async fn cache_reuse_matches_across_catalogs_on_the_same_content_slot() {
     let adapter = Arc::new(FakeAdapter::default());
     let state = Arc::new(SqliteStateStore::in_memory().unwrap());
     let (compilation, version, _target) = dev_materialised(adapter.clone(), state.clone()).await;
 
-    // The identical version is recorded — but for a different relation, so
-    // nothing proves the bytes live at this environment's target.
     let plan = plan_prod_after(
         adapter,
         state,
         &compilation,
         version,
         "other_catalog.assay.results",
+        Some("fake"),
+        Some("snap:dev"),
+    )
+    .await;
+    let model = &plan.models[0];
+    assert_eq!(model.action, PlanAction::Cached, "{:?}", model.reasons);
+    let reuse = model
+        .reuse
+        .as_ref()
+        .expect("a cached action carries its source");
+    assert_eq!(reuse.environment.as_deref(), Some("dev"));
+    assert_eq!(reuse.target, "other_catalog.assay.results");
+    assert_eq!(reuse.output_identity, "snap:dev");
+    assert_eq!(reuse.run_id, "run-dev");
+}
+
+/// A same-version record pointing at a genuinely different content slot
+/// (another schema/table) cannot vouch for this target — defensive, since
+/// the version hash already pins the slot, but a malformed or legacy record
+/// must still fail closed.
+#[tokio::test]
+async fn cache_reuse_rejects_a_different_content_slot() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let (compilation, version, _target) = dev_materialised(adapter.clone(), state.clone()).await;
+
+    let plan = plan_prod_after(
+        adapter,
+        state,
+        &compilation,
+        version,
+        "other_schema.other_table",
         Some("fake"),
         Some("snap:dev"),
     )
@@ -1433,6 +1467,313 @@ async fn cache_hit_rejects_records_without_an_output_fingerprint() {
         .reasons
         .iter()
         .any(|reason| reason.kind == ReasonKind::CacheMiss));
+}
+
+/// `Cached` is real execution semantics, not just a classification: the run
+/// issues no model SQL, records the model run as `cached`, and writes the
+/// environment's own materialisation record — claiming the producing run's
+/// id and timestamp verbatim. The next plan sees the env-local record and
+/// skips on it.
+#[tokio::test]
+async fn a_cached_run_adopts_the_verified_output_into_the_environment() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let (compilation, version, target) = dev_materialised(adapter.clone(), state.clone()).await;
+    let dev_run = state
+        .materialized_version("assay.results", Some("dev"))
+        .unwrap()
+        .expect("dev record")
+        .run_id;
+    let creates_before = adapter.created.lock().unwrap().len();
+
+    let plan = plan_all_with_state(
+        &compilation,
+        adapter.clone(),
+        state.clone(),
+        Some("prod".to_string()),
+    )
+    .await;
+    assert_eq!(plan.models[0].action, PlanAction::Cached);
+    let result = Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &compilation,
+            &plan,
+            &RunOptions {
+                environment: Some("prod".to_string()),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // No physical write happened for the model.
+    assert_eq!(adapter.created.lock().unwrap().len(), creates_before);
+    let model_result = &result.models[0];
+    assert_eq!(model_result.status, ExecutionStatus::Cached);
+    assert_eq!(model_result.action, "cached");
+
+    // The environment now has its own record: same version, this
+    // environment's target, the verified identity — and the *producing*
+    // run's id, not this run's.
+    let record = state
+        .materialized_version("assay.results", Some("prod"))
+        .unwrap()
+        .expect("prod adopts a record");
+    assert_eq!(record.version.hash, version.hash);
+    assert_eq!(record.target, target);
+    assert_eq!(record.output_identity.as_deref(), Some("snap:dev"));
+    assert_eq!(record.adapter.as_deref(), Some("fake"));
+    assert_eq!(record.run_id, dev_run);
+
+    // The next prod plan is a same-environment Skip — the adoption made
+    // the reuse durable rather than a repeated cross-env lookup.
+    let plan = plan_all_with_state(&compilation, adapter, state, Some("prod".to_string())).await;
+    assert_eq!(
+        plan.models[0].action,
+        PlanAction::Skip,
+        "{:?}",
+        plan.models[0].reasons
+    );
+}
+
+/// The plan's cache evidence can go stale before the run executes it — a
+/// concurrent writer rewrote the relation. The run must fail closed: the
+/// model builds instead of adopting, and the env record this run writes is
+/// for the output it actually produced.
+#[tokio::test]
+async fn a_cached_run_falls_back_to_build_when_identity_drifts() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let (compilation, _version, target) = dev_materialised(adapter.clone(), state.clone()).await;
+
+    let plan = plan_all_with_state(
+        &compilation,
+        adapter.clone(),
+        state.clone(),
+        Some("prod".to_string()),
+    )
+    .await;
+    assert_eq!(plan.models[0].action, PlanAction::Cached);
+
+    // Between plan and run, another writer replaced the relation's
+    // contents.
+    adapter.set_output_identity(&target, "snap:other");
+    let result = Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &compilation,
+            &plan,
+            &RunOptions {
+                environment: Some("prod".to_string()),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let model_result = &result.models[0];
+    assert_eq!(
+        model_result.status,
+        ExecutionStatus::Passed,
+        "{:?}",
+        model_result
+    );
+    assert_eq!(model_result.action, "build");
+    assert!(model_result
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("cache evidence stale")));
+
+    // The env record reflects what this run built — not the stale source.
+    let record = state
+        .materialized_version("assay.results", Some("prod"))
+        .unwrap()
+        .expect("the fallback build records prod state");
+    assert_eq!(record.run_id, result.run_id);
+    assert_eq!(record.output_identity.as_deref(), Some("snap:other"));
+}
+
+/// A version-equal record whose target moved — the catalog re-binding case
+/// — adopts when the recorded output verifiably sits at the new target.
+/// The environment's record is updated to name the target it now claims.
+#[tokio::test]
+async fn a_catalog_retarget_adopts_the_visible_output() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let (compilation, _version, _target) = dev_materialised(adapter.clone(), state.clone()).await;
+
+    // Recompile the same workspace bound to a different catalog — same
+    // version, new physical target.
+    let mut project = SemanticProject::in_memory(vec![model("assay.results", "select 1 as id")]);
+    project.defaults.catalog = Some("phlo_prod".to_string());
+    let rebound = compile(&project);
+    assert!(rebound.is_ok(), "{:?}", rebound.diagnostics);
+    let rebound_model = &rebound.models[0];
+    assert_eq!(rebound_model.target.display(), "phlo_prod.assay.results");
+    assert_eq!(
+        rebound_model.version.hash, compilation.models[0].version.hash,
+        "a catalog binding is not model content"
+    );
+
+    // The catalog's branch view shows the same physical output.
+    adapter
+        .existing
+        .lock()
+        .unwrap()
+        .insert("phlo_prod.assay.results".to_string());
+    adapter.set_output_identity("phlo_prod.assay.results", "snap:dev");
+
+    let plan = plan_all_with_state(
+        &rebound,
+        adapter.clone(),
+        state.clone(),
+        Some("dev".to_string()),
+    )
+    .await;
+    let model = &plan.models[0];
+    assert_eq!(model.action, PlanAction::Cached, "{:?}", model.reasons);
+    Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &rebound,
+            &plan,
+            &RunOptions {
+                environment: Some("dev".to_string()),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let record = state
+        .materialized_version("assay.results", Some("dev"))
+        .unwrap()
+        .expect("dev record");
+    assert_eq!(record.target, "phlo_prod.assay.results");
+    assert_eq!(record.output_identity.as_deref(), Some("snap:dev"));
+}
+
+/// The same retarget with no provable identity at the new target must
+/// rebuild — the record alone cannot vouch for bytes at an address it
+/// never described.
+#[tokio::test]
+async fn a_catalog_retarget_without_verifiable_identity_rebuilds() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let (compilation, _version, _target) = dev_materialised(adapter.clone(), state.clone()).await;
+
+    let mut project = SemanticProject::in_memory(vec![model("assay.results", "select 1 as id")]);
+    project.defaults.catalog = Some("phlo_prod".to_string());
+    let rebound = compile(&project);
+    assert!(rebound.is_ok(), "{:?}", rebound.diagnostics);
+    adapter
+        .existing
+        .lock()
+        .unwrap()
+        .insert("phlo_prod.assay.results".to_string());
+    // No output identity at the new target — nothing to adopt.
+
+    let plan = plan_all_with_state(
+        &rebound,
+        adapter.clone(),
+        state.clone(),
+        Some("dev".to_string()),
+    )
+    .await;
+    let model = &plan.models[0];
+    assert_eq!(model.action, PlanAction::Build, "{:?}", model.reasons);
+    assert!(model
+        .reasons
+        .iter()
+        .any(|reason| reason.kind == ReasonKind::TargetChange));
+    assert_eq!(
+        compilation.models[0].version.hash,
+        rebound.models[0].version.hash
+    );
+}
+
+/// The catalog is no longer a version input, so a retarget leaves the
+/// version hash identical — staleness must catch it on the physical target
+/// instead. A plan inspected against catalog A must never execute against a
+/// compilation bound to catalog B: execution binds its targets from the
+/// compilation, and an accepted stale plan would land on a relation the
+/// plan never named.
+#[tokio::test]
+async fn a_plan_is_stale_when_the_compilation_retargets_the_model() {
+    let adapter = Arc::new(FakeAdapter::default());
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let (compilation, _version, _target) = dev_materialised(adapter.clone(), state.clone()).await;
+
+    // The plan was made against the dev-bound compilation.
+    let plan = plan_all_with_state(
+        &compilation,
+        adapter.clone(),
+        state.clone(),
+        Some("prod".to_string()),
+    )
+    .await;
+
+    // The workspace recompiles against another catalog — same content, so
+    // the same version; only the physical target moved.
+    let mut project = SemanticProject::in_memory(vec![model("assay.results", "select 1 as id")]);
+    project.defaults.catalog = Some("phlo_prod".to_string());
+    let rebound = compile(&project);
+    assert_eq!(
+        rebound.models[0].version.hash, compilation.models[0].version.hash,
+        "same content — only the binding moved"
+    );
+
+    let error = Runner::new(adapter, Some(state))
+        .apply(
+            &rebound,
+            &plan,
+            &RunOptions {
+                environment: Some("prod".to_string()),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a retargeted compilation must not take the old plan");
+    assert!(matches!(error, EngineError::StalePlan(_)), "{error:?}");
+    assert!(error.to_string().contains("target changed"), "{error}");
+}
+
+/// Adopting a time-window model copies the source environment's watermark:
+/// identical content has the same frontier, so the adopted record must not
+/// leave the new environment re-reading history the source already covered.
+#[tokio::test]
+async fn a_cached_run_adopts_the_source_environments_watermark() {
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_max_value("2026-09-10 00:00:00.000");
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let provider = events_provider();
+    let project = SemanticProject::in_memory(vec![incremental_with(
+        "select id, updated_at from external.events",
+        IncrementalStrategy::TimeWindow {
+            column: "updated_at".to_string(),
+            overlap_seconds: None,
+        },
+    )]);
+    let compilation = compile_with_options(&project, &provider, &EmptySourceStateProvider);
+    assert!(compilation.is_ok(), "{:?}", compilation.diagnostics);
+    for model in &compilation.models {
+        adapter.set_output_identity(&model.target.display(), "snap:dev");
+    }
+
+    run_once(adapter.clone(), state.clone(), &compilation, "dev").await;
+    assert_eq!(
+        state.watermark("assay.events", Some("dev")).unwrap(),
+        Some("2026-09-10 00:00:00.000".to_string())
+    );
+
+    let result = run_once(adapter.clone(), state.clone(), &compilation, "prod").await;
+    assert_eq!(result.models[0].status, ExecutionStatus::Cached);
+    assert_eq!(
+        state.watermark("assay.events", Some("prod")).unwrap(),
+        Some("2026-09-10 00:00:00.000".to_string()),
+        "the adoption must carry the source watermark"
+    );
 }
 
 /// A schema/row-count `source_state` is not a content identity: an adapter
@@ -3168,6 +3509,112 @@ async fn retry_failed_reruns_only_the_failed_portion() {
         .await
         .expect_err("nothing left to retry");
     assert!(error.to_string().contains("nothing to retry"), "{error}");
+}
+
+/// `Cached` is executable work: when the failed model can now adopt a
+/// verified sibling environment's output, the retry must run the adoption —
+/// not report the portion "already materialised" and skip it. Tests over
+/// the adopted model stay in scope: what the environment holds changed.
+#[tokio::test]
+async fn retry_failed_executes_a_now_cacheable_model() {
+    let compilation = project_with_tests();
+    let adapter = Arc::new(FakeAdapter::default());
+    adapter.set_test_rows(0);
+    let state = Arc::new(SqliteStateStore::in_memory().unwrap());
+    let runner = Runner::new(adapter.clone(), Some(state.clone()));
+
+    // `assay.results` fails under prod; `reporting.monthly` is blocked by it.
+    adapter.fail_with("assay.results", AdapterError::new("FAKE001", "boom"));
+    let first = runner
+        .apply(
+            &compilation,
+            &plan_all_with_state(
+                &compilation,
+                adapter.clone(),
+                state.clone(),
+                Some("prod".to_string()),
+            )
+            .await,
+            &RunOptions {
+                environment: Some("prod".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status, ExecutionStatus::Failed);
+
+    // The same content materialises under dev — its records are reuse
+    // evidence for the retry.
+    adapter.heal("assay.results");
+    for model in &compilation.models {
+        adapter.set_output_identity(&model.target.display(), "snap:dev");
+    }
+    runner
+        .apply(
+            &compilation,
+            &plan_all_with_state(
+                &compilation,
+                adapter.clone(),
+                state.clone(),
+                Some("dev".to_string()),
+            )
+            .await,
+            &RunOptions {
+                environment: Some("dev".to_string()),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let dev_run = state
+        .materialized_version("assay.results", Some("dev"))
+        .unwrap()
+        .expect("dev record")
+        .run_id;
+
+    let retry = runner
+        .retry_failed(
+            &compilation,
+            &first.run_id[..8],
+            &RunOptions {
+                environment: Some("prod".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a cacheable failed model is retryable work");
+
+    // The failed and blocked models adopt — no SQL ran for them.
+    assert_eq!(
+        model_result(&retry, "assay.results").status,
+        ExecutionStatus::Cached
+    );
+    assert_eq!(
+        model_result(&retry, "reporting.monthly").status,
+        ExecutionStatus::Cached
+    );
+    assert_eq!(
+        adapter.attempts("assay.results"),
+        2,
+        "the failed prod attempt and the dev build — the retry rebuilt nothing"
+    );
+
+    // The environment received its own record, carrying the producing run.
+    let record = state
+        .materialized_version("assay.results", Some("prod"))
+        .unwrap()
+        .expect("prod adopts a record");
+    assert_eq!(record.run_id, dev_run);
+
+    // The test over the adopted model ran; the unrelated test did not.
+    assert!(retry
+        .tests
+        .iter()
+        .any(|test| test.test == "results_positive" && test.status == ExecutionStatus::Passed));
+    assert!(!retry.tests.iter().any(|test| test.test == "raw_not_null"));
+    assert_eq!(retry.status, ExecutionStatus::Passed);
 }
 
 #[tokio::test]
@@ -5168,6 +5615,7 @@ fn promotion_records_persist_in_state() {
             passed: true,
             detail: "run run-1 passed".to_string(),
         }],
+        evidence: None,
         timestamp: "2024-01-01T00:00:00Z".to_string(),
         actor: None,
     };
@@ -7523,6 +7971,164 @@ async fn a_promotion_evaluates_evidence_written_by_another_workspace() {
     assert_eq!(
         evaluation.lineage.as_ref().map(|entry| entry.status),
         Some("current")
+    );
+}
+
+/// The id a promotion records must be the row the audit actually resolved
+/// — not whatever a second query would find after a concurrent writer
+/// landed newer evidence. The id travels with the read that consulted it.
+#[test]
+fn audit_evidence_ids_name_the_record_the_audit_consulted() {
+    let state = SqliteStateStore::in_memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let report = bound_branch_report("ci/x", "main", "bbb", "aaa");
+    state
+        .record_evidence(&branch_store_record(&report, "ev-first"))
+        .expect("the first audit lands");
+
+    let audit =
+        phlo_transform_engine::audited_diff(dir.path(), Some(&state), "ci/x", "main", None, None);
+    assert_eq!(audit.diff_evidence_id.as_deref(), Some("ev-first"));
+
+    // A concurrent writer lands a newer audit of the same pair — a fresh
+    // resolution names it, proving the id tracks the consulted row rather
+    // than being a stable alias for "the pair".
+    let mut newer = bound_branch_report("ci/x", "main", "bbb", "aaa");
+    newer.finished_at = "t9".to_string();
+    state
+        .record_evidence(&branch_store_record(&newer, "ev-second"))
+        .expect("the newer audit lands");
+    let audit =
+        phlo_transform_engine::audited_diff(dir.path(), Some(&state), "ci/x", "main", None, None);
+    assert_eq!(audit.diff_evidence_id.as_deref(), Some("ev-second"));
+}
+
+/// The end-to-end form of the race: an evaluation resolves evidence A, a
+/// concurrent writer lands evidence B for the same pair, and the promotion
+/// record must still name A — the rows the gates consulted. The ids are
+/// captured by the audit-resolution reads themselves, so nothing re-queries
+/// the store for them afterwards.
+#[tokio::test]
+async fn a_promotion_records_the_evidence_ids_the_gates_evaluated() {
+    let nessie = InMemoryNessie::new();
+    nessie.seed("main", "aaa").seed("ci/x", "bbb");
+    let dir = tempfile::tempdir().unwrap();
+    let state = SqliteStateStore::in_memory().unwrap();
+    let compilation = project_with_tests();
+
+    write_environment_artifacts(dir.path(), Some(&state), &evidence_setup("ci/x", "cat_x"))
+        .expect("environment evidence");
+    state
+        .start_run(
+            &RunRecord {
+                run_id: "run-a".to_string(),
+                plan_id: "plan-a".to_string(),
+                environment: Some("ci/x".to_string()),
+                reference_hash: None,
+                started_at: "t".to_string(),
+                finished_at: None,
+                status: ExecutionStatus::Running,
+                model_count: 1,
+                failed_count: 0,
+            },
+            &StoredPlan {
+                plan_id: "plan-a".to_string(),
+                environment: Some("ci/x".to_string()),
+                models: Vec::new(),
+                seeds: Vec::new(),
+                tests: Vec::new(),
+            },
+        )
+        .expect("start run");
+    state
+        .finish_run("run-a", ExecutionStatus::Passed, "t", 0)
+        .expect("finish run");
+    state
+        .bind_run_reference_hash("run-a", "bbb")
+        .expect("bind head");
+    state
+        .record_evidence(&branch_store_record(
+            &bound_branch_report("ci/x", "main", "bbb", "aaa"),
+            "ev-diff",
+        ))
+        .expect("diff evidence");
+    state
+        .record_evidence(&lineage_store_record(
+            &bound_lineage_artifact(
+                "ci/x",
+                "bbb",
+                "main",
+                "aaa",
+                &compilation.lineage.fingerprint(),
+            ),
+            "ev-lineage",
+        ))
+        .expect("lineage evidence");
+    let environment_id = state
+        .evidence_for(EvidenceKind::Environment, "ci/x")
+        .unwrap()
+        .first()
+        .expect("environment record")
+        .evidence_id
+        .clone();
+
+    let evaluation = evaluate_promotion(
+        dir.path(),
+        &nessie,
+        Some(&state),
+        &compilation,
+        "ci/x",
+        "main",
+        &PromotionOptions {
+            require_diff: true,
+            allow_breaking_schema: false,
+        },
+    )
+    .await
+    .expect("evaluates");
+    assert!(evaluation.gates.passed, "{:?}", evaluation.gates.results);
+    assert_eq!(
+        evaluation.evidence.branch_diff.as_deref(),
+        Some("ev-diff"),
+        "the evaluation names the row the audit read"
+    );
+    assert_eq!(
+        evaluation.evidence.lineage_diff.as_deref(),
+        Some("ev-lineage")
+    );
+    assert_eq!(
+        evaluation.evidence.environment.as_deref(),
+        Some(environment_id.as_str())
+    );
+
+    // A concurrent writer lands a newer branch-diff audit for the same
+    // pair before the merge completes.
+    let mut newer = bound_branch_report("ci/x", "main", "bbb", "aaa");
+    newer.finished_at = "t9".to_string();
+    state
+        .record_evidence(&branch_store_record(&newer, "ev-diff-later"))
+        .expect("a newer audit lands");
+
+    let request = evaluation.request(
+        &PromotionOptions {
+            require_diff: true,
+            allow_breaking_schema: false,
+        },
+        None,
+    );
+    let record = phlo_transform_engine::promote(&nessie, &request)
+        .await
+        .expect("promotes");
+    let evidence = record.evidence.expect("the record carries provenance");
+    assert_eq!(
+        evidence.branch_diff.as_deref(),
+        Some("ev-diff"),
+        "the record names the evaluated evidence, not the newer row"
+    );
+    assert_eq!(evidence.lineage_diff.as_deref(), Some("ev-lineage"));
+    assert_eq!(
+        evidence.environment.as_deref(),
+        Some(environment_id.as_str())
     );
 }
 

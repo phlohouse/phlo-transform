@@ -17,7 +17,18 @@ use crate::identity::{ModelId, SourceId};
 /// catalog. The rewrite acts on the emitted SQL, not the versioned
 /// canonical AST, so without a bump a version recorded by a pre-change
 /// build would still compare equal and the fix would never take effect.
-pub const COMPILER_SEMANTICS_VERSION: u32 = 2;
+///
+/// 3 — the target version input drops the catalog binding: it is now
+/// `schema.table|materialization`. A catalog is *where* an environment
+/// materialises the model — a deployment binding — not part of what the
+/// model computes. Binding it into the version made the same logical model
+/// hash differently per environment, which made cross-environment reuse
+/// (a Nessie candidate adopting a `main` materialisation) unreachable in
+/// principle and made branch diffs report identical content as changed.
+/// Whether a record's physical location is the one this environment sees
+/// is decided by target/identity comparison at plan and run time, not by
+/// the version hash.
+pub const COMPILER_SEMANTICS_VERSION: u32 = 3;
 
 /// Component hashes that make up a model version.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -52,7 +63,9 @@ pub struct VersionInputs {
     pub dependencies: Vec<(String, String)>,
     /// `source logical name -> source state`.
     pub sources: Vec<(String, String)>,
-    /// Physical target display and materialisation.
+    /// Physical target slot and materialisation — `schema.table|materialization`
+    /// — deliberately without the catalog (an environment binding, not part
+    /// of what the model computes).
     pub target: String,
 }
 

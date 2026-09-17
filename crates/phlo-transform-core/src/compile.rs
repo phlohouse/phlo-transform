@@ -467,10 +467,16 @@ fn version_inputs(
         })
         .collect();
 
+    // The version input names the content's slot — schema.table — not the
+    // environment's catalog binding: `catalog` is where an environment
+    // materialises the model, and two environments bound to different
+    // catalogs compute the same logical output. Portability across catalogs
+    // is what cross-environment cache reuse (a Nessie candidate adopting a
+    // `main` materialisation) is keyed on; the record's full target and the
+    // live output identity still prove *where* the bytes are.
     let target = format!(
-        "{}|{}",
-        model.target.display(),
-        model.config.materialization
+        "{}.{}|{}",
+        model.target.schema, model.target.table, model.config.materialization
     );
 
     VersionInputs {

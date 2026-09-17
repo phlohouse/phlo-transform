@@ -217,14 +217,28 @@ impl TrinoAdapter {
             schema: relation.schema.clone(),
             table: format!("{}$snapshots", relation.table),
         };
-        self.run(&format!(
+        let sql = format!(
             "SELECT snapshot_id FROM {} ORDER BY committed_at DESC LIMIT 1",
             snapshots.sql()
-        ))
-        .await
-        .ok()
-        .and_then(|result| result.rows.first().and_then(|row| row.first()).cloned())
-        .map(|value| format!("snapshot:{value}"))
+        );
+        // A missing relation is a real answer (`None`); anything else is a
+        // transient — queueing, a worker hiccup, a Nessie blip — that must
+        // not masquerade as "no verifiable identity" and demote an
+        // unchanged model to a rebuild.
+        let mut result = self.run(&sql).await;
+        for delay in [150, 400] {
+            match &result {
+                Err(error) if !is_missing_relation(error) => {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    result = self.run(&sql).await;
+                }
+                _ => break,
+            }
+        }
+        result
+            .ok()
+            .and_then(|result| result.rows.first().and_then(|row| row.first()).cloned())
+            .map(|value| format!("snapshot:{value}"))
     }
 }
 
