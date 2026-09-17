@@ -4,7 +4,7 @@ A plan says what should happen.
 
 An execution engine has a different responsibility: make that plan happen while preserving dependency order, bounded concurrency, failure semantics and state.
 
-Those concerns are easy to blur together. Phlo keeps them separate deliberately.
+Those concerns are easy to blur together. Phlo Transform keeps them separate deliberately.
 
 ```text
 compiler
@@ -67,7 +67,7 @@ It gives us concurrency without violating graph order.
 
 Unlimited parallelism is rarely useful against a real warehouse.
 
-Phlo bounds concurrent model work with `--jobs`:
+Phlo Transform bounds concurrent model work with `--jobs`:
 
 ```bash
 phlo-transform run --jobs 8
@@ -226,7 +226,7 @@ query failed
 
 is not enough for retries or automation.
 
-Phlo records structured failure information including categories such as:
+Phlo Transform records structured failure information including categories such as:
 
 ```text
 adapter
@@ -260,7 +260,7 @@ Others will not:
 - type mismatch;
 - failed data test.
 
-Phlo retries only failures classified as retryable by the adapter policy.
+Phlo Transform retries only failures classified as retryable by the adapter policy.
 
 ```bash
 phlo-transform run --retries 2
@@ -298,7 +298,7 @@ That was safe in one sense—it forced a rebuild—but misleading in another. A 
 
 The Trino adapter now retries non-missing-relation snapshot-read failures briefly before returning an unverified result.
 
-If verification still cannot be established, Phlo still fails closed to `BUILD`.
+If verification still cannot be established, Phlo Transform still fails closed to `BUILD`.
 
 Resilience may reduce unnecessary work; it never weakens the proof required for reuse.
 
@@ -306,7 +306,7 @@ Resilience may reduce unnecessary work; it never weakens the proof required for 
 
 A model can be bounded with a per-attempt timeout.
 
-When an attempt times out, Phlo records a timeout failure and, where the adapter can identify in-flight queries, asks the warehouse to cancel them.
+When an attempt times out, Phlo Transform records a timeout failure and, where the adapter can identify in-flight queries, asks the warehouse to cancel them.
 
 The Trino adapter tracks query ids and can cancel active statements through Trino's query API.
 
@@ -351,7 +351,7 @@ A killed process may leave a run that never reached a terminal state.
 
 That is different from a run that completed and was recorded as failed.
 
-Phlo provides separate operations for those cases.
+Phlo Transform provides separate operations for those cases.
 
 ### `--resume`
 
@@ -390,7 +390,7 @@ That behaviour matters because cache reuse is now a real execution action, not m
 
 The state store is updated as execution progresses.
 
-Phlo does not wait until the end and write one optimistic “run result”.
+Phlo Transform does not wait until the end and write one optimistic “run result”.
 
 That means a killed process can leave an honest trace:
 
@@ -424,6 +424,6 @@ Human CLI output is derived from that value.
 
 `--json` exposes the structured representation directly.
 
-This pattern—one semantic result, multiple renderings—is important for the next post. Phlo is not only a CLI. The same compiler and engine are exposed through a versioned local daemon API for automation and agents.
+This pattern—one semantic result, multiple renderings—is important for the next post. Phlo Transform is not only a CLI. The same compiler and engine are exposed through a versioned local daemon API for automation and agents.
 
 *Next: [A transformation engine for humans and machines](09-the-machine-interface.md).*
