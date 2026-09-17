@@ -20,7 +20,7 @@ That sounds almost trivial, but it determines a large part of the architecture.
 
 A compiler is often associated with turning a language such as Rust or C into machine code. More generally, a compiler takes one representation of a program, understands its structure, validates it, and produces a representation suitable for later stages.
 
-Phlo does the same thing with a transformation workspace.
+Phlo Transform does the same thing with a transformation workspace.
 
 A simplified pipeline is:
 
@@ -91,7 +91,7 @@ A text search for `orders` cannot tell whether the final `from orders` means a w
 
 A SQL parser can.
 
-Phlo parses SQL into an abstract syntax tree. Relation extraction walks that tree with SQL scope rules, including CTE shadowing, aliases and nested queries.
+Phlo Transform parses SQL into an abstract syntax tree. Relation extraction walks that tree with SQL scope rules, including CTE shadowing, aliases and nested queries.
 
 That is why dependency inference can be a compiler feature rather than a naming convention.
 
@@ -129,7 +129,7 @@ The important rule is:
 
 > **Inference is only safe if ambiguity is an error.**
 
-Phlo does not “pick the most likely model” and hope.
+Phlo Transform does not “pick the most likely model” and hope.
 
 ## Why no `ref()`?
 
@@ -189,7 +189,7 @@ select * from raw.instrument_results
 
 If `raw.instrument_results` is not a model, it becomes a source.
 
-When a default catalog is configured, Phlo qualifies unqualified or two-part external sources through that catalog. This matters under Nessie: a candidate environment uses a branch-bound catalog, and reads must resolve through the same environment as writes.
+When a default catalog is configured, Phlo Transform qualifies unqualified or two-part external sources through that catalog. This matters under Nessie: a candidate environment uses a branch-bound catalog, and reads must resolve through the same environment as writes.
 
 Without that rule, a candidate could write its own branch while accidentally reading a source through the session's base catalog.
 
@@ -203,7 +203,7 @@ Some information is not present in a `SELECT` statement.
 
 For example, SQL cannot tell us whether a model should be a table or view, or whether an incremental table should merge on `sample_id`.
 
-Phlo represents that information as configuration or lightweight comment directives:
+Phlo Transform represents that information as configuration or lightweight comment directives:
 
 ```sql
 -- @table
@@ -249,7 +249,7 @@ A build system should care that the computation changed, not that the file's whi
 
 ## Compilation should fail early and specifically
 
-Because Phlo owns the compiler stage, invalid workspaces fail before execution.
+Because Phlo Transform owns the compiler stage, invalid workspaces fail before execution.
 
 Typical errors include:
 
@@ -269,7 +269,7 @@ This is one of the main reasons to keep SQL statically understandable: the tool 
 
 Plain SQL means giving up unrestricted compile-time metaprogramming inside models.
 
-Phlo does not try to execute arbitrary Jinja to discover what SQL might emerge.
+Phlo Transform does not try to execute arbitrary Jinja to discover what SQL might emerge.
 
 That is a constraint, but it buys strong properties:
 
