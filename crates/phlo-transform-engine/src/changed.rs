@@ -42,7 +42,14 @@ pub fn changed_models(
         let changed_model = match state {
             Some(state) => {
                 match state.materialized_version(&model.id.logical_name(), environment)? {
-                    Some(record) => record.version.hash != model.version.hash,
+                    Some(record) => {
+                        // A moved target counts even when the version is
+                        // unchanged — the environment's record still needs
+                        // the retarget adoption (or rebuild) the plan will
+                        // decide.
+                        record.version.hash != model.version.hash
+                            || record.target != model.target.display()
+                    }
                     None => true,
                 }
             }

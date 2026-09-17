@@ -20,7 +20,7 @@
 //! materialise step creates 5,000 real Iceberg tables — expect tens of
 //! minutes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,9 +35,11 @@ use phlo_transform_core::{
     SemanticModel, SemanticProject, WorkspaceDefaults,
 };
 use phlo_transform_engine::{
-    changed_models, Adapter, AdapterError, CatalogRequest, ColumnInfo, ExecutionStatus,
-    PlanOptions, Planner, QueryResult, RunOptions, Runner, SqliteStateStore, StateStore,
+    changed_models, ensure_environment, Adapter, AdapterError, CatalogRequest, ColumnInfo,
+    EnvironmentSpec, ExecutionStatus, PlanAction, PlanOptions, Planner, QueryResult, RunOptions,
+    Runner, SqliteStateStore, StateStore,
 };
+use phlo_transform_nessie::{NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
 
 const TRINO_CONFIG: &str = "\
@@ -278,7 +280,11 @@ impl Adapter for CountingAdapter {
 /// parent in layer L-1, so dependency depth and the downstream-propagation
 /// a real project has are both present. `changed` models get a different
 /// literal so their version hashes move.
-fn scaled_project(count: usize, changed: &std::collections::BTreeSet<usize>) -> Compilation {
+fn scaled_project(
+    count: usize,
+    changed: &std::collections::BTreeSet<usize>,
+    catalog: &str,
+) -> Compilation {
     let per_layer = count.div_ceil(LAYERS);
     let mut models = Vec::with_capacity(count);
     for layer in 0..LAYERS {
@@ -309,7 +315,7 @@ fn scaled_project(count: usize, changed: &std::collections::BTreeSet<usize>) -> 
     let mut project = SemanticProject::in_memory(models);
     project.defaults = WorkspaceDefaults {
         materialization: Materialization::Table,
-        catalog: Some(CATALOG.to_string()),
+        catalog: Some(catalog.to_string()),
         schema: Some("default".to_string()),
     };
     let compilation = compile(&project);
@@ -371,7 +377,7 @@ async fn plan_scaling_on_real_trino() {
     let network = format!("phlo-bench-it-{suffix}");
     let nessie_name = format!("phlo-bench-nessie-{suffix}");
 
-    let _nessie = GenericImage::new("ghcr.io/projectnessie/nessie", "latest")
+    let nessie = GenericImage::new("ghcr.io/projectnessie/nessie", "latest")
         .with_wait_for(WaitFor::message_on_stdout(
             "Listening on: http://0.0.0.0:19120",
         ))
@@ -398,6 +404,7 @@ async fn plan_scaling_on_real_trino() {
         .expect("trino starts");
 
     let trino_port = trino.get_host_port_ipv4(8080).await.expect("trino port");
+    let nessie_port = nessie.get_host_port_ipv4(19120).await.expect("nessie port");
     let nessie_internal = format!("http://{nessie_name}:19120");
 
     let adapter: Arc<dyn Adapter> = Arc::new(
@@ -408,7 +415,7 @@ async fn plan_scaling_on_real_trino() {
         .ensure_catalog(&CatalogRequest {
             catalog: CATALOG.to_string(),
             reference: Some("main".to_string()),
-            nessie_uri: Some(nessie_internal),
+            nessie_uri: Some(nessie_internal.clone()),
             warehouse: Some(WAREHOUSE.to_string()),
         })
         .await
@@ -424,7 +431,7 @@ async fn plan_scaling_on_real_trino() {
 
         // Cold: nothing recorded, nothing materialised. Every model plans
         // Build off one batched existence probe.
-        let compilation = scaled_project(count, &Default::default());
+        let compilation = scaled_project(count, &Default::default(), CATALOG);
         let selected = Selection::all(&compilation);
         let started = Instant::now();
         let plan = Planner::new(adapter.clone(), Some(state.clone()))
@@ -513,8 +520,13 @@ async fn plan_scaling_on_real_trino() {
         let changed = bench_changed_percent(count).min(count);
         let changed_indexes: std::collections::BTreeSet<usize> =
             (0..count).step_by(count / changed).take(changed).collect();
-        let touched = scaled_project(count, &changed_indexes);
+        let touched = scaled_project(count, &changed_indexes, CATALOG);
         let change_set = changed_models(&touched, Some(&state), None).expect("change set");
+        let changed_names: BTreeSet<String> =
+            change_set.iter().map(|id| id.logical_name()).collect();
+        // A stray live-infra identity read can still fail closed after its
+        // retry budget; a handful is tolerated, a collapse is not.
+        let transient_slack = 3usize.max(count / 500);
         counting.calls.lock().unwrap().clear();
         let started = Instant::now();
         let plan = Planner::new(adapter.clone(), Some(state.clone()))
@@ -587,5 +599,184 @@ async fn plan_scaling_on_real_trino() {
                 started.elapsed().as_millis() as f64 / sample.len() as f64
             ),
         );
+
+        // Candidate cache reuse: a fresh Nessie branch inherits every base
+        // table, so an unchanged workspace plans all `Cached` and the run
+        // adopts the recorded outputs without issuing model SQL.
+        let nessie_client =
+            NessieRestClient::new(NessieConfig::new(format!("http://127.0.0.1:{nessie_port}")))
+                .expect("nessie client");
+        let candidate_ref = format!("ci/bench-{count}");
+        let setup = ensure_environment(
+            &nessie_client,
+            adapter.as_ref(),
+            &EnvironmentSpec {
+                base_ref: "main".to_string(),
+                candidate_ref: candidate_ref.clone(),
+                nessie_uri: Some(nessie_internal.clone()),
+                warehouse: Some(WAREHOUSE.to_string()),
+                catalog: None,
+            },
+        )
+        .await
+        .expect("candidate environment");
+        let candidate_compilation = scaled_project(count, &Default::default(), &setup.catalog);
+        counting.calls.lock().unwrap().clear();
+        let started = Instant::now();
+        let plan = Planner::new(adapter.clone(), Some(state.clone()))
+            .plan(
+                &candidate_compilation,
+                &Selection::all(&candidate_compilation),
+                Some(candidate_ref.clone()),
+                &PlanOptions::default(),
+            )
+            .await
+            .expect("candidate plan");
+        let cached = plan
+            .models
+            .iter()
+            .filter(|model| model.action == PlanAction::Cached)
+            .count();
+        report(
+            count,
+            "candidate-plan",
+            started.elapsed(),
+            &counting,
+            format!("{cached}/{count} cached"),
+        );
+        assert!(
+            cached >= count - transient_slack,
+            "cache adoption collapsed ({cached}/{count}): {:?}",
+            plan.models
+                .iter()
+                .filter(|model| model.action != PlanAction::Cached)
+                .map(|model| (&model.id, &model.reasons))
+                .collect::<Vec<_>>()
+        );
+
+        counting.calls.lock().unwrap().clear();
+        let started = Instant::now();
+        let run = Runner::new(adapter.clone(), Some(state.clone()))
+            .apply(
+                &candidate_compilation,
+                &plan,
+                &RunOptions {
+                    environment: Some(candidate_ref.clone()),
+                    run_tests: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("candidate run");
+        report(
+            count,
+            "candidate-run",
+            started.elapsed(),
+            &counting,
+            format!("{} cached {} built", run.counts.cached, run.counts.passed),
+        );
+        assert!(
+            run.counts.passed <= transient_slack && run.counts.cached >= count - transient_slack,
+            "candidate run should adopt almost everything: {} cached {} built",
+            run.counts.cached,
+            run.counts.passed,
+        );
+
+        // Forced miss: the same fresh-candidate shape but with the 1%
+        // changed subset — changed models have no version-matched record
+        // anywhere, so they build while the rest still adopt.
+        let miss_ref = format!("ci/bench-miss-{count}");
+        let miss_setup = ensure_environment(
+            &nessie_client,
+            adapter.as_ref(),
+            &EnvironmentSpec {
+                base_ref: "main".to_string(),
+                candidate_ref: miss_ref.clone(),
+                nessie_uri: Some(nessie_internal.clone()),
+                warehouse: Some(WAREHOUSE.to_string()),
+                catalog: None,
+            },
+        )
+        .await
+        .expect("miss environment");
+        let candidate_touched = scaled_project(count, &changed_indexes, &miss_setup.catalog);
+        counting.calls.lock().unwrap().clear();
+        let started = Instant::now();
+        let plan = Planner::new(adapter.clone(), Some(state.clone()))
+            .plan(
+                &candidate_touched,
+                &Selection::all(&candidate_touched),
+                Some(miss_ref.clone()),
+                &PlanOptions::default(),
+            )
+            .await
+            .expect("miss plan");
+        let (cached, build) =
+            plan.models
+                .iter()
+                .fold((0usize, 0usize), |(c, b), m| match m.action {
+                    PlanAction::Cached => (c + 1, b),
+                    PlanAction::Build => (c, b + 1),
+                    _ => (c, b),
+                });
+        report(
+            count,
+            "candidate-miss",
+            started.elapsed(),
+            &counting,
+            format!("{cached} cached {build} build of {count}"),
+        );
+        // The expected build set is `change_set` — deterministic and
+        // state-derived — not the base plan's non-Skip count, which can
+        // absorb a transient identity miss on an unchanged model. Changed
+        // work must never adopt: every change-set model is a hard Build.
+        for model in &plan.models {
+            if changed_names.contains(&model.id) {
+                assert_eq!(
+                    model.action,
+                    PlanAction::Build,
+                    "changed model {:?} must never adopt: {:?}",
+                    model.id,
+                    model.reasons
+                );
+            }
+        }
+        assert!(build >= change_set.len() && build <= change_set.len() + transient_slack);
+        assert_eq!(cached + build, count);
+        let started = Instant::now();
+        let run = Runner::new(adapter.clone(), Some(state.clone()))
+            .apply(
+                &candidate_touched,
+                &plan,
+                &RunOptions {
+                    environment: Some(miss_ref.clone()),
+                    run_tests: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("miss run");
+        report(
+            count,
+            "candidate-miss-run",
+            started.elapsed(),
+            &counting,
+            format!("{} cached {} built", run.counts.cached, run.counts.passed),
+        );
+        assert_eq!(run.status, ExecutionStatus::Passed, "{:?}", run.models);
+        for model in &run.models {
+            if changed_names.contains(&model.model) {
+                assert_eq!(
+                    model.action, "build",
+                    "changed model {:?} must have built, not adopted",
+                    model.model
+                );
+            }
+        }
+        assert!(
+            run.counts.passed >= change_set.len()
+                && run.counts.passed <= change_set.len() + transient_slack
+        );
+        assert!(run.counts.cached >= count - change_set.len() - transient_slack);
     }
 }

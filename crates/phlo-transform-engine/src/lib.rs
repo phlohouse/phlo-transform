@@ -66,12 +66,13 @@ pub use failure::{Attempt, Failure, FailureCategory, RetryPolicy};
 pub use gates::{evaluate_gates, GateInput, GateReport, GateResult};
 pub use lineage_diff::LineageDiffContext;
 pub use plan::{
-    dependency_closure, diff_reasons, Membership, Plan, PlanAction, PlanOptions, PlanReason,
-    PlanSelection, PlannedModel, PlannedSeed, PlannedTest, Planner, ReasonKind,
+    dependency_closure, diff_reasons, CacheSource, Membership, Plan, PlanAction, PlanOptions,
+    PlanReason, PlanSelection, PlannedModel, PlannedSeed, PlannedTest, Planner, ReasonKind,
 };
 pub use promotion::{
     bind_run_reference, cleanup_candidate, evaluate_promotion, find_unique_run, persist_promotion,
-    promote, PromotionEvaluation, PromotionOptions, PromotionRecord, PromotionRequest,
+    promote, PromotionEvaluation, PromotionEvidenceIds, PromotionOptions, PromotionRecord,
+    PromotionRequest,
 };
 pub use run::{
     execute_tests, ModelResult, RunCounts, RunOptions, RunResult, Runner, SeedResult, TestOutcome,

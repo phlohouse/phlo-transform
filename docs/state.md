@@ -31,8 +31,15 @@ hash = H(
 - `source_state_hash` folds in `SourceStateProvider` values for external
   sources.
 - `compiler_semantics_version` is an explicit constant bumped only when
-  compilation/materialisation semantics change.
-- `target_hash` covers the physical target and materialisation.
+  compilation/materialisation semantics change (v3: the catalog left the
+  target input — see below).
+- `target_hash` covers the *content slot* — `schema.table` — and the
+  materialisation. The catalog is deliberately absent: it is each
+  environment's binding of the slot to a physical location, not model
+  content, so identical content must hash identically in `main` and in a
+  candidate catalog for cross-environment reuse to be possible. Target
+  *moves* (a different catalog) are still detected — `diff_reasons`
+  compares full target displays, and `changed_models` does too.
 
 `phlo-transform-core` exposes `compile_with_options(project, schemas,
 source_state)`; `compile` and `compile_with_provider` use empty providers.
@@ -50,17 +57,30 @@ versions and produces a `source_change` build reason.
 
 `Planner` classifies a model as `cached` when its desired version is not
 materialised in the current environment but a record for another environment
-vouches for the same physical output. A version hash alone is *not* enough:
-the record must also
+vouches for the same physical output — reachable here. A version hash alone
+is *not* enough: the record must also
 
-- name the same physical target relation — the bytes must actually be where
-  this plan would read them;
+- name the same content slot (`schema.table`; the catalog may differ —
+  under Nessie each environment's catalog is a branch view of the same
+  repository, so the base's slot *is* the candidate's slot, bound under a
+  different name);
 - have been produced by the same adapter — execution semantics differ across
   engines, so another adapter's output cannot be assumed byte-identical; and
 - carry a strong `output_identity` that still matches the relation's current
   `output_identity` — the record is historical, so without proof the
   relation still holds what was written, a version hash is metadata, not
   evidence (a later writer may have overwritten it).
+
+The matched record rides along on the plan as `reuse` (source environment,
+source target, identity, producing run, materialisation timestamp). At run
+time the identity is re-verified and the output is *adopted*: an
+environment-local materialisation record is persisted naming the source's
+run id and timestamp — the run produced no new output — and the source
+environment's time-window watermark is copied. A stale or unreadable
+identity flips the action back to `build` with a `cache_miss` reason.
+Adoption is also how a catalog retarget lands: a same-version record whose
+recorded target differs by catalog adopts the output at the new target when
+the identity verifies, rather than rebuilding identical content.
 
 `output_identity` is the adapter's strong physical identity: an unchanged
 value proves the same materialised output (Trino reports the Iceberg
@@ -81,14 +101,22 @@ identity no longer matches the physical relation, it rebuilds with
 `output_drift`.
 
 This is covered by `cache_reuse_across_environments_is_reported_as_cached`,
-`cache_reuse_requires_same_physical_target`,
+`cache_reuse_matches_across_catalogs_on_the_same_content_slot`,
+`cache_reuse_rejects_a_different_content_slot`,
 `cache_reuse_requires_same_adapter`,
 `cache_reuse_rejects_unrecorded_adapter`,
 `cache_hit_requires_the_relation_to_still_hold_the_recorded_output`,
 `cache_hit_rejects_records_without_an_output_fingerprint`,
+`a_cached_run_adopts_the_verified_output_into_the_environment`,
+`a_cached_run_falls_back_to_build_when_identity_drifts`,
+`a_catalog_retarget_adopts_the_visible_output`,
+`a_catalog_retarget_without_verifiable_identity_rebuilds`,
 `materialisation_by_another_adapter_rebuilds`,
 `materialisation_by_an_unrecorded_adapter_rebuilds` and
-`output_drift_invalidates_the_current_environments_record`.
+`output_drift_invalidates_the_current_environments_record`. The real
+Trino/Iceberg/Nessie path is covered by
+`candidate_reuses_inherited_materialisations_without_rebuilding`
+(`phlo-transform-trino/tests/nessie_wap_e2e.rs`).
 
 ## Materialised state
 
@@ -116,6 +144,9 @@ The runner records a materialisation after each `passed` build — but only
 while the relation still holds what the run wrote: the post-build
 `source_state` is re-read at record time, and a drifted output is skipped
 with a warning rather than claimed (a concurrent writer's version stands).
+A `cached` action records one too — the *adopted* record carries the source
+materialisation's `run_id`/`materialized_at` verbatim, so history shows
+which run produced the bytes, not which run noticed them.
 
 Because the store is shared, same-key writes are ordered rather than
 last-writer-wins:
@@ -142,8 +173,10 @@ was tracked simply yield generic dependency/source reasons.
 
 - `build` — missing relation, unknown state, any component changed, or
   `--force`;
-- `skip` — the desired hash already matches the materialised version here;
-- `cached` — the desired hash is materialised in another environment.
+- `skip` — this environment's record already vouches for the desired
+  version at this target;
+- `cached` — another environment's record plus a live identity proof let
+  this environment adopt the output (see *Cached reuse* above).
 
 Every decided model carries structured `PlanReason`s (stable `kind` codes
 such as `sql_semantic_change`, `dependency_change`, `source_change`,

@@ -244,10 +244,15 @@ PASS conflicts  — candidate merges cleanly
 passes every gate merges, writes `promotion.json` to `.phlo/transform/` and
 persists the record in the state store's `promotions` table — promotion id,
 candidate/target refs and hashes, plan/run ids, gate results, merged flag,
-conflicts, timestamp — for later APIs and audit. With `--cleanup`, the
-candidate branch and its catalog are removed after a successful merge only;
-a cleanup failure is reported and fails the command (the promotion record
-already persisted still shows the merge succeeded).
+conflicts, timestamp — for later APIs and audit. The record also carries
+`evidence`: the immutable ids of the branch-diff, lineage-diff and
+environment records the evaluation consulted, captured at evaluation time,
+so a historical promotion names the exact audit rows that authorised it —
+no "latest evidence" lookup after the merge can redefine what the decision
+rested on. Records written before evidence ids existed simply carry none.
+With `--cleanup`, the candidate branch and its catalog are removed after a
+successful merge only; a cleanup failure is reported and fails the command
+(the promotion record already persisted still shows the merge succeeded).
 
 ## Rollback
 

@@ -78,8 +78,10 @@ phlo-transform -r <dir> explain / inspect / lineage / manifest
 - DuckDB `source_state` (schema + row count) still cannot see in-place updates
   that preserve row count; Iceberg snapshot ids remain the only precise source
   state.
-- `inspect`/`explain` computed offline (no `--adapter`) can derive a different
-  desired version than the catalogue-enriched one used by `run`, so `status`
-  can read `changed` spuriously; pass `--adapter` for accurate state.
+- `inspect`/`explain` computed offline (no `--adapter`) cannot observe source
+  state, so a model reading external sources derives a different desired
+  version than the enriched one `run` uses; pass `--adapter` for accurate
+  state. (The catalog no longer contributes — it is an environment binding,
+  not a version input.)
 - `dbt_utils.star`-style macro call sites are preserved verbatim and flagged
   REVIEW — they require manual rewrite, as documented.

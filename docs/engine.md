@@ -179,8 +179,12 @@ environment. Actions:
 
 - `build` — the relation is missing, the recorded version differs, or
   `--force` was passed;
-- `skip` — the recorded version matches;
-- `cached` — the identical version is materialised in another environment;
+- `skip` — this environment's own materialisation record vouches for the
+  desired version at this target;
+- `cached` — no local record vouches, but the identical version is
+  recorded in another environment and this environment's target provably
+  already holds the same physical output — the run adopts it (see
+  *Cache adoption* below);
 - `unknown` — compilation errors block a decision.
 
 Every decided model carries structured `PlanReason`s — a stable `kind`
@@ -225,6 +229,26 @@ not. Dependents of a failed node are `blocked` transitively — a blocked
 model is not reported as a SQL failure. Models that would write the same
 physical relation are serialised on a per-target lock, so a skipped parent
 and a rebuilt child can never race the same table.
+
+### Cache adoption
+
+`cached` is executable, not just a label. The plan's evidence is the
+source record (`reuse`: source environment and target, the output
+identity, the producing run id and materialisation timestamp), and the
+runner re-reads the target's live `output_identity` before adopting —
+evidence can go stale between plan and run, so an identity that no longer
+matches (or cannot be read) flips the action to a full `build` with a
+`cache_miss` reason rather than claiming unverified output.
+
+A successful adoption writes an environment-local materialisation record
+that preserves the source's `run_id` and `materialized_at` — the run
+reused an existing output; it did not produce a new one — and copies the
+source environment's time-window watermark, since identical content has
+the same frontier. Subsequent plans against this environment then resolve
+through its own record — `skip`, not another `cached` hop. This is the
+Nessie fast path: a candidate branch inherits the base's Iceberg tables,
+so a `run --ref` on unchanged content adopts every output and issues no
+model SQL at all.
 
 ### Failures and retries
 

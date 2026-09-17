@@ -81,9 +81,12 @@ implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
   versions, materialised-version state, state-aware plan
   (`build`/`skip`/`cached` with reasons) and stale-plan rejection. Source
   states are wired through `Adapter::source_state` (Iceberg snapshots) and CLI
-  enrichment; cached classification is tested. See [`docs/state.md`](docs/state.md).
-  Gaps: non-Iceberg sources have no observable state; `cached` is a
-  classification without cross-environment reuse execution.
+  enrichment. `cached` is executable cross-environment reuse: the plan
+  carries the source materialisation's provenance, the runner re-verifies
+  the live output identity, and a hit adopts it — no model SQL — while a
+  stale identity falls back to `build`. See [`docs/state.md`](docs/state.md)
+  and [`docs/engine.md`](docs/engine.md#cache-adoption).
+  Gap: non-Iceberg sources have no observable state.
 - **Phase 4 — incremental models: partial.** `@incremental`
   append/key/partition/time-window intent, version hashing, full-rebuild
   detection, adapter `append`/`merge`/`replace_partitions`, typed time-window

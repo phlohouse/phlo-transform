@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use serde::Serialize;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
@@ -767,7 +768,7 @@ impl Runner {
             .filter_map(|model| ModelId::parse(&model.id).ok())
             .collect();
         let planned_set: BTreeSet<ModelId> = planned.iter().cloned().collect();
-        let plan_info: BTreeMap<ModelId, PlannedModel> = plan
+        let mut plan_info: BTreeMap<ModelId, PlannedModel> = plan
             .models
             .iter()
             .filter_map(|model| ModelId::parse(&model.id).ok().map(|id| (id, model.clone())))
@@ -1009,6 +1010,40 @@ impl Runner {
             }
         }
 
+        // Re-verify every planned cache adoption at run time: a Cached
+        // action is only executable while this environment's target still
+        // reports the exact output identity the plan matched on. Plan-time
+        // evidence can go stale between planning and execution — identity
+        // reads are bounded-parallel and fail closed (an unreadable or
+        // mismatched identity turns the action back into a build).
+        let verified_identity: BTreeMap<ModelId, Option<String>> = {
+            let pending_cached: Vec<(ModelId, Relation)> = planned
+                .iter()
+                .filter(|id| status.get(id) == Some(&ExecutionStatus::Pending))
+                .filter(|id| {
+                    plan_info
+                        .get(*id)
+                        .map(|model| model.action == PlanAction::Cached)
+                        .unwrap_or(false)
+                })
+                .filter_map(|id| {
+                    compilation
+                        .model(id)
+                        .map(|model| (id.clone(), model.target.clone()))
+                })
+                .collect();
+            futures::stream::iter(pending_cached)
+                .map(|(id, target)| async move {
+                    (
+                        id,
+                        self.adapter.output_identity(&target).await.ok().flatten(),
+                    )
+                })
+                .buffered(16)
+                .collect()
+                .await
+        };
+
         // Skip or reuse models that do not need building, releasing dependents.
         for id in &planned {
             if status.get(id) != Some(&ExecutionStatus::Pending) {
@@ -1020,6 +1055,106 @@ impl Runner {
                 .unwrap_or(PlanAction::Build);
             if action == PlanAction::Build || action == PlanAction::Unknown {
                 continue;
+            }
+            if action == PlanAction::Cached {
+                // Adoption requires the plan's reuse evidence to still hold:
+                // this target must report the recorded output identity now.
+                let live = verified_identity.get(id).cloned().flatten();
+                let has_evidence = plan_info.get(id).is_some_and(|model| model.reuse.is_some());
+                let adoptable = plan_info
+                    .get(id)
+                    .and_then(|model| model.reuse.as_ref())
+                    .is_some_and(|reuse| live.as_deref() == Some(reuse.output_identity.as_str()));
+                if !adoptable {
+                    // Fail closed: the evidence went stale between plan and
+                    // run — turn the action back into a full rebuild so the
+                    // run produces what it claimed rather than adopting an
+                    // unverified output.
+                    if let Some(planned) = plan_info.get_mut(id) {
+                        planned.action = PlanAction::Build;
+                        planned.full_rebuild = true;
+                        planned.reuse = None;
+                        let detail = if !has_evidence {
+                            format!(
+                                "cache reuse has no recorded source; building {} instead",
+                                planned.target
+                            )
+                        } else {
+                            match live {
+                                Some(live) => format!(
+                                    "cache evidence stale at run time: {} now reports \
+                                     `{live}`; building instead",
+                                    planned.target
+                                ),
+                                None => format!(
+                                    "cache evidence stale at run time: {} has no verifiable \
+                                     output identity; building instead",
+                                    planned.target
+                                ),
+                            }
+                        };
+                        planned
+                            .reasons
+                            .push(PlanReason::simple(ReasonKind::CacheMiss, detail));
+                    }
+                    continue;
+                }
+                // Adopt the verified output into this environment's state:
+                // the record claims the producing run and materialisation
+                // timestamp of the source record verbatim — this run reused
+                // an existing output, it did not produce a new one.
+                if let (Some(state), Some(model), Some(planned)) = (
+                    self.state.as_ref(),
+                    compilation.model(id),
+                    plan_info.get(id),
+                ) {
+                    if let Some(reuse) = planned.reuse.as_ref() {
+                        state.record_materialized(&MaterializedRecord {
+                            model_id: model.id.logical_name(),
+                            environment: options.environment.clone(),
+                            version: model.version.clone(),
+                            detail: Some(model.version_detail.clone()),
+                            target: model.target.display(),
+                            incremental_strategy: model
+                                .config
+                                .incremental
+                                .as_ref()
+                                .map(|strategy| strategy.as_str().to_string()),
+                            incremental_key: model
+                                .config
+                                .incremental
+                                .as_ref()
+                                .map(|strategy| strategy.columns().join(","))
+                                .filter(|key| !key.is_empty()),
+                            adapter: Some(self.adapter.name().to_string()),
+                            output_identity: Some(reuse.output_identity.clone()),
+                            contract: model.contract.clone(),
+                            effective_key: Some(
+                                crate::contracts::effective_key(model).unwrap_or_default(),
+                            ),
+                            run_id: reuse.run_id.clone(),
+                            materialized_at: reuse.materialized_at.clone(),
+                        })?;
+                        // A time-window model's watermark is a statement
+                        // about the content — identical content means the
+                        // same watermark applies in this environment.
+                        if matches!(
+                            model.config.incremental,
+                            Some(IncrementalStrategy::TimeWindow { .. })
+                        ) {
+                            if let Some(watermark) = state
+                                .watermark(&model.id.logical_name(), reuse.environment.as_deref())?
+                            {
+                                state.set_watermark(
+                                    &model.id.logical_name(),
+                                    options.environment.as_deref(),
+                                    &watermark,
+                                    &run_id,
+                                )?;
+                            }
+                        }
+                    }
+                }
             }
             let outcome = match action {
                 PlanAction::Cached => ExecutionStatus::Cached,
@@ -1033,8 +1168,21 @@ impl Runner {
                     query_id: None,
                     duration_ms: 0,
                 });
-                let result =
+                let mut result =
                     model_result(model, outcome, Vec::new(), None, None, 0, plan_info.get(id));
+                if action == PlanAction::Cached {
+                    result.output_identity = verified_identity.get(id).cloned().flatten();
+                    if let Some(reuse) = plan_info.get(id).and_then(|model| model.reuse.as_ref()) {
+                        let source_env = reuse
+                            .environment
+                            .as_deref()
+                            .unwrap_or("the default environment");
+                        result.reasons.push(format!(
+                            "adopted the output recorded in {source_env} — `{}` verified live",
+                            reuse.output_identity
+                        ));
+                    }
+                }
                 self.persist_model(&run_id, &result)?;
                 results.insert(id.clone(), result);
             }

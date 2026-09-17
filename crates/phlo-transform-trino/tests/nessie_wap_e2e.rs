@@ -19,8 +19,8 @@ use phlo_transform_core::{
 use phlo_transform_engine::{
     branch_diff, catalog_name, diff, ensure_environment, evaluate_gates, promote, Adapter,
     BranchDiffRequest, CatalogRequest, CatalogStatus, DatasetStatus, DiffPolicy, DiffRequest,
-    DiffStrategy, EnvironmentSpec, ExecutionStatus, GateInput, PlanOptions, Planner,
-    PromotionRequest, RunOptions, Runner, SqliteStateStore, StateStore,
+    DiffStrategy, EnvironmentSpec, ExecutionStatus, GateInput, PlanAction, PlanOptions, Planner,
+    PromotionEvidenceIds, PromotionRequest, RunOptions, Runner, SqliteStateStore, StateStore,
 };
 use phlo_transform_nessie::{NessieClient, NessieConfig, NessieRestClient};
 use phlo_transform_trino::{TrinoAdapter, TrinoConfig};
@@ -101,10 +101,19 @@ async fn apply(
         .expect("apply")
 }
 
-#[tokio::test]
-#[ignore = "requires Docker; run with --ignored"]
-async fn wap_candidate_on_nessie_branch_is_promoted() {
-    let suffix = std::process::id();
+/// A running Nessie + Trino pair wired for dynamic Iceberg catalogs. The
+/// containers stay alive for the test that created them and are dropped
+/// with the fixture.
+struct Infra {
+    _nessie: testcontainers::ContainerAsync<GenericImage>,
+    _trino: testcontainers::ContainerAsync<GenericImage>,
+    adapter: Arc<TrinoAdapter>,
+    nessie_client: Arc<NessieRestClient>,
+    nessie_internal: String,
+}
+
+async fn start_infra(tag: &str) -> Infra {
+    let suffix = format!("{}-{}", tag, std::process::id());
     let network = format!("phlo-nessie-it-{suffix}");
     let nessie_name = format!("phlo-nessie-it-{suffix}");
 
@@ -136,15 +145,29 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
 
     let trino_port = trino.get_host_port_ipv4(8080).await.expect("trino port");
     let nessie_port = nessie.get_host_port_ipv4(19120).await.expect("nessie port");
-    let nessie_internal = format!("http://{nessie_name}:19120");
 
-    let adapter = Arc::new(
-        TrinoAdapter::new(TrinoConfig::new(format!("http://127.0.0.1:{trino_port}")))
-            .expect("adapter"),
-    );
-    let nessie_client =
-        NessieRestClient::new(NessieConfig::new(format!("http://127.0.0.1:{nessie_port}")))
-            .expect("nessie client");
+    Infra {
+        _nessie: nessie,
+        _trino: trino,
+        adapter: Arc::new(
+            TrinoAdapter::new(TrinoConfig::new(format!("http://127.0.0.1:{trino_port}")))
+                .expect("adapter"),
+        ),
+        nessie_client: Arc::new(
+            NessieRestClient::new(NessieConfig::new(format!("http://127.0.0.1:{nessie_port}")))
+                .expect("nessie client"),
+        ),
+        nessie_internal: format!("http://{nessie_name}:19120"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker; run with --ignored"]
+async fn wap_candidate_on_nessie_branch_is_promoted() {
+    let infra = start_infra("wap").await;
+    let adapter = infra.adapter.clone();
+    let nessie_client = infra.nessie_client.clone();
+    let nessie_internal = infra.nessie_internal.clone();
 
     // Base catalog points at `main`.
     adapter
@@ -172,7 +195,7 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
     // plus the ref's hash, so `ci/pr-1` and `ci_pr_1` can never share one
     // physical catalog.
     let setup = ensure_environment(
-        &nessie_client,
+        nessie_client.as_ref(),
         adapter.as_ref(),
         &EnvironmentSpec {
             base_ref: "main".to_string(),
@@ -385,7 +408,7 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
         .expect("candidate exists")
         .hash;
     let record = promote(
-        &nessie_client,
+        nessie_client.as_ref(),
         &PromotionRequest {
             candidate_ref: "ci/pr-1".to_string(),
             target_ref: "main".to_string(),
@@ -401,6 +424,7 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
             dry_run: false,
             actor: None,
             gates: Vec::new(),
+            evidence: PromotionEvidenceIds::default(),
         },
     )
     .await
@@ -419,7 +443,7 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
     // still matches (the merge did not move it), so the stale-target check
     // is what fires.
     let stale = promote(
-        &nessie_client,
+        nessie_client.as_ref(),
         &PromotionRequest {
             candidate_ref: "ci/pr-1".to_string(),
             target_ref: "main".to_string(),
@@ -435,6 +459,7 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
             dry_run: false,
             actor: None,
             gates: Vec::new(),
+            evidence: PromotionEvidenceIds::default(),
         },
     )
     .await;
@@ -464,4 +489,216 @@ async fn wap_candidate_on_nessie_branch_is_promoted() {
         .expect("delete candidate");
     let refs = nessie_client.list_references().await.expect("list refs");
     assert!(!refs.iter().any(|reference| reference.name == "ci/pr-1"));
+}
+
+/// The cross-environment cache contract end to end: a candidate branch
+/// inherits main's Iceberg tables, so identical content must plan `Cached`,
+/// adopt the source materialisation into the candidate's state without
+/// issuing model SQL, and fall back to `Build` the moment the inherited
+/// table's identity drifts.
+#[tokio::test]
+#[ignore = "requires Docker; run with --ignored"]
+async fn candidate_reuses_inherited_materialisations_without_rebuilding() {
+    let infra = start_infra("cache").await;
+    let adapter = infra.adapter.clone();
+    let nessie_client = infra.nessie_client.clone();
+    let nessie_internal = infra.nessie_internal.clone();
+
+    adapter
+        .ensure_catalog(&CatalogRequest {
+            catalog: "phlo_main".to_string(),
+            reference: Some("main".to_string()),
+            nessie_uri: Some(nessie_internal.clone()),
+            warehouse: Some(WAREHOUSE.to_string()),
+        })
+        .await
+        .expect("main catalog");
+
+    let state: Arc<dyn StateStore> = Arc::new(SqliteStateStore::in_memory().expect("state"));
+
+    // Materialise both models on main: phlo_main.default.{raw,results}.
+    let base = compile(&project("phlo_main", 10));
+    let base_run = apply(adapter.clone(), &base, "main", Some(state.clone())).await;
+    assert_eq!(base_run.status, ExecutionStatus::Passed);
+    let main_results = state
+        .materialized_version("assay.results", Some("main"))
+        .expect("main record")
+        .expect("assay.results recorded on main");
+
+    // A fresh candidate inherits main's tables untouched.
+    let setup = ensure_environment(
+        nessie_client.as_ref(),
+        adapter.as_ref(),
+        &EnvironmentSpec {
+            base_ref: "main".to_string(),
+            candidate_ref: "ci/reuse".to_string(),
+            nessie_uri: Some(nessie_internal.clone()),
+            warehouse: Some(WAREHOUSE.to_string()),
+            catalog: None,
+        },
+    )
+    .await
+    .expect("environment provisioned");
+    assert_eq!(setup.catalog_status, CatalogStatus::Created);
+    let candidate_catalog = setup.catalog.clone();
+
+    // Identical content compiled against the candidate's own catalog: the
+    // version hash is catalog-independent, so the planner can match it to
+    // main's records.
+    let candidate = compile(&project(&candidate_catalog, 10));
+    for model in &candidate.models {
+        let recorded = state
+            .materialized_version(&model.id.logical_name(), Some("main"))
+            .expect("main record")
+            .expect("recorded on main");
+        assert_eq!(
+            model.version.hash, recorded.version.hash,
+            "{} must hash identically across catalogs",
+            model.id
+        );
+    }
+
+    let selected = Selection::all(&candidate);
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(
+            &candidate,
+            &selected,
+            Some("ci/reuse".to_string()),
+            &PlanOptions::default(),
+        )
+        .await
+        .expect("candidate plan");
+    assert_eq!(plan.models.len(), 2);
+    for model in &plan.models {
+        assert_eq!(
+            model.action,
+            PlanAction::Cached,
+            "{} must plan Cached, got {:?}: {:?}",
+            model.id,
+            model.action,
+            model.reasons
+        );
+        let source = state
+            .materialized_version(&model.id, Some("main"))
+            .expect("main record")
+            .expect("recorded on main");
+        let reuse = model.reuse.as_ref().expect("cache source recorded");
+        assert_eq!(reuse.environment.as_deref(), Some("main"));
+        assert_eq!(reuse.run_id, source.run_id);
+        assert_eq!(
+            reuse.output_identity,
+            source.output_identity.clone().expect("identity")
+        );
+    }
+
+    // Executing the cached plan issues no model SQL — it records the
+    // adoption against the candidate environment.
+    let run = Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &candidate,
+            &plan,
+            &RunOptions {
+                environment: Some("ci/reuse".to_string()),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("cached run");
+    assert_eq!(run.status, ExecutionStatus::Passed);
+    assert_eq!(run.counts.passed, 0, "a cache hit never builds: {run:?}");
+    assert_eq!(run.counts.cached, 2);
+    for result in &run.models {
+        assert_eq!(result.status, ExecutionStatus::Cached, "{result:?}");
+        assert!(result.query_id.is_none(), "no SQL was issued: {result:?}");
+        assert_eq!(result.action, "cached");
+    }
+
+    // The candidate environment now owns records carrying the producing
+    // run's provenance — not fabricated timestamps.
+    let adopted = state
+        .materialized_version("assay.results", Some("ci/reuse"))
+        .expect("candidate record")
+        .expect("assay.results adopted into ci/reuse");
+    assert_eq!(adopted.run_id, main_results.run_id);
+    assert_eq!(adopted.materialized_at, main_results.materialized_at);
+    assert_eq!(adopted.output_identity, main_results.output_identity);
+    assert_eq!(
+        adopted.target,
+        format!("{candidate_catalog}.default.assay__results")
+    );
+
+    // The inherited table is genuinely readable through the candidate
+    // catalog — adoption claimed a real, visible output.
+    let rows = adapter
+        .execute(&format!(
+            "SELECT value FROM {candidate_catalog}.default.assay__results"
+        ))
+        .await
+        .expect("candidate read");
+    assert_eq!(rows.rows[0][0], "10");
+
+    // Drift: rewriting the inherited table on the candidate branch moves
+    // its snapshot. The untouched model now reads as a plain Skip — the
+    // adoption above left an environment-local record that still verifies —
+    // while the rewritten table's recorded identity no longer matches live,
+    // so it must rebuild.
+    adapter
+        .execute(&format!(
+            "INSERT INTO {candidate_catalog}.default.assay__results VALUES (2, 77)"
+        ))
+        .await
+        .expect("candidate-side rewrite");
+    let plan = Planner::new(adapter.clone(), Some(state.clone()))
+        .plan(
+            &candidate,
+            &selected,
+            Some("ci/reuse".to_string()),
+            &PlanOptions::default(),
+        )
+        .await
+        .expect("post-drift plan");
+    let action = |id: &str| {
+        plan.models
+            .iter()
+            .find(|model| model.id == id)
+            .map(|model| model.action)
+            .unwrap_or_else(|| panic!("{id} missing from plan"))
+    };
+    assert_eq!(action("assay.raw"), PlanAction::Skip);
+    assert_eq!(
+        action("assay.results"),
+        PlanAction::Build,
+        "an externally rewritten table invalidates the adoption"
+    );
+    let run = Runner::new(adapter.clone(), Some(state.clone()))
+        .apply(
+            &candidate,
+            &plan,
+            &RunOptions {
+                environment: Some("ci/reuse".to_string()),
+                run_tests: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("post-drift run");
+    assert_eq!(run.status, ExecutionStatus::Passed);
+    assert_eq!(run.counts.passed, 1);
+    assert_eq!(run.counts.skipped, 1);
+    let rows = adapter
+        .execute(&format!(
+            "SELECT COUNT(*) FROM {candidate_catalog}.default.assay__results"
+        ))
+        .await
+        .expect("candidate recount");
+    assert_eq!(
+        rows.rows[0][0], "1",
+        "the rebuild replaced the drifted table"
+    );
+
+    nessie_client
+        .delete_branch("ci/reuse")
+        .await
+        .expect("delete candidate");
 }
