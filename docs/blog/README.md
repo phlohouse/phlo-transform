@@ -39,7 +39,7 @@ You do not need to memorise these; each is explained properly in the relevant po
 - **Relation** — a queryable table/view-like object.
 - **Materialisation** — the physical representation of a model, such as a table, view or incremental table.
 - **DAG** — the directed acyclic graph formed by model/source dependencies.
-- **State** — durable evidence of what Phlo previously ran or materialised.
+- **State** — durable evidence of what Phlo Transform previously ran or materialised.
 - **Plan** — the comparison between desired compiled state and current recorded/live state.
 - **Output identity** — strong physical identity for a materialisation, such as an Iceberg snapshot id.
 - **Environment** — the logical execution context; on the lakehouse path it is tied to a Nessie reference and physical catalog binding.
