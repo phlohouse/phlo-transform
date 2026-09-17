@@ -17,7 +17,7 @@ select
 from assay.raw_results
 ```
 
-Yesterday, Phlo built it successfully.
+Yesterday, Phlo Transform built it successfully.
 
 Today, should it run again?
 
@@ -27,11 +27,11 @@ The real question is:
 
 > **Does the physical output we have now still prove that it represents the model we want now?**
 
-Phlo answers that question before execution.
+Phlo Transform answers that question before execution.
 
 ## What is state?
 
-State is a durable record of what Phlo has observed and produced.
+State is a durable record of what Phlo Transform has observed and produced.
 
 The default local store is SQLite:
 
@@ -60,7 +60,7 @@ For Iceberg, that is the snapshot id.
 
 ## A model version is a statement about meaning
 
-Phlo computes a content-addressed version for every compiled model.
+Phlo Transform computes a content-addressed version for every compiled model.
 
 The version incorporates the pieces that can change what the model computes:
 
@@ -94,7 +94,7 @@ An Iceberg source can be represented by a snapshot identity. DuckDB uses a more 
 
 ### Compiler semantics version
 
-Sometimes the compiler itself changes how the same source program is interpreted. Phlo carries an explicit compiler-semantics version so an upgrade can trigger a one-time honest rebuild rather than silently treating old and new semantics as equivalent.
+Sometimes the compiler itself changes how the same source program is interpreted. Phlo Transform carries an explicit compiler-semantics version so an upgrade can trigger a one-time honest rebuild rather than silently treating old and new semantics as equivalent.
 
 ### Why the catalogue is not in the model version
 
@@ -111,7 +111,7 @@ The catalog says **where an environment sees the model**. It does not change wha
 
 So the version hashes the content slot — effectively `schema.table|materialisation` — rather than the environment's catalog binding.
 
-Physical target movement is still detected separately. Removing the catalog from semantic identity does not mean Phlo ignores where data lives.
+Physical target movement is still detected separately. Removing the catalog from semantic identity does not mean Phlo Transform ignores where data lives.
 
 ## Desired state versus recorded state
 
@@ -143,11 +143,11 @@ That last step is critical. State is evidence from the past. The warehouse is al
 
 ## The three normal actions
 
-Phlo plans every model as one of three meaningful actions.
+Phlo Transform plans every model as one of three meaningful actions.
 
 ### `BUILD`
 
-Phlo cannot prove the required output already exists safely.
+Phlo Transform cannot prove the required output already exists safely.
 
 Reasons include:
 
@@ -200,7 +200,7 @@ main                candidate
 
 Before the candidate changes anything, both references can see the inherited snapshot.
 
-If the compiled candidate wants the same model version, Phlo can ask:
+If the compiled candidate wants the same model version, Phlo Transform can ask:
 
 1. Is there a materialised record for this exact model version elsewhere?
 2. Was it produced by the same adapter semantics?
@@ -236,7 +236,7 @@ A table could change after the plan was created.
 
 If the identity no longer matches, the runner changes course and performs a full build with a `cache_miss` reason. It does not adopt stale evidence.
 
-If the identity still matches, Phlo writes an environment-local materialisation record pointing at the verified output.
+If the identity still matches, Phlo Transform writes an environment-local materialisation record pointing at the verified output.
 
 It preserves the original producing run id and materialisation timestamp. Reuse must not pretend that this run physically created data it did not create.
 
@@ -251,12 +251,12 @@ Consider this failure mode:
 ```text
 state says assay.results = version abc123
 warehouse table exists
-someone rewrites the table outside Phlo
+someone rewrites the table outside Phlo Transform
 ```
 
 If the planner checked only the relation name, it could incorrectly skip.
 
-For Iceberg, Phlo records the snapshot id after a successful build and checks it again on later plans.
+For Iceberg, Phlo Transform records the snapshot id after a successful build and checks it again on later plans.
 
 If state says:
 
@@ -270,11 +270,11 @@ and live storage says:
 snapshot:104
 ```
 
-then the record no longer proves the table contains Phlo's recorded output.
+then the record no longer proves the table contains Phlo Transform's recorded output.
 
 The model rebuilds.
 
-This is why warm planning is not free. At large scale, strong drift checks require real metadata reads. In v0.1, a 5,000-model warm Trino/Iceberg plan is dominated by per-table snapshot lookups. Phlo deliberately pays that cost rather than turning “probably unchanged” into `SKIP`.
+This is why warm planning is not free. At large scale, strong drift checks require real metadata reads. In v0.1, a 5,000-model warm Trino/Iceberg plan is dominated by per-table snapshot lookups. Phlo Transform deliberately pays that cost rather than turning “probably unchanged” into `SKIP`.
 
 ## What does a plan look like?
 
@@ -361,7 +361,7 @@ Sometimes we already know which source files changed relative to Git.
 phlo-transform plan --since main
 ```
 
-Phlo maps the Git change set back into model identity, expands the necessary dependency closure, and plans only the affected subset.
+Phlo Transform maps the Git change set back into model identity, expands the necessary dependency closure, and plans only the affected subset.
 
 This matters at scale because expensive physical verification is only needed for the selected work.
 
@@ -399,7 +399,7 @@ The point is not the formatting. It is that `inspect`, `explain`, `plan` and `ru
 
 Minimal rebuilds are useful, but the deeper benefit is accountability.
 
-For every model, Phlo can explain:
+For every model, Phlo Transform can explain:
 
 - what it wants;
 - what it previously built;
