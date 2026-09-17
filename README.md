@@ -53,88 +53,13 @@ the `CLEAN`/`REVIEW`/`UNSUPPORTED` classification, and the report format.
 
 ## Status
 
-Audited against code and tests. Phase 0 is complete; Phases 1–8 are
-implemented but **partial**, with gaps documented in each roadmap phase's
-implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
-
-- **Phase 0 — compiler spike: done.** Multi-root discovery, stable IDs,
-  ordinary-SQL dependency resolution without `ref()`, deterministic DAG,
-  `check`/`list`/`inspect` with JSON. See [`docs/architecture.md`](docs/architecture.md).
-- **Phase 1 — MVP build engine: partial.** Trino adapter, view/table
-  materialisations, `plan`/`apply`/`run`/`test`, bounded-concurrency scheduler,
-  custom SQL tests, SQLite run history, cancellation and versioned artifacts.
-  `--retries N` retries retryable adapter failures with bounded backoff;
-  `--resume`/`--retry-failed` continue interrupted runs.
-  See [`docs/engine.md`](docs/engine.md).
-  Gap: no partition-level scheduler tests.
-- **Phase 2 — typed compiler and lineage: partial.** Typed semantic IR, schema
-  provider boundary and catalogue enrichment, column resolution and type
-  inference, inferred output schemas, a canonical lineage graph behind
-  `lineage`/`impact`, direct/indirect column edges with confidence, config-file
-  schema contracts, `@key`/`@not-null` assertions with generated SQL tests, and
-  `lineage.json`/`openlineage.json` artifacts. Nested `array`/`map`/`row` types
-  parse recursively; `lineage` direction flags, `--format graph|openlineage`
-  and source/seed-column `impact` work. See [`docs/semantic.md`](docs/semantic.md)
-  and [`docs/lineage.md`](docs/lineage.md). Gaps: offline column
-  lineage/impact need schemas; unsupported SQL degrades to `unknown`
-  confidence.
-- **Phase 3 — state-aware execution: partial.** Content-addressed model
-  versions, materialised-version state, state-aware plan
-  (`build`/`skip`/`cached` with reasons) and stale-plan rejection. Source
-  states are wired through `Adapter::source_state` (Iceberg snapshots) and CLI
-  enrichment. `cached` is executable cross-environment reuse: the plan
-  carries the source materialisation's provenance, the runner re-verifies
-  the live output identity, and a hit adopts it — no model SQL — while a
-  stale identity falls back to `build`. See [`docs/state.md`](docs/state.md)
-  and [`docs/engine.md`](docs/engine.md#cache-adoption).
-  Gap: non-Iceberg sources have no observable state.
-- **Phase 4 — incremental models: partial.** `@incremental`
-  append/key/partition/time-window intent, version hashing, full-rebuild
-  detection, adapter `append`/`merge`/`replace_partitions`, typed time-window
-  watermarks and planner schema-change classification. Trino `MERGE` is
-  verified live on Iceberg. See [`docs/incremental.md`](docs/incremental.md).
-  Gaps: incremental partition replacement is column-list based (no metadata
-  pruning).
-- **Phase 5 — Nessie and WAP: partial.** `NessieClient` (REST + in-memory),
-  environment provisioning (`run --ref <candidate> --from <base>` creates the
-  branch and a branch-scoped Trino catalog; `plan`/`test --ref` resolve it
-  read-only), candidate writes isolated from `main`, catalog-ownership
-  tracking so cleanup drops only catalogs Phlo created, audited `promote`
-  with staleness/conflict checks, a diff gate and a breaking-schema gate,
-  candidate `--cleanup`, `rollback`, and a promotion artifact. See
-  [`docs/wap.md`](docs/wap.md). Missing: Iceberg snapshot in the promotion
-  record, automatic rebase; Nessie Iceberg catalogs have no view support.
-  Live Nessie + Iceberg E2E is in CI.
-- **Phase 6 — native data diff: partial.** Keyed diff with per-column change
-  counts, config-driven policies and numeric tolerances, real sampling,
-  Iceberg `$partitions` metadata comparison (row-count fallback), populated
-  schema diffs, `diff.json`, and stale-aware promotion gating. See
-  [`docs/diff.md`](docs/diff.md). Gaps: no statistical distribution summaries;
-  no example-value redaction.
-- **Phase 7 — workflow integration: partial (transform-side).** Workflow
-  ownership, a unified typed graph artifact (`model`/`source`/`quality_gate`),
-  cross-workflow dependency policy, and registered consumers in impact. See
-  [`docs/workflow.md`](docs/workflow.md). Missing: host workflow graph/tasks, a
-  transform-group invocation API, run correlation, gating API and e2e.
-- **Phase 8 — daemon and agent APIs: partial (local service).** A versioned
-  local HTTP/JSON semantic service with a coherent snapshot, file watcher and
-  reload; `/v1/plan` resolves environments read-only through the same shared
-  logic the CLI uses, and promote/test/diff run the identical engine
-  orchestration. See [`docs/daemon.md`](docs/daemon.md). Missing:
-  dependency-aware targeted invalidation (reload is a full recompile), the
-  benchmark, and push diagnostics.
-- **dbt migration: implemented.** `translate --from dbt` lowers dbt
-  projects (`ref()`/`source()`/`var()`, materialisations, keys, tests, tags,
-  config inheritance) into native `.sql` directives + `phlo.toml`/
-  `transform.toml`, classifies every resource `CLEAN`/`REVIEW`/`UNSUPPORTED`,
-  and writes a report + `.phlo/migration/dbt-translation.json` manifest. See
-  [`docs/dbt-migration.md`](docs/dbt-migration.md).
-- **Adapters: Trino + DuckDB.** `--adapter duckdb` runs everything locally
-  with no infrastructure; `--adapter trino` targets a Trino cluster. See the
-  adapter boundary in [`docs/engine.md`](docs/engine.md).
-
-All eight numbered phases have implementations; only Phase 0 is complete
-against the audit's criteria.
+Phlo Transform is an early release (v0.1). The end-to-end workflow —
+compile, plan, run, test, content-addressed state, lineage, contracts,
+diffs, Nessie branch environments and audited promotion, the daemon API and
+dbt translation — is implemented and exercised against live
+Trino/Iceberg/Nessie, Postgres and DuckDB. Known limitations are called out
+in the [release notes](docs/v0.1-release-notes.md); per-area implementation
+status is tracked in [docs/roadmap/](docs/roadmap/README.md).
 
 ## Toolchain
 
