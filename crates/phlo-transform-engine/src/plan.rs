@@ -377,6 +377,20 @@ impl Plan {
                     model.id
                 ));
             }
+            // The catalog is an environment binding, not model content — it
+            // sits outside the version hash — so a retarget can leave the
+            // hash identical while the plan's physical target no longer
+            // matches the compilation. Execution binds targets from the
+            // compilation; compare the full display so a stale plan cannot
+            // silently land on another relation.
+            if compiled.target.display() != model.target {
+                return Some(format!(
+                    "model `{}` target changed since the plan was created (`{}` -> `{}`)",
+                    model.id,
+                    model.target,
+                    compiled.target.display()
+                ));
+            }
         }
         None
     }

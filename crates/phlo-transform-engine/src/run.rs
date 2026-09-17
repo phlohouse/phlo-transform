@@ -582,22 +582,26 @@ impl Runner {
             .await?;
 
         // Scope the tests to the failed portion: the failed tests
-        // themselves, plus tests over models this retry actually rebuilds
-        // (their data changed, so a stale pass no longer holds).
-        let rebuilt: BTreeSet<String> = plan
+        // themselves, plus tests over models this retry actually executes
+        // (a rebuild or a cache adoption changes what the environment
+        // holds, so a stale pass no longer holds).
+        let executable: BTreeSet<String> = plan
             .models
             .iter()
-            .filter(|model| model.action == PlanAction::Build)
+            .filter(|model| matches!(model.action, PlanAction::Build | PlanAction::Cached))
             .map(|model| model.id.clone())
             .collect();
         plan.tests.retain(|test| {
             failed_test_ids.contains(&test.id)
-                || test.targets.iter().any(|target| rebuilt.contains(target))
+                || test
+                    .targets
+                    .iter()
+                    .any(|target| executable.contains(target))
         });
 
         // The failed portion may already be materialised — for example a
         // previous retry fixed it. A retry that would only skip is noise.
-        if rebuilt.is_empty() && plan.tests.is_empty() {
+        if executable.is_empty() && plan.tests.is_empty() {
             return Err(EngineError::InvalidPlan(format!(
                 "the failed portion of run {} is already materialised — nothing to retry",
                 short_id(&run_id)

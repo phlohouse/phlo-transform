@@ -353,7 +353,8 @@ pub async fn evaluate_promotion(
         _ => (Vec::new(), Vec::new(), Vec::new()),
     };
 
-    let environment = crate::audit::read_environment_for(workspace_root, state, candidate)?;
+    let (environment, environment_evidence_id) =
+        crate::audit::read_environment_evidence(workspace_root, state, candidate)?;
     let mut audit = crate::audit::audited_diff(
         workspace_root,
         state,
@@ -419,41 +420,16 @@ pub async fn evaluate_promotion(
         merge_check,
     });
 
-    // The exact evidence rows the gates consulted — captured at evaluation
-    // time so a persisted promotion names the audit trail it rested on.
-    // Each lookup mirrors the resolution the audit made above: the store's
-    // newest record for the pair (a just-imported file's record stands
-    // here too), or the candidate's live environment binding. A store read
-    // failure here cannot be silent — the ids are promotion evidence.
-    let evidence = match state {
-        Some(state) => {
-            let pair_record = |kind: crate::state::EvidenceKind| {
-                state
-                    .evidence_for(kind, candidate)
-                    .map_err(|error| {
-                        EngineError::State(format!("cannot read the evidence store: {error}"))
-                    })
-                    .map(|records| {
-                        records
-                            .iter()
-                            .find(|record| record.target_ref == to)
-                            .map(|record| record.evidence_id.clone())
-                    })
-            };
-            let environment_id = state
-                .evidence_for(crate::state::EvidenceKind::Environment, candidate)
-                .map_err(|error| {
-                    EngineError::State(format!("cannot read the evidence store: {error}"))
-                })?
-                .first()
-                .map(|record| record.evidence_id.clone());
-            PromotionEvidenceIds {
-                branch_diff: pair_record(crate::state::EvidenceKind::BranchDiff)?,
-                lineage_diff: pair_record(crate::state::EvidenceKind::LineageDiff)?,
-                environment: environment_id,
-            }
-        }
-        None => PromotionEvidenceIds::default(),
+    // The ids the audit functions resolved against travel back with the
+    // evidence itself — a promotion names the exact rows the gates
+    // consulted, not whatever row a second query would find after a
+    // concurrent writer landed newer evidence.
+    let evidence = PromotionEvidenceIds {
+        branch_diff: audit.diff_evidence_id.clone(),
+        lineage_diff: lineage
+            .as_ref()
+            .and_then(|evidence| evidence.evidence_id.clone()),
+        environment: environment_evidence_id,
     };
 
     Ok(PromotionEvaluation {
