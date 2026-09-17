@@ -45,7 +45,7 @@ workflows/reporting/transforms/
 
 Those folders can represent ownership, domains or application boundaries. They do not need to become separate transformation universes.
 
-Phlo discovers multiple transform roots and compiles them into one logical workspace.
+Phlo Transform discovers multiple transform roots and compiles them into one logical workspace.
 
 For example:
 
@@ -120,7 +120,7 @@ B and C can run concurrently after A finishes. D must wait for both.
 
 That is a **topological order**: an ordering where every node appears after its dependencies.
 
-Phlo's runner uses the graph directly rather than turning the whole workspace into one long serial list. Independent branches can execute concurrently as soon as their upstream work is satisfied.
+Phlo Transform's runner uses the graph directly rather than turning the whole workspace into one long serial list. Independent branches can execute concurrently as soon as their upstream work is satisfied.
 
 We will return to the scheduler later.
 
@@ -128,7 +128,7 @@ We will return to the scheduler later.
 
 A dependency graph that only knows “A depends on B” is valuable, but limited.
 
-Phlo's compiler builds a semantic model of the query too.
+Phlo Transform's compiler builds a semantic model of the query too.
 
 Consider:
 
@@ -186,7 +186,7 @@ can walk downstream.
 
 Because both are derived from the compiler graph, they are not separate metadata that can drift from execution.
 
-Phlo can also export the canonical graph as OpenLineage-compatible events for systems that consume that standard.
+Phlo Transform can also export the canonical graph as OpenLineage-compatible events for systems that consume that standard.
 
 ## Where types come from
 
@@ -207,7 +207,7 @@ The compiler needs to know what `concentration` and `dilution` are to infer the 
 
 Offline, external source columns may be unknown.
 
-With an adapter configured, Phlo can ask the real catalogue for relation columns and enrich the compilation.
+With an adapter configured, Phlo Transform can ask the real catalogue for relation columns and enrich the compilation.
 
 This is an important boundary:
 
@@ -260,7 +260,7 @@ select ...
 
 For a composite key, the pair is unique; the individual columns do not need to be unique by themselves.
 
-Phlo turns the declaration into several consistent behaviours:
+Phlo Transform turns the declaration into several consistent behaviours:
 
 - not-null assertions for the key columns;
 - one composite uniqueness assertion;
@@ -310,7 +310,7 @@ one typed graph
    └── promotion analysis
 ```
 
-The next question is what happens over time. Once yesterday's graph has produced physical tables and today's graph has changed, how does Phlo decide what to build, skip or safely reuse?
+The next question is what happens over time. Once yesterday's graph has produced physical tables and today's graph has changed, how does Phlo Transform decide what to build, skip or safely reuse?
 
 That is a state and planning problem.
 
