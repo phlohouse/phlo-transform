@@ -8,7 +8,8 @@ Set Padding 16
 Set TypingSpeed 40ms
 Set Theme "Catppuccin Mocha"
 
-Env PATH "/Users/garethprice/Developer/phlo-transform/target/debug:/usr/bin:/bin:/opt/homebrew/bin"
+# Requires `phlo-transform` on PATH (e.g. cargo install --path crates/phlo-transform-cli)
+Env PATH "$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"
 Env SHELL "/bin/zsh"
 
 Type "cd /tmp/phlo-demo/dbt-shop"

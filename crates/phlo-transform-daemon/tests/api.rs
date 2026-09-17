@@ -44,6 +44,11 @@ async fn exposes_semantic_api() {
     let status = get_json(&client, &format!("{base}/status")).await;
     assert_eq!(status["models"], 3);
     assert_eq!(status["sources"], 1);
+    assert_eq!(
+        status["version"],
+        env!("CARGO_PKG_VERSION"),
+        "status reports the daemon's release version"
+    );
 
     let models = get_json(&client, &format!("{base}/v1/models")).await;
     assert_eq!(models["models"].as_array().unwrap().len(), 3);

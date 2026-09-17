@@ -1,5 +1,11 @@
 # Convergence review
 
+> Point-in-time record of the convergence pass (before portable evidence,
+> PR #17, and executable cache reuse, PR #18). Where this review and the
+> current docs disagree — for example `cached` below is described as
+> classification-only — the current docs win: `cached` now executes verified
+> adoption. See [`v0.1-readiness.md`](v0.1-readiness.md).
+
 A repository-wide hardening pass over `phlo-transform` after the roadmap
 implementation: one audit of whether the compiler, state, execution,
 lakehouse environments, promotion workflow, CLI and machine API all agree

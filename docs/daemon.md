@@ -32,7 +32,7 @@ launched with (`adapter`, `state`, `nessie`).
 
 | Endpoint | CLI equivalent | Notes |
 |---|---|---|
-| `GET /status`, `GET /v1/status` | — | workspace root, semantics version, counts, capabilities, last update |
+| `GET /status`, `GET /v1/status` | — | workspace root, release version, compiler semantics version, counts, capabilities, last update |
 | `GET /v1/check` | `check --json` | diagnostics / check report |
 | `GET /v1/models` | `list --json` | models, sources and tests |
 | `GET /v1/models/{id}` | `inspect <id> --json` | model detail |
