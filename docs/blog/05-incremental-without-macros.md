@@ -52,7 +52,7 @@ Rows can be selected after a known processing frontier, usually with some overla
 
 These are different operations. Treating all of them as one “incremental mode” pushes the complexity somewhere else.
 
-## Why Phlo declares the strategy
+## Why Phlo Transform declares the strategy
 
 In a templated transformation system, incremental behaviour often lives inside the model itself:
 
@@ -65,7 +65,7 @@ else:
 
 Now the SQL has two possible meanings depending on runtime state.
 
-Phlo instead makes the incremental **strategy** explicit configuration.
+Phlo Transform instead makes the incremental **strategy** explicit configuration.
 
 Examples:
 
@@ -132,7 +132,7 @@ rather than quietly applying a new maintenance algorithm to a table created unde
 
 An incremental strategy only makes sense once a target exists.
 
-On the first run, Phlo creates the table from the full model query.
+On the first run, Phlo Transform creates the table from the full model query.
 
 ```text
 no target
@@ -227,7 +227,7 @@ Suppose the model declares:
 select ...
 ```
 
-After a successful run, Phlo stores a watermark such as:
+After a successful run, Phlo Transform stores a watermark such as:
 
 ```text
 2026-09-17 10:42:00
@@ -275,7 +275,7 @@ State advances with successful materialisation, not with attempted work.
 
 Executable cache reuse introduces an interesting case.
 
-Suppose a Nessie candidate inherits exactly the same Iceberg output as `main`, and Phlo verifies the physical snapshot identity matches.
+Suppose a Nessie candidate inherits exactly the same Iceberg output as `main`, and Phlo Transform verifies the physical snapshot identity matches.
 
 The candidate can adopt the existing materialisation without running model SQL.
 
@@ -283,7 +283,7 @@ For a time-window model, it also adopts the source environment's watermark.
 
 That is safe because the watermark is a statement about the content that was materialised. If the content is proven identical, the processing frontier is identical too.
 
-Again, Phlo does not fabricate a new “latest” timestamp. It preserves provenance from the physical output being reused.
+Again, Phlo Transform does not fabricate a new “latest” timestamp. It preserves provenance from the physical output being reused.
 
 ## Failures, retries and incrementals
 
@@ -293,7 +293,7 @@ A temporary Nessie or warehouse resource failure may be retryable.
 
 A syntax error is not.
 
-Phlo records structured attempts and only retries adapter failures classified as retryable. A successful retry records one successful materialisation transition; failed attempts do not advance watermarks or claim new output identity.
+Phlo Transform records structured attempts and only retries adapter failures classified as retryable. A successful retry records one successful materialisation transition; failed attempts do not advance watermarks or claim new output identity.
 
 This matters because incrementals are stateful. Retrying blindly is much more dangerous when each attempt can mutate a target.
 
@@ -341,12 +341,12 @@ advance by time window
 
 The adapter layer owns warehouse-specific DDL and DML.
 
-That is the same general Phlo design principle we have seen already:
+That is the same general Phlo Transform design principle we have seen already:
 
 > Put semantic intent in the model; put physical execution mechanics in the engine.
 
 The next problem is broader than one model. How do you make changes to an entire lakehouse without writing directly into production and hoping the tests catch problems afterwards?
 
-Phlo's answer is Write-Audit-Publish on Nessie branches.
+Phlo Transform's answer is Write-Audit-Publish on Nessie branches.
 
 *Next: [Safe by default: branches, audits and diffs](06-safe-by-default.md).*
