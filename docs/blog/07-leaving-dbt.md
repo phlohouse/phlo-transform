@@ -1,6 +1,6 @@
 # 7. Leaving dbt without losing your work
 
-The first six posts describe Phlo as if a workspace starts from scratch.
+The first six posts describe Phlo Transform as if a workspace starts from scratch.
 
 Real teams rarely start from scratch.
 
@@ -8,7 +8,7 @@ They already have models, tests, sources, configuration and years of accumulated
 
 A replacement that requires every model to be rewritten manually is not a practical migration path.
 
-Phlo therefore includes a one-way dbt translator:
+Phlo Transform therefore includes a one-way dbt translator:
 
 ```bash
 phlo-transform translate --from dbt
@@ -56,7 +56,7 @@ Simply renaming template functions would preserve the syntax without simplifying
 
 ## Migration should preserve intent
 
-Phlo's translator tries to answer:
+Phlo Transform's translator tries to answer:
 
 > What did this resource *mean*?
 
@@ -78,7 +78,7 @@ select
 from staging.stg_orders
 ```
 
-Several dbt mechanisms disappear because Phlo has native representations for the intent.
+Several dbt mechanisms disappear because Phlo Transform has native representations for the intent.
 
 ### `ref()` becomes a normal logical relation
 
@@ -96,15 +96,15 @@ The compiler infers the dependency from SQL after translation.
 
 ### `source()` becomes a source relation
 
-A declared dbt source is lowered to the relation name Phlo's compiler and adapter can resolve.
+A declared dbt source is lowered to the relation name Phlo Transform's compiler and adapter can resolve.
 
 ### `config()` becomes native model configuration
 
-Materialisation, tags, keys and other supported configuration become directives or generated Phlo config rather than runtime templates.
+Materialisation, tags, keys and other supported configuration become directives or generated Phlo Transform config rather than runtime templates.
 
 ### Incremental control flow becomes a strategy
 
-If the translator can prove that a dbt incremental pattern means “merge by this key” or “advance by this time window”, it lowers the pattern into Phlo's native incremental strategy.
+If the translator can prove that a dbt incremental pattern means “merge by this key” or “advance by this time window”, it lowers the pattern into Phlo Transform's native incremental strategy.
 
 The Jinja branch is no longer needed because the engine owns incremental execution.
 
@@ -124,15 +124,15 @@ General Jinja is a programming language.
 
 A macro can execute arbitrary logic to generate SQL. Static translation cannot safely pretend to understand every possible program.
 
-So Phlo classifies resources explicitly.
+So Phlo Transform classifies resources explicitly.
 
 ### `CLEAN`
 
-The resource was translated to native Phlo semantics without unresolved behaviour.
+The resource was translated to native Phlo Transform semantics without unresolved behaviour.
 
 ### `REVIEW`
 
-Phlo could emit a useful result, but a human needs to inspect or complete part of it.
+Phlo Transform could emit a useful result, but a human needs to inspect or complete part of it.
 
 Examples include macro call sites or patterns whose intended meaning cannot be proven statically.
 
@@ -140,7 +140,7 @@ Examples include macro call sites or patterns whose intended meaning cannot be p
 
 The resource has no current native translation and is not emitted as a working model.
 
-Examples can include dbt-specific resource categories outside Phlo's model scope, such as snapshots or semantic-layer resources.
+Examples can include dbt-specific resource categories outside Phlo Transform's model scope, such as snapshots or semantic-layer resources.
 
 The key rule is:
 
@@ -152,7 +152,7 @@ For some `REVIEW` cases, preserving the unresolved call site is more useful than
 
 That means the generated file may still contain something such as a macro invocation that plain SQL cannot parse.
 
-`--verify` compile-checks the generated Phlo workspace and exits non-zero when that residual content is not valid native SQL.
+`--verify` compile-checks the generated Phlo Transform workspace and exits non-zero when that residual content is not valid native SQL.
 
 The developer receives a precise place to fix rather than a successful migration with changed semantics.
 
@@ -160,7 +160,7 @@ The developer receives a precise place to fix rather than a successful migration
 
 A migration is not only a directory of files.
 
-Phlo records what happened to each source resource:
+Phlo Transform records what happened to each source resource:
 
 ```text
 resource
@@ -197,7 +197,7 @@ phlo-transform -r my-dbt-project \
     --verify
 ```
 
-The generated workspace can then go through the normal Phlo lifecycle:
+The generated workspace can then go through the normal Phlo Transform lifecycle:
 
 ```bash
 phlo-transform -r generated check
@@ -206,7 +206,7 @@ phlo-transform -r generated run --adapter duckdb
 phlo-transform -r generated test --adapter duckdb
 ```
 
-The translator ends at native Phlo files. The runtime does not carry a hidden dbt compatibility mode afterwards.
+The translator ends at native Phlo Transform files. The runtime does not carry a hidden dbt compatibility mode afterwards.
 
 ## Seeds, tests and configuration matter too
 
@@ -257,11 +257,11 @@ The release review also exercised external projects rather than only bespoke fix
 
 Those results are more useful than a claim that “most Jinja is supported”.
 
-## Why not make Phlo understand all dbt macros?
+## Why not make Phlo Transform understand all dbt macros?
 
 Because that would turn the migration layer into the architecture of the new runtime.
 
-If Phlo had to execute arbitrary dbt Jinja forever before compiling a model, then the core properties described earlier in this series would disappear:
+If Phlo Transform had to execute arbitrary dbt Jinja forever before compiling a model, then the core properties described earlier in this series would disappear:
 
 - dependencies would no longer be statically knowable;
 - SQL would no longer be the source program;
@@ -282,10 +282,10 @@ semantic translation
     └── UNSUPPORTED
     │
     ▼
-native Phlo workspace
+native Phlo Transform workspace
 ```
 
-Once the workspace is native, it participates in the same compiler, state, planning, WAP and evidence model as anything written for Phlo directly.
+Once the workspace is native, it participates in the same compiler, state, planning, WAP and evidence model as anything written for Phlo Transform directly.
 
 ## Migration is where first-principles design gets tested
 
@@ -304,7 +304,7 @@ project hierarchy      → workspace/root/folder config
 
 Where the mapping is real, translation removes machinery.
 
-Where it is not real, Phlo says so.
+Where it is not real, Phlo Transform says so.
 
 The next post moves back under the hood and explains the execution engine itself: how a plan becomes concurrent warehouse work, how failures propagate, and why resume, retry and cancellation need their own state model.
 
