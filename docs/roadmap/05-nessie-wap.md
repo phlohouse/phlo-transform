@@ -361,15 +361,16 @@ Implemented:
   against Nessie 0.108) and in-memory client; references, branch creation,
   non-destructive merge checks, merge against an expected target hash, assign
   (rollback) and delete.
-- `apply --ref <candidate> --from <base>` creates the candidate branch from the
-  base and a branch-scoped Trino catalog (dynamic catalog management; Trino
-  cannot switch Nessie refs at query time) and compiles/applies against it, so
-  candidate data is isolated from `main`.
+- `run`/`apply --ref <candidate> --from <base>` creates the candidate branch
+  from the base and a branch-scoped Trino catalog (dynamic catalog management;
+  Trino cannot switch Nessie refs at query time) and compiles/applies against
+  it, so candidate data is isolated from `main`.
 - `promote` enforces a successful candidate run, target staleness via the
   recorded base hash (`environment.json`), merge conflicts, an optional
   data-diff gate (`--require-diff`) and a breaking-schema gate
   (`--allow-breaking-schema`), and can remove the candidate with `--cleanup`;
-  it writes `promotion.json`.
+  it writes `promotion.json` and persists the record in the state store's
+  `promotions` table.
 - `rollback --ref <ref> --to <hash>` moves a reference.
 
 Missing / deviated:
@@ -380,6 +381,4 @@ Missing / deviated:
   opt-in (`--cleanup`) rather than automatic.
 - Views are unsupported by Trino's Nessie Iceberg catalog, so view models
   cannot run in a Nessie candidate environment.
-- Promotion state is written to an artifact but not persisted in the state
-  store.
 

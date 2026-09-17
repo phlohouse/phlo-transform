@@ -361,17 +361,23 @@ Phase 3 is **partially implemented** (audited against code and tests). See
 - SQLite `model_versions` table with `record_materialized`,
   `materialized_version` and `materialized_by_hash`.
 - `Planner` is state-aware: `build` / `skip` / `cached` with structured
-  `ChangeReason`s.
+  `ChangeReason`s. `cached` executes verified adoption: the plan carries the
+  source materialisation's provenance and the runner re-verifies the live
+  output identity (Iceberg snapshot) before adopting, falling back to `build`
+  on stale evidence.
 - Runner records materialisations and rejects stale plans.
 - `inspect` exposes desired/current versions and status.
 
 Tests cover formatting/comment stability, SQL/config/materialisation/upstream
 and source-state invalidation, owner/tag non-invalidation, second-run skip,
-cross-environment `cached` classification, and stale-plan rejection.
+cross-environment `cached` adoption, stale-identity build fallback, and
+stale-plan rejection — plus the live Nessie e2e adopting inherited
+materialisations with zero model SQL.
 
-Remaining gaps: `cached` is a classification only (no cross-environment reuse
-execution); no direct test for `compiler_semantics_change`. Non-Iceberg sources
-fall back to a schema fingerprint rather than data state.
+Remaining gaps: no direct test for `compiler_semantics_change`. Non-Iceberg
+sources fall back to a schema fingerprint rather than data state. `cached`
+adoption is same-adapter only and requires the relation to be visible through
+the target environment's binding (true for Nessie branch inheritance).
 
 Deferred, as listed above: optimiser semantics.
 

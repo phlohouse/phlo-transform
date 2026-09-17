@@ -53,19 +53,20 @@ the `CLEAN`/`REVIEW`/`UNSUPPORTED` classification, and the report format.
 
 ## Status
 
-Audited against code and tests. Phases 0–1 are complete; Phases 2–8 are
+Audited against code and tests. Phase 0 is complete; Phases 1–8 are
 implemented but **partial**, with gaps documented in each roadmap phase's
 implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
 
 - **Phase 0 — compiler spike: done.** Multi-root discovery, stable IDs,
   ordinary-SQL dependency resolution without `ref()`, deterministic DAG,
   `check`/`list`/`inspect` with JSON. See [`docs/architecture.md`](docs/architecture.md).
-- **Phase 1 — MVP build engine: done.** Trino adapter, view/table
+- **Phase 1 — MVP build engine: partial.** Trino adapter, view/table
   materialisations, `plan`/`apply`/`run`/`test`, bounded-concurrency scheduler,
   custom SQL tests, SQLite run history, cancellation and versioned artifacts.
   `--retries N` retries retryable adapter failures with bounded backoff;
   `--resume`/`--retry-failed` continue interrupted runs.
   See [`docs/engine.md`](docs/engine.md).
+  Gap: no partition-level scheduler tests.
 - **Phase 2 — typed compiler and lineage: partial.** Typed semantic IR, schema
   provider boundary and catalogue enrichment, column resolution and type
   inference, inferred output schemas, a canonical lineage graph behind
@@ -132,8 +133,8 @@ implementation notes and in [`docs/roadmap/README.md`](docs/roadmap/README.md).
   with no infrastructure; `--adapter trino` targets a Trino cluster. See the
   adapter boundary in [`docs/engine.md`](docs/engine.md).
 
-All eight numbered phases have implementations; only Phases 0–1 are complete
-against their acceptance criteria.
+All eight numbered phases have implementations; only Phase 0 is complete
+against the audit's criteria.
 
 ## Toolchain
 
@@ -196,7 +197,7 @@ runs a disposable container and is executed explicitly in CI.
 - [Full specification](SPEC.md)
 - [Blog series: what Phlo Transform is, from first principles](docs/blog/README.md)
 - [Implementation roadmap](docs/roadmap/README.md)
-- [Convergence review](docs/convergence-review.md) — the system model, hardening pass and remaining debt
+- [v0.1 release notes](docs/v0.1-release-notes.md) and the [final release review](docs/v0.1-final-review.md)
 - [Compiler architecture](docs/architecture.md)
 - [Engine architecture](docs/engine.md)
 - [Semantic compiler](docs/semantic.md)

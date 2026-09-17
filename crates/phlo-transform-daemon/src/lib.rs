@@ -373,6 +373,7 @@ async fn status(State(service): State<Arc<WorkspaceService>>) -> ApiResult {
     let errors = snapshot.errors().count();
     Ok(Json(json!({
         "workspace_root": snapshot.workspace_root.as_ref().map(|path| path.to_string_lossy().replace('\\', "/")),
+        "version": env!("CARGO_PKG_VERSION"),
         "compiler_semantics_version": phlo_transform_core::COMPILER_SEMANTICS_VERSION,
         "models": snapshot.models.len(),
         "sources": snapshot.sources().len(),

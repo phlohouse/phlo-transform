@@ -113,7 +113,5 @@ answer in one line per post:
 6. Production changes are written, audited, and promoted on evidence.
 7. Getting here from dbt is a command, not a rewrite.
 
-Sources and further reading: [`SPEC.md`](../../SPEC.md) for the full design,
-[`docs/roadmap/`](../roadmap/README.md) for honest implementation status,
-and [`docs/validation.md`](../validation.md) for what an end-to-end audit
-found and fixed.
+Sources and further reading: [`SPEC.md`](../../SPEC.md) for the full design
+and [`docs/roadmap/`](../roadmap/README.md) for honest implementation status.
