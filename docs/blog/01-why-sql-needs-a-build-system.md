@@ -70,7 +70,7 @@ marts.daily_events
 analytics.customer_value
 ```
 
-A relation may be an external input that Phlo does not build, or it may be the physical output of a model that Phlo does build.
+A relation may be an external input that Phlo Transform does not build, or it may be the physical output of a model that Phlo Transform does build.
 
 That gives us two more useful terms:
 
@@ -146,7 +146,7 @@ The important point is that the model describes *what the data means*. The engin
 
 ## Desired state and current state
 
-Phlo's planning model becomes much easier to understand if you separate two worlds.
+Phlo Transform's planning model becomes much easier to understand if you separate two worlds.
 
 ### Desired state
 
@@ -163,7 +163,7 @@ These inputs produce a content-addressed model version.
 
 ### Current state
 
-The state store records what Phlo previously materialised:
+The state store records what Phlo Transform previously materialised:
 
 - model version;
 - environment;
@@ -185,7 +185,7 @@ CACHED  the required verified output already exists and can be adopted here
 
 We will unpack all three later. For now, notice the important property: these are decisions backed by evidence, not merely commands.
 
-## The basic Phlo loop
+## The basic Phlo Transform loop
 
 A local workspace can start with no external infrastructure:
 
