@@ -20,10 +20,19 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            executable: phlo-transform
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            executable: phlo-transform
           - os: macos-latest
             target: aarch64-apple-darwin
+            executable: phlo-transform
           - os: macos-15-intel
             target: x86_64-apple-darwin
+            executable: phlo-transform
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            executable: phlo-transform.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -57,15 +66,28 @@ jobs:
         run: |
           name=phlo-transform-${{ matrix.target }}
           mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/phlo-transform" "dist/$name/"
+          cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" "dist/$name/"
           cp README.md LICENSE "dist/$name/"
           cd dist && tar -czf "$name.tar.gz" "$name"
+          python - "$name.tar.gz" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          archive = pathlib.Path(sys.argv[1])
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          archive.with_suffix(archive.suffix + ".sha256").write_text(
+              f"{digest}  {archive.name}\n"
+          )
+          PY
           echo "artifact=$name.tar.gz" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
           name: phlo-transform-${{ matrix.target }}
-          path: dist/${{ steps.package.outputs.artifact }}
+          path: |
+            dist/${{ steps.package.outputs.artifact }}
+            dist/${{ steps.package.outputs.artifact }}.sha256
 
   release:
     name: Create GitHub release
@@ -80,5 +102,7 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          files: "*.tar.gz"
+          files: |
+            *.tar.gz
+            *.tar.gz.sha256
           generate_release_notes: true
