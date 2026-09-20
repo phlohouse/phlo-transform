@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing tag to build and publish
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -21,9 +27,11 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             executable: phlo-transform
+            manylinux: quay.io/pypa/manylinux_2_28_x86_64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             executable: phlo-transform
+            manylinux: quay.io/pypa/manylinux_2_28_aarch64
           - os: macos-latest
             target: aarch64-apple-darwin
             executable: phlo-transform
@@ -35,6 +43,8 @@ jobs:
             executable: phlo-transform.exe
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Free disk space
         if: runner.os == 'Linux'
@@ -51,14 +61,27 @@ jobs:
           df -h /
 
       - uses: jdx/mise-action@v2
+        if: matrix.manylinux == ''
       - uses: Swatinem/rust-cache@v2
+        if: matrix.manylinux == ''
 
       - name: Install target
+        if: matrix.manylinux == ''
         run: rustup target add ${{ matrix.target }}
 
       # The bundled DuckDB C++ build is heavy; release builds take a while.
       - name: Build
+        if: matrix.manylinux == ''
         run: cargo build --release --locked -p phlo-transform-cli --target ${{ matrix.target }}
+
+      - name: Build portable Linux binary
+        if: matrix.manylinux != ''
+        run: |
+          docker run --rm \
+            -v "$PWD:/io" \
+            -w /io \
+            "${{ matrix.manylinux }}" \
+            bash -lc 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.93.0 && source "$HOME/.cargo/env" && cargo build --release --locked -p phlo-transform-cli --target ${{ matrix.target }}'
 
       - name: Package
         id: package
@@ -102,6 +125,7 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
           files: |
             *.tar.gz
             *.tar.gz.sha256
