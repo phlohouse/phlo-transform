@@ -133,4 +133,5 @@ runs a disposable container and is executed explicitly in CI.
 - [Nessie and WAP](docs/wap.md)
 - [Native data diff](docs/diff.md)
 - [Workflow integration](docs/workflow.md)
+- [Phlo integration](docs/phlo-integration.md)
 - [Daemon and agent APIs](docs/daemon.md)
